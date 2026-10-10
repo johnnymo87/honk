@@ -1,6 +1,16 @@
 use anyhow::Context;
 use reqwest::Url;
 
+pub mod conn;
+pub mod record;
+pub mod redact;
+pub mod sse;
+
+pub use conn::{StreamKey, Upstream};
+pub use record::{Direction, RecordEntry, Recorder};
+pub use redact::Redactor;
+pub use sse::sse_to_json_stream;
+
 /// Production goose serve port; probes must never talk to it.
 pub const PRODUCTION_GOOSE_PORT: u16 = 4080;
 

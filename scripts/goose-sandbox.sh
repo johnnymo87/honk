@@ -143,6 +143,7 @@ exec env \
     GOOSE_PATH_ROOT="$SANDBOX" \
     GOOSE_SERVER__SECRET_KEY="$(cat "$SANDBOX/secret")" \
     GOOSE_PROVIDER=gcp_vertex_ai \
+    GOOSE_MODEL="${GOOSE_MODEL:-claude-opus-5-5}" \
     GCP_LOCATION=global \
     GCP_PROJECT_ID="$(cat "$gcp_secret")" \
     GOOGLE_APPLICATION_CREDENTIALS="$gcloud_creds" \
