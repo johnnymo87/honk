@@ -249,7 +249,7 @@ paste, OSC 52.
 
 | | Scope | Exit criterion |
 |---|---|---|
-| **M0 spike (1-2 days)** | (1) Is goose's agent loop good enough: one real day of root sessions on existing tooling. (2) HTTP+SSE vs WS disconnect behavior on the pinned goose. (3) Two connections on one session: visibility, extension state, `session/load` during another's run. (4) Permission/form with no listener: buffered? answerable later? (5) Cancel while parked on a permission; `$/cancel_request` honored? (6) Stream vs replay message ids. (7) Hydra-acp against `goose serve` (2 h timebox, prior art). (8) Open a goose upstream Discussion proposing opt-in detach-tolerant turns + `session/subscribe` as an extension of roaming. | Findings written; §3 confirmed or design amended. (1) failing kills the project. |
+| **M0 spike (1-2 days)** | (1) Is goose's agent loop good enough: one real day of root sessions on existing tooling. (2) HTTP+SSE vs WS disconnect behavior on the pinned goose. (3) Two connections on one session: visibility, extension state, `session/load` during another's run. (4) Permission/form with no listener: buffered? answerable later? (5) Cancel while parked on a permission; `$/cancel_request` honored? (6) Stream vs replay message ids. (7) Hydra-acp against `goose serve` (2 h timebox, prior art). (8) Write goose patch notes (detach-tolerant WS turns, `session/subscribe`) for a patch track carried in the author's goose fork; upstream proposal deferred until after living with the patches. | Findings written; §3 confirmed or design amended. (1) failing kills the project. |
 | **M1** | honkd proxy (HTTP+SSE upstream, state file, attach/replay, pending requests, queue/steer); pigeon repointed at honkd; ~100-line `honk tail`. | A pigeon turn is visible in `honk tail`; `kill -9 honkd` mid-turn, restart: the turn completes and `tail` resumes without duplicated text; restart goose mid-turn: `cancelled` shown, retry not duplicated. |
 | **M2** | TUI daily-driver: edtui composer, markdown/tables/colors, thinking, tool blocks, inline subagent progress, scrolling, history, interrupt. Used alongside OpenCode v1. | Author uses it for a full day. |
 | **M3** | Forms/permissions, model switch, MCP toggle, usage line, diffs. | All MVP interaction features present. |
@@ -278,7 +278,9 @@ proxy; ~100-180 h with substantial reuse, 200-300+ h owning everything.
   design has the mirror-image cost: honkd becomes load-bearing for swarm delivery.
   Accepted, because honkd is small and single-purpose and pigeon is not.)
 - **Patch goose** to decouple turns from connections and broadcast updates: permanent
-  fork burden; still needs subscription semantics. Proposed upstream instead (M0).
+  fork burden; still needs subscription semantics. Revised by the author: patches *are*
+  carried in the existing goose fork alongside honkd for practice, then considered for
+  upstream.
 - **One TUI per session kept alive by tmux, no relay**: cheapest, but fails the
   thin-client and live-pigeon-turn requirements.
 - **Inline (native scrollback) rendering**: preferred for vim-native yank, but makes
