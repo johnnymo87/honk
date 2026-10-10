@@ -12,7 +12,7 @@
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in {
         devShells.default = pkgs.mkShell {
-          packages = [ rust pkgs.pkg-config pkgs.openssl pkgs.jq pkgs.websocat ];
+          packages = [ rust pkgs.pkg-config pkgs.openssl pkgs.jq pkgs.websocat pkgs.shellcheck ];
         };
       });
 }

@@ -12,19 +12,25 @@
 
 set -euo pipefail
 
-SANDBOX=$(realpath -m "${HONK_SANDBOX:-$HOME/.local/state/honk-sandbox}")
-case "$SANDBOX" in
+RAW_SANDBOX="${HONK_SANDBOX:-$HOME/.local/state/honk-sandbox}"
+case "$RAW_SANDBOX" in
     /*) ;;
     *)
-        echo "ERROR: SANDBOX path must be absolute: $SANDBOX" >&2
+        echo "ERROR: HONK_SANDBOX must be an absolute path: $RAW_SANDBOX" >&2
         exit 1
         ;;
 esac
 
+SANDBOX=$(realpath -m "$RAW_SANDBOX")
+if [[ "$SANDBOX" == "$HOME" || "$SANDBOX" == "/" ]]; then
+    echo "ERROR: SANDBOX cannot be \$HOME or root (/): $SANDBOX" >&2
+    exit 1
+fi
+
 mkdir -p "$SANDBOX"/{config,data,state}
 chmod 0700 "$SANDBOX"
 
-# First run only: copy ONLY ~/.config/goose/config.yaml and edit it
+# First run only: build sandbox config.yaml from scratch using allowlist
 if [[ ! -f "$SANDBOX/config/config.yaml" ]]; then
     src_config="$HOME/.config/goose/config.yaml"
     if [[ ! -f "$src_config" ]]; then
@@ -32,99 +38,91 @@ if [[ ! -f "$SANDBOX/config/config.yaml" ]]; then
         exit 1
     fi
 
-    tmp_config=$(mktemp)
+    tmp_config=$(mktemp -p "$SANDBOX" config.XXXXXX)
+    trap 'rm -f "$tmp_config"' EXIT
+
+    # Allowlist: copy only these scalar/block keys from source if present
     awk '
     BEGIN {
-        in_ext = 0
-        in_dev = 0
-        dev_found = 0
-        header_seen = 0
-        telem_seen = 0
+        in_allow = 0
     }
-    /^GCP_PROJECT_ID:/ { next }
-    /^GCP_VERTEX_SESSION_HEADER:/ {
-        print "GCP_VERTEX_SESSION_HEADER: x-honk-sandbox-session"
-        header_seen = 1
-        next
-    }
-    /^GOOSE_TELEMETRY_ENABLED:/ {
-        print "GOOSE_TELEMETRY_ENABLED: false"
-        telem_seen = 1
-        next
-    }
-    /^extensions:/ {
-        in_ext = 1
-        print "extensions:"
-        next
-    }
-    in_ext && /^  developer:/ {
-        in_dev = 1
-        dev_found = 1
-        print
-        next
-    }
-    in_ext && in_dev && /^    / {
-        print
-        next
-    }
-    in_ext && in_dev && !/^    / {
-        in_dev = 0
-    }
-    in_ext && /^[A-Za-z0-9_]/ {
-        if (!dev_found) {
-            print "  developer:"
-            print "    enabled: true"
-            print "    type: platform"
-            print "    name: developer"
-            print "    description: Write and edit files, and execute shell commands"
-            print "    display_name: Developer"
-            print "    bundled: true"
-        }
-        in_ext = 0
-    }
-    {
-        if (!in_ext) {
+    /^[A-Za-z0-9_]+:/ {
+        in_allow = 0
+        if (/^(GCP_VERTEX_HOST|GCP_AUTH_SCOPES|GOOSE_DISABLE_KEYRING|GOOSE_MODEL|GOOSE_PROVIDER):/) {
+            in_allow = 1
             print
+            next
         }
     }
-    END {
-        if (in_ext && !dev_found) {
-            print "  developer:"
-            print "    enabled: true"
-            print "    type: platform"
-            print "    name: developer"
-            print "    description: Write and edit files, and execute shell commands"
-            print "    display_name: Developer"
-            print "    bundled: true"
-        }
-        if (!header_seen) {
-            print "GCP_VERTEX_SESSION_HEADER: x-honk-sandbox-session"
-        }
-        if (!telem_seen) {
-            print "GOOSE_TELEMETRY_ENABLED: false"
-        }
+    in_allow && /^[ \t]/ {
+        print
+        next
+    }
+    in_allow && !/^[ \t]/ {
+        in_allow = 0
     }
     ' "$src_config" > "$tmp_config"
 
+    # Append fixed lines and canonical extensions block
+    cat >> "$tmp_config" << 'EOF'
+GCP_VERTEX_SESSION_HEADER: x-honk-sandbox-session
+GOOSE_TELEMETRY_ENABLED: false
+extensions:
+  developer:
+    enabled: true
+    type: platform
+    name: developer
+    description: Write and edit files, and execute shell commands
+    display_name: Developer
+    bundled: true
+EOF
+
+    # Post-generation assertions
+    if grep -q 'plugins:' "$tmp_config"; then
+        echo "ERROR: Assertion failed: generated config contains plugins:" >&2
+        exit 1
+    fi
+
+    if grep -q 'x-opencode-session' "$tmp_config"; then
+        echo "ERROR: Assertion failed: generated config contains x-opencode-session" >&2
+        exit 1
+    fi
+
+    bad_ext=$(awk '
+        /^extensions:/ { in_ext=1; next }
+        in_ext && /^[A-Za-z0-9_]/ { in_ext=0 }
+        in_ext && /^  [a-zA-Z0-9_-]+:/ && !/^  developer:/ { print $1 }
+    ' "$tmp_config")
+    if [[ -n "$bad_ext" ]]; then
+        echo "ERROR: Assertion failed: generated config contains non-developer extension: $bad_ext" >&2
+        exit 1
+    fi
+
     install -m 0600 "$tmp_config" "$SANDBOX/config/config.yaml"
     rm -f "$tmp_config"
+    trap - EXIT
 fi
 
-# Secret: create once at $SANDBOX/secret (mode 0600)
+# Secret: create once directly at $SANDBOX/secret (mode 0600) under umask 077
 if [[ ! -f "$SANDBOX/secret" ]]; then
-    tmp_secret=$(mktemp)
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 32 > "$tmp_secret"
-    else
-        od -vN 32 -An -tx1 /dev/urandom | tr -d ' \n' > "$tmp_secret"
-    fi
-    install -m 0600 "$tmp_secret" "$SANDBOX/secret"
-    rm -f "$tmp_secret"
+    (
+        umask 077
+        if command -v openssl >/dev/null 2>&1; then
+            openssl rand -hex 32 > "$SANDBOX/secret"
+        else
+            od -vN 32 -An -tx1 /dev/urandom | tr -d ' \n' > "$SANDBOX/secret"
+        fi
+    )
+    chmod 0600 "$SANDBOX/secret"
 fi
 
 PORT="${HONK_SANDBOX_PORT:-4180}"
-if [[ "$PORT" == "4080" ]]; then
-    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing to run sandbox on port 4080." >&2
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PORT must be numeric: $PORT" >&2
+    exit 1
+fi
+if (( 10#$PORT == 4080 )); then
+    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing port 4080." >&2
     exit 1
 fi
 

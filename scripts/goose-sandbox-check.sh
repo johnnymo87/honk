@@ -10,17 +10,27 @@
 
 set -euo pipefail
 
-SANDBOX=$(realpath -m "${HONK_SANDBOX:-$HOME/.local/state/honk-sandbox}")
-case "$SANDBOX" in
+RAW_SANDBOX="${HONK_SANDBOX:-$HOME/.local/state/honk-sandbox}"
+case "$RAW_SANDBOX" in
     /*) ;;
     *)
-        echo "ERROR: SANDBOX path must be absolute: $SANDBOX" >&2
+        echo "ERROR: HONK_SANDBOX must be an absolute path: $RAW_SANDBOX" >&2
         exit 1
         ;;
 esac
 
+SANDBOX=$(realpath -m "$RAW_SANDBOX")
+if [[ "$SANDBOX" == "$HOME" || "$SANDBOX" == "/" ]]; then
+    echo "ERROR: SANDBOX cannot be \$HOME or root (/): $SANDBOX" >&2
+    exit 1
+fi
+
 PORT="${HONK_SANDBOX_PORT:-4180}"
-if [[ "$PORT" == "4080" ]]; then
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PORT must be numeric: $PORT" >&2
+    exit 1
+fi
+if (( 10#$PORT == 4080 )); then
     echo "ERROR: Refusing to interact with port 4080 (production goose-serve)" >&2
     exit 1
 fi
@@ -52,8 +62,8 @@ if [[ "$actual_cwd" != "$SANDBOX" ]]; then
 fi
 
 # 3. POST initialize with bounded retry (up to 15s in case service just started)
-tmp_headers=$(mktemp)
-tmp_body=$(mktemp)
+tmp_headers=$(mktemp -p "$SANDBOX" headers.XXXXXX)
+tmp_body=$(mktemp -p "$SANDBOX" body.XXXXXX)
 trap 'rm -f "$tmp_headers" "$tmp_body"' EXIT
 
 http_status=""
