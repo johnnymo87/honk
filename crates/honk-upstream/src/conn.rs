@@ -388,8 +388,10 @@ impl Upstream {
     /// Subscribes to the connection stream (`session == None`) or a session stream (`session == Some(...)`).
     ///
     /// On HTTP 409 Conflict, retries with backoff up to `subscribe_deadline`.
+    /// Returns the duration of the 409 conflict window (from first 409 to successful subscribe,
+    /// or `Duration::ZERO` if no 409 occurred).
     /// Spawns a background task that streams parsed JSON frames into the client receiver.
-    pub async fn subscribe(&mut self, session: Option<&str>) -> anyhow::Result<()> {
+    pub async fn subscribe(&mut self, session: Option<&str>) -> anyhow::Result<Duration> {
         let stream_key = session
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
@@ -401,6 +403,7 @@ impl Upstream {
 
         let stream_name = stream_key.stream_record_name();
         let start = Instant::now();
+        let mut first_409: Option<Instant> = None;
         let mut backoff = self.subscribe_initial_backoff;
 
         loop {
@@ -422,6 +425,9 @@ impl Upstream {
 
             let status = res.status();
             if status == StatusCode::CONFLICT {
+                if first_409.is_none() {
+                    first_409 = Some(Instant::now());
+                }
                 self.rec.record_marker(
                     &stream_name,
                     format!("409 Conflict subscribing to {stream_name}"),
@@ -448,8 +454,12 @@ impl Upstream {
                 anyhow::bail!("GET stream for {stream_name} failed with status {status}");
             }
 
-            self.rec
-                .record_marker(&stream_name, format!("subscribed to {stream_name}"));
+            let conflict_window = first_409.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+
+            self.rec.record_marker(
+                &stream_name,
+                format!("subscribed to {stream_name} (409 window: {conflict_window:?})"),
+            );
 
             let sse_stream = crate::sse::sse_to_json_stream(res.bytes_stream());
             let tx = self.tx.clone();
@@ -484,7 +494,7 @@ impl Upstream {
             });
 
             self.stream_tasks.insert(stream_key, handle);
-            return Ok(());
+            return Ok(conflict_window);
         }
     }
 
