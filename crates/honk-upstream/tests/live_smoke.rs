@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use honk_upstream::{Recorder, Redactor, StreamKey, Upstream};
+use honk_upstream::{Event, Recorder, Redactor, StreamKey, Upstream};
 
 #[tokio::test]
 #[ignore]
@@ -195,9 +195,16 @@ async fn live_smoke() -> anyhow::Result<()> {
             panic!("timed out waiting for prompt response and PONG");
         }
         let remaining = timeout - start.elapsed();
-        let frame_opt = upstream.next(remaining).await?;
-        let Some((stream_key, frame)) = frame_opt else {
-            panic!("stream ended or timed out waiting for prompt frames");
+        let event_opt = upstream.next(remaining).await?;
+        let Some(event) = event_opt else {
+            panic!("timed out waiting for prompt frames");
+        };
+
+        let (stream_key, frame) = match event {
+            Event::Frame(key, frame) => (key, frame),
+            Event::StreamEnded { key, error } => {
+                panic!("stream {key:?} ended unexpectedly: {error:?}");
+            }
         };
 
         println!(

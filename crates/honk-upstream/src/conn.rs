@@ -10,6 +10,9 @@ use serde_json::Value;
 use crate::guard_url;
 use crate::record::{Direction, Recorder};
 
+/// Timeout applied to all JSON-RPC POST and DELETE requests.
+pub const POST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Identifies whether a stream belongs to the connection mailbox or a specific session mailbox.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamKey {
@@ -26,6 +29,46 @@ impl StreamKey {
     }
 }
 
+/// Lifecycle and payload events delivered across SSE streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A JSON-RPC frame received from an SSE stream.
+    Frame(StreamKey, Value),
+    /// Indicates an SSE stream has terminated, either cleanly (error is None) or with an error.
+    StreamEnded {
+        key: StreamKey,
+        error: Option<String>,
+    },
+}
+
+impl Event {
+    pub fn key(&self) -> &StreamKey {
+        match self {
+            Event::Frame(key, _) => key,
+            Event::StreamEnded { key, .. } => key,
+        }
+    }
+
+    pub fn frame(&self) -> Option<&Value> {
+        match self {
+            Event::Frame(_, val) => Some(val),
+            Event::StreamEnded { .. } => None,
+        }
+    }
+}
+
+/// Compares two JSON-RPC ids for equality, handling number-string equivalence.
+pub fn rpc_id_matches(expected: &Value, actual: &Value) -> bool {
+    if expected == actual {
+        return true;
+    }
+    match (expected, actual) {
+        (Value::Number(n), Value::String(s)) => n.to_string() == *s,
+        (Value::String(s), Value::Number(n)) => *s == n.to_string(),
+        _ => false,
+    }
+}
+
 /// Upstream ACP HTTP+SSE client.
 pub struct Upstream {
     url: Url,
@@ -36,9 +79,9 @@ pub struct Upstream {
     next_request_id: AtomicU64,
     rec: Recorder,
     stream_tasks: HashMap<StreamKey, tokio::task::JoinHandle<()>>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<(StreamKey, Value)>,
-    tx: tokio::sync::mpsc::UnboundedSender<(StreamKey, Value)>,
-    buffered_frames: VecDeque<(StreamKey, Value)>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    buffered_events: VecDeque<Event>,
     subscribe_deadline: Duration,
     subscribe_initial_backoff: Duration,
     subscribe_max_backoff: Duration,
@@ -52,6 +95,7 @@ impl Upstream {
     /// stores the resulting `Acp-Connection-Id`, and records all frames.
     pub async fn initialize(url: &str, secret: String, rec: Recorder) -> anyhow::Result<Self> {
         let parsed_url = guard_url(url)?;
+        let trimmed_secret = secret.trim().to_string();
         let client = reqwest::Client::builder().build()?;
 
         let init_body = serde_json::json!({
@@ -66,7 +110,8 @@ impl Upstream {
 
         let res = client
             .post(parsed_url.clone())
-            .header("x-secret-key", &secret)
+            .timeout(POST_TIMEOUT)
+            .header("x-secret-key", &trimmed_secret)
             .header("content-type", "application/json")
             .json(&init_body)
             .send()
@@ -93,6 +138,7 @@ impl Upstream {
             .ok_or_else(|| anyhow::anyhow!("initialize response missing Acp-Connection-Id header"))?
             .to_str()
             .with_context(|| "invalid Acp-Connection-Id header")?
+            .trim()
             .to_string();
 
         let init_response: Value = res
@@ -106,7 +152,7 @@ impl Upstream {
 
         Ok(Self {
             url: parsed_url,
-            secret,
+            secret: trimmed_secret,
             conn_id,
             init_result: Some(init_response),
             client,
@@ -115,7 +161,7 @@ impl Upstream {
             stream_tasks: HashMap::new(),
             rx,
             tx,
-            buffered_frames: VecDeque::new(),
+            buffered_events: VecDeque::new(),
             subscribe_deadline: Duration::from_secs(60),
             subscribe_initial_backoff: Duration::from_millis(100),
             subscribe_max_backoff: Duration::from_secs(2),
@@ -131,15 +177,17 @@ impl Upstream {
         rec: Recorder,
     ) -> anyhow::Result<Self> {
         let parsed_url = guard_url(url)?;
+        let trimmed_secret = secret.trim().to_string();
+        let trimmed_conn_id = conn_id.trim().to_string();
         let client = reqwest::Client::builder().build()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        rec.record_marker("conn", format!("resumed connection {conn_id}"));
+        rec.record_marker("conn", format!("resumed connection {trimmed_conn_id}"));
 
         Ok(Self {
             url: parsed_url,
-            secret,
-            conn_id,
+            secret: trimmed_secret,
+            conn_id: trimmed_conn_id,
             init_result: None,
             client,
             next_request_id: AtomicU64::new(1000),
@@ -147,7 +195,7 @@ impl Upstream {
             stream_tasks: HashMap::new(),
             rx,
             tx,
-            buffered_frames: VecDeque::new(),
+            buffered_events: VecDeque::new(),
             subscribe_deadline: Duration::from_secs(60),
             subscribe_initial_backoff: Duration::from_millis(100),
             subscribe_max_backoff: Duration::from_secs(2),
@@ -176,8 +224,15 @@ impl Upstream {
         self.subscribe_max_backoff = max;
     }
 
+    pub fn buffered_event_count(&self) -> usize {
+        self.buffered_events.len()
+    }
+
     pub fn buffered_frame_count(&self) -> usize {
-        self.buffered_frames.len()
+        self.buffered_events
+            .iter()
+            .filter(|e| matches!(e, Event::Frame(_, _)))
+            .count()
     }
 
     /// Sends a JSON-RPC request frame with a monotonic integer id.
@@ -200,6 +255,7 @@ impl Upstream {
         let mut req = self
             .client
             .post(self.url.clone())
+            .timeout(POST_TIMEOUT)
             .header("x-secret-key", &self.secret)
             .header("acp-connection-id", &self.conn_id)
             .header("content-type", "application/json");
@@ -248,6 +304,7 @@ impl Upstream {
         let mut req = self
             .client
             .post(self.url.clone())
+            .timeout(POST_TIMEOUT)
             .header("x-secret-key", &self.secret)
             .header("acp-connection-id", &self.conn_id)
             .header("content-type", "application/json");
@@ -296,6 +353,7 @@ impl Upstream {
         let mut req = self
             .client
             .post(self.url.clone())
+            .timeout(POST_TIMEOUT)
             .header("x-secret-key", &self.secret)
             .header("acp-connection-id", &self.conn_id)
             .header("content-type", "application/json");
@@ -401,21 +459,28 @@ impl Upstream {
 
             let handle = tokio::spawn(async move {
                 let mut stream = sse_stream;
+                let mut stream_err = None;
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(val) => {
                             rec.record_in(&s_name, val.clone());
-                            if tx.send((key.clone(), val)).is_err() {
-                                break;
+                            if tx.send(Event::Frame(key.clone(), val)).is_err() {
+                                return;
                             }
                         }
                         Err(err) => {
-                            rec.record_marker(&s_name, format!("stream error: {err}"));
+                            let err_str = err.to_string();
+                            rec.record_marker(&s_name, format!("stream error: {err_str}"));
+                            stream_err = Some(err_str);
                             break;
                         }
                     }
                 }
                 rec.record_marker(&s_name, format!("stream {s_name} ended"));
+                let _ = tx.send(Event::StreamEnded {
+                    key,
+                    error: stream_err,
+                });
             });
 
             self.stream_tasks.insert(stream_key, handle);
@@ -423,10 +488,10 @@ impl Upstream {
         }
     }
 
-    /// Reads the next frame, checking buffered frames first, then waiting on SSE streams up to `timeout`.
-    /// Returns `Ok(None)` if `timeout` expires or streams are closed.
-    pub async fn next(&mut self, timeout: Duration) -> anyhow::Result<Option<(StreamKey, Value)>> {
-        if let Some(buffered) = self.buffered_frames.pop_front() {
+    /// Reads the next event, checking buffered events first, then waiting on SSE streams up to `timeout`.
+    /// Returns `Ok(None)` if `timeout` expires.
+    pub async fn next(&mut self, timeout: Duration) -> anyhow::Result<Option<Event>> {
+        if let Some(buffered) = self.buffered_events.pop_front() {
             return Ok(Some(buffered));
         }
 
@@ -439,7 +504,7 @@ impl Upstream {
 
     /// Convenience method: sends a request and waits on `next()` for the matching response id.
     ///
-    /// Any non-matching frames received while waiting are buffered into internal storage and
+    /// Any non-matching events received while waiting are buffered into internal storage and
     /// drained by subsequent calls to `next()` or `call()`.
     /// Returns the `"result"` field of the response, or fails if the response contains an `"error"`.
     pub async fn call(
@@ -480,33 +545,49 @@ impl Upstream {
             let now = Instant::now();
             if now >= deadline {
                 for item in unmatched.into_iter().rev() {
-                    self.buffered_frames.push_front(item);
+                    self.buffered_events.push_front(item);
                 }
                 anyhow::bail!("timed out waiting for response to request id {req_id}");
             }
             let remaining = deadline - now;
             match self.next(remaining).await {
-                Ok(Some((stream_key, frame))) => {
-                    if frame.get("id") == Some(&req_id) {
+                Ok(Some(Event::Frame(stream_key, frame))) => {
+                    if frame
+                        .get("id")
+                        .is_some_and(|id| rpc_id_matches(&req_id, id))
+                    {
                         for item in unmatched.into_iter().rev() {
-                            self.buffered_frames.push_front(item);
+                            self.buffered_events.push_front(item);
                         }
                         return Ok((stream_key, frame));
                     } else {
-                        unmatched.push((stream_key, frame));
+                        unmatched.push(Event::Frame(stream_key, frame));
+                    }
+                }
+                Ok(Some(Event::StreamEnded { key, error })) => {
+                    let expected_stream = session
+                        .map(|s| StreamKey::Session(s.to_string()))
+                        .unwrap_or(StreamKey::Conn);
+                    if key == expected_stream || key == StreamKey::Conn {
+                        for item in unmatched.into_iter().rev() {
+                            self.buffered_events.push_front(item);
+                        }
+                        anyhow::bail!(
+                            "stream {key:?} ended while waiting for response to request id {req_id}: {error:?}"
+                        );
+                    } else {
+                        unmatched.push(Event::StreamEnded { key, error });
                     }
                 }
                 Ok(None) => {
                     for item in unmatched.into_iter().rev() {
-                        self.buffered_frames.push_front(item);
+                        self.buffered_events.push_front(item);
                     }
-                    anyhow::bail!(
-                        "stream ended or timed out waiting for response to request id {req_id}"
-                    );
+                    anyhow::bail!("timed out waiting for response to request id {req_id}");
                 }
                 Err(err) => {
                     for item in unmatched.into_iter().rev() {
-                        self.buffered_frames.push_front(item);
+                        self.buffered_events.push_front(item);
                     }
                     return Err(err);
                 }
@@ -529,6 +610,7 @@ impl Upstream {
         let res = self
             .client
             .delete(self.url.clone())
+            .timeout(POST_TIMEOUT)
             .header("x-secret-key", &self.secret)
             .header("acp-connection-id", &self.conn_id)
             .send()
@@ -563,6 +645,65 @@ mod tests {
         assert!(res.is_err());
     }
 
+    #[test]
+    fn resume_trims_secret_and_conn_id() {
+        let upstream = Upstream::resume(
+            "http://127.0.0.1:4180/acp",
+            "  secret-123 \n".into(),
+            " conn-abc \r\n".into(),
+            Recorder::disabled(),
+        )
+        .expect("resume ok");
+        assert_eq!(upstream.secret, "secret-123");
+        assert_eq!(upstream.conn_id(), "conn-abc");
+    }
+
+    #[test]
+    fn rpc_id_matching_handles_number_and_string_equivalence() {
+        use serde_json::json;
+        assert!(rpc_id_matches(&json!(42), &json!(42)));
+        assert!(rpc_id_matches(&json!("42"), &json!("42")));
+        assert!(rpc_id_matches(&json!(42), &json!("42")));
+        assert!(rpc_id_matches(&json!("42"), &json!(42)));
+        assert!(!rpc_id_matches(&json!(42), &json!(43)));
+        assert!(!rpc_id_matches(&json!(42), &json!("43")));
+        assert!(!rpc_id_matches(&json!(42), &json!("not_a_number")));
+        assert!(!rpc_id_matches(&json!(true), &json!("true")));
+    }
+
+    #[tokio::test]
+    async fn next_returns_stream_ended_event() {
+        let mut upstream = Upstream::resume(
+            "http://127.0.0.1:4180/acp",
+            "secret".into(),
+            "conn-test".into(),
+            Recorder::disabled(),
+        )
+        .expect("resume ok");
+
+        // Simulate sending a StreamEnded event
+        upstream
+            .tx
+            .send(Event::StreamEnded {
+                key: StreamKey::Conn,
+                error: Some("test error".into()),
+            })
+            .unwrap();
+
+        let event = upstream
+            .next(Duration::from_millis(50))
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            Event::StreamEnded { key, error } => {
+                assert_eq!(key, StreamKey::Conn);
+                assert_eq!(error.as_deref(), Some("test error"));
+            }
+            _ => panic!("expected StreamEnded event, got {event:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn initialize_refuses_production_port() {
         let res = Upstream::initialize(
@@ -593,10 +734,11 @@ mod tests {
         )
         .expect("resume ok");
 
-        upstream
-            .buffered_frames
-            .push_back((StreamKey::Conn, serde_json::json!({"buffered": 1})));
-        upstream.buffered_frames.push_back((
+        upstream.buffered_events.push_back(Event::Frame(
+            StreamKey::Conn,
+            serde_json::json!({"buffered": 1}),
+        ));
+        upstream.buffered_events.push_back(Event::Frame(
             StreamKey::Session("s1".into()),
             serde_json::json!({"buffered": 2}),
         ));
@@ -606,16 +748,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.0, StreamKey::Conn);
-        assert_eq!(first.1, serde_json::json!({"buffered": 1}));
+        assert_eq!(
+            first,
+            Event::Frame(StreamKey::Conn, serde_json::json!({"buffered": 1}))
+        );
 
         let second = upstream
             .next(Duration::from_millis(50))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.0, StreamKey::Session("s1".into()));
-        assert_eq!(second.1, serde_json::json!({"buffered": 2}));
+        assert_eq!(
+            second,
+            Event::Frame(
+                StreamKey::Session("s1".into()),
+                serde_json::json!({"buffered": 2})
+            )
+        );
 
         let third = upstream.next(Duration::from_millis(10)).await.unwrap();
         assert!(third.is_none());
