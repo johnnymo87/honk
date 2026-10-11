@@ -11,12 +11,24 @@ use crate::record::{Direction, Recorder};
 use crate::sse::SseFrame;
 use crate::{HttpStatusError, guard_url_with};
 
+fn truncate_body(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let mut truncated: String = trimmed.chars().take(max_chars).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
 fn http_status_error(op: &'static str, status: StatusCode, body: String) -> anyhow::Error {
     let err = anyhow::Error::new(HttpStatusError { op, status });
-    if body.trim().is_empty() {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
         err
     } else {
-        err.context(body)
+        err.context(truncate_body(trimmed, 200))
     }
 }
 
@@ -206,6 +218,7 @@ pub(crate) struct UpstreamInner {
     pub(crate) conn_id: String,
     pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Event>,
     pub(crate) stream_tasks: std::sync::Mutex<HashMap<StreamKey, tokio::task::JoinHandle<()>>>,
+    pub(crate) generations: std::sync::Mutex<HashMap<StreamKey, u64>>,
     pub(crate) last_byte_at: std::sync::Arc<std::sync::Mutex<HashMap<StreamKey, Instant>>>,
     pub(crate) rec: Recorder,
     pub(crate) features: std::sync::Mutex<Option<StreamFeatures>>,
@@ -213,6 +226,19 @@ pub(crate) struct UpstreamInner {
     pub(crate) subscribe_initial_backoff: Duration,
     pub(crate) subscribe_max_backoff: Duration,
     pub(crate) subscribe_headers_timeout: Duration,
+}
+
+impl Drop for UpstreamInner {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.stream_tasks.lock() {
+            for (_, handle) in tasks.drain() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut bytes) = self.last_byte_at.lock() {
+            bytes.clear();
+        }
+    }
 }
 
 /// Cloneable; every method takes &self. Subscribing spawns the reader task, which sends into
@@ -297,6 +323,13 @@ impl UpstreamHandle {
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
 
+        let my_gen = {
+            let mut gens = self.inner.generations.lock().unwrap();
+            let generation = gens.entry(stream_key.clone()).or_insert(0);
+            *generation += 1;
+            *generation
+        };
+
         if let Some(prev) = self.inner.stream_tasks.lock().unwrap().remove(&stream_key) {
             prev.abort();
         }
@@ -318,28 +351,38 @@ impl UpstreamHandle {
         )
         .await?;
 
-        *self.inner.features.lock().unwrap() = Some(outcome.features);
-        self.inner
-            .stream_tasks
-            .lock()
-            .unwrap()
-            .insert(stream_key, task_handle);
-        Ok(outcome)
-    }
+        {
+            let gens = self.inner.generations.lock().unwrap();
+            let current_gen = gens.get(&stream_key).copied().unwrap_or(0);
+            if current_gen != my_gen {
+                task_handle.abort();
+                anyhow::bail!(
+                    "subscribe to {} superseded by newer operation",
+                    stream_key.stream_record_name()
+                );
+            }
 
-    pub fn hard_drop(&self) {
-        for (_, handle) in self.inner.stream_tasks.lock().unwrap().drain() {
-            handle.abort();
+            let mut tasks = self.inner.stream_tasks.lock().unwrap();
+            if let Some(displaced) = tasks.insert(stream_key, task_handle) {
+                displaced.abort();
+            }
         }
-        self.inner
-            .rec
-            .record_marker("conn", "hard_drop: aborted all SSE stream tasks");
+
+        *self.inner.features.lock().unwrap() = Some(outcome.features);
+        Ok(outcome)
     }
 
     pub fn unsubscribe(&self, session: Option<&str>) {
         let stream_key = session
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
+
+        {
+            let mut gens = self.inner.generations.lock().unwrap();
+            let generation = gens.entry(stream_key.clone()).or_insert(0);
+            *generation += 1;
+        }
+
         if let Some(prev) = self.inner.stream_tasks.lock().unwrap().remove(&stream_key) {
             prev.abort();
             self.inner.rec.record_marker(
@@ -347,10 +390,19 @@ impl UpstreamHandle {
                 format!("unsubscribed from {}", stream_key.stream_record_name()),
             );
         }
+        self.inner.last_byte_at.lock().unwrap().remove(&stream_key);
     }
 
     pub async fn delete(&self) -> anyhow::Result<reqwest::StatusCode> {
-        self.hard_drop();
+        if let Ok(mut tasks) = self.inner.stream_tasks.lock() {
+            for (_, handle) in tasks.drain() {
+                handle.abort();
+            }
+        }
+        self.inner.last_byte_at.lock().unwrap().clear();
+        self.inner
+            .rec
+            .record_marker("conn", "delete: aborted all SSE stream tasks");
         do_delete(&self.target()).await
     }
 }
@@ -665,35 +717,46 @@ async fn do_subscribe_with(
             let mut stream = sse_stream;
             let mut stream_err = None;
             let mut floor = opts.resume_after;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(SseFrame { id, data }) => {
-                        if let Some(id) = id {
-                            if floor.is_some_and(|f| id <= f) {
-                                rec.record_marker(
-                                    &s_name,
-                                    format!("dropped duplicate event id {id}"),
-                                );
-                                continue;
-                            }
-                            floor = Some(id);
-                        }
-                        rec.record(
-                            Direction::In,
-                            &s_name,
-                            None,
-                            Some(data.clone()),
-                            id.map(|id| format!("event id {id}")),
-                        );
-                        if tx.send(Event::Frame(key.clone(), data, id)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        let err_str = err.to_string();
-                        rec.record_marker(&s_name, format!("stream error: {err_str}"));
-                        stream_err = Some(err_str);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
                         break;
+                    }
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(SseFrame { id, data })) => {
+                                if let Some(id) = id {
+                                    if floor.is_some_and(|f| id <= f) {
+                                        rec.record_marker(
+                                            &s_name,
+                                            format!("dropped duplicate event id {id}"),
+                                        );
+                                        continue;
+                                    }
+                                    floor = Some(id);
+                                }
+                                rec.record(
+                                    Direction::In,
+                                    &s_name,
+                                    None,
+                                    Some(data.clone()),
+                                    id.map(|id| format!("event id {id}")),
+                                );
+                                if tx.send(Event::Frame(key.clone(), data, id)).is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Err(err)) => {
+                                let err_str = err.to_string();
+                                rec.record_marker(&s_name, format!("stream error: {err_str}"));
+                                stream_err = Some(err_str);
+                                break;
+                            }
+                            None => {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -726,8 +789,9 @@ pub struct Upstream {
     next_request_id: AtomicU64,
     rec: Recorder,
     pub(crate) stream_tasks: HashMap<StreamKey, tokio::task::JoinHandle<()>>,
+    pub(crate) generations: HashMap<StreamKey, u64>,
     pub(crate) last_byte_at: std::sync::Arc<std::sync::Mutex<HashMap<StreamKey, Instant>>>,
-    pub(crate) rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub(crate) rx: Option<tokio::sync::mpsc::UnboundedReceiver<Event>>,
     pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Event>,
     pub(crate) buffered_events: VecDeque<Event>,
     subscribe_deadline: Duration,
@@ -736,6 +800,15 @@ pub struct Upstream {
     subscribe_headers_timeout: Duration,
     last_call_stream: Option<StreamKey>,
     features: Option<StreamFeatures>,
+    split_done: bool,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        if !self.split_done {
+            self.hard_drop();
+        }
+    }
 }
 
 impl Upstream {
@@ -781,7 +854,7 @@ impl Upstream {
             .json(&init_body)
             .send()
             .await
-            .with_context(|| format!("failed to send POST initialize to {url}"))?;
+            .context("failed to send POST initialize")?;
 
         let status = res.status();
         rec.record(
@@ -806,10 +879,16 @@ impl Upstream {
             .trim()
             .to_string();
 
-        let init_response: Value = res
-            .json()
+        let body_text = res
+            .text()
             .await
-            .with_context(|| "failed to parse initialize response JSON body")?;
+            .context("failed to read initialize response body")?;
+        let init_response: Value = serde_json::from_str(&body_text).with_context(|| {
+            format!(
+                "failed to parse initialize response JSON body: {}",
+                truncate_body(&body_text, 200)
+            )
+        })?;
 
         rec.record_in("conn", init_response.clone());
 
@@ -824,8 +903,9 @@ impl Upstream {
             next_request_id: AtomicU64::new(2),
             rec,
             stream_tasks: HashMap::new(),
+            generations: HashMap::new(),
             last_byte_at: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            rx,
+            rx: Some(rx),
             tx,
             buffered_events: VecDeque::new(),
             subscribe_deadline: Duration::from_secs(60),
@@ -834,6 +914,7 @@ impl Upstream {
             subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
             features: None,
+            split_done: false,
         })
     }
 
@@ -871,8 +952,9 @@ impl Upstream {
             next_request_id: AtomicU64::new(1000),
             rec,
             stream_tasks: HashMap::new(),
+            generations: HashMap::new(),
             last_byte_at: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            rx,
+            rx: Some(rx),
             tx,
             buffered_events: VecDeque::new(),
             subscribe_deadline: Duration::from_secs(60),
@@ -881,6 +963,7 @@ impl Upstream {
             subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
             features: None,
+            split_done: false,
         })
     }
 
@@ -1008,6 +1091,12 @@ impl Upstream {
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
 
+        let my_gen = {
+            let generation = self.generations.entry(stream_key.clone()).or_insert(0);
+            *generation += 1;
+            *generation
+        };
+
         // Cancel previous task for this key if one was active
         if let Some(prev) = self.stream_tasks.remove(&stream_key) {
             prev.abort();
@@ -1030,8 +1119,20 @@ impl Upstream {
         )
         .await?;
 
+        let current_gen = self.generations.get(&stream_key).copied().unwrap_or(0);
+        if current_gen != my_gen {
+            task_handle.abort();
+            anyhow::bail!(
+                "subscribe to {} superseded by newer operation",
+                stream_key.stream_record_name()
+            );
+        }
+
+        if let Some(displaced) = self.stream_tasks.insert(stream_key, task_handle) {
+            displaced.abort();
+        }
+
         self.features = Some(outcome.features);
-        self.stream_tasks.insert(stream_key, task_handle);
         Ok(outcome)
     }
 
@@ -1040,13 +1141,21 @@ impl Upstream {
         if let Some(event) = self.buffered_events.pop_front() {
             return Some(event);
         }
-        self.rx.recv().await
+        if let Some(rx) = self.rx.as_mut() {
+            rx.recv().await
+        } else {
+            None
+        }
     }
 
     pub fn unsubscribe(&mut self, session: Option<&str>) {
         let stream_key = session
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
+
+        let generation = self.generations.entry(stream_key.clone()).or_insert(0);
+        *generation += 1;
+
         if let Some(prev) = self.stream_tasks.remove(&stream_key) {
             prev.abort();
             self.rec.record_marker(
@@ -1054,20 +1163,28 @@ impl Upstream {
                 format!("unsubscribed from {}", stream_key.stream_record_name()),
             );
         }
+        self.last_byte_at.lock().unwrap().remove(&stream_key);
     }
 
     /// I2: split into a cloneable handle (POST/DELETE/subscribe) and the single event receiver.
-    pub fn split(self) -> (UpstreamHandle, EventRx) {
+    pub fn split(mut self) -> (UpstreamHandle, EventRx) {
+        self.split_done = true;
+        let tasks = std::mem::take(&mut self.stream_tasks);
+        let gens = std::mem::take(&mut self.generations);
+        let rx = self.rx.take().expect("Upstream::split called once");
+        let buffered = std::mem::take(&mut self.buffered_events);
+
         let handle = UpstreamHandle {
             inner: std::sync::Arc::new(UpstreamInner {
-                client: self.client,
-                url: self.url,
-                secret: self.secret,
-                conn_id: self.conn_id,
-                tx: self.tx,
-                stream_tasks: std::sync::Mutex::new(self.stream_tasks),
-                last_byte_at: self.last_byte_at,
-                rec: self.rec,
+                client: self.client.clone(),
+                url: self.url.clone(),
+                secret: std::mem::take(&mut self.secret),
+                conn_id: std::mem::take(&mut self.conn_id),
+                tx: self.tx.clone(),
+                stream_tasks: std::sync::Mutex::new(tasks),
+                generations: std::sync::Mutex::new(gens),
+                last_byte_at: self.last_byte_at.clone(),
+                rec: self.rec.clone(),
                 features: std::sync::Mutex::new(self.features),
                 subscribe_deadline: self.subscribe_deadline,
                 subscribe_initial_backoff: self.subscribe_initial_backoff,
@@ -1075,11 +1192,8 @@ impl Upstream {
                 subscribe_headers_timeout: self.subscribe_headers_timeout,
             }),
         };
-        let rx = EventRx {
-            rx: self.rx,
-            buffered: self.buffered_events,
-        };
-        (handle, rx)
+        let event_rx = EventRx { rx, buffered };
+        (handle, event_rx)
     }
 
     /// Reads the next event, checking buffered events first, then waiting on SSE streams up to `timeout`.
@@ -1089,10 +1203,14 @@ impl Upstream {
             return Ok(Some(buffered));
         }
 
-        match tokio::time::timeout(timeout, self.rx.recv()).await {
-            Ok(Some(item)) => Ok(Some(item)),
-            Ok(None) => Ok(None),
-            Err(_) => Ok(None),
+        if let Some(rx) = self.rx.as_mut() {
+            match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(item)) => Ok(Some(item)),
+                Ok(None) => Ok(None),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
         }
     }
 
@@ -1194,6 +1312,7 @@ impl Upstream {
         for (_, handle) in self.stream_tasks.drain() {
             handle.abort();
         }
+        self.last_byte_at.lock().unwrap().clear();
         self.rec
             .record_marker("conn", "hard_drop: aborted all SSE stream tasks");
     }
@@ -1696,17 +1815,46 @@ mod tests {
             Recorder::disabled(),
         )
         .unwrap();
+
+        let (conn_tx, mut conn_rx) = tokio::sync::oneshot::channel::<()>();
+        let conn_task = tokio::spawn(async move {
+            let _guard = conn_tx;
+            std::future::pending::<()>().await
+        });
+
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel::<()>();
+        let session_task = tokio::spawn(async move {
+            let _guard = session_tx;
+            std::future::pending::<()>().await
+        });
+
+        up.stream_tasks.insert(StreamKey::Conn, conn_task);
         up.stream_tasks
-            .insert(StreamKey::Conn, tokio::spawn(std::future::pending::<()>()));
-        up.stream_tasks.insert(
-            StreamKey::Session("x".into()),
-            tokio::spawn(std::future::pending::<()>()),
-        );
+            .insert(StreamKey::Session("x".into()), session_task);
+
         up.unsubscribe(Some("x"));
+
         assert!(up.stream_tasks.contains_key(&StreamKey::Conn));
         assert!(
             !up.stream_tasks
                 .contains_key(&StreamKey::Session("x".into()))
+        );
+
+        // Session task must have been aborted (drop guard dropped)
+        let session_aborted = tokio::time::timeout(Duration::from_secs(1), session_rx).await;
+        assert!(session_aborted.is_ok(), "session task abort timed out");
+        assert!(
+            session_aborted.unwrap().is_err(),
+            "session task should have been aborted"
+        );
+
+        // Conn task must NOT have been aborted
+        assert!(
+            matches!(
+                conn_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "conn task was unexpectedly aborted"
         );
     }
 
@@ -1800,16 +1948,170 @@ mod tests {
         res2.unwrap();
 
         let mut frames = Vec::new();
-        while frames.len() < 2 {
-            let ev = rx.recv().await.unwrap();
-            if let Event::Frame(key, data, _) = ev {
-                frames.push((key, data));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while frames.len() < 2 {
+                let ev = rx.recv().await.expect("recv event");
+                if let Event::Frame(key, data, _) = ev {
+                    frames.push((key, data));
+                }
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for frames from both streams");
 
         let mut keys: Vec<StreamKey> = frames.into_iter().map(|(k, _)| k).collect();
         keys.sort_by_key(|k| k.stream_record_name());
         assert_eq!(keys, vec![StreamKey::Conn, StreamKey::Session("s1".into())]);
+    }
+
+    #[tokio::test]
+    async fn drop_all_handles_aborts_readers_and_closes_event_rx() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+
+        let (_tx, rx) =
+            futures::channel::mpsc::unbounded::<Result<bytes::Bytes, std::convert::Infallible>>();
+        let body_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(Body::from_stream(rx))));
+
+        let app = Router::new().route(
+            "/acp",
+            get(move || {
+                let body_holder = body_holder.clone();
+                async move {
+                    let body = body_holder.lock().unwrap().take().unwrap_or_default();
+                    (
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("cache-control", "no-cache"),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (handle, mut event_rx) = upstream.split();
+
+        handle
+            .subscribe_with(None, SubscribeOpts::default())
+            .await
+            .unwrap();
+
+        let handle_clone = handle.clone();
+
+        // Drop first handle; handle_clone is still alive, so rx stays open
+        drop(handle);
+
+        // Drop last handle; UpstreamInner drops, aborting reader task and dropping tx
+        drop(handle_clone);
+
+        // event_rx should close and return None within timeout
+        let res = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for event_rx.recv()");
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn drop_unsplit_upstream_aborts_readers() {
+        let mut up = Upstream::resume(
+            "http://127.0.0.1:4180/acp",
+            "s".into(),
+            "c".into(),
+            Recorder::disabled(),
+        )
+        .unwrap();
+
+        let (task_tx, task_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = task_tx;
+            std::future::pending::<()>().await
+        });
+        up.stream_tasks.insert(StreamKey::Conn, task);
+
+        drop(up);
+
+        let res = tokio::time::timeout(Duration::from_secs(1), task_rx).await;
+        assert!(res.is_ok(), "task drop guard not closed in time");
+        assert!(
+            res.unwrap().is_err(),
+            "task was not aborted on Upstream drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_during_subscribe_aborts_stale_task() {
+        use axum::Router;
+        use axum::extract::Request;
+        use axum::routing::get;
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(Some(gate_rx)));
+
+        let app = Router::new().route(
+            "/acp",
+            get({
+                let gate = gate.clone();
+                move |_: Request| {
+                    let gate = gate.clone();
+                    async move {
+                        let rx = gate.lock().await.take();
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                        (
+                            [
+                                ("content-type", "text/event-stream"),
+                                ("cache-control", "no-cache"),
+                            ],
+                            "id: 1\ndata: {}\n\n",
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (handle, _rx) = upstream.split();
+
+        let h = handle.clone();
+        let join_sub =
+            tokio::spawn(async move { h.subscribe_with(None, SubscribeOpts::default()).await });
+
+        // Allow subscribe_with to connect and block on the gate
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Unsubscribe while subscribe_with is in-flight
+        handle.unsubscribe(None);
+
+        // Release the gate
+        let _ = gate_tx.send(());
+
+        let sub_res = tokio::time::timeout(Duration::from_secs(2), join_sub)
+            .await
+            .expect("subscribe_with timed out")
+            .expect("join failed");
+
+        assert!(sub_res.is_err(), "expected in-flight subscribe to fail");
+        assert!(handle.inner.stream_tasks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ pub const PRODUCTION_GOOSE_PORT: u16 = 4080;
 /// Validates that a target URL does not point to the production goose serve port
 /// unless `allow_production` is true.
 pub fn guard_url_with(url: &str, allow_production: bool) -> anyhow::Result<Url> {
-    let parsed = Url::parse(url).with_context(|| format!("failed to parse URL '{url}'"))?;
+    let parsed = Url::parse(url).context("failed to parse URL")?;
     if parsed.port() == Some(PRODUCTION_GOOSE_PORT) && !allow_production {
         anyhow::bail!(
             "refusing to connect to production goose port {PRODUCTION_GOOSE_PORT} \
