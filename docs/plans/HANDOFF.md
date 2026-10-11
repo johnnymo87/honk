@@ -20,7 +20,7 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - [ ] T7 goose patch notes
 - [x] T8 P3: Same-conn reload mid-run safe, agent preserved, no replay duplicates; CWD rewritten (honkd must pass stored CWD); cross-conn reload does not redirect live stream.
 - [x] T9 P4: No SSE redelivery or load re-send of pending permissions; same-conn survives 90s listener drop and finishes; lost frames unrecoverable; teardown answers execute nothing.
-- [x] T10 P5: cancel works from any conn (54-77ms, kills child); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, replays unfulfilled turn.
+- [x] T10 P5: cancel works from any conn (54-79ms, leaks orphan shell descendants); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, export works before load.
 - [x] T11 P6: Message IDs and toolCallIds completely stable (block id = messageId); replayTail:1 covers last turn; goose ~0.5-1.7 MB/session RSS, 0 child procs; honkd TTL 15m, max 16 conns.
 - [ ] T12 hydra (optional)  - [ ] T13 findings + M1 plan + goose-patch plan
 

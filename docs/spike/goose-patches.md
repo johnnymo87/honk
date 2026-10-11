@@ -247,14 +247,29 @@ surface in an `unstable` namespace.
 
 **Size:** about 300-500 LOC plus tests.
 
+## 5. Process group termination for developer shell (fixes orphaned child processes on cancel)
+
+**Problem.** When an in-flight prompt is cancelled (`session/cancel`), goose triggers the agent turn's cancellation token. In `crates/goose/src/agents/platform_extensions/developer/shell.rs:611,622`, the cancellation handler calls `child.start_kill()`. On Unix, `child` is the direct `bash` process (`build_shell_command`, line 732). Calling `start_kill()` sends `SIGKILL` only to `bash`. Any descendant processes spawned by `bash` (such as `sleep`, compiler invocations, build scripts, background tasks) are NOT killed; they are orphaned, reparented to PID 1 / user systemd (P5a), and continue running in the background until completion. This bug applies equally to production goose.
+
+**Fix.** Spawn the shell process in its own process group on Unix (using `tokio::process::Command::process_group(0)` or `command.pre_exec(|| { nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)) })`), and on cancellation send `SIGKILL` to the process group (`-pgid`) rather than only the parent process before awaiting child exit.
+
+**Test idea.** Run a shell command with a subshell or command chain (e.g. `bash -c "sleep 40"`), cancel the session, and verify using `pgrep -u $UID -f "sleep 40"` that no descendant processes survive.
+
+**What honkd could drop:** Nothing directly, but prevents resource leaks and runaway background processes on the goose server host when user turns are cancelled.
+
+**Risk:** Low. Standard Unix process group management.
+
+**Size:** ≈20-40 LOC in `crates/goose/src/agents/platform_extensions/developer/shell.rs`.
+
 ## Ranking (value for honkd ÷ cost)
 
 | Rank | Patch | Value for honkd | Cost | Where |
 |---|---|---|---|---|
 | 1 | 2: takeover | High: removes the indefinite 409 | S (≈100 LOC) | crate (vendored) |
 | 2 | 3: replay ring | High: removes per-reattach loss; reconcile becomes rare | M (≈150 LOC) | crate (vendored) |
-| 3 | 4: session/subscribe | Low: honkd already fans out | L | goose |
-| 4 | 1: WS detach | ~None: honkd uses HTTP+SSE; honest version needs resume and acks | M+ | crate |
+| 3 | 5: shell process group kill | High (host hygiene): stops runaway orphaned shell processes on cancel | S (≈30 LOC) | goose |
+| 4 | 4: session/subscribe | Low: honkd already fans out | L | goose |
+| 5 | 1: WS detach | ~None: honkd uses HTTP+SSE; honest version needs resume and acks | M+ | crate |
 
 **Recommendation.** Build **2 then 3** in one vendored-crate patch series.
 Write them so they can be upstreamed to `agent-client-protocol-http`, and

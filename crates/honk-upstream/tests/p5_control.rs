@@ -134,6 +134,20 @@ pub fn check_child_processes(pid: u32) -> anyhow::Result<Vec<String>> {
     Ok(stats.children)
 }
 
+pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
+    let uid_out = std::process::Command::new("id").arg("-u").output()?;
+    let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
+    let output = std::process::Command::new("pgrep")
+        .args(["-u", &uid, "-f", pattern])
+        .output()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    let pids: Vec<u32> = s
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect();
+    Ok(pids)
+}
+
 pub async fn restart_sandbox_unit() -> anyhow::Result<()> {
     let res = tokio::process::Command::new("systemctl")
         .args(["--user", "restart", "honk-goose-sandbox"])
@@ -185,16 +199,16 @@ pub async fn restart_sandbox_unit() -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore]
 async fn p5a1_cancel_conn_a() -> anyhow::Result<()> {
-    run_p5a_conn_a_case("p5a1").await
+    run_p5a_conn_a_case("p5a1", 41).await
 }
 
 #[tokio::test]
 #[ignore]
 async fn p5a2_cancel_conn_a() -> anyhow::Result<()> {
-    run_p5a_conn_a_case("p5a2").await
+    run_p5a_conn_a_case("p5a2", 42).await
 }
 
-async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
+async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result<()> {
     let Some(mut ts) = setup_session_with_mode("p5a_conn_a", "auto").await? else {
         return Ok(());
     };
@@ -205,15 +219,17 @@ async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
         ts.sid, ts.conn_id, goose_pid
     );
 
-    let prompt =
-        "Run the shell command \"sleep 40 && echo done\", then reply with only the word FINISHED.";
+    let prompt = format!(
+        "Run the shell command \"sleep {sleep_secs}; echo P5A_DONE_{case_name}\", then reply with only the word FINISHED."
+    );
+    let prompt_start = Instant::now();
     let prompt_req_id = ts
         .upstream
         .request(
             "session/prompt",
             json!({
                 "sessionId": &ts.sid,
-                "prompt": [{"type": "text", "text": prompt}]
+                "prompt": [{"type": "text", "text": &prompt}]
             }),
             Some(&ts.sid),
         )
@@ -239,20 +255,24 @@ async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Confirm sleep child process exists
-    let mut sleep_child_detected = false;
+    // Confirm sleep child process exists via system-wide pgrep
+    let marker_pattern = format!("sleep {sleep_secs}");
+    let mut initial_pids = Vec::new();
     for _ in 0..15 {
-        let children = check_child_processes(goose_pid)?;
-        if children.iter().any(|c| c.contains("sleep")) {
-            sleep_child_detected = true;
+        initial_pids = pgrep_user(&marker_pattern)?;
+        if !initial_pids.is_empty() {
             println!(
-                "[{case_name}] Confirmed sleep child process running: {:?}",
-                children
+                "[{case_name}] Confirmed sleep command running with pids: {:?}",
+                initial_pids
             );
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    assert!(
+        !initial_pids.is_empty(),
+        "sleep command must be running before cancel"
+    );
 
     // Send session/cancel notification from Connection A
     let cancel_start = Instant::now();
@@ -293,10 +313,48 @@ async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
         .unwrap_or("unknown")
         .to_string();
 
-    // Check if sleep child process is killed
+    // Check immediately if sleep process survived as an orphan
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let children_after = check_child_processes(goose_pid)?;
-    let sleep_child_alive = children_after.iter().any(|c| c.contains("sleep"));
+    let pids_after_cancel = pgrep_user(&marker_pattern)?;
+    let direct_children_after = check_child_processes(goose_pid)?;
+    let orphan_survived_immediately = !pids_after_cancel.is_empty();
+
+    println!(
+        "[{case_name}] Direct children under goose: {:?}, system-wide pids: {:?}",
+        direct_children_after, pids_after_cancel
+    );
+
+    if orphan_survived_immediately {
+        for pid in &pids_after_cancel {
+            let ppid_out = std::process::Command::new("ps")
+                .args(["-o", "pid,ppid,cmd", "-p", &pid.to_string()])
+                .output();
+            if let Ok(out) = ppid_out {
+                println!(
+                    "[{case_name}] Orphan process details:\n{}",
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
+        }
+    }
+
+    // Wait until sleep_secs + 4s has elapsed from start to check if orphan completes on its own
+    let wait_target = Duration::from_secs(sleep_secs + 4);
+    if prompt_start.elapsed() < wait_target {
+        let sleep_remaining = wait_target - prompt_start.elapsed();
+        println!(
+            "[{case_name}] Waiting {:.1}s for orphan to complete natural sleep...",
+            sleep_remaining.as_secs_f64()
+        );
+        tokio::time::sleep(sleep_remaining).await;
+    }
+    let pids_after_completion = pgrep_user(&marker_pattern)?;
+    let orphan_completed = pids_after_completion.is_empty();
+    println!(
+        "[{case_name}] After {}s, orphan completed: {}",
+        sleep_secs + 4,
+        orphan_completed
+    );
 
     // Export session
     let export_json = export_session(&mut ts.upstream, &ts.sid).await?;
@@ -306,12 +364,14 @@ async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
         "case": case_name,
         "session_id": ts.sid,
         "conn_id": ts.conn_id,
-        "sleep_child_detected_before_cancel": sleep_child_detected,
+        "sleep_secs": sleep_secs,
         "cancel_latency_ms": cancel_latency.as_millis(),
         "prompt_reply_received": prompt_reply_frame.is_some(),
         "stop_reason": stop_reason,
-        "sleep_child_still_alive": sleep_child_alive,
-        "children_after_cancel": children_after,
+        "direct_children_after_cancel": direct_children_after,
+        "orphan_pids_after_cancel": pids_after_cancel,
+        "orphan_survived_immediately": orphan_survived_immediately,
+        "orphan_completed_after_wait": orphan_completed,
         "export_message_count": export_summary.message_count,
         "export_user_persisted": export_summary.user_message_persisted,
         "export_assistant_persisted": export_summary.assistant_message_persisted,
@@ -341,16 +401,20 @@ async fn run_p5a_conn_a_case(case_name: &str) -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore]
 async fn p5a3_cancel_conn_b_without_load() -> anyhow::Result<()> {
-    run_p5a_conn_b_case("p5a3", false).await
+    run_p5a_conn_b_case("p5a3", false, 43).await
 }
 
 #[tokio::test]
 #[ignore]
 async fn p5a4_cancel_conn_b_with_load() -> anyhow::Result<()> {
-    run_p5a_conn_b_case("p5a4", true).await
+    run_p5a_conn_b_case("p5a4", true, 44).await
 }
 
-async fn run_p5a_conn_b_case(case_name: &str, with_load: bool) -> anyhow::Result<()> {
+async fn run_p5a_conn_b_case(
+    case_name: &str,
+    with_load: bool,
+    sleep_secs: u64,
+) -> anyhow::Result<()> {
     let subfolder = if with_load {
         "p5a_conn_b_with_load"
     } else {
@@ -366,15 +430,16 @@ async fn run_p5a_conn_b_case(case_name: &str, with_load: bool) -> anyhow::Result
         ts.sid, ts.conn_id
     );
 
-    let prompt =
-        "Run the shell command \"sleep 40 && echo done\", then reply with only the word FINISHED.";
+    let prompt = format!(
+        "Run the shell command \"sleep {sleep_secs}; echo P5A_DONE_{case_name}\", then reply with only the word FINISHED."
+    );
     let prompt_req_id = ts
         .upstream
         .request(
             "session/prompt",
             json!({
                 "sessionId": &ts.sid,
-                "prompt": [{"type": "text", "text": prompt}]
+                "prompt": [{"type": "text", "text": &prompt}]
             }),
             Some(&ts.sid),
         )
@@ -401,15 +466,23 @@ async fn run_p5a_conn_b_case(case_name: &str, with_load: bool) -> anyhow::Result
     }
 
     // Confirm sleep child
-    let mut sleep_child_detected = false;
+    let marker_pattern = format!("sleep {sleep_secs}");
+    let mut initial_pids = Vec::new();
     for _ in 0..15 {
-        let children = check_child_processes(goose_pid)?;
-        if children.iter().any(|c| c.contains("sleep")) {
-            sleep_child_detected = true;
+        initial_pids = pgrep_user(&marker_pattern)?;
+        if !initial_pids.is_empty() {
+            println!(
+                "[{case_name}] Confirmed sleep command running with pids: {:?}",
+                initial_pids
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    assert!(
+        !initial_pids.is_empty(),
+        "sleep command must be running before cancel"
+    );
 
     // Connect Connection B
     println!("[{case_name}] Initializing Conn B...");
@@ -478,8 +551,21 @@ async fn run_p5a_conn_b_case(case_name: &str, with_load: bool) -> anyhow::Result
         .to_string();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let children_after = check_child_processes(goose_pid)?;
-    let sleep_child_alive = children_after.iter().any(|c| c.contains("sleep"));
+    let pids_after_cancel = pgrep_user(&marker_pattern)?;
+    let direct_children_after = check_child_processes(goose_pid)?;
+    let orphan_survived_immediately = !pids_after_cancel.is_empty();
+
+    println!(
+        "[{case_name}] Direct children under goose: {:?}, system-wide pids: {:?}",
+        direct_children_after, pids_after_cancel
+    );
+
+    // Clean up orphan process so it does not linger
+    for pid in &pids_after_cancel {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
 
     let export_json = export_session(&mut ts.upstream, &ts.sid).await?;
     let export_summary = summarize_export(&export_json);
@@ -490,12 +576,13 @@ async fn run_p5a_conn_b_case(case_name: &str, with_load: bool) -> anyhow::Result
         "session_id": ts.sid,
         "conn_a_id": ts.conn_id,
         "conn_b_id": conn_b_id,
-        "sleep_child_detected_before_cancel": sleep_child_detected,
+        "sleep_secs": sleep_secs,
         "cancel_latency_ms": cancel_latency.as_millis(),
         "prompt_reply_received": prompt_reply_frame.is_some(),
         "stop_reason": stop_reason,
-        "sleep_child_still_alive": sleep_child_alive,
-        "children_after_cancel": children_after,
+        "direct_children_after_cancel": direct_children_after,
+        "orphan_pids_after_cancel": pids_after_cancel,
+        "orphan_survived_immediately": orphan_survived_immediately,
         "export_message_count": export_summary.message_count,
         "export_user_persisted": export_summary.user_message_persisted,
         "export_assistant_persisted": export_summary.assistant_message_persisted,
@@ -1087,6 +1174,16 @@ async fn run_p5d_case(case_name: &str, late_timing: bool) -> anyhow::Result<()> 
             steer_in_conversation,
             "control steer must appear in conversation"
         );
+    } else {
+        // Late steer: turn must end cleanly with prompt reply, steer accepted
+        assert!(
+            prompt_reply_frame.is_some(),
+            "late steer turn must end cleanly with prompt reply"
+        );
+        assert!(
+            steer_accepted,
+            "late steer request must be accepted with runId and messageId"
+        );
     }
 
     Ok(())
@@ -1239,7 +1336,11 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
         "[{case_name}] Sleep child survived under goose: {sleep_survived_under_new_pid}, system-wide: {sleep_survived_system}"
     );
 
-    // Export session on new connection before session/load
+    // Subscribe new_upstream to session so we can receive RPC replies on session stream
+    new_upstream.subscribe(None).await?;
+    new_upstream.subscribe(Some(&ts.sid)).await?;
+
+    // Export session on new connection BEFORE session/load
     let export_before_load = export_session(&mut new_upstream, &ts.sid).await;
     let export_before_load_ok = export_before_load.is_ok();
     let export_summary_before = export_before_load.as_ref().ok().map(summarize_export);
@@ -1247,10 +1348,6 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
         "[{case_name}] Export on fresh connection before session/load: ok={export_before_load_ok}, summary={:?}",
         export_summary_before
     );
-
-    // Subscribe new_upstream to session
-    new_upstream.subscribe(None).await?;
-    new_upstream.subscribe(Some(&ts.sid)).await?;
 
     // session/load on fresh connection
     println!("[{case_name}] Calling session/load on new connection...");
@@ -1338,6 +1435,10 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
     assert!(
         !sleep_survived_system,
         "sleep process should not survive unit restart"
+    );
+    assert!(
+        export_before_load_ok,
+        "export must succeed on fresh connection before session/load"
     );
     assert!(
         recovery_successful,
