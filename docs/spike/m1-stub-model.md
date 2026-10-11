@@ -9,12 +9,12 @@
 
 | Check | Description | Result | Details |
 |---|---|---|---|
-| 1 | Text turn streaming | PASS | Streams `agent_message_chunk`s matching scripted chunks and finishes turn cleanly |
+| 1 | Text turn streaming | PASS | Streams `agent_message_chunk`s matching scripted chunks 1:1 (`chunks == scripted`) and finishes turn cleanly |
 | 2 | Tool turn (`shell` / `echo hi` in auto mode) | PASS | Emits `tool_call` then `tool_call_update completed`, runs second completion text turn; `export()` contains both tool call and assistant text |
 | 3 | Approve mode | PASS | Emits `session/request_permission`; answering `allow_once` executes the tool and finishes the turn |
-| 4 | Gated completion, busy prompt, steer, cancel | PASS | Gate holds second completion; concurrent prompt receives busy error `-32602` (`already has active run`); steer with `expectedRunId` is accepted; `session/cancel` aborts run with `stopReason: "cancelled"` |
-| 5 | Takeover and replay | PASS | `GET /acp` advertises `Acp-Stream-Features: takeover, replay`; resume with `takeover: true` and `resume_after` yields `ReplayOutcome::Complete` with all subsequent frames replayed in sequence |
-| 6 | Process kill and respawn | PASS | Child kill drops connection; after `restart()`, old connection returns 404 / fails, and `export()` on respawned goose reads persisted session from SQLite |
+| 4 | Gated completion, busy prompt, steer, cancel | PASS | Gate holds second completion; concurrent prompt receives busy error `-32602` with data verifying `already has active run` and active `runId`; steer with `expectedRunId` is accepted; `session/cancel` aborts run with `stopReason: "cancelled"` |
+| 5 | Takeover and replay | PASS | `GET /acp` advertises `Acp-Stream-Features: takeover, replay`; resume with `takeover: true` and `resume_after` yields `ReplayOutcome::Complete` with exactly the missed session frame IDs and matching payloads replayed |
+| 6 | Process kill and respawn | PASS | Prompt reply verified before kill; child kill drops connection; after `restart()` on the same port, old connection returns HTTP 404 (`is_gone`), and `export()` on respawned goose reads persisted session from SQLite |
 
 ## Auxiliary Model Calls & Classification Log
 
@@ -47,6 +47,8 @@ Tool call matching in `StubModel` matches exact tool names as well as `__<tool>`
 
 ## Gap Notes & Wire Observations
 
-1. **Steer requires `expectedRunId`:** When invoking `_goose/unstable/session/steer`, goose requires `expectedRunId` matching `session_info_update._meta.goose.activeRunId`. Calling steer without `expectedRunId` returns error `-32602` ("missing field `expectedRunId`").
-2. **Replay ring is connection-scoped:** Replay ring buffers are maintained per connection mailbox. To replay missed frames using `Last-Event-ID` (`resume_after`), the subscriber must resume the same connection (`Upstream::resume`) rather than initializing a fresh connection.
-3. **No fake fallback required for primary tests:** Because all 6 checks succeeded on real goose with the stub model, the primary test harness does not need to emulate core session semantics via `FakeGoose`. `FakeGoose` will be used in Task A2 only for synthetic fault injection (unpatched-style permanent 409, missing ring/gap emulation, and CI environments without a goose binary).
+1. **Chunk streaming is 1:1:** Goose preserves chunk boundaries from the SSE stream and emits each `delta.content` as an individual `agent_message_chunk` frame on ACP without merging or splitting.
+2. **Steer requires `expectedRunId`:** When invoking `_goose/unstable/session/steer`, goose requires `expectedRunId` matching `session_info_update._meta.goose.activeRunId`. Calling steer without `expectedRunId` returns error `-32602` ("missing field `expectedRunId`").
+3. **Replay ring is connection-scoped:** Replay ring buffers are maintained per connection mailbox. To replay missed frames using `Last-Event-ID` (`resume_after`), the subscriber must resume the same connection (`Upstream::resume`) rather than initializing a fresh connection.
+4. **Port reuse on restart & TOCTOU resilience:** Respawning goose on the same port requires waiting for the kernel socket to clear TIME_WAIT. Initial spawn retries up to 3 times with a fresh free port to guard against TOCTOU race conditions.
+5. **No fake fallback required for primary tests:** Because all 6 checks succeeded on real goose with the stub model, the primary test harness does not need to emulate core session semantics via `FakeGoose`. `FakeGoose` will be used in Task A2 only for synthetic fault injection (unpatched-style permanent 409, missing ring/gap emulation, and CI environments without a goose binary).

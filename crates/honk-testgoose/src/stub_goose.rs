@@ -77,13 +77,6 @@ impl StubGoose {
         let secret_path = temp_path.join("secret");
         std::fs::write(&secret_path, &secret).expect("write secret");
 
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
-            let p = listener.local_addr().expect("local addr").port();
-            drop(listener);
-            p
-        };
-
         let dirs = ChildDirs {
             root_dir: &root_dir,
             home_dir: &home_dir,
@@ -91,17 +84,47 @@ impl StubGoose {
             temp_path: &temp_path,
         };
 
-        let (child, pid) =
-            spawn_child(&goose_bin, port, &secret, &dirs, &model.base_url()).expect("spawn goose");
+        let mut attempts = 0;
+        let (child, pid, port) = loop {
+            attempts += 1;
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+                let p = listener.local_addr().expect("local addr").port();
+                drop(listener);
+                p
+            };
 
-        let wait_ready = wait_until_ready(port, &secret, Duration::from_secs(10)).await;
-        if let Err(e) = wait_ready {
-            let log_path = temp_path.join("goose.log");
-            let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
-            eprintln!("goose readiness failed: {e}\ngoose log:\n{log_content}");
-            kill_pgid(pid);
-            panic!("goose readiness failed: {e}");
-        }
+            let (mut child, pid) =
+                match spawn_child(&goose_bin, port, &secret, &dirs, &model.base_url()) {
+                    Ok(res) => res,
+                    Err(_e) if attempts < 3 => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(e) => panic!("failed to spawn goose: {e}"),
+                };
+
+            match wait_until_ready(port, &secret, Duration::from_secs(10)).await {
+                Ok(()) => break (child, pid, port),
+                Err(e) => {
+                    kill_pgid(pid);
+                    let _ = child.start_kill();
+                    let mut status = 0;
+                    unsafe {
+                        libc::waitpid(pid as libc::pid_t, &mut status, 0);
+                    }
+                    if attempts >= 3 {
+                        let log_path = temp_path.join("goose.log");
+                        let log_content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                        eprintln!(
+                            "goose readiness failed after 3 attempts: {e}\ngoose log:\n{log_content}"
+                        );
+                        panic!("goose readiness failed after 3 attempts: {e}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
 
         Some(Self {
             child: Some(child),
@@ -188,7 +211,29 @@ impl StubGoose {
 
     pub async fn restart(&mut self) {
         self.kill9();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Wait until port is released and available to bind again (retrying if in TIME_WAIT)
+        let bind_start = Instant::now();
+        let port_ready = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", self.port)) {
+                Ok(listener) => {
+                    drop(listener);
+                    break true;
+                }
+                Err(_) => {
+                    if bind_start.elapsed() > Duration::from_secs(10) {
+                        break false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        if !port_ready {
+            panic!(
+                "timed out waiting for port {} to become reusable",
+                self.port
+            );
+        }
 
         let temp_path = self
             .temp_dir
@@ -209,7 +254,7 @@ impl StubGoose {
             &dirs,
             &self.model.base_url(),
         )
-        .expect("respawn goose child");
+        .expect("respawn goose child on same port");
 
         self.child = Some(child);
         self.pid = pid;

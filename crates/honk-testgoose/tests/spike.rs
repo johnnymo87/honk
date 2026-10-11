@@ -113,8 +113,11 @@ async fn check1_text_turn() -> anyhow::Result<()> {
 
     assert!(run_ended, "run should have ended");
     assert!(prompt_replied, "prompt should have received reply");
-    let full_text = chunks.concat();
-    assert_eq!(full_text, "Hello from stub model!");
+    assert_eq!(
+        chunks,
+        vec!["Hello from ".to_string(), "stub model!".to_string()],
+        "chunks emitted by goose must equal scripted chunks"
+    );
 
     up.delete().await?;
     Ok(())
@@ -439,7 +442,7 @@ async fn check4_gate_busy_steer_cancel() -> anyhow::Result<()> {
                 active_run_id = Some(rid.to_string());
             }
         }
-        if goose.model().turn_requests().len() >= 2 {
+        if goose.model().turn_requests().len() >= 2 && active_run_id.is_some() {
             break;
         }
         anyhow::ensure!(
@@ -449,9 +452,11 @@ async fn check4_gate_busy_steer_cancel() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    let run_id = active_run_id.expect("active run id observed before gate");
+
     // 1. Session is busy: a concurrent prompt must receive error code -32602
-    let busy_res = up
-        .call(
+    let (_, busy_frame) = up
+        .call_full(
             "session/prompt",
             json!({
                 "sessionId": &sid,
@@ -460,19 +465,29 @@ async fn check4_gate_busy_steer_cancel() -> anyhow::Result<()> {
             Some(&sid),
             Duration::from_secs(10),
         )
-        .await;
-    assert!(
-        busy_res.is_err(),
-        "concurrent prompt must fail while run is active"
+        .await?;
+    let error_obj = busy_frame
+        .get("error")
+        .expect("error object in busy response");
+    assert_eq!(
+        error_obj.get("code").and_then(|c| c.as_i64()),
+        Some(-32602),
+        "busy error code must be -32602: {error_obj}"
     );
-    let err_str = busy_res.unwrap_err().to_string();
+    let data_str = error_obj
+        .get("data")
+        .and_then(|d| d.as_str())
+        .expect("data string in busy error");
     assert!(
-        err_str.contains("-32602") || err_str.contains("already has active run"),
-        "error must indicate busy active run: {err_str}"
+        data_str.contains("already has active run"),
+        "error data must mention 'already has active run': {data_str}"
+    );
+    assert!(
+        data_str.contains(&run_id),
+        "error data must contain active run id '{run_id}': {data_str}"
     );
 
     // 2. Steer is accepted
-    let run_id = active_run_id.expect("active run id observed before gate");
     let steer_res = up
         .call(
             "_goose/unstable/session/steer",
@@ -578,7 +593,7 @@ async fn check5_takeover_and_replay() -> anyhow::Result<()> {
         )
         .await?;
 
-    let mut session_frame_ids = Vec::new();
+    let mut session_frames: Vec<(u64, serde_json::Value)> = Vec::new();
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
 
@@ -591,7 +606,7 @@ async fn check5_takeover_and_replay() -> anyhow::Result<()> {
                 && s == &sid
                 && let Some(frame_id) = id
             {
-                session_frame_ids.push(frame_id);
+                session_frames.push((frame_id, frame.clone()));
             }
             if is_run_end(&frame) {
                 break;
@@ -600,10 +615,16 @@ async fn check5_takeover_and_replay() -> anyhow::Result<()> {
     }
 
     assert!(
-        session_frame_ids.len() >= 2,
-        "expected multiple frame ids on session stream, got: {session_frame_ids:?}"
+        session_frames.len() >= 2,
+        "expected multiple frame ids on session stream, got: {:?}",
+        session_frames.iter().map(|(id, _)| *id).collect::<Vec<_>>()
     );
-    let resume_from = session_frame_ids[0]; // drop from first id, expect replay of subsequent frames
+    let resume_from = session_frames[0].0; // drop from first id, expect replay of subsequent frames
+    let expected_missed: Vec<(u64, serde_json::Value)> = session_frames
+        .into_iter()
+        .filter(|(id, _)| *id > resume_from)
+        .collect();
+    let expected_ids: Vec<u64> = expected_missed.iter().map(|(id, _)| *id).collect();
 
     // Resume the existing connection to test takeover & replay
     let mut resumed = Upstream::resume(
@@ -629,29 +650,36 @@ async fn check5_takeover_and_replay() -> anyhow::Result<()> {
         "replay outcome should be Complete"
     );
 
-    let mut replayed_ids = Vec::new();
+    let mut replayed_frames: Vec<(u64, serde_json::Value)> = Vec::new();
     let r_start = Instant::now();
     while r_start.elapsed() < Duration::from_secs(5) {
         let Some(event) = resumed.next(Duration::from_millis(200)).await? else {
             continue;
         };
-        if let Event::Frame(key, _frame, id) = event
+        if let Event::Frame(key, frame, id) = event
             && let honk_upstream::StreamKey::Session(s) = &key
             && s == &sid
             && let Some(frame_id) = id
         {
-            replayed_ids.push(frame_id);
+            replayed_frames.push((frame_id, frame));
+            if replayed_frames.len() == expected_missed.len() {
+                break;
+            }
         }
     }
 
-    assert!(
-        !replayed_ids.is_empty(),
-        "should receive replayed frames after {resume_from}"
+    let replayed_ids: Vec<u64> = replayed_frames.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        replayed_ids, expected_ids,
+        "replayed ids must exactly match missed session ids"
     );
-    assert!(
-        replayed_ids.iter().all(|id| *id > resume_from),
-        "all replayed frames must have id > {resume_from}, got: {replayed_ids:?}"
-    );
+    for ((exp_id, exp_frame), (act_id, act_frame)) in expected_missed.iter().zip(&replayed_frames) {
+        assert_eq!(exp_id, act_id);
+        assert_eq!(
+            exp_frame, act_frame,
+            "replayed frame payload must match original for id {exp_id}"
+        );
+    }
 
     resumed.delete().await?;
     Ok(())
@@ -705,6 +733,7 @@ async fn check6_kill_restart_export() -> anyhow::Result<()> {
         )
         .await?;
 
+    let mut prompt_replied = false;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
         let Some(event) = up.next(Duration::from_millis(500)).await? else {
@@ -715,9 +744,11 @@ async fn check6_kill_restart_export() -> anyhow::Result<()> {
                 .get("id")
                 .is_some_and(|id| honk_upstream::rpc_id_matches(&prompt_id, id))
         {
+            prompt_replied = true;
             break;
         }
     }
+    assert!(prompt_replied, "prompt reply must be received before kill");
 
     // Verify export works before kill
     let export_before = goose.export(&sid).await?;
@@ -726,17 +757,18 @@ async fn check6_kill_restart_export() -> anyhow::Result<()> {
     // 1. Kill child
     goose.kill9();
 
-    // 2. Old connection requests fail / return error
-    let fail_res = up
-        .call("session/list", json!({}), None, Duration::from_secs(2))
-        .await;
-    assert!(
-        fail_res.is_err(),
-        "requests on old connection must fail after goose kill"
-    );
-
-    // 3. Restart goose
+    // 2. Restart goose on the SAME port
     goose.restart().await;
+
+    // 3. Old connection called AFTER restart must return HTTP 404 (is_gone)
+    let err = up
+        .call("session/list", json!({}), None, Duration::from_secs(5))
+        .await
+        .expect_err("old connection call after restart must fail");
+    assert!(
+        honk_upstream::is_gone(&err),
+        "old connection error after restart must be 404 (is_gone), got: {err:?}"
+    );
 
     // 4. Export works on respawned goose
     let export_after = goose.export(&sid).await?;

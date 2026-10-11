@@ -229,15 +229,44 @@ async fn chat_completions(
         Turn::Text(vec!["ok".to_string()])
     };
 
-    // 4. Resolve gates
+    // 4. Resolve gates: race-free wait armed before checking gate set, bounded by 60s timeout
     let mut resolved_turn = turn;
+    let gate_deadline = std::time::Instant::now() + Duration::from_secs(60);
     while let Turn::Gate(gate_name, inner) = resolved_turn {
         loop {
-            let is_open = state.gates.lock().unwrap().contains(&gate_name);
-            if is_open {
+            let notified = state.gate_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if state.gates.lock().unwrap().contains(&gate_name) {
                 break;
             }
-            state.gate_notify.notified().await;
+
+            let now = std::time::Instant::now();
+            if now >= gate_deadline {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Timed out waiting for gate '{gate_name}'")
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+
+            let remaining = gate_deadline - now;
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Timed out waiting for gate '{gate_name}'")
+                        }
+                    })),
+                )
+                    .into_response();
+            }
         }
         resolved_turn = *inner;
     }
