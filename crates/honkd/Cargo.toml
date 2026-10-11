@@ -12,6 +12,7 @@ fs4 = "1.1.0"
 honk-wire = { path = "../honk-wire" }
 serde.workspace = true
 serde_json.workspace = true
+tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile.workspace = true

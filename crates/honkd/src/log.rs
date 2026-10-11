@@ -23,11 +23,19 @@ struct LogHeader {
     resume_from: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct LogLine {
+#[derive(Serialize)]
+struct BorrowedLogLine<'a> {
     seq: Option<u64>,
     id: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame: Option<&'a Value>,
+}
+
+#[derive(Deserialize)]
+struct OwnedLogLine {
+    seq: Option<u64>,
+    id: Option<u64>,
+    #[serde(default)]
     frame: Option<Value>,
 }
 
@@ -89,6 +97,11 @@ impl SessionLog {
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let file_name = path
             .file_name()
@@ -96,11 +109,14 @@ impl SessionLog {
             .unwrap_or("session.jsonl");
         let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
 
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut tmp_file = opts.open(&tmp_path)?;
 
         let header = LogHeader { epoch, resume_from };
         let mut buf = serde_json::to_string(&header)?;
@@ -111,15 +127,20 @@ impl SessionLog {
         let mut seq = 0u64;
 
         for (upstream_id, mut frame) in frames {
+            debug_assert_eq!(
+                crate::rpc::kind(&frame),
+                crate::rpc::Kind::Notification,
+                "logged frame must be a notification (has method, no id)"
+            );
             seq += 1;
             stamp_frame(&mut frame, epoch, seq);
             if let Some(id) = upstream_id {
                 last_upstream_id = Some(last_upstream_id.map_or(id, |prev| prev.max(id)));
             }
-            let line = LogLine {
+            let line = BorrowedLogLine {
                 seq: Some(seq),
                 id: upstream_id,
-                frame: Some(frame.clone()),
+                frame: Some(&frame),
             };
             buf.push_str(&serde_json::to_string(&line)?);
             buf.push('\n');
@@ -135,6 +156,12 @@ impl SessionLog {
         drop(tmp_file);
 
         std::fs::rename(&tmp_path, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let dir_file = std::fs::File::open(parent)?;
+            dir_file.sync_all()?;
+        }
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -185,14 +212,16 @@ impl SessionLog {
 
         while offset < data.len() {
             let line_start = offset;
-            let line_end = match data[offset..].iter().position(|&b| b == b'\n') {
-                Some(pos) => offset + pos,
-                None => {
-                    break;
-                }
+            let has_newline = data[offset..].iter().position(|&b| b == b'\n');
+            let Some(pos) = has_newline else {
+                // Final partial line (no trailing \n) -> truncate it
+                break;
             };
+            let line_end = offset + pos;
             let line_bytes = &data[line_start..line_end];
-            match serde_json::from_slice::<LogLine>(line_bytes) {
+            let more_bytes_follow = line_end + 1 < data.len();
+
+            match serde_json::from_slice::<OwnedLogLine>(line_bytes) {
                 Ok(line) => {
                     if let Some(id) = line.id {
                         last_upstream_id = Some(last_upstream_id.map_or(id, |prev| prev.max(id)));
@@ -207,8 +236,20 @@ impl SessionLog {
                     valid_file_len = line_end + 1;
                     offset = line_end + 1;
                 }
-                Err(_) => {
-                    break;
+                Err(e) => {
+                    if more_bytes_follow {
+                        anyhow::bail!(
+                            "corrupt log line in middle of log file {} at offset {line_start}: {e}",
+                            path.display()
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "final complete log line is unparseable; truncating"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -238,16 +279,21 @@ impl SessionLog {
         let mut buf = String::new();
 
         for (upstream_id, mut frame) in frames {
+            debug_assert_eq!(
+                crate::rpc::kind(&frame),
+                crate::rpc::Kind::Notification,
+                "appended frame must be a notification (has method, no id)"
+            );
             seq += 1;
             stamp_frame(&mut frame, self.epoch, seq);
             if let Some(id) = upstream_id {
                 self.last_processed_id =
                     Some(self.last_processed_id.map_or(id, |prev| prev.max(id)));
             }
-            let line = LogLine {
+            let line = BorrowedLogLine {
                 seq: Some(seq),
                 id: upstream_id,
-                frame: Some(frame.clone()),
+                frame: Some(&frame),
             };
             buf.push_str(&serde_json::to_string(&line)?);
             buf.push('\n');
@@ -265,7 +311,7 @@ impl SessionLog {
     /// Id-only line: a session-stream frame that was processed but not logged.
     pub fn mark_processed(&mut self, id: u64) -> Result<()> {
         self.last_processed_id = Some(self.last_processed_id.map_or(id, |prev| prev.max(id)));
-        let line = LogLine {
+        let line = BorrowedLogLine {
             seq: None,
             id: Some(id),
             frame: None,
@@ -457,5 +503,67 @@ mod tests {
             honk_wire::frame_cursor(&entries[0].frame),
             Some(honk_wire::Cursor { epoch: 4, seq: 2 })
         );
+    }
+
+    #[test]
+    fn middle_corruption_refuses_to_open() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("sessions").join("s.jsonl");
+        let mut log = SessionLog::create(&p, 1, None, vec![]).unwrap();
+        log.append(vec![(Some(1), chunk("m", "a")), (Some(2), chunk("m", "b"))])
+            .unwrap();
+        drop(log);
+
+        // Check permissions of parent (sessions) and file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(p.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        // Corrupt middle line (line 1 of 2 entries)
+        let contents = std::fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 3);
+        lines[1] = "{\"seq\":1,not-valid-json}";
+        let corrupted_data = lines.join("\n") + "\n";
+        std::fs::write(&p, corrupted_data).unwrap();
+
+        let res = SessionLog::open(&p);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("middle"),
+            "expected middle corruption error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn final_complete_unparseable_line_is_truncated() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let mut log = SessionLog::create(&p, 1, None, vec![]).unwrap();
+        log.append(vec![(Some(1), chunk("m", "a"))]).unwrap();
+        drop(log);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"{\"seq\":2,invalid}\n")
+            .unwrap();
+        let log = SessionLog::open(&p).unwrap();
+        assert_eq!(log.head().seq, 1);
     }
 }

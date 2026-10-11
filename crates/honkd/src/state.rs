@@ -89,16 +89,14 @@ pub enum LedgerEntry {
 
 fn save_atomic(dir: &Path, state: &State) -> Result<()> {
     let tmp_path = dir.join(".state.json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp_path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut file = opts.open(&tmp_path)?;
     let data = serde_json::to_vec_pretty(state)?;
     file.write_all(&data)?;
     file.write_all(b"\n")?;
@@ -140,17 +138,18 @@ impl StateStore {
         }
 
         let lock_path = dir.join("lock");
-        let lock_file = std::fs::OpenOptions::new()
+        let mut lock_opts = std::fs::OpenOptions::new();
+        lock_opts
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+            .truncate(false);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = lock_file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600);
         }
+        let lock_file = lock_opts.open(&lock_path)?;
 
         match fs4::FileExt::try_lock(&lock_file) {
             Ok(()) => {}
@@ -231,8 +230,10 @@ impl StateStore {
     }
 
     pub fn mutate<R>(&mut self, f: impl FnOnce(&mut State) -> R) -> Result<R> {
-        let result = f(&mut self.state);
-        save_atomic(&self.dir, &self.state)?;
+        let mut cloned = self.state.clone();
+        let result = f(&mut cloned);
+        save_atomic(&self.dir, &cloned)?;
+        self.state = cloned;
         Ok(result)
     }
 
@@ -400,5 +401,24 @@ mod tests {
         assert!(st.ledger.contains_key("live"));
         assert!(st.ledger.contains_key("live2"));
         assert_eq!(st.ledger.len(), 2);
+    }
+
+    #[test]
+    fn mutate_rolls_back_in_memory_state_on_save_failure() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = StateStore::open(d.path(), None, false).unwrap();
+        assert_eq!(s.boot, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            let res = s.mutate(|st| {
+                st.boot = 999;
+            });
+            assert!(res.is_err());
+            assert_eq!(s.boot, 1);
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 }
