@@ -201,7 +201,7 @@ async fn live_smoke() -> anyhow::Result<()> {
         };
 
         let (stream_key, frame) = match event {
-            Event::Frame(key, frame) => (key, frame),
+            Event::Frame(key, frame, _) => (key, frame),
             Event::StreamEnded { key, error } => {
                 panic!("stream {key:?} ended unexpectedly: {error:?}");
             }

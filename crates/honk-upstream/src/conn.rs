@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::guard_url;
 use crate::record::{Direction, Recorder};
+use crate::sse::SseFrame;
 
 /// Timeout applied to all JSON-RPC POST and DELETE requests.
 pub const POST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,8 +48,9 @@ impl StreamKey {
 /// Lifecycle and payload events delivered across SSE streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A JSON-RPC frame received from an SSE stream.
-    Frame(StreamKey, Value),
+    /// A JSON-RPC frame received from an SSE stream, with its SSE event id if goose
+    /// sent one (patched-1.54.0.3+). Persist the id only after processing the frame.
+    Frame(StreamKey, Value, Option<u64>),
     /// Indicates an SSE stream has terminated, either cleanly (error is None) or with an error.
     StreamEnded {
         key: StreamKey,
@@ -59,14 +61,21 @@ pub enum Event {
 impl Event {
     pub fn key(&self) -> &StreamKey {
         match self {
-            Event::Frame(key, _) => key,
+            Event::Frame(key, _, _) => key,
             Event::StreamEnded { key, .. } => key,
         }
     }
 
     pub fn frame(&self) -> Option<&Value> {
         match self {
-            Event::Frame(_, val) => Some(val),
+            Event::Frame(_, val, _) => Some(val),
+            Event::StreamEnded { .. } => None,
+        }
+    }
+
+    pub fn event_id(&self) -> Option<u64> {
+        match self {
+            Event::Frame(_, _, id) => *id,
             Event::StreamEnded { .. } => None,
         }
     }
@@ -82,6 +91,88 @@ pub fn rpc_id_matches(expected: &Value, actual: &Value) -> bool {
         (Value::String(s), Value::Number(n)) => *s == n.to_string(),
         _ => false,
     }
+}
+
+/// What a goose `GET /acp` advertises in `Acp-Stream-Features` (patched-1.54.0.3+).
+/// Unpatched goose sends no header: both false.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamFeatures {
+    pub takeover: bool,
+    pub replay: bool,
+}
+
+impl StreamFeatures {
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let mut features = Self::default();
+        if let Some(value) = headers
+            .get("acp-stream-features")
+            .and_then(|v| v.to_str().ok())
+        {
+            for token in value.split(',').map(str::trim) {
+                match token {
+                    "takeover" => features.takeover = true,
+                    "replay" => features.replay = true,
+                    _ => {}
+                }
+            }
+        }
+        features
+    }
+
+    /// Everything honkd's lossless-reattach design needs.
+    pub fn is_patched(self) -> bool {
+        self.takeover && self.replay
+    }
+}
+
+/// Per-call subscribe options. Safe against unpatched goose: it ignores both headers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscribeOpts {
+    /// Send `Acp-Takeover: 1`: evict a stuck subscriber instead of retrying 409.
+    pub takeover: bool,
+    /// Send `Last-Event-ID: <n>`: replay what follows the last *processed* id.
+    /// `None` sends nothing; use `Some(0)` to replay everything retained.
+    pub resume_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOutcome {
+    NotRequested,
+    /// Resume was requested but the server did not answer `Acp-Replay` (unpatched).
+    Unsupported,
+    Complete,
+    Gap,
+}
+
+impl ReplayOutcome {
+    pub fn from_headers(requested: bool, headers: &reqwest::header::HeaderMap) -> Self {
+        if !requested {
+            return Self::NotRequested;
+        }
+        match headers
+            .get("acp-replay")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+        {
+            Some("complete") => Self::Complete,
+            Some("gap") => Self::Gap,
+            _ => Self::Unsupported,
+        }
+    }
+
+    /// Whether the caller must reconcile (export / same-connection session/load, A3/A5).
+    pub fn needs_reconcile(self) -> bool {
+        !matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOutcome {
+    pub conflict_window: Duration,
+    /// The server honoured `Acp-Takeover` (it advertises takeover and we asked).
+    pub took_over: bool,
+    pub replay: ReplayOutcome,
+    pub features: StreamFeatures,
 }
 
 /// Upstream ACP HTTP+SSE client.
@@ -102,6 +193,7 @@ pub struct Upstream {
     subscribe_max_backoff: Duration,
     subscribe_headers_timeout: Duration,
     last_call_stream: Option<StreamKey>,
+    features: Option<StreamFeatures>,
 }
 
 impl Upstream {
@@ -183,6 +275,7 @@ impl Upstream {
             subscribe_max_backoff: Duration::from_secs(2),
             subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
+            features: None,
         })
     }
 
@@ -218,6 +311,7 @@ impl Upstream {
             subscribe_max_backoff: Duration::from_secs(2),
             subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
+            features: None,
         })
     }
 
@@ -227,6 +321,10 @@ impl Upstream {
 
     pub fn init_result(&self) -> Option<&Value> {
         self.init_result.as_ref()
+    }
+
+    pub fn stream_features(&self) -> Option<StreamFeatures> {
+        self.features
     }
 
     pub fn last_call_stream(&self) -> Option<&StreamKey> {
@@ -253,7 +351,7 @@ impl Upstream {
     pub fn buffered_frame_count(&self) -> usize {
         self.buffered_events
             .iter()
-            .filter(|e| matches!(e, Event::Frame(_, _)))
+            .filter(|e| matches!(e, Event::Frame(_, _, _)))
             .count()
     }
 
@@ -414,6 +512,18 @@ impl Upstream {
     /// or `Duration::ZERO` if no 409 occurred).
     /// Spawns a background task that streams parsed JSON frames into the client receiver.
     pub async fn subscribe(&mut self, session: Option<&str>) -> anyhow::Result<Duration> {
+        Ok(self
+            .subscribe_with(session, SubscribeOpts::default())
+            .await?
+            .conflict_window)
+    }
+
+    /// Subscribes to the stream with the specified options (takeover and resume).
+    pub async fn subscribe_with(
+        &mut self,
+        session: Option<&str>,
+        opts: SubscribeOpts,
+    ) -> anyhow::Result<SubscribeOutcome> {
         let stream_key = session
             .map(|s| StreamKey::Session(s.to_string()))
             .unwrap_or(StreamKey::Conn);
@@ -439,6 +549,12 @@ impl Upstream {
             if let Some(sid) = session {
                 req = req.header("acp-session-id", sid);
             }
+            if opts.takeover {
+                req = req.header("acp-takeover", "1");
+            }
+            if let Some(last) = opts.resume_after {
+                req = req.header("last-event-id", last.to_string());
+            }
 
             let send_fut = req.send();
             let res = tokio::time::timeout(self.subscribe_headers_timeout, send_fut)
@@ -450,6 +566,9 @@ impl Upstream {
                     )
                 })?
                 .with_context(|| format!("failed to send GET request for {stream_name}"))?;
+
+            let features = StreamFeatures::from_headers(res.headers());
+            self.features = Some(features);
 
             let status = res.status();
             if status == StatusCode::CONFLICT {
@@ -483,13 +602,25 @@ impl Upstream {
             }
 
             let conflict_window = first_409.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+            let replay = ReplayOutcome::from_headers(opts.resume_after.is_some(), res.headers());
+            let took_over = opts.takeover && features.takeover;
 
             self.rec.record_marker(
                 &stream_name,
                 format!("subscribed to {stream_name} (409 window: {conflict_window:?})"),
             );
 
-            let sse_stream = crate::sse::sse_to_json_stream(res.bytes_stream());
+            if opts.takeover || opts.resume_after.is_some() {
+                self.rec.record_marker(
+                    &stream_name,
+                    format!(
+                        "stream options: took_over={took_over} resume_after={:?} replay={replay:?} features={features:?}",
+                        opts.resume_after
+                    ),
+                );
+            }
+
+            let sse_stream = crate::sse::sse_to_frames(res.bytes_stream());
             let tx = self.tx.clone();
             let rec = self.rec.clone();
             let key = stream_key.clone();
@@ -498,11 +629,28 @@ impl Upstream {
             let handle = tokio::spawn(async move {
                 let mut stream = sse_stream;
                 let mut stream_err = None;
+                let mut floor = opts.resume_after;
                 while let Some(item) = stream.next().await {
                     match item {
-                        Ok(val) => {
-                            rec.record_in(&s_name, val.clone());
-                            if tx.send(Event::Frame(key.clone(), val)).is_err() {
+                        Ok(SseFrame { id, data }) => {
+                            if let Some(id) = id {
+                                if floor.is_some_and(|f| id <= f) {
+                                    rec.record_marker(
+                                        &s_name,
+                                        format!("dropped duplicate event id {id}"),
+                                    );
+                                    continue;
+                                }
+                                floor = Some(id);
+                            }
+                            rec.record(
+                                Direction::In,
+                                &s_name,
+                                None,
+                                Some(data.clone()),
+                                id.map(|id| format!("event id {id}")),
+                            );
+                            if tx.send(Event::Frame(key.clone(), data, id)).is_err() {
                                 return;
                             }
                         }
@@ -522,7 +670,12 @@ impl Upstream {
             });
 
             self.stream_tasks.insert(stream_key, handle);
-            return Ok(conflict_window);
+            return Ok(SubscribeOutcome {
+                conflict_window,
+                took_over,
+                replay,
+                features,
+            });
         }
     }
 
@@ -589,7 +742,7 @@ impl Upstream {
             }
             let remaining = deadline - now;
             match self.next(remaining).await {
-                Ok(Some(Event::Frame(stream_key, frame))) => {
+                Ok(Some(Event::Frame(stream_key, frame, id))) => {
                     if frame
                         .get("id")
                         .is_some_and(|id| rpc_id_matches(&req_id, id))
@@ -599,7 +752,7 @@ impl Upstream {
                         }
                         return Ok((stream_key, frame));
                     } else {
-                        unmatched.push(Event::Frame(stream_key, frame));
+                        unmatched.push(Event::Frame(stream_key, frame, id));
                     }
                 }
                 Ok(Some(Event::StreamEnded { key, error })) => {
@@ -775,10 +928,12 @@ mod tests {
         upstream.buffered_events.push_back(Event::Frame(
             StreamKey::Conn,
             serde_json::json!({"buffered": 1}),
+            None,
         ));
         upstream.buffered_events.push_back(Event::Frame(
             StreamKey::Session("s1".into()),
             serde_json::json!({"buffered": 2}),
+            None,
         ));
 
         let first = upstream
@@ -788,7 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             first,
-            Event::Frame(StreamKey::Conn, serde_json::json!({"buffered": 1}))
+            Event::Frame(StreamKey::Conn, serde_json::json!({"buffered": 1}), None)
         );
 
         let second = upstream
@@ -800,7 +955,8 @@ mod tests {
             second,
             Event::Frame(
                 StreamKey::Session("s1".into()),
-                serde_json::json!({"buffered": 2})
+                serde_json::json!({"buffered": 2}),
+                None,
             )
         );
 
@@ -967,7 +1123,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             first,
-            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 1}))
+            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 1}), None)
         );
 
         let second = upstream
@@ -977,7 +1133,148 @@ mod tests {
             .unwrap();
         assert_eq!(
             second,
-            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 2}))
+            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 2}), None)
         );
+    }
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn stream_features_parse_from_header() {
+        let mut h = HeaderMap::new();
+        assert_eq!(StreamFeatures::from_headers(&h), StreamFeatures::default());
+        assert!(!StreamFeatures::from_headers(&h).is_patched());
+        h.insert("acp-stream-features", HeaderValue::from_static("takeover"));
+        assert_eq!(
+            StreamFeatures::from_headers(&h),
+            StreamFeatures {
+                takeover: true,
+                replay: false
+            }
+        );
+        h.insert(
+            "acp-stream-features",
+            HeaderValue::from_static("takeover, replay, later-thing"),
+        );
+        assert!(StreamFeatures::from_headers(&h).is_patched());
+    }
+
+    #[test]
+    fn replay_outcome_trusts_only_an_explicit_complete() {
+        let mut h = HeaderMap::new();
+        assert_eq!(
+            ReplayOutcome::from_headers(false, &h),
+            ReplayOutcome::NotRequested
+        );
+        assert_eq!(
+            ReplayOutcome::from_headers(true, &h),
+            ReplayOutcome::Unsupported
+        );
+        h.insert("acp-replay", HeaderValue::from_static("gap"));
+        assert_eq!(ReplayOutcome::from_headers(true, &h), ReplayOutcome::Gap);
+        h.insert("acp-replay", HeaderValue::from_static("complete"));
+        assert_eq!(
+            ReplayOutcome::from_headers(true, &h),
+            ReplayOutcome::Complete
+        );
+        assert!(!ReplayOutcome::Complete.needs_reconcile());
+        for outcome in [
+            ReplayOutcome::NotRequested,
+            ReplayOutcome::Unsupported,
+            ReplayOutcome::Gap,
+        ] {
+            assert!(outcome.needs_reconcile());
+        }
+    }
+
+    /// Accepts one GET, returns its lowercased request head, answers with an SSE body.
+    async fn one_shot_sse_server(
+        response_headers: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/acp", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut head = String::new();
+            while !head.contains("\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{response_headers}\r\n{body}"
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+            head.to_ascii_lowercase()
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_sends_takeover_and_resume_and_drops_replayed_duplicates() {
+        let (url, server) = one_shot_sse_server(
+            "acp-stream-features: takeover, replay\r\nacp-replay: complete\r\n",
+            "id: 42\ndata: {\"n\":42}\n\nid: 43\ndata: {\"n\":43}\n\n",
+        )
+        .await;
+        let mut up = Upstream::resume(&url, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let out = up
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(42),
+                },
+            )
+            .await
+            .unwrap();
+        let head = server.await.unwrap();
+        assert!(head.contains("acp-takeover: 1"), "{head}");
+        assert!(head.contains("last-event-id: 42"), "{head}");
+        assert!(out.took_over);
+        assert_eq!(out.replay, ReplayOutcome::Complete);
+        assert_eq!(
+            up.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true
+            })
+        );
+        let first = up.next(Duration::from_secs(1)).await.unwrap().unwrap();
+        assert_eq!(
+            first.frame(),
+            Some(&serde_json::json!({"n": 43})),
+            "id 42 was already processed"
+        );
+        assert_eq!(first.event_id(), Some(43));
+    }
+
+    #[tokio::test]
+    async fn subscribe_without_resume_sends_no_last_event_id() {
+        let (url, server) = one_shot_sse_server("", "data: {\"n\":1}\n\n").await;
+        let mut up = Upstream::resume(&url, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let out = up
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: None,
+                },
+            )
+            .await
+            .unwrap();
+        let head = server.await.unwrap();
+        assert!(!head.contains("last-event-id"), "{head}");
+        assert!(!out.took_over, "an unpatched server cannot honour takeover");
+        assert_eq!(out.replay, ReplayOutcome::NotRequested);
+        assert_eq!(up.stream_features(), Some(StreamFeatures::default()));
+        let first = up.next(Duration::from_secs(1)).await.unwrap().unwrap();
+        assert_eq!(first.event_id(), None);
     }
 }

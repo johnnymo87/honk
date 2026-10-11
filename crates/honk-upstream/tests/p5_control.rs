@@ -313,7 +313,7 @@ async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed");
@@ -362,7 +362,7 @@ async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_frame = Some(frame.clone());
@@ -523,7 +523,7 @@ async fn run_p5a_conn_b_case(
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed on Conn A");
@@ -599,7 +599,7 @@ async fn run_p5a_conn_b_case(
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_frame = Some(frame.clone());
@@ -723,7 +723,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed");
@@ -768,7 +768,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
 
     while observe_start.elapsed() < observe_timeout {
         let remaining = observe_timeout - observe_start.elapsed();
-        if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_during_observe = Some(frame.clone());
@@ -812,7 +812,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
         let cleanup_start = Instant::now();
         while cleanup_start.elapsed() < cleanup_timeout {
             let remaining = cleanup_timeout - cleanup_start.elapsed();
-            if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+            if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
                 && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
             {
                 final_stop_reason = frame
@@ -907,7 +907,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for permission request");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_permission_request(frame)
         {
             let id = frame.get("id").cloned().expect("permission id");
@@ -939,7 +939,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
 
     while observe_start.elapsed() < observe_timeout {
         let remaining = observe_timeout - observe_start.elapsed();
-        if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_without_answer = Some(frame.clone());
@@ -982,7 +982,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             post_answer_reply = Some(frame.clone());
@@ -1113,7 +1113,7 @@ async fn run_p5d_case(case_name: &str, late_timing: bool) -> anyhow::Result<()> 
             break;
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             if let Some(rid) = get_active_run_id(frame) {
                 active_run_id = Some(rid);
             }
@@ -1308,7 +1308,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call observed, verifying sleep child...");
@@ -1434,7 +1434,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
     let drain_start = Instant::now();
     while drain_start.elapsed() < Duration::from_secs(3) {
         let remaining = Duration::from_secs(3) - drain_start.elapsed();
-        if let Ok(Some(Event::Frame(_, frame))) = new_upstream.next(remaining).await {
+        if let Ok(Some(Event::Frame(_, frame, _))) = new_upstream.next(remaining).await {
             resent_frames.push(frame);
         }
     }

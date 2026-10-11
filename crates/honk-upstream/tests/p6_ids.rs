@@ -490,7 +490,7 @@ pub async fn run_canonical_turn_and_replays(
         let Some(ev) = conn1.next(Duration::from_secs(10)).await? else {
             break;
         };
-        if let Event::Frame(_, frame) = ev {
+        if let Event::Frame(_, frame, _) = ev {
             if let Some(update) = frame.pointer("/params/update") {
                 let su = update.get("sessionUpdate").and_then(|v| v.as_str());
                 if su == Some("agent_thought_chunk") {
@@ -827,7 +827,7 @@ async fn p6_multiturn_replay_tail_check() -> anyhow::Result<()> {
         )
         .await?;
     while let Some(ev) = conn1.next(Duration::from_secs(15)).await? {
-        if let Event::Frame(_, f) = ev
+        if let Event::Frame(_, f, _) = ev
             && f.get("id") == Some(&t1_id)
         {
             break;
@@ -843,7 +843,7 @@ async fn p6_multiturn_replay_tail_check() -> anyhow::Result<()> {
         )
         .await?;
     while let Some(ev) = conn1.next(Duration::from_secs(15)).await? {
-        if let Event::Frame(_, f) = ev
+        if let Event::Frame(_, f, _) = ev
             && f.get("id") == Some(&t2_id)
         {
             break;
@@ -886,7 +886,7 @@ async fn p6_multiturn_replay_tail_check() -> anyhow::Result<()> {
     )
     .await
     {
-        if let Event::Frame(_, f) = ev
+        if let Event::Frame(_, f, _) = ev
             && f.pointer("/params/update/sessionUpdate")
                 .and_then(|v| v.as_str())
                 == Some("user_message_chunk")
@@ -1000,7 +1000,7 @@ async fn p6_resource_cost() -> anyhow::Result<()> {
             let Some(ev) = upstream.next(Duration::from_secs(10)).await? else {
                 break;
             };
-            if let Event::Frame(_, f) = ev
+            if let Event::Frame(_, f, _) = ev
                 && f.get("id") == Some(&prompt_req_id)
             {
                 break;

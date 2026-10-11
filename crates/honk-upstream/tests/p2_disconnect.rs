@@ -155,7 +155,7 @@ async fn p2a_quiet_drop() -> anyhow::Result<()> {
             panic!("[P2a] stream ended or timed out waiting for tool_call");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2a] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -206,7 +206,7 @@ async fn p2a_quiet_drop() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2a] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -299,7 +299,7 @@ async fn p2b_drop_streaming() -> anyhow::Result<()> {
             panic!("[P2b] stream ended or timed out waiting for chunks");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2b] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -355,7 +355,7 @@ async fn p2b_drop_streaming() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2b] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -474,7 +474,7 @@ async fn p2c_long_gap() -> anyhow::Result<()> {
             panic!("[P2c] stream ended or timed out waiting for tool_call");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2c] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -530,7 +530,7 @@ async fn p2c_long_gap() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2c] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -710,7 +710,7 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
             panic!("[P2d] stream ended or timed out waiting for chunks");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2d] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -813,7 +813,7 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2d] unexpected session/request_permission in auto mode: {frame}");
             }

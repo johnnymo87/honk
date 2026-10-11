@@ -6,10 +6,13 @@ pub mod record;
 pub mod redact;
 pub mod sse;
 
-pub use conn::{Event, StreamKey, Upstream, rpc_id_matches};
+pub use conn::{
+    Event, ReplayOutcome, StreamFeatures, StreamKey, SubscribeOpts, SubscribeOutcome, Upstream,
+    rpc_id_matches,
+};
 pub use record::{Direction, RecordEntry, Recorder};
 pub use redact::{Redactor, parse_redact_file, resolve_redact_file};
-pub use sse::sse_to_json_stream;
+pub use sse::{SseFrame, sse_to_frames, sse_to_json_stream};
 
 /// Production goose serve port; probes must never talk to it.
 pub const PRODUCTION_GOOSE_PORT: u16 = 4080;

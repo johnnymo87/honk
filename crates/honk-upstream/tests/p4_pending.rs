@@ -120,7 +120,7 @@ async fn run_p4a_case(case_name: &str, wait_seconds: u64) -> anyhow::Result<()> 
             panic!("[{case_name}] Stream closed while waiting for session/request_permission");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_permission_request(frame)
         {
             let id = frame.get("id").cloned().expect("permission request id");
@@ -162,7 +162,7 @@ async fn run_p4a_case(case_name: &str, wait_seconds: u64) -> anyhow::Result<()> 
     let check_redelivery_start = Instant::now();
     while check_redelivery_start.elapsed() < Duration::from_secs(5) {
         let remaining = Duration::from_secs(5) - check_redelivery_start.elapsed();
-        if let Ok(Some(Event::Frame(_, frame))) = upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, frame, _))) = upstream.next(remaining).await
             && is_permission_request(&frame)
         {
             redelivered_id = frame.get("id").cloned();
@@ -204,7 +204,7 @@ async fn run_p4a_case(case_name: &str, wait_seconds: u64) -> anyhow::Result<()> 
         let check_load_start = Instant::now();
         while check_load_start.elapsed() < Duration::from_secs(5) {
             let remaining = Duration::from_secs(5) - check_load_start.elapsed();
-            if let Ok(Some(Event::Frame(_, frame))) = upstream.next(remaining).await
+            if let Ok(Some(Event::Frame(_, frame, _))) = upstream.next(remaining).await
                 && is_permission_request(&frame)
             {
                 load_perm_id = frame.get("id").cloned();
@@ -253,7 +253,7 @@ async fn run_p4a_case(case_name: &str, wait_seconds: u64) -> anyhow::Result<()> 
             break;
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             if is_run_end(frame) {
                 saw_run_end = true;
                 println!("[{case_name}] Saw run end");
@@ -360,7 +360,7 @@ async fn run_p4b_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] Stream closed waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             if is_permission_request(frame) {
                 perm_read_before_drop = true;
                 println!("[{case_name}] Note: permission request arrived before tool_call drop!");
@@ -396,7 +396,7 @@ async fn run_p4b_case(case_name: &str) -> anyhow::Result<()> {
     let resume_check_start = Instant::now();
     while resume_check_start.elapsed() < Duration::from_secs(5) {
         let remaining = Duration::from_secs(5) - resume_check_start.elapsed();
-        if let Ok(Some(Event::Frame(_, frame))) = upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, frame, _))) = upstream.next(remaining).await
             && is_permission_request(&frame)
         {
             perm_id_after_resume = frame.get("id").cloned();
@@ -432,7 +432,7 @@ async fn run_p4b_case(case_name: &str) -> anyhow::Result<()> {
         let load_check_start = Instant::now();
         while load_check_start.elapsed() < Duration::from_secs(5) {
             let remaining = Duration::from_secs(5) - load_check_start.elapsed();
-            if let Ok(Some(Event::Frame(_, frame))) = upstream.next(remaining).await
+            if let Ok(Some(Event::Frame(_, frame, _))) = upstream.next(remaining).await
                 && is_permission_request(&frame)
             {
                 load_perm_id = frame.get("id").cloned();
@@ -477,7 +477,7 @@ async fn run_p4b_case(case_name: &str) -> anyhow::Result<()> {
         let Some(event) = upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             if is_run_end(frame) {
                 saw_run_end = true;
             }
@@ -604,7 +604,7 @@ async fn run_p4c_case(case_name: &str, state_machine: bool) -> anyhow::Result<()
             panic!("[{case_name}] Stream closed on Conn A");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_permission_request(frame)
         {
             let id = frame.get("id").cloned().expect("permission id on Conn A");
@@ -669,7 +669,7 @@ async fn run_p4c_case(case_name: &str, state_machine: bool) -> anyhow::Result<()
     let check_start = Instant::now();
     while check_start.elapsed() < Duration::from_secs(10) {
         let remaining = Duration::from_secs(10) - check_start.elapsed();
-        if let Ok(Some(Event::Frame(_, frame))) = upstream_b.next(remaining).await
+        if let Ok(Some(Event::Frame(_, frame, _))) = upstream_b.next(remaining).await
             && is_permission_request(&frame)
         {
             resent_perm_id = frame.get("id").cloned();
@@ -721,7 +721,7 @@ async fn run_p4c_case(case_name: &str, state_machine: bool) -> anyhow::Result<()
     let mut activity_events = 0usize;
     while wait_activity_start.elapsed() < Duration::from_secs(10) {
         let remaining = Duration::from_secs(10) - wait_activity_start.elapsed();
-        if let Ok(Some(Event::Frame(_, ref frame))) = upstream_b.next(remaining).await {
+        if let Ok(Some(Event::Frame(_, ref frame, _))) = upstream_b.next(remaining).await {
             activity_events += 1;
             println!(
                 "[{case_name}] Conn B received event: {:?}",
