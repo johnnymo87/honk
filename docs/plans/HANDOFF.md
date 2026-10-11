@@ -41,3 +41,10 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - Org-name leak: commits 133bf83..ee1781b (pushed, public) contained the org name in redact.rs; fixed forward in b2443a5 (needles now in ~/.config/honk/redact.txt). History NOT rewritten — author decides.
 - goose bug found (P5a): cancel orphans shell descendants — affects production goose; patch 1 of the patch plan fixes it.
 - Open questions for author: GOOSE_STATE_MACHINE in production? widened extension set on re-activation acceptable? in-file Apache notice on shell.rs?
+
+## Goose patch track (2026-10-11) — branch `goose-patch-track` (worktree ../honk-patch-track)
+- Fork worktree: ~/projects/goose-patched-track3 (local branch patched/v1.54.0). Pushed fork/patched/v1.54.0 = e41c1ec30; tag patched-1.54.0.3 pushed; release run 38116818991.
+- Fork build env: the fork flake's rust-overlay lacks 1.99.0 -> `nix develop --no-write-lock-file --override-input rust-overlay github:oxalica/rust-overlay/<honk flake.lock rev>`; goose-cli default features need LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS/cmake from nixpkgs (llama-cpp). goose lib tests need the release feature set (see patched-release.yml $F).
+- Tasks 0-8 done (honk commits: Task 1 scripts, Task 7 honk-upstream ids/resume/features, Task 8 probes + fixes). Pre-tag gate PASS: P2e x2 (after control fix), P2f x3, P4b' x2, P5a' x2, pigeon WS probes x3 on the patched sandbox unit `honk-goose-sandbox-patched` (:4181, ~/.local/state/honk-sandbox-patched).
+- Tasks 9-11 DONE: release run 38116818991 green; assets verified; release binary packaged at ~/.local/state/honk-goose-bin/patched-1.54.0.3/pkg (GC root); all probes + pigeon WS qualification PASS on it (logs /tmp/opencode/pigeon-qual-release-*.log); fixtures committed. `honk-goose-sandbox-patched` left running on the release binary for M1.
+- Production deploy of patched-1.54.0.3 is AUTHOR-ONLY (plan "Production deploy" section); gate evidence = Task 10 pigeon-qual-release logs.

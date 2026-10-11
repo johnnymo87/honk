@@ -306,6 +306,64 @@ paste, OSC 52.
   socket) or 127.0.0.1 with a token; peer uid checked. This is not a boundary against
   the agent itself (same uid); with allow-all permissions that is accepted.
 
+### Reattach rules: patched and unpatched goose
+
+Added after the goose patch track (fork release `patched-1.54.0.3`; results in
+`docs/spike/goose-patches.md`, "Results: patched-1.54.0.3"). This supersedes the
+409-backoff and reconcile-after-every-reattach rules above when goose is patched.
+
+**The signal.** Patched goose sends `Acp-Stream-Features: takeover, replay` on every
+SSE `GET /acp` response, `200` and `409`. Unpatched goose sends nothing.
+- The signal comes from the crate, which is where the behaviour lives.
+- It costs no extra request.
+- It does not depend on version strings. `agentInfo.version` is `1.54.0` in both
+  builds; log it for diagnostics only.
+- `honk-upstream` exposes it as `Upstream::stream_features()` and
+  `StreamFeatures::is_patched()`.
+
+**M1 policy: honkd requires patched goose.**
+- After its first subscribe on each goose process, honkd checks
+  `stream_features().is_patched()`. If that is false, it **refuses to serve**, with an
+  error naming the release to deploy.
+- The escape hatch is **`--allow-unpatched-upstream`**. It makes honkd run in
+  degraded mode instead: 409 backoff with no DELETE (A2), and every reattach treated
+  as a gap, i.e. a coarse rebuild from export (A3). There is no precise in-flight
+  recovery and no lost-permission heuristic (M1 plan, Task A12; refinement in M1c).
+- honkd re-checks after every `404`, i.e. after a goose restart (A13). A restart may
+  have swapped the binary in either direction.
+
+**Sending the headers is always safe. Trusting the result is not.**
+- Unpatched goose ignores `Acp-Takeover` (it answers 409) and `Last-Event-ID` (no
+  replay).
+- Gate behaviour **only** on positive signals: `took_over`, and
+  `ReplayOutcome::Complete`. Never treat the absence of a gap signal as "no loss".
+
+| goose advertises | On a dead stream (no bytes for > 20 s; goose keeps alive every 15 s) | After reattach |
+|---|---|---|
+| nothing (unpatched): only with `--allow-unpatched-upstream` | 409 retry with backoff, never DELETE (A2) | Always rebuild from export (gap) |
+| `takeover` only (not a released combination; treat as degraded) | `subscribe_with{takeover}` | Always rebuild from export |
+| `takeover, replay` (`patched-1.54.0.3`+) | `subscribe_with{takeover, resume_after: Some(last processed id, or 0)}` | Rebuild from export **only** on the session stream's `Gap`/`Unsupported` (at turn end if a run is active), or on any new connection (404, activation) |
+
+**Where honkd persists what (matches the M1 plan).**
+- **The last processed session-stream event id lives in the session's append-only log**
+  (`<state>/sessions/<sid>.jsonl`). Each line is appended *after* its frame was
+  processed. Frames that aren't logged (responses, requests) get an id-only line
+  `{"seq":null,"id":N}`. On restart, the last id in the log is exactly what to pass as
+  `resume_after`.
+- **Effects that must survive a crash live in `state.json`**: pending permissions (A8)
+  and the prompt ledger, each written *before* fan-out or POST. The log line comes
+  after, so a crash in between re-delivers the frame on resume. Re-processing is
+  therefore **idempotent**: pending requests dedupe by id, prompt replies by upstream
+  id, and the actor drops any frame with an id ≤ the stream's last processed id.
+- **The connection stream** is low-rate (`session/new` replies). Its last id lives
+  next to the connection id in `state.json` (A15).
+
+**Still required with replay:**
+- Persisted pending permissions (A8). Replay only helps while the connection lives; a
+  goose restart loses everything in memory.
+- Takeover is for honkd's own dead streams only. honkd owns its connection ids, and two
+  honkd instances must never share one: the last subscriber silently wins.
+
 ## 7. Testing
 
 - **Wire fixtures** recorded from the pinned goose (redacted) drive `honk-acp` and

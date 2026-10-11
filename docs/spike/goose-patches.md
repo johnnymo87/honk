@@ -1,6 +1,7 @@
 # Goose fork patches: candidates for the ACP transport
 
-Status: research only. Nothing below has been built.
+Status: Built: patches 2, 3 and 5 ship in fork release `patched-1.54.0.3`; see
+Results.
 Baseline: goose `v1.54.0` (fork branch `patched/v1.54.0`; its existing local
 patches don't touch the ACP transport) and `agent-client-protocol-http` 2.2.0.
 Evidence: `m0-findings.md` §T5 and §P2.
@@ -279,3 +280,88 @@ backoff. After 2+3, honkd can make reconcile a gap- or restart-only fallback.
 Optionally probe the goose-only `TCP_USER_TIMEOUT` change first. If it turns
 out to clear the zero-window case too, it is a one-file stopgap that bounds
 the 409 window without vendoring anything.
+
+## Results: patched-1.54.0.3
+
+Built per `docs/plans/2026-10-11-goose-patches-plan.md`. The release ships
+patches 2 (takeover), 3 (replay ring plus `Last-Event-ID`) and 5 (shell
+process-group termination). The vendored crate advertises them as
+`Acp-Stream-Features: takeover, replay` on every SSE `GET /acp`. Patches 1 and
+4 were not built (out of scope).
+
+The numbers below are from the pre-release runs, on a build of fork commit
+`e41c1ec30` (the commit tagged `patched-1.54.0.3`), against the isolated
+`honk-goose-sandbox-patched` unit on port 4181. The release-binary re-run
+(plan Task 10, the autoPatchelf'd `goose-aarch64-unknown-linux-gnu` asset from
+release run 38116818991) passed every probe once; only that run's fixtures are
+committed.
+
+| Probe | Question | Verdict (pre-release) | Numbers (pre-release) | Release-binary re-run | Fixture |
+|---|---|---|---|---|---|
+| P2e (control) | Without `Last-Event-ID`, does a takeover after the turn committed behind a frozen socket still lose frames? | PASS: takeover works and loss is still there, as expected for a control | 409 window 0 on both streams; reattach 0-1 ms; `took_over` on both; prompt reply and run end **lost**; `chars_missing > 0` (streamed 231 chars of the turn's text) | PASS (release): streamed 215 chars, prompt reply + run end lost, 409 0, reattach 0 ms | `fixtures/goose-1.54.0-patched.3/p2e/` |
+| P2f | Does takeover plus `Last-Event-ID` after commit recover everything? | PASS 3× | `Acp-Replay: complete` on both streams; `replayed_frames` 191 and 350 in the two recorded runs; prompt reply and run end replayed; `chars_missing` 0 | PASS (release): `complete`, 21 frames replayed, reply + run end, 0 missing | `fixtures/goose-1.54.0-patched.3/p2f/` |
+| P4b′ | Is a permission request lost between `tool_call` and the permission frame recovered by resume? | PASS 2× | Drop right after `tool_call`, resume from id 9: permission replayed, answered `allow_once`, tool ran, run finished, `Acp-Replay: complete` | PASS (release): permission replayed from id 9, tool ran | `fixtures/goose-1.54.0-patched.3/p4b_prime/` |
+| P5a′ | Does cancel kill the shell's whole process group, including backgrounded children? | PASS 2× | Two backgrounded `sleep`s; `stopReason: cancelled`; zero survivors in the unit's cgroup after 3 s | PASS (release): cancelled, 0 survivors | `fixtures/goose-1.54.0-patched.3/p5a_prime/` |
+| Pigeon WS qualification | Does pigeon's WS path still work on the patched binary? | PASS | `goose-launch`, `goose-runner` and `goose-id-split` probes over `ws://…:4181/acp`: all exit 0, "ALL LIVE CHECKS PASSED" | PASS (release): all three exit 0; every check PASS (deploy gate evidence) | none (pigeon probe logs only) |
+
+**P2e had to wait for commit.** Its first attempt took over 1 ms after the
+freeze, before goose had written anything into the dead socket, so nothing was
+lost and the control proved nothing. The probe now waits until the turn has
+committed before taking over (honk commit `1a11d53`), which guarantees frames
+went into the dead socket.
+
+**Deviation from §2: owner-token leases instead of a pump task.** §2 sketched
+takeover as a per-subscriber pump task that owns the lease and is aborted on
+takeover. The build keeps the key insight (a stuck stream is never polled, so
+the lease must be *taken*, not handed back) but uses owner tokens instead:
+- The HTTP mailbox's queue sits under a `std::sync::Mutex` together with
+  `owner: Option<u64>`. A lease is `(Arc<shared>, id)`, and every dequeue
+  checks `owner == Some(id)` under the lock.
+- Takeover installs a new owner id synchronously. If the stuck generator is
+  ever polled again, it sees the mismatch and ends. Nothing is aborted or
+  awaited.
+
+The reason: a pump dequeues ahead of hyper, so a clean client drop would lose
+whatever the pump had staged. That breaks the crate's existing test
+`sse_allows_one_active_subscriber_per_logical_stream`, which asserts that frames
+queued before a drop reach the next subscriber. Owner tokens keep today's
+dequeue-on-poll behaviour exactly.
+
+**The WS mailbox is unchanged.** The owner-token and ring mailbox is a new
+module, `http_mailbox.rs` (`HttpMailbox`/`HttpLease`), used only by
+`HttpOutbound`. The original `OutboundMailbox`/`OutboundLease` in
+`connection.rs` and all of `websocket_server.rs` are byte-identical to the
+crate, so pigeon's WS path runs the same source. The pigeon qualification
+above checks that in practice.
+
+**Patch 5 is TERM→KILL, not a bare SIGKILL.** On cancel, timeout and drop,
+goose sends SIGTERM to the command's whole process group, waits up to 2 s for
+the group to empty, then SIGKILLs the group. The grace lets cleanup handlers
+run (a SIGTERMed git removes `.git/index.lock`; a SIGKILLed one leaves it). The
+shell patch is 2 fork commits: the second keeps the pgid across terminate's
+grace period, so an abort that lands mid-grace still escalates to SIGKILL
+instead of dropping the group.
+
+**Ring memory against A14.**
+- Each HTTP stream's ring holds up to `REPLAY_RING_MAX_FRAMES = 4096` frames and
+  `REPLAY_RING_MAX_BYTES = 1 MiB` until a `Last-Event-ID` acks it, and a
+  healthy client acks only on reattach.
+- Session mailboxes, and so their rings, are never removed until the
+  connection ends (`connection.rs:322-333`).
+- honkd's worst case, 16 held sessions with one connection each, is about
+  16 MiB plus up to 1 MiB per connection stream. A14 measured 0.5-1.7 MB RSS
+  per active session, so the rings could dominate goose's per-session cost by
+  up to about 10×.
+- A long-lived connection that subscribes many session streams grows without
+  bound. honkd therefore runs every export on a short-lived side connection
+  (initialize, subscribe, export, DELETE), which frees the mailbox and ring.
+
+**Fork-flake gaps (worth fixing in the fork later).** Building the fork
+worktree needed two workarounds that the fork's `flake.nix` should carry
+itself:
+- The fork's `rust-overlay` input is too old for Rust 1.99.0. The build used
+  `--override-input rust-overlay` pinned to honk's locked rev, without writing
+  the fork's lock.
+- `goose-cli`'s default features pull in llama-cpp, whose build script needs
+  libclang and cmake. Both came from nixpkgs, with `LIBCLANG_PATH` and
+  `BINDGEN_EXTRA_CLANG_ARGS` set by hand.
