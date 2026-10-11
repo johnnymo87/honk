@@ -118,6 +118,8 @@ async fn check1_text_turn() -> anyhow::Result<()> {
         vec!["Hello from ".to_string(), "stub model!".to_string()],
         "chunks emitted by goose must equal scripted chunks"
     );
+    assert_eq!(goose.turn_text(&sid).await, "Hello from stub model!");
+    assert!(goose.secret_file().exists());
 
     up.delete().await?;
     Ok(())
@@ -229,7 +231,7 @@ async fn check2_tool_turn() -> anyhow::Result<()> {
     assert!(saw_tool_completed, "tool_call_update completed expected");
     assert_eq!(text_chunks.concat(), "tool finished");
 
-    let export = goose.export(&sid).await?;
+    let export = goose.export(&sid).await;
     let export_str = export.to_string();
     assert!(
         export_str.contains("echo hi"),
@@ -239,6 +241,7 @@ async fn check2_tool_turn() -> anyhow::Result<()> {
         export_str.contains("tool finished"),
         "export should contain assistant text: {export_str}"
     );
+    assert_eq!(goose.turn_text(&sid).await, "tool finished");
 
     up.delete().await?;
     Ok(())
@@ -751,7 +754,7 @@ async fn check6_kill_restart_export() -> anyhow::Result<()> {
     assert!(prompt_replied, "prompt reply must be received before kill");
 
     // Verify export works before kill
-    let export_before = goose.export(&sid).await?;
+    let export_before = goose.export(&sid).await;
     assert!(export_before.to_string().contains("committed text"));
 
     // 1. Kill child
@@ -771,7 +774,7 @@ async fn check6_kill_restart_export() -> anyhow::Result<()> {
     );
 
     // 4. Export works on respawned goose
-    let export_after = goose.export(&sid).await?;
+    let export_after = goose.export(&sid).await;
     let export_after_str = export_after.to_string();
     assert!(
         export_after_str.contains("committed text"),

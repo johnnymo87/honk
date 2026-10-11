@@ -169,12 +169,15 @@ impl StubGoose {
         &self.model
     }
 
-    pub async fn export(&self, sid: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn export(&self, sid: &str) -> serde_json::Value {
         let mut up =
             Upstream::initialize(&self.url(), self.secret().to_string(), Recorder::disabled())
-                .await?;
-        up.subscribe(None).await?;
-        up.subscribe(Some(sid)).await?;
+                .await
+                .expect("initialize export upstream");
+        up.subscribe(None).await.expect("subscribe export conn");
+        up.subscribe(Some(sid))
+            .await
+            .expect("subscribe export session");
 
         let export_res = up
             .call(
@@ -186,16 +189,23 @@ impl StubGoose {
                 Some(sid),
                 Duration::from_secs(30),
             )
-            .await?;
+            .await
+            .expect("call export");
 
         let data_str = export_res
             .get("data")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("export missing data string: {export_res}"))?;
+            .unwrap_or_else(|| panic!("export missing data string: {export_res}"));
 
-        let session_val: serde_json::Value = serde_json::from_str(data_str)?;
+        let session_val: serde_json::Value =
+            serde_json::from_str(data_str).expect("parse export data JSON");
         let _ = up.delete().await;
-        Ok(session_val)
+        session_val
+    }
+
+    pub async fn turn_text(&self, sid: &str) -> String {
+        let export = self.export(sid).await;
+        extract_turn_text(&export)
     }
 
     pub fn kill9(&mut self) {
@@ -369,4 +379,60 @@ async fn wait_until_ready(port: u16, secret: &str, timeout: Duration) -> anyhow:
     }
 
     anyhow::bail!("goose did not become ready within {timeout:?}")
+}
+
+pub fn extract_turn_text(export: &serde_json::Value) -> String {
+    let conversation = match export.get("conversation").and_then(|c| c.as_array()) {
+        Some(c) => c,
+        None => return String::new(),
+    };
+
+    let is_user_prompt = |msg: &serde_json::Value| -> bool {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            return false;
+        }
+        if msg
+            .pointer("/metadata/userVisible")
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            return false;
+        }
+        if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+            let has_tool_response = content.iter().any(|item| {
+                item.get("type").and_then(|t| t.as_str()) == Some("toolResponse")
+                    || item.get("toolResult").is_some()
+            });
+            if has_tool_response {
+                return false;
+            }
+            return content
+                .iter()
+                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"));
+        }
+        false
+    };
+
+    let last_user_idx = conversation.iter().rposition(is_user_prompt);
+
+    let msgs_after = match last_user_idx {
+        Some(idx) => &conversation[idx + 1..],
+        None => &conversation[..],
+    };
+
+    let mut out = String::new();
+    for msg in msgs_after {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && let Some(contents) = msg.get("content").and_then(|c| c.as_array())
+        {
+            for item in contents {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                {
+                    out.push_str(text);
+                }
+            }
+        }
+    }
+    out
 }

@@ -11,3 +11,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace   # live probes are #[ignore]d
+
+  live-stub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download patched goose binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download patched-1.54.0.3 --repo johnnymo87/goose --pattern 'goose-x86_64-unknown-linux-gnu.tar.gz'
+          tar -xzf goose-x86_64-unknown-linux-gnu.tar.gz
+          chmod +x goose
+          echo "HONK_GOOSE_BIN=$GITHUB_WORKSPACE/goose" >> "$GITHUB_ENV"
+      - run: cargo test --workspace
