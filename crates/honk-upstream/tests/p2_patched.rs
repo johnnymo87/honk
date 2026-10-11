@@ -104,6 +104,35 @@ async fn read_to_turn_end(
     Ok(tail)
 }
 
+async fn read_until_idle(
+    up: &mut Upstream,
+    prompt_id: &Value,
+    idle_timeout: Duration,
+) -> anyhow::Result<Tail> {
+    let mut tail = Tail {
+        frames: Vec::new(),
+        prompt_reply: false,
+        run_end: false,
+    };
+    while !(tail.prompt_reply && tail.run_end) {
+        let Some(Event::Frame(_, frame, _)) = up.next(idle_timeout).await? else {
+            break;
+        };
+        if frame
+            .get("id")
+            .is_some_and(|id| rpc_id_matches(prompt_id, id))
+            && frame.get("result").is_some()
+        {
+            tail.prompt_reply = true;
+        }
+        if is_run_end(&frame) {
+            tail.run_end = true;
+        }
+        tail.frames.push(frame);
+    }
+    Ok(tail)
+}
+
 fn streamed_text(frames: &[Value]) -> String {
     frames.iter().filter_map(chunk_text).collect()
 }
@@ -115,6 +144,7 @@ async fn p2e_half_open_takeover() -> anyhow::Result<()> {
     let Some(h) = freeze_mid_stream("p2e").await? else {
         return Ok(());
     };
+    let waited = wait_until_turn_committed(&h.ts, Duration::from_secs(150)).await?;
     let mut resumed = Upstream::resume(
         &goose_url(),
         h.ts.secret.clone(),
@@ -130,7 +160,7 @@ async fn p2e_half_open_takeover() -> anyhow::Result<()> {
     let conn = resumed.subscribe_with(None, opts).await?;
     let sess = resumed.subscribe_with(Some(&h.ts.sid), opts).await?;
     let reattach = t0.elapsed();
-    let tail = read_to_turn_end(&mut resumed, &h.prompt_id, Duration::from_secs(180)).await?;
+    let tail = read_until_idle(&mut resumed, &h.prompt_id, Duration::from_secs(10)).await?;
     let export = export_session(&mut resumed, &h.ts.sid).await?;
     let streamed = format!(
         "{}{}",
@@ -145,7 +175,8 @@ async fn p2e_half_open_takeover() -> anyhow::Result<()> {
     h.ts.rec.record_marker(
         "probe",
         json!({
-            "probe": "p2e", "reattach_ms": reattach.as_millis(),
+            "probe": "p2e", "waited_for_commit_ms": waited.as_millis(),
+            "reattach_ms": reattach.as_millis(),
             "conn_409_ms": conn.conflict_window.as_millis(), "session_409_ms": sess.conflict_window.as_millis(),
             "took_over": [conn.took_over, sess.took_over],
             "prompt_reply": tail.prompt_reply, "run_end": tail.run_end,
@@ -167,6 +198,10 @@ async fn p2e_half_open_takeover() -> anyhow::Result<()> {
     assert!(
         missing > 0,
         "control failed: no loss without replay (freeze landed after goose finished writing?)"
+    );
+    assert!(
+        !tail.prompt_reply,
+        "control failed: prompt reply arrived without replay"
     );
     drop(h.proxy);
     Ok(())
