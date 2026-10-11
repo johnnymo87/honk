@@ -384,7 +384,176 @@ follow-ups (patch, config, or recipe), not as failures.
 - Marked untested per spike plan §P4.4: Sandbox carries only the developer extension (no eliciting MCP server installed).
 
 ## P5: Cancel, steer, restart
-_pending_
+
+### Executive Summary & Verdicts
+1. **P5a: `session/cancel` notification stops the run immediately and kills child processes; works from any connection.**
+   - Sending `session/cancel` stops the turn with `stopReason: "cancelled"` in 54–77ms.
+   - The shell child process (`sleep 40`) is terminated immediately upon cancellation (0 children remaining under goose PID).
+   - Crucially, `session/cancel` succeeds from a fresh Connection B both **without** `session/load` (75ms) and **with** `session/load` (54ms).
+   - In all cancellation scenarios, the user prompt is persisted on disk (`export_user_persisted: true`), while in-flight uncommitted assistant turns or tool responses are discarded.
+2. **P5b: `$/cancel_request` protocol notification is accepted by HTTP transport but completely ignored by goose.**
+   - The notification is accepted with HTTP 202, but goose does not monitor request cancellation tokens for `session/prompt` (`on_prompt` ignores `responder.cancellation()`).
+   - The `sleep 40` process continues running, no prompt reply is returned, and the run does not stop.
+   - `honkd` must NOT use `$/cancel_request` to stop turns; prompt handles must remain alive until `session/cancel` or turn completion.
+3. **P5c: `session/cancel` while parked on a permission request does NOT stop the run without an answer.**
+   - When goose is parked awaiting user approval (`session/request_permission`), `session/cancel` alone leaves goose parked indefinitely (`stopped_without_answer: false` across 15s wait).
+   - The moment the client responds to the permission request with `outcome: "cancelled"` (`{"outcome": {"outcome": "cancelled"}}`), the turn terminates immediately (2ms latency) with `stopReason: "cancelled"`.
+   - `honkd`'s Cancel operation must both notify `session/cancel` and submit `cancelled` outcomes to all outstanding permission requests.
+4. **P5d: `_goose/unstable/session/steer` is consumed early and late; goose resets chat exit if steers are queued.**
+   - Early steers (during tool execution) succeed and steer subsequent model outputs (`assistant_steered: true`, text `P5D_EARLY_STEERED`, message persisted in conversation).
+   - Late steers sent during the first `agent_message_chunk` are queued by goose; goose's loop resets `exit_chat = false` upon detecting pending steers, triggering a subsequent model inference that produces `P5D_LATE_STEERED`.
+   - Because `clear_active_run` unconditionally discards pending steers once the agent stream terminates, steers that race with turn completion are dropped; `honkd` must verify consumption via stream/export and fall back to queueing as a regular prompt.
+5. **P5e: Sandbox restart mid-turn returns 404, wipes in-flight processes, and leaves an unfulfilled turn that replays on load.**
+   - Sandbox restart drops active connections: POST and GET with old connection IDs return HTTP 404 Not Found.
+   - Goose accepts fresh `initialize` calls within ~205ms.
+   - In-flight shell processes (`sleep 40`) die with the systemd cgroup and do NOT survive restart.
+   - Calling `_goose/unstable/session/export` fails on a fresh connection before `session/load`.
+   - `session/load` on the fresh connection succeeds and replays the interrupted user message (`user_message_chunk`).
+   - The session remains fully functional: follow-up prompts execute normally.
+
+**Decision-rule outcomes:**
+1. **Cancel from B works:** TRUE. `honkd` may issue `session/cancel` from any connection; it does not need to proxy cancellations through the original prompting connection or issue `session/load` first.
+2. **`$/cancel_request` honored:** FALSE. `honkd` must never rely on `$/cancel_request` to stop runs, and must prevent client handle drops from causing unintended cancellations.
+3. **Cancel while parked doesn't stop the run:** TRUE. `honkd`'s Cancel handler must notify `session/cancel` AND explicitly answer all outstanding pending permissions with outcome `cancelled`.
+4. **Steer consumption confirmed:** TRUE. `honkd` must track steer consumption via stream events or export, falling back to prompt queueing if rejected or dropped.
+5. **Reconnect on restart:** On HTTP 404, `honkd` must re-initialize, reload sessions via `session/load` (passing stored CWD), mark interrupted turns as aborted/unanswered, and offer re-prompt.
+
+**Source References:**
+- `goose-patched/crates/goose/src/acp/server.rs`:
+  - `on_cancel` (lines 2420–2437): Looks up `self.active_runs.agent_cancel_token(&session_id)` across the global server state, cancelling the token regardless of connection origin.
+  - `on_steer_session` (lines 2378–2418): Method `_goose/unstable/session/steer` requires `expectedRunId` matching `active_runs.agent_run(session_id)`. Pushes message to `agent.steer(&session_id, message)`.
+  - `clear_active_run` (lines 1929–1952): Removes run from `active_runs` and invokes `agent.discard_pending_steers(session_id)`.
+  - `handle_tool_permission_request` (lines 1606–1632): Awaits response from client; on receive, delivers decision to `agent.submit_tool_confirmation`.
+- `goose-patched/crates/goose/src/acp/server/dispatch.rs`:
+  - Lines 124–141: `on_prompt` is spawned without inspecting `responder.cancellation()`, ignoring `$/cancel_request`.
+  - Lines 143–147: `CancelNotification` maps to `agent.on_cancel(notif)`.
+- `goose-patched/crates/goose/src/agents/agent.rs`:
+  - Lines 2761–2786: `can_drain_pending_steers` drains queued steers and persists them into conversation before next tool/output.
+  - Lines 3467 & 3644–3646: If `has_pending_steers` is true, `exit_chat` is reset to `false`, continuing the agent loop for the steered message.
+- `goose-patched/crates/goose/src/agents/tool_execution.rs`:
+  - Lines 211–227: `confirmation_rx.await` parks the agent awaiting tool confirmation without `select!` on `cancellation_token`.
+
+**Probe results:**
+
+### P5a: Cancel notification (`session/cancel`)
+- **Run 1 (Conn A - Prompting connection):**
+  - Session: `20261011_32` | Connection: `097525b1-f9d9-44b0-95f4-e515e1e831af`
+  - Goose PID: `3727793` | Sleep child before cancel: `["3789298 bash -c sleep 40 && echo done"]`
+  - Cancel latency: 74ms | Stop reason: `cancelled`
+  - Sleep child alive after cancel: `false` (0 children)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5a_conn_a/1791681911.jsonl`
+- **Run 2 (Conn A - Prompting connection):**
+  - Session: `20261011_33` | Connection: `cd3e0a01-5eac-4f29-9758-6474ee1d2d44`
+  - Goose PID: `3727793` | Sleep child before cancel: `["3792252 bash -c sleep 40 && echo done"]`
+  - Cancel latency: 77ms | Stop reason: `cancelled`
+  - Sleep child alive after cancel: `false` (0 children)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5a_conn_a/1791681917.jsonl`
+- **Run 3 (Conn B - Fresh connection, without `session/load`):**
+  - Session: `20261011_34` | Conn A: `5358061c-2b6d-4fbf-b1ef-d3f4b8760f27` | Conn B: `78103b18-3852-43c9-9154-a412570a3c96`
+  - Cancel latency on Conn A: 75ms | Stop reason: `cancelled`
+  - Sleep child alive after cancel: `false` (0 children)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5a_conn_b_no_load/1791681922.jsonl`
+- **Run 4 (Conn B - Fresh connection, with `session/load`):**
+  - Session: `20261011_35` | Conn A: `9e457dbf-cd07-4c16-b518-c810b88170a8` | Conn B: `4e65efa3-33a3-4205-94a9-00a4a0b9b1a2`
+  - Cancel latency on Conn A: 54ms | Stop reason: `cancelled`
+  - Sleep child alive after cancel: `false` (0 children)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5a_conn_b_with_load/1791681926.jsonl`
+
+### P5b: `$/cancel_request` (protocol-level request cancellation)
+- **Run 1:**
+  - Session: `20261011_36` | Connection: `18d19014-5632-4925-9b88-c9e955875f2b`
+  - Prompt Request ID: `5` | `$/cancel_request` accepted: `true` (HTTP 202)
+  - Observed for 15s: prompt reply received = `false`, sleep child alive = `true` (`honored: false`)
+  - Fallback `session/cancel` stopped turn immediately (`stopReason: cancelled`)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5b/1791681931.jsonl`
+- **Run 2:**
+  - Session: `20261011_37` | Connection: `6c4c6849-d3fb-4d44-86c2-f934e1637b85`
+  - Prompt Request ID: `5` | `$/cancel_request` accepted: `true` (HTTP 202)
+  - Observed for 15s: prompt reply received = `false`, sleep child alive = `true` (`honored: false`)
+  - Fallback `session/cancel` stopped turn immediately (`stopReason: cancelled`)
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5b/1791681951.jsonl`
+
+### P5c: Cancel while parked on permission request
+- **Run 1:**
+  - Session: `20261011_38` | Connection: `a2940745-00af-418a-829a-e121c4129e58`
+  - Permission ID: `5572ce7c-6769-4b66-8007-976145db7ebb`
+  - `session/cancel` sent without answer; observed for 15s: stopped without answer = `false`
+  - Answered permission with `outcome: "cancelled"`: respond OK = `true`
+  - Post-answer latency: 2ms | Stop reason: `cancelled`
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5c/1791681970.jsonl`
+- **Run 2:**
+  - Session: `20261011_39` | Connection: `2184b84a-290c-4339-8dbd-19ac74d784bb`
+  - Permission ID: `ed0699f1-43f5-4a3d-8703-2eba3be84a44`
+  - `session/cancel` sent without answer; observed for 15s: stopped without answer = `false`
+  - Answered permission with `outcome: "cancelled"`: respond OK = `true`
+  - Post-answer latency: 2ms | Stop reason: `cancelled`
+  - Export: user persisted = `true`, assistant persisted = `false`, message count = 2
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5c/1791681989.jsonl`
+
+### P5d: Steer lifecycle (`_goose/unstable/session/steer`)
+- **Run 1 (Early steer control - during tool call):**
+  - Session: `20261011_40` | Active Run ID: `run_43614ed5-eb7d-45b0-8e52-d599969a0149`
+  - Steer response: `Ok({ messageId: "steer_7eb2bac7-a27a-4c07-afba-1682901cc9d4", runId: "..." })`
+  - Assistant steered: `true` (replied `P5D_EARLY_STEERED`)
+  - Steer in conversation export: `true` | Steer dropped: `false`
+  - Total messages in export: 6 | Duration: 11.62s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5d_early/1791682010.jsonl`
+- **Run 2 (Early steer control - during tool call):**
+  - Session: `20261011_41` | Active Run ID: `run_d5868da0-dd45-4029-acd0-68784804bc03`
+  - Steer response: `Ok({ messageId: "steer_e02048a9-6a2a-40f5-b596-0e2949c14b5c", runId: "..." })`
+  - Assistant steered: `true` (replied `P5D_EARLY_STEERED`)
+  - Steer in conversation export: `true` | Steer dropped: `false`
+  - Total messages in export: 6 | Duration: 12.06s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5d_early/1791682026.jsonl`
+- **Run 3 (Late steer - on first `agent_message_chunk`):**
+  - Session: `20261011_43` | Active Run ID: `run_066e4464-43b5-47cd-bc52-5249ad9f5500`
+  - Steer response: `Ok({ messageId: "steer_a5ea98a3-d9d0-450b-bd89-2a0ec47dab82", runId: "..." })`
+  - Assistant steered: `true` (replied initial `FINISHED` followed by steered `P5D_LATE_STEERED`)
+  - Steer in conversation export: `true` | Steer dropped: `false`
+  - Total messages in export: 7 | Duration: 5.95s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5d_late/1791682069.jsonl`
+- **Run 4 (Late steer - on first `agent_message_chunk`):**
+  - Session: `20261011_44` | Active Run ID: `run_102be0f5-ace3-41b9-93cc-5593c187ec50`
+  - Steer response: `Ok({ messageId: "steer_20c2fb41-b145-4335-b236-245eda423dfd", runId: "..." })`
+  - Assistant steered: `true` (replied initial `FINISHED` followed by steered `P5D_LATE_STEERED`)
+  - Steer in conversation export: `true` | Steer dropped: `false`
+  - Total messages in export: 7 | Duration: 5.03s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5d_late/1791682095.jsonl`
+
+### P5e: Goose sandbox restart mid-turn
+- **Run 1:**
+  - Session: `20261011_46` | Old Conn: `2f262ea5-364d-4cc7-b0bb-cba522219c24`
+  - Initial goose PID: `3854699` | Sleep child: `["3890658 bash -c sleep 40 && echo done"]`
+  - Restart command duration: 0.03s | Recovery duration to `initialize`: 205ms
+  - New goose PID: `3890689` | New Conn: `ca495eba-3df9-4df9-88a7-1dcc5b88356f`
+  - POST with old connection ID: HTTP 404 Not Found
+  - GET with old connection ID: HTTP 404 Not Found
+  - Sleep child survived under goose: `false` | System-wide: `false`
+  - Export on fresh connection before `session/load`: `ok: false`
+  - `session/load` on fresh connection: `ok: true` (replayed 4 frames including unfulfilled user prompt)
+  - Export after `session/load`: user message persisted = `true`, assistant persisted = `false`, message count = 2
+  - Follow-up prompt: succeeded with `stopReason: "end_turn"` (replied `RECOVERED`)
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5e/1791682250.jsonl`
+- **Run 2:**
+  - Session: `20261011_47` | Old Conn: `734f72d4-0894-4dd4-b5f8-8d6ecbda1add`
+  - Initial goose PID: `3890689` | Sleep child: `["3906168 bash -c sleep 40 && echo done"]`
+  - Restart command duration: 0.03s | Recovery duration to `initialize`: 205ms
+  - New goose PID: `3906172` | New Conn: `7e189a39-311c-45a6-94f7-4ffb5ebad8c2`
+  - POST with old connection ID: HTTP 404 Not Found
+  - GET with old connection ID: HTTP 404 Not Found
+  - Sleep child survived under goose: `false` | System-wide: `false`
+  - Export on fresh connection before `session/load`: `ok: false`
+  - `session/load` on fresh connection: `ok: true` (replayed 4 frames including unfulfilled user prompt)
+  - Export after `session/load`: user message persisted = `true`, assistant persisted = `false`, message count = 2
+  - Follow-up prompt: succeeded with `stopReason: "end_turn"` (replied `RECOVERED`)
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p5e/1791682292.jsonl`
 
 ## P6: Message ids, resource cost, fixtures
 _pending_

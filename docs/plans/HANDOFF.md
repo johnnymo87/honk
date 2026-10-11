@@ -20,7 +20,8 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - [ ] T7 goose patch notes
 - [x] T8 P3: Same-conn reload mid-run safe, agent preserved, no replay duplicates; CWD rewritten (honkd must pass stored CWD); cross-conn reload does not redirect live stream.
 - [x] T9 P4: No SSE redelivery or load re-send of pending permissions; same-conn survives 90s listener drop and finishes; lost frames unrecoverable; teardown answers execute nothing.
-- [ ] T10 P5  - [ ] T11 P6  - [ ] T12 hydra (optional)  - [ ] T13 findings + M1 plan + goose-patch plan
+- [x] T10 P5: cancel works from any conn (54-77ms, kills child); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, replays unfulfilled turn.
+- [ ] T11 P6  - [ ] T12 hydra (optional)  - [ ] T13 findings + M1 plan + goose-patch plan
 
 ## Carry-forward from reviews
 - Wire learnings: modes `auto|approve|smart_approve|chat` (default auto); `configOptions` array with `options:[{name,value}]`, `currentValue`; cheap model `claude-haiku-4-5@20251001` via `session/set_config_option {configId:"model"}`; run start/end visible as `session_info_update` `_meta.goose.activeRunId` set/null; prompt reply has `stopReason` + usage.
