@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +23,8 @@ type StreamSubscriber = (
 
 struct StreamState {
     next_seq: u64,
-    ring: Vec<(u64, Value)>,
+    queue: VecDeque<(u64, Value)>,
+    ring: VecDeque<(u64, Value)>,
     sender: Option<mpsc::UnboundedSender<Result<bytes::Bytes, std::convert::Infallible>>>,
     evict_tx: Option<oneshot::Sender<()>>,
 }
@@ -32,24 +33,41 @@ impl StreamState {
     fn new() -> Self {
         Self {
             next_seq: 1,
-            ring: Vec::new(),
+            queue: VecDeque::new(),
+            ring: VecDeque::new(),
             sender: None,
             evict_tx: None,
         }
     }
 
-    fn push_frame(&mut self, frame: Value, patched: bool) {
+    fn push_frame(&mut self, frame: Value, patched: bool, is_lost: bool) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.ring.push((seq, frame.clone()));
 
         if let Some(sender) = &self.sender {
+            if is_lost {
+                if patched {
+                    self.ring.push_back((seq, frame));
+                }
+                return;
+            }
+
             let sse_str = if patched {
                 format!("id: {seq}\ndata: {frame}\n\n")
             } else {
                 format!("data: {frame}\n\n")
             };
-            let _ = sender.send(Ok(bytes::Bytes::from(sse_str)));
+
+            if sender.send(Ok(bytes::Bytes::from(sse_str))).is_ok() {
+                if patched {
+                    self.ring.push_back((seq, frame));
+                }
+            } else {
+                self.sender = None;
+                self.queue.push_back((seq, frame));
+            }
+        } else {
+            self.queue.push_back((seq, frame));
         }
     }
 
@@ -76,11 +94,26 @@ impl StreamState {
         self.evict_tx = Some(evict_tx);
 
         if patched && let Some(last_id) = last_event_id {
+            while self.ring.front().is_some_and(|(seq, _)| *seq <= last_id) {
+                self.ring.pop_front();
+            }
             for (seq, frame) in &self.ring {
                 if *seq > last_id {
                     let sse_str = format!("id: {seq}\ndata: {frame}\n\n");
                     let _ = tx.send(Ok(bytes::Bytes::from(sse_str)));
                 }
+            }
+        }
+
+        while let Some((seq, frame)) = self.queue.pop_front() {
+            let sse_str = if patched {
+                format!("id: {seq}\ndata: {frame}\n\n")
+            } else {
+                format!("data: {frame}\n\n")
+            };
+            let _ = tx.send(Ok(bytes::Bytes::from(sse_str)));
+            if patched {
+                self.ring.push_back((seq, frame));
             }
         }
 
@@ -91,7 +124,6 @@ impl StreamState {
 struct ConnectionState {
     conn_stream: StreamState,
     sessions: HashMap<String, StreamState>,
-    active_prompt_cancels: HashMap<String, Arc<AtomicBool>>,
 }
 
 impl ConnectionState {
@@ -99,7 +131,6 @@ impl ConnectionState {
         Self {
             conn_stream: StreamState::new(),
             sessions: HashMap::new(),
-            active_prompt_cancels: HashMap::new(),
         }
     }
 }
@@ -118,6 +149,9 @@ struct FakeGooseInner {
     next_session_num: AtomicU64,
     prompt_chunks: Mutex<Vec<String>>,
     export_data: Mutex<HashMap<String, Value>>,
+    active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    all_sessions: Mutex<HashMap<String, String>>,
+    keepalive_interval: Mutex<Duration>,
 }
 
 pub struct FakeGoose {
@@ -153,6 +187,9 @@ impl FakeGoose {
             next_session_num: AtomicU64::new(1),
             prompt_chunks: Mutex::new(vec!["fake chunk".to_string()]),
             export_data: Mutex::new(HashMap::new()),
+            active_prompt_cancels: Mutex::new(HashMap::new()),
+            all_sessions: Mutex::new(HashMap::new()),
+            keepalive_interval: Mutex::new(Duration::from_secs(15)),
         });
 
         let app = Router::new()
@@ -252,6 +289,10 @@ impl FakeGoose {
             .insert(sid.to_string(), data);
     }
 
+    pub fn set_keepalive_interval(&self, interval: Duration) {
+        *self.state.keepalive_interval.lock().unwrap() = interval;
+    }
+
     pub async fn restart(&mut self) {
         self.state.connections.lock().unwrap().clear();
     }
@@ -277,6 +318,24 @@ fn check_auth(state: &FakeGooseInner, headers: &HeaderMap, query: &AuthQuery) ->
         return true;
     }
     false
+}
+
+fn method_requires_session(method: &str) -> bool {
+    matches!(
+        method,
+        "session/prompt"
+            | "session/cancel"
+            | "session/close"
+            | "session/delete"
+            | "session/fork"
+            | "session/load"
+            | "session/resume"
+            | "session/set_config_option"
+            | "session/set_mode"
+            | "session/set_model"
+            | "_goose/unstable/session/export"
+            | "_goose/unstable/session/steer"
+    )
 }
 
 async fn handle_post(
@@ -359,6 +418,25 @@ async fn handle_post(
         .map(String::from);
     let target_session = session_header.or(session_param);
 
+    if method.is_some_and(method_requires_session) && target_session.is_none() {
+        return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
+    }
+
+    if let Some(ref sid) = target_session {
+        let mut conns = state.connections.lock().unwrap();
+        if let Some(conn) = conns.get_mut(&conn_id) {
+            conn.sessions
+                .entry(sid.clone())
+                .or_insert_with(StreamState::new);
+        }
+        state
+            .all_sessions
+            .lock()
+            .unwrap()
+            .entry(sid.clone())
+            .or_insert_with(|| "/tmp".to_string());
+    }
+
     let patched = state.advertise_patched.load(Ordering::SeqCst);
 
     match method {
@@ -367,6 +445,14 @@ async fn handle_post(
                 "ses_{}",
                 state.next_session_num.fetch_add(1, Ordering::SeqCst)
             );
+            let cwd = frame
+                .pointer("/params/cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or("/tmp")
+                .to_string();
+
+            state.all_sessions.lock().unwrap().insert(sid.clone(), cwd);
+
             let mut conns = state.connections.lock().unwrap();
             if let Some(conn) = conns.get_mut(&conn_id) {
                 conn.sessions.insert(sid.clone(), StreamState::new());
@@ -378,27 +464,37 @@ async fn handle_post(
                             "sessionId": sid
                         }
                     });
-                    conn.conn_stream.push_frame(resp, patched);
+                    conn.conn_stream.push_frame(resp, patched, false);
                 }
             }
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/list") => {
+            let sessions_guard = state.all_sessions.lock().unwrap();
+            let sessions_list: Vec<Value> = sessions_guard
+                .iter()
+                .map(|(s, cwd)| {
+                    json!({
+                        "sessionId": s,
+                        "cwd": cwd,
+                        "title": Value::Null,
+                        "updatedAt": Value::Null
+                    })
+                })
+                .collect();
+
             let mut conns = state.connections.lock().unwrap();
-            if let Some(conn) = conns.get_mut(&conn_id) {
-                let list: Vec<Value> = conn
-                    .sessions
-                    .keys()
-                    .map(|s| json!({"sessionId": s}))
-                    .collect();
-                if let Some(id) = req_id {
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": list
-                    });
-                    conn.conn_stream.push_frame(resp, patched);
-                }
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "sessions": sessions_list
+                    }
+                });
+                conn.conn_stream.push_frame(resp, patched, false);
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -413,11 +509,13 @@ async fn handle_post(
                     "result": {}
                 });
                 if let Some(sid) = &target_session {
-                    if let Some(stream) = conn.sessions.get_mut(sid) {
-                        stream.push_frame(resp, patched);
-                    }
+                    let stream = conn
+                        .sessions
+                        .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
                 } else {
-                    conn.conn_stream.push_frame(resp, patched);
+                    conn.conn_stream.push_frame(resp, patched, false);
                 }
             }
             StatusCode::ACCEPTED.into_response()
@@ -440,28 +538,28 @@ async fn handle_post(
                     }
                 });
                 if let Some(sid) = &target_session {
-                    if let Some(stream) = conn.sessions.get_mut(sid) {
-                        stream.push_frame(resp, patched);
-                    }
+                    let stream = conn
+                        .sessions
+                        .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
                 } else {
-                    conn.conn_stream.push_frame(resp, patched);
+                    conn.conn_stream.push_frame(resp, patched, false);
                 }
             }
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/prompt") => {
             let Some(sid) = target_session else {
-                return (StatusCode::BAD_REQUEST, "sessionId required").into_response();
+                return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
             };
 
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            {
-                let mut conns = state.connections.lock().unwrap();
-                if let Some(conn) = conns.get_mut(&conn_id) {
-                    conn.active_prompt_cancels
-                        .insert(sid.clone(), cancel_flag.clone());
-                }
-            }
+            state
+                .active_prompt_cancels
+                .lock()
+                .unwrap()
+                .insert(sid.clone(), cancel_flag.clone());
 
             let state_clone = state.clone();
             let conn_id_clone = conn_id.clone();
@@ -471,6 +569,7 @@ async fn handle_post(
             tokio::spawn(async move {
                 let chunks = state_clone.prompt_chunks.lock().unwrap().clone();
                 let run_id = "run_fake_001".to_string();
+                let message_id = format!("msg_fake_{run_id}");
 
                 // 1. Run start
                 emit_session_frame(
@@ -496,7 +595,7 @@ async fn handle_post(
 
                 tokio::time::sleep(Duration::from_millis(10)).await;
 
-                // 2. Chunks
+                // 2. Chunks carrying messageId and _meta.goose.messageId
                 for chunk in chunks {
                     if cancel_flag.load(Ordering::SeqCst) {
                         break;
@@ -512,9 +611,15 @@ async fn handle_post(
                                 "sessionId": &sid_clone,
                                 "update": {
                                     "sessionUpdate": "agent_message_chunk",
+                                    "messageId": &message_id,
                                     "content": {
                                         "type": "text",
                                         "text": chunk
+                                    },
+                                    "_meta": {
+                                        "goose": {
+                                            "messageId": &message_id
+                                        }
                                     }
                                 }
                             }
@@ -566,22 +671,20 @@ async fn handle_post(
                     );
                 }
 
-                let mut conns = state_clone.connections.lock().unwrap();
-                if let Some(conn) = conns.get_mut(&conn_id_clone) {
-                    conn.active_prompt_cancels.remove(&sid_clone);
-                }
+                state_clone
+                    .active_prompt_cancels
+                    .lock()
+                    .unwrap()
+                    .remove(&sid_clone);
             });
 
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/cancel") => {
-            if let Some(sid) = target_session {
-                let conns = state.connections.lock().unwrap();
-                if let Some(conn) = conns.get(&conn_id)
-                    && let Some(cancel) = conn.active_prompt_cancels.get(&sid)
-                {
-                    cancel.store(true, Ordering::SeqCst);
-                }
+            if let Some(sid) = target_session
+                && let Some(cancel) = state.active_prompt_cancels.lock().unwrap().get(&sid)
+            {
+                cancel.store(true, Ordering::SeqCst);
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -604,16 +707,14 @@ fn emit_session_frame(state: &FakeGooseInner, conn_id: &str, sid: &str, frame: V
         }
     };
 
-    if should_lose {
-        return;
-    }
-
     let patched = state.advertise_patched.load(Ordering::SeqCst);
     let mut conns = state.connections.lock().unwrap();
-    if let Some(conn) = conns.get_mut(conn_id)
-        && let Some(stream) = conn.sessions.get_mut(sid)
-    {
-        stream.push_frame(frame, patched);
+    if let Some(conn) = conns.get_mut(conn_id) {
+        let stream = conn
+            .sessions
+            .entry(sid.to_string())
+            .or_insert_with(StreamState::new);
+        stream.push_frame(frame, patched, should_lose);
     }
 }
 
@@ -716,13 +817,24 @@ async fn handle_get(
         None
     };
 
-    let stream = futures::stream::unfold((rx, evict_rx), |(mut rx, mut evict_rx)| async move {
-        tokio::select! {
-            biased;
-            _ = &mut evict_rx => None,
-            item = rx.recv() => item.map(|val| (val, (rx, evict_rx))),
-        }
-    });
+    let interval_dur = *state.keepalive_interval.lock().unwrap();
+    let mut ticker = tokio::time::interval(interval_dur);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.reset();
+
+    let stream = futures::stream::unfold(
+        (rx, evict_rx, ticker),
+        |(mut rx, mut evict_rx, mut ticker)| async move {
+            tokio::select! {
+                biased;
+                _ = &mut evict_rx => None,
+                item = rx.recv() => item.map(|val| (val, (rx, evict_rx, ticker))),
+                _ = ticker.tick() => {
+                    Some((Ok(bytes::Bytes::from("data:\n\n")), (rx, evict_rx, ticker)))
+                }
+            }
+        },
+    );
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
