@@ -20,6 +20,12 @@ pub enum ActorState {
     Gone,
 }
 
+pub struct PendingSessionRequest {
+    pub viewer_id: ViewerId,
+    pub downstream_id: Value,
+    pub is_steer: bool,
+}
+
 pub enum SessionMsg {
     // from viewers / hub
     AttachLive {
@@ -79,22 +85,7 @@ pub struct Session {
     pub last_processed_session_id: Option<u64>,
     pub last_processed_conn_id: Option<u64>,
     pub viewers: HashMap<ViewerId, (ViewerTx, bool)>,
-}
-
-pub fn extract_user_text(params: &Value) -> String {
-    if let Some(s) = params.get("prompt").and_then(Value::as_str) {
-        return s.to_string();
-    }
-    if let Some(arr) = params.get("prompt").and_then(Value::as_array) {
-        let mut text = String::new();
-        for block in arr {
-            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                text.push_str(t);
-            }
-        }
-        return text;
-    }
-    String::new()
+    pub pending_requests: HashMap<String, PendingSessionRequest>,
 }
 
 impl Session {
@@ -163,43 +154,93 @@ impl Session {
             }
         }
 
-        // 2. Process frame
+        // 2. Process
         let is_session_stream = matches!(&key, StreamKey::Session(_));
         let kind = crate::rpc::kind(&frame);
 
         if is_session_stream {
             if let Some(update) = frame.pointer("/params/update") {
+                // If user_message_chunk, notify turn core of live user message
+                if update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                    && let Some(msg_id) = update
+                        .get("messageId")
+                        .or_else(|| update.pointer("/_meta/goose/messageId"))
+                        .and_then(Value::as_str)
+                {
+                    self.turn.on_user_message(msg_id);
+                }
+
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     let actions = self.turn.on_run_state(run_opt, &mut self.ids);
                     self.execute_actions(actions).await;
                 }
-                self.forward_to_viewers(&frame);
             } else if kind == crate::rpc::Kind::Response {
-                // Check if this is a response to our inflight prompt
-                let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
-                    honk_upstream::rpc_id_matches(
-                        &json!(inf.upstream_id),
-                        frame.get("id").unwrap_or(&Value::Null),
-                    )
-                });
+                // Check if this is a response to pending steer or forward
+                let found_pending = self
+                    .pending_requests
+                    .keys()
+                    .find(|k| {
+                        honk_upstream::rpc_id_matches(
+                            &json!(k),
+                            frame.get("id").unwrap_or(&Value::Null),
+                        )
+                    })
+                    .cloned();
 
-                if is_inflight_reply {
-                    let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                    let actions = self
-                        .turn
-                        .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
-                    self.execute_actions(actions).await;
+                if let Some(up_id) = found_pending {
+                    let pending = self.pending_requests.remove(&up_id).unwrap();
+                    let mut resp = frame.clone();
+                    resp["id"] = pending.downstream_id;
+
+                    if pending.is_steer
+                        && let Some(msg_id) =
+                            frame.pointer("/result/messageId").and_then(Value::as_str)
+                    {
+                        let actions = self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
+                        self.execute_actions(actions).await;
+                    }
+
+                    if let Some((tx, _)) = self.viewers.get(&pending.viewer_id)
+                        && !tx.send_frame(axum::extract::ws::Message::Text(resp.to_string().into()))
+                    {
+                        self.viewers.remove(&pending.viewer_id);
+                    }
+                } else {
+                    // Check if response to inflight prompt
+                    let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
+                        honk_upstream::rpc_id_matches(
+                            &json!(inf.upstream_id),
+                            frame.get("id").unwrap_or(&Value::Null),
+                        )
+                    });
+
+                    if is_inflight_reply {
+                        let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                        let actions =
+                            self.turn
+                                .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
+                        self.execute_actions(actions).await;
+                    }
                 }
             } else if kind == crate::rpc::Kind::Request {
                 // Server request (e.g. request_permission) -> forward to viewers
-                self.forward_to_viewers(&frame);
+                self.forward_raw(&frame);
             }
         }
 
-        // 3. Record
+        // 3. Record & 4. Fan out stamped frame
         if is_session_stream {
             if kind == crate::rpc::Kind::Notification {
-                let _ = self.log.append(vec![(id_opt, frame)]);
+                let stamped = match self.log.append(vec![(id_opt, frame)]) {
+                    Ok(entries) => entries.last().map(|e| e.frame.clone()),
+                    Err(e) => {
+                        tracing::error!("failed to append frame to session log: {e:#}");
+                        None
+                    }
+                };
+                if let Some(frame) = stamped {
+                    self.fan_out_stamped(&frame, false);
+                }
             } else if let Some(id) = id_opt {
                 let _ = self.log.mark_processed(id);
             }
@@ -250,34 +291,57 @@ impl Session {
 
                     let mut clean_params = params;
                     crate::rpc::strip_honk_meta(&mut clean_params);
-                    let up = self.up.clone();
-                    let sid_clone = self.sid.clone();
-                    tokio::spawn(async move {
-                        let _ = up
-                            .request_with_id(
-                                json!(upstream_id),
-                                "session/prompt",
-                                clean_params,
-                                Some(&sid_clone),
-                            )
-                            .await;
-                    });
+
+                    // Awaited INLINE on handle (no tokio::spawn)
+                    if let Err(e) = self
+                        .up
+                        .request_with_id(
+                            json!(upstream_id),
+                            "session/prompt",
+                            clean_params,
+                            Some(&self.sid),
+                        )
+                        .await
+                    {
+                        // Prompt POST failed -> reply error to owners + clear inflight/ledger
+                        {
+                            let mut s = self.state_store.lock().await;
+                            let _ = s.mutate(|st| {
+                                if let Some(h) = st.sessions.get_mut(&sid) {
+                                    h.inflight = None;
+                                }
+                            });
+                        }
+                        let owners = self
+                            .turn
+                            .inflight
+                            .take()
+                            .map(|i| i.owners)
+                            .unwrap_or_default();
+                        for o in owners {
+                            let err_resp = crate::rpc::error(
+                                o.downstream_id.clone(),
+                                -32603,
+                                format!("Prompt POST failed: {e:#}"),
+                                None,
+                            );
+                            self.send_to_owner(&o, err_resp);
+                        }
+                    }
                 }
                 Action::SendCancel => {
-                    let up = self.up.clone();
-                    let sid_clone = self.sid.clone();
-                    tokio::spawn(async move {
-                        let _ = up
-                            .notify(
-                                "session/cancel",
-                                json!({ "sessionId": sid_clone }),
-                                Some(&sid_clone),
-                            )
-                            .await;
-                    });
+                    // Awaited INLINE
+                    let _ = self
+                        .up
+                        .notify(
+                            "session/cancel",
+                            json!({ "sessionId": self.sid }),
+                            Some(&self.sid),
+                        )
+                        .await;
                 }
                 Action::SynthUser { params, owner } => {
-                    let user_text = extract_user_text(&params);
+                    let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
                     let mut synth_frame = json!({
                         "jsonrpc": "2.0",
@@ -303,16 +367,20 @@ impl Session {
                         });
                     }
 
-                    let _ = self.log.append(vec![(None, synth_frame.clone())]);
-                    for (tx, is_honk_aware) in self.viewers.values() {
-                        if *is_honk_aware {
-                            tx.send_frame(axum::extract::ws::Message::Text(
-                                synth_frame.to_string().into(),
-                            ));
-                        }
+                    // Record first -> fan out stamped entry
+                    let stamped = match self.log.append(vec![(None, synth_frame.clone())]) {
+                        Ok(entries) => entries.last().map(|e| e.frame.clone()),
+                        Err(_) => None,
+                    };
+                    if let Some(frame) = stamped {
+                        self.fan_out_stamped(&frame, true); // honk-aware only
                     }
                 }
-                Action::Reply { owners, body } => match body {
+                Action::Reply {
+                    owners,
+                    body,
+                    user_text,
+                } => match body {
                     Reply::Error(err) => {
                         let sid = self.sid.clone();
                         {
@@ -335,20 +403,13 @@ impl Session {
                     Reply::Result(result_val) => {
                         let hub = self.hub.clone();
                         let sid = self.sid.clone();
-                        let user_text = extract_user_text(
-                            &self
-                                .turn
-                                .inflight
-                                .as_ref()
-                                .map(|i| i.params.clone())
-                                .unwrap_or(Value::Null),
-                        );
                         let self_tx = self.self_tx.clone();
                         tokio::spawn(async move {
                             let export_res = hub.export(&sid).await;
                             let text = match export_res {
                                 Ok(exp) => {
-                                    let t = honk_wire::export::turn_text(&exp, &user_text);
+                                    let u_text = user_text.as_deref().unwrap_or("");
+                                    let t = honk_wire::export::turn_text(&exp, u_text);
                                     if t.is_empty() { None } else { Some(t) }
                                 }
                                 Err(e) => {
@@ -423,36 +484,45 @@ impl Session {
             SessionMsg::Steer {
                 viewer_id,
                 viewer,
-                id: _,
+                id,
                 params,
             } => {
-                let up = self.up.clone();
-                let sid = self.sid.clone();
-                let sid_clone = sid.clone();
+                let up_id = self.ids.next();
+                self.pending_requests.insert(
+                    up_id.clone(),
+                    PendingSessionRequest {
+                        viewer_id,
+                        downstream_id: id.clone(),
+                        is_steer: true,
+                    },
+                );
+
                 let mut clean_params = params;
                 crate::rpc::strip_honk_meta(&mut clean_params);
-                let up_id = self.ids.next();
-                tokio::spawn(async move {
-                    let _ = up
-                        .request_with_id(
-                            json!(up_id),
-                            "_goose/unstable/session/steer",
-                            clean_params,
-                            Some(&sid_clone),
-                        )
-                        .await;
-                });
-                self.turn.steers.push((sid, viewer_id));
-                let _ = viewer;
+
+                // Awaited INLINE on handle
+                if let Err(e) = self
+                    .up
+                    .request_with_id(
+                        json!(up_id),
+                        "_goose/unstable/session/steer",
+                        clean_params,
+                        Some(&self.sid),
+                    )
+                    .await
+                {
+                    self.pending_requests.remove(&up_id);
+                    let err_resp =
+                        crate::rpc::error(id, -32603, format!("Steer POST failed: {e:#}"), None);
+                    viewer.send_frame(axum::extract::ws::Message::Text(
+                        err_resp.to_string().into(),
+                    ));
+                }
             }
             SessionMsg::Cancel => {
-                let up = self.up.clone();
-                let sid = self.sid.clone();
-                tokio::spawn(async move {
-                    let _ = up
-                        .notify("session/cancel", json!({ "sessionId": sid }), Some(&sid))
-                        .await;
-                });
+                let actions = self.turn.on_cancel();
+                self.execute_actions(actions).await;
+                // TODO(A13/A15): answer any pending server requests with "cancelled"
             }
             SessionMsg::Answer {
                 viewer_id: _,
@@ -461,21 +531,38 @@ impl Session {
                 // Server request answer (A10/A13)
             }
             SessionMsg::Forward {
-                viewer_id: _,
-                viewer: _,
+                viewer_id,
+                viewer,
                 id,
                 method,
                 params,
             } => {
-                let up = self.up.clone();
-                let sid = self.sid.clone();
+                let up_id = self.ids.next();
+                self.pending_requests.insert(
+                    up_id.clone(),
+                    PendingSessionRequest {
+                        viewer_id,
+                        downstream_id: id.clone(),
+                        is_steer: false,
+                    },
+                );
+
                 let mut clean_params = params;
                 crate::rpc::strip_honk_meta(&mut clean_params);
-                tokio::spawn(async move {
-                    let _ = up
-                        .request_with_id(id, &method, clean_params, Some(&sid))
-                        .await;
-                });
+
+                // Awaited INLINE on handle
+                if let Err(e) = self
+                    .up
+                    .request_with_id(json!(up_id), &method, clean_params, Some(&self.sid))
+                    .await
+                {
+                    self.pending_requests.remove(&up_id);
+                    let err_resp =
+                        crate::rpc::error(id, -32603, format!("Forward POST failed: {e:#}"), None);
+                    viewer.send_frame(axum::extract::ws::Message::Text(
+                        err_resp.to_string().into(),
+                    ));
+                }
             }
             SessionMsg::ReplyText { owners, body, text } => {
                 let sid = self.sid.clone();
@@ -532,9 +619,12 @@ impl Session {
     }
 
     fn attach_live(&mut self, viewer_id: ViewerId, viewer: ViewerTx, is_honk_aware: bool) {
-        self.viewers
-            .insert(viewer_id, (viewer.clone(), is_honk_aware));
-        if !is_honk_aware {
+        let was_present = self
+            .viewers
+            .insert(viewer_id, (viewer.clone(), is_honk_aware))
+            .is_some();
+
+        if !was_present && !is_honk_aware {
             let synth_info = json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -556,25 +646,52 @@ impl Session {
         }
     }
 
-    fn send_to_owner(&self, owner: &OwnerRef, frame: Value) {
+    fn send_to_owner(&mut self, owner: &OwnerRef, frame: Value) {
         if let Some(vid) = owner.viewer
             && let Some((tx, _)) = self.viewers.get(&vid)
+            && !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into()))
         {
-            tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into()));
+            self.viewers.remove(&vid);
         }
     }
 
-    fn forward_to_viewers(&self, frame: &Value) {
-        for (tx, is_honk_aware) in self.viewers.values() {
+    fn fan_out_stamped(&mut self, stamped_frame: &Value, honk_aware_only: bool) {
+        let mut dead = Vec::new();
+        let mut legacy_frame = None;
+
+        for (vid, (tx, is_honk_aware)) in &self.viewers {
             if *is_honk_aware {
-                tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into()));
-            } else {
-                let mut legacy_frame = frame.clone();
-                crate::rpc::strip_honk_meta(&mut legacy_frame);
-                tx.send_frame(axum::extract::ws::Message::Text(
-                    legacy_frame.to_string().into(),
-                ));
+                if !tx.send_frame(axum::extract::ws::Message::Text(
+                    stamped_frame.to_string().into(),
+                )) {
+                    dead.push(*vid);
+                }
+            } else if !honk_aware_only {
+                let frame = legacy_frame.get_or_insert_with(|| {
+                    let mut f = stamped_frame.clone();
+                    crate::rpc::strip_honk_meta(&mut f);
+                    f
+                });
+                if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
+                    dead.push(*vid);
+                }
             }
+        }
+
+        for vid in dead {
+            self.viewers.remove(&vid);
+        }
+    }
+
+    fn forward_raw(&mut self, frame: &Value) {
+        let mut dead = Vec::new();
+        for (vid, (tx, _)) in &self.viewers {
+            if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
+                dead.push(*vid);
+            }
+        }
+        for vid in dead {
+            self.viewers.remove(&vid);
         }
     }
 }

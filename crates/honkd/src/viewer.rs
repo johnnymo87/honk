@@ -1,6 +1,7 @@
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Notify, mpsc};
@@ -37,7 +38,7 @@ impl ViewerTx {
 pub struct Viewer {
     pub id: u64,
     pub is_honk_aware: bool,
-    pub attached_session: Option<String>,
+    pub attached_sessions: HashSet<String>,
     pub tx: ViewerTx,
 }
 
@@ -80,7 +81,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
     let mut viewer = Viewer {
         id: viewer_id,
         is_honk_aware: false,
-        attached_session: None,
+        attached_sessions: HashSet::new(),
         tx: viewer_tx,
     };
 
@@ -140,8 +141,10 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                 }
 
                 if method == Some("session/close") {
-                    // Detach this WS; reply {}; never forwarded; keep socket open
-                    if let Some(sid) = &viewer.attached_session {
+                    // Detach session(s); reply {}; never forwarded; keep socket open
+                    let sid_opt = params.get("sessionId").and_then(Value::as_str);
+                    if let Some(sid) = sid_opt {
+                        viewer.attached_sessions.remove(sid);
                         let session_tx = {
                             let sessions = hub.sessions.read().await;
                             sessions.get(sid).map(|h| h.tx.clone())
@@ -153,8 +156,22 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 })
                                 .await;
                         }
+                    } else {
+                        for sid in viewer.attached_sessions.drain() {
+                            let session_tx = {
+                                let sessions = hub.sessions.read().await;
+                                sessions.get(&sid).map(|h| h.tx.clone())
+                            };
+                            if let Some(tx) = session_tx {
+                                let _ = tx
+                                    .send(crate::session::SessionMsg::Detach {
+                                        viewer_id: viewer.id,
+                                    })
+                                    .await;
+                            }
+                        }
                     }
-                    viewer.attached_session = None;
+
                     if !id.is_null() {
                         let resp = crate::rpc::response(id, json!({}));
                         if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
@@ -190,7 +207,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     match hub.create_session(params).await {
                         Ok(new_res) => {
                             if let Some(sid) = new_res.get("sessionId").and_then(Value::as_str) {
-                                viewer.attached_session = Some(sid.to_string());
+                                viewer.attached_sessions.insert(sid.to_string());
                                 let session_tx = {
                                     let sessions = hub.sessions.read().await;
                                     sessions.get(sid).map(|h| h.tx.clone())
@@ -237,7 +254,18 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         };
 
                         if let Some(tx) = session_tx {
-                            viewer.attached_session = Some(sid.to_string());
+                            // Auto-attach if not already attached
+                            if !viewer.attached_sessions.contains(sid) {
+                                let _ = tx
+                                    .send(crate::session::SessionMsg::AttachLive {
+                                        viewer_id: viewer.id,
+                                        viewer: viewer.tx.clone(),
+                                        is_honk_aware: viewer.is_honk_aware,
+                                    })
+                                    .await;
+                                viewer.attached_sessions.insert(sid.to_string());
+                            }
+
                             let _ = tx
                                 .send(crate::session::SessionMsg::Prompt {
                                     viewer_id: viewer.id,
@@ -282,7 +310,18 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     };
 
                     if let Some(tx) = session_tx {
-                        viewer.attached_session = Some(sid.to_string());
+                        // Auto-attach if not already attached
+                        if !viewer.attached_sessions.contains(sid) {
+                            let _ = tx
+                                .send(crate::session::SessionMsg::AttachLive {
+                                    viewer_id: viewer.id,
+                                    viewer: viewer.tx.clone(),
+                                    is_honk_aware: viewer.is_honk_aware,
+                                })
+                                .await;
+                            viewer.attached_sessions.insert(sid.to_string());
+                        }
+
                         if method == Some("_goose/unstable/session/steer") {
                             let _ = tx
                                 .send(crate::session::SessionMsg::Steer {
@@ -371,7 +410,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
         }
     }
 
-    if let Some(sid) = viewer.attached_session.take() {
+    for sid in viewer.attached_sessions.drain() {
         let session_tx = {
             let sessions = hub.sessions.read().await;
             sessions.get(&sid).map(|h| h.tx.clone())

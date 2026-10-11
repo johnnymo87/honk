@@ -434,6 +434,14 @@ impl Viewer {
         panic!("timed out in wait_for");
     }
 
+    pub fn accumulated_text(&self) -> &str {
+        &self.accumulated_agent_text
+    }
+
+    pub fn prompt_reply_text(&self) -> Option<&str> {
+        self.prompt_reply_text.as_deref()
+    }
+
     pub fn receipt_text(&self) -> String {
         if let Some(txt) = &self.prompt_reply_text {
             txt.clone()

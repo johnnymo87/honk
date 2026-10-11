@@ -327,36 +327,44 @@ impl Hub {
             })?;
         }
 
-        // 2. Subscribe session stream (without takeover)
-        side_up
-            .subscribe_with(
-                Some(sid),
-                SubscribeOpts {
-                    takeover: false,
-                    resume_after: None,
-                },
-            )
-            .await
-            .context("failed to subscribe export session stream")?;
+        // Guaranteed cleanup on every path after initialize
+        let export_result: anyhow::Result<Value> = async {
+            side_up
+                .subscribe_with(
+                    Some(sid),
+                    SubscribeOpts {
+                        takeover: false,
+                        resume_after: None,
+                    },
+                )
+                .await
+                .context("failed to subscribe export session stream")?;
 
-        // 3. Call export
-        let export_res = side_up
-            .call(
-                "_goose/unstable/session/export",
-                serde_json::json!({
-                    "sessionId": sid,
-                    "format": "json"
-                }),
-                Some(sid),
-                Duration::from_secs(30),
-            )
-            .await
-            .context("failed to call export on side connection")?;
+            let export_res = side_up
+                .call(
+                    "_goose/unstable/session/export",
+                    serde_json::json!({
+                        "sessionId": sid,
+                        "format": "json"
+                    }),
+                    Some(sid),
+                    Duration::from_secs(30),
+                )
+                .await
+                .context("failed to call export on side connection")?;
 
-        // 4. Delete side connection
+            let data_str = export_res
+                .get("data")
+                .and_then(Value::as_str)
+                .context("export missing data string")?;
+            let session_val: Value =
+                serde_json::from_str(data_str).context("failed to parse export data JSON")?;
+            Ok(session_val)
+        }
+        .await;
+
+        // Guaranteed cleanup: DELETE + orphan removal
         let _ = side_up.delete().await;
-
-        // 5. Remove orphan
         {
             let mut s = self.state.lock().await;
             let _ = s.mutate(|st| {
@@ -364,13 +372,7 @@ impl Hub {
             });
         }
 
-        let data_str = export_res
-            .get("data")
-            .and_then(Value::as_str)
-            .context("export missing data string")?;
-        let session_val: Value =
-            serde_json::from_str(data_str).context("failed to parse export data JSON")?;
-        Ok(session_val)
+        export_result
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
@@ -491,6 +493,12 @@ impl Hub {
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
 
         let boot = { self.state.lock().await.boot };
+        let last_processed_session = session_log.last_upstream_id();
+        let last_processed_conn = {
+            let s = self.state.lock().await;
+            s.sessions.get(&sid).and_then(|h| h.last_conn_event_id)
+        };
+
         let session = crate::session::Session {
             sid: sid.clone(),
             state_dir: self.state_dir.clone(),
@@ -504,9 +512,10 @@ impl Hub {
             turn: crate::turn::TurnCore::default(),
             state: crate::session::ActorState::Live,
             ids: UpstreamIds::new(boot),
-            last_processed_session_id: None,
-            last_processed_conn_id: None,
+            last_processed_session_id: last_processed_session,
+            last_processed_conn_id: last_processed_conn,
             viewers: HashMap::new(),
+            pending_requests: HashMap::new(),
         };
 
         tokio::spawn(session.run());

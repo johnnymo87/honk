@@ -149,6 +149,22 @@ pub fn is_no_active_run(val: &Value) -> bool {
         || val.as_str().is_some_and(check_str)
 }
 
+pub fn extract_user_text(params: &Value) -> String {
+    if let Some(s) = params.get("prompt").and_then(Value::as_str) {
+        return s.to_string();
+    }
+    if let Some(arr) = params.get("prompt").and_then(Value::as_array) {
+        let mut text = String::new();
+        for block in arr {
+            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        }
+        return text;
+    }
+    String::new()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamIds {
     pub boot: u64,

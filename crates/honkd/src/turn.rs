@@ -89,6 +89,7 @@ pub enum Action {
     Reply {
         owners: Vec<OwnerRef>,
         body: Reply,
+        user_text: Option<String>,
     },
     NotifySteerUnconsumed {
         viewer: ViewerId,
@@ -117,6 +118,7 @@ impl TurnCore {
             return vec![Action::Reply {
                 owners: vec![owner],
                 body: Reply::Error(crate::rpc::busy_error(run)),
+                user_text: None,
             }];
         }
         if self.inflight.is_some() {
@@ -164,6 +166,7 @@ impl TurnCore {
                     out.push(Action::Reply {
                         owners: vec![o],
                         body: Reply::Error(crate::rpc::busy_error(&r)),
+                        user_text: None,
                     });
                 }
             }
@@ -199,9 +202,11 @@ impl TurnCore {
             Some(e) => Reply::Error(e.clone()),
             None => Reply::Result(frame.get("result").cloned().unwrap_or(Value::Null)),
         };
+        let user_text = Some(crate::rpc::extract_user_text(&inf.params));
         let mut out = vec![Action::Reply {
             owners: inf.owners,
             body,
+            user_text,
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -266,6 +271,7 @@ impl TurnCore {
                     }
                 }
             })),
+            user_text: None,
         }]
     }
 
@@ -325,6 +331,7 @@ mod tests {
             vec![Action::Reply {
                 owners: vec![owner],
                 body: Reply::Error(busy_error("run_active")),
+                user_text: None,
             }]
         );
         assert!(core.inflight.is_none());
@@ -362,6 +369,7 @@ mod tests {
                 Action::Reply {
                     owners: vec![owner2],
                     body: Reply::Error(busy_error("run_1")),
+                    user_text: None,
                 },
             ]
         );
@@ -394,6 +402,7 @@ mod tests {
                 Action::Reply {
                     owners: vec![owner1],
                     body: Reply::Result(json!({"text": "done"})),
+                    user_text: Some("first".into()),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -432,6 +441,7 @@ mod tests {
             vec![Action::Reply {
                 owners: vec![owner],
                 body: Reply::Result(json!({"status": "ok"})),
+                user_text: Some("hi".into()),
             }]
         );
         assert!(core.inflight.is_none());
@@ -518,6 +528,7 @@ mod tests {
                         }
                     }
                 })),
+                user_text: None,
             }]
         );
         assert!(core.run.is_none());
@@ -764,6 +775,7 @@ mod tests {
             vec![Action::Reply {
                 owners: vec![owner1],
                 body: Reply::Error(busy_err.clone()),
+                user_text: Some("p1".into()),
             }]
         );
         // 2. Run is recorded
@@ -779,6 +791,7 @@ mod tests {
             vec![Action::Reply {
                 owners: vec![owner3],
                 body: Reply::Error(busy_err),
+                user_text: None,
             }]
         );
         assert_eq!(core.parked.len(), 1);
