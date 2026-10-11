@@ -145,6 +145,7 @@ impl TurnCore {
         match run {
             Some(r) => {
                 self.run = Some(r.clone());
+                self.consumed_steers.clear();
                 if let Some(inf) = self.inflight.as_mut()
                     && !inf.announced
                 {
@@ -168,7 +169,6 @@ impl TurnCore {
             }
             None => {
                 self.run = None;
-                self.consumed_steers.clear();
                 for (message_id, viewer) in self.steers.drain(..) {
                     out.push(Action::NotifySteerUnconsumed { viewer, message_id });
                 }
@@ -194,7 +194,6 @@ impl TurnCore {
             self.run = Some(run);
         } else {
             self.run = None;
-            self.consumed_steers.clear();
         }
         let body = match frame.get("error") {
             Some(e) => Reply::Error(e.clone()),
@@ -702,6 +701,36 @@ mod tests {
         // Run ends -> nothing unconsumed notified
         let end_actions = core.on_run_state(None, &mut ids);
         assert!(end_actions.is_empty());
+        // consumed_steers is kept until the next run starts
+        assert!(core.consumed_steers.contains("steer_early"));
+    }
+
+    #[test]
+    fn test_steer_consumed_then_run_ends_then_steer_ok_emits_nothing() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        // 1. Run 1 starts
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+
+        // 2. user_message_chunk arrives and consumes steer X before steer reply
+        core.on_user_message("steer_x");
+        assert!(core.consumed_steers.contains("steer_x"));
+
+        // 3. activeRunId: null arrives (run ends) BEFORE steer reply
+        let end_actions = core.on_run_state(None, &mut ids);
+        assert!(end_actions.is_empty());
+        // consumed_steers is preserved across run end until next run start
+        assert!(core.consumed_steers.contains("steer_x"));
+
+        // 4. Steer reply for X arrives AFTER activeRunId: null
+        let steer_actions = core.on_steer_ok("steer_x".into(), 42);
+        // Because X was consumed during the turn, it MUST NOT emit NotifySteerUnconsumed
+        assert!(steer_actions.is_empty());
+        assert!(core.steers.is_empty());
+
+        // 5. When Run 2 starts, consumed_steers is cleared
+        let _ = core.on_run_state(Some("run_2".into()), &mut ids);
         assert!(core.consumed_steers.is_empty());
     }
 
