@@ -136,3 +136,50 @@ async fn header_auth_and_honk_aware_connect() {
         .await;
     assert_eq!(r["result"]["_meta"]["honk"]["protocol"], 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewer_overflow_closes_with_4001() {
+    use futures::{SinkExt, StreamExt};
+
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream", "--viewer-queue", "1"],
+    )
+    .await;
+
+    let url = format!("{}?token={}", h.ws_url(), h.secret());
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
+
+    // Flood with initialize requests without reading responses
+    for i in 1..=50 {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": i,
+            "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        });
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                req.to_string().into(),
+            ))
+            .await;
+    }
+
+    // Read frames until Close
+    let mut close_code = None;
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(frame)) => {
+                close_code = frame.map(|f| u16::from(f.code));
+                break;
+            }
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(close_code, Some(4001));
+}

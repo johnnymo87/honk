@@ -24,12 +24,15 @@ pub struct Honkd {
 
 impl Honkd {
     pub async fn spawn(upstream: &str, upstream_secret: &Path, extra: &[&str]) -> Self {
-        let bind_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("find free port");
-        let addr = bind_listener.local_addr().expect("local addr");
-        drop(bind_listener);
-
         let state_dir = tempfile::tempdir().expect("create temp dir");
-        let child = spawn_process(addr, upstream, upstream_secret, state_dir.path(), extra).await;
+        let (child, addr) = spawn_process(
+            None, // listen on 127.0.0.1:0
+            upstream,
+            upstream_secret,
+            state_dir.path(),
+            extra,
+        )
+        .await;
 
         Self {
             child: Some(child),
@@ -80,8 +83,8 @@ impl Honkd {
         }
 
         let extra_refs: Vec<&str> = self.extra.iter().map(|s| s.as_str()).collect();
-        let child = spawn_process(
-            self.addr,
+        let (child, addr) = spawn_process(
+            Some(self.addr), // restart reuses explicit port!
             &self.upstream,
             &self.upstream_secret,
             self.state_dir.path(),
@@ -89,13 +92,11 @@ impl Honkd {
         )
         .await;
 
+        assert_eq!(addr, self.addr, "restarted honkd bound expected address");
         self.child = Some(child);
     }
 
     pub fn spawn_expect_exit(upstream: &str, secret: &Path, extra: &[&str]) -> (i32, String) {
-        let bind_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("find free port");
-        let addr = bind_listener.local_addr().expect("local addr");
-        drop(bind_listener);
         let temp_dir = tempfile::tempdir().expect("create temp dir");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_honkd"));
@@ -116,7 +117,7 @@ impl Honkd {
         }
 
         if !has_listen {
-            cmd.arg("--listen").arg(addr.to_string());
+            cmd.arg("--listen").arg("127.0.0.1:0");
         }
         cmd.arg("--upstream").arg(upstream);
         if !has_secret_file {
@@ -146,16 +147,27 @@ impl Drop for Honkd {
 }
 
 async fn spawn_process(
-    addr: SocketAddr,
+    explicit_addr: Option<SocketAddr>,
     upstream: &str,
     upstream_secret: &Path,
     state_dir: &Path,
     extra: &[&str],
-) -> Child {
+) -> (Child, SocketAddr) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_honkd"));
-    cmd.arg("--listen")
-        .arg(addr.to_string())
-        .arg("--upstream")
+    let mut has_listen = false;
+    for arg in extra {
+        if *arg == "--listen" || arg.starts_with("--listen=") {
+            has_listen = true;
+        }
+    }
+
+    if !has_listen {
+        let listen_addr = explicit_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "127.0.0.1:0".to_string());
+        cmd.arg("--listen").arg(listen_addr);
+    }
+    cmd.arg("--upstream")
         .arg(upstream)
         .arg("--upstream-secret-file")
         .arg(upstream_secret)
@@ -193,8 +205,10 @@ async fn spawn_process(
         for line in reader.lines() {
             match line {
                 Ok(l) => {
-                    if l.contains("honkd listening on") {
-                        let _ = tx.send(Ok(()));
+                    if let Some(rest) = l.strip_prefix("honkd listening on ")
+                        && let Ok(addr) = rest.trim().parse::<SocketAddr>()
+                    {
+                        let _ = tx.send(Ok(addr));
                         return;
                     }
                 }
@@ -205,7 +219,7 @@ async fn spawn_process(
             }
         }
         let _ = tx.send(Err(
-            "process exited without 'honkd listening on'".to_string()
+            "process exited without 'honkd listening on <addr>'".to_string()
         ));
     });
 
@@ -214,7 +228,7 @@ async fn spawn_process(
         .expect("join wait thread");
 
     match res {
-        Ok(Ok(())) => child,
+        Ok(Ok(addr)) => (child, addr),
         Ok(Err(err)) => {
             let _ = child.kill();
             let _ = child.wait();

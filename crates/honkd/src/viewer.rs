@@ -3,34 +3,81 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Notify, mpsc};
 
 use crate::hub::Hub;
 
 static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone)]
+pub struct ViewerTx {
+    tx: mpsc::Sender<Message>,
+    evict: Arc<Notify>,
+}
+
+impl ViewerTx {
+    pub fn new(tx: mpsc::Sender<Message>, evict: Arc<Notify>) -> Self {
+        Self { tx, evict }
+    }
+
+    pub fn send_frame(&self, msg: Message) -> bool {
+        match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.evict.notify_one();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+
 pub struct Viewer {
     pub id: u64,
     pub is_honk_aware: bool,
-    pub tx: tokio::sync::mpsc::Sender<Message>,
+    pub tx: ViewerTx,
 }
 
 pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
     let viewer_id = NEXT_VIEWER_ID.fetch_add(1, Ordering::SeqCst);
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(hub.args.viewer_queue);
+    let (tx, mut rx) = mpsc::channel::<Message>(hub.args.viewer_queue);
+    let evict = Arc::new(Notify::new());
+    let evict_clone = evict.clone();
 
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(msg).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                _ = evict_clone.notified() => {
+                    let _ = ws_sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 4001,
+                            reason: "queue overflow".into(),
+                        })))
+                        .await;
+                    break;
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Some(m) => {
+                            if ws_sender.send(m).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
     });
 
+    let viewer_tx = ViewerTx::new(tx, evict);
+
     let mut viewer = Viewer {
         id: viewer_id,
         is_honk_aware: false,
-        tx: tx.clone(),
+        tx: viewer_tx,
     };
 
     while let Some(msg_res) = ws_receiver.next().await {
@@ -52,7 +99,12 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 "message": "Parse error"
                             }
                         });
-                        let _ = tx.send(Message::Text(err_resp.to_string().into())).await;
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -71,20 +123,11 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         "id": id,
                         "result": res
                     });
-                    if let Err(e) = viewer
+                    if !viewer
                         .tx
-                        .try_send(Message::Text(resp_frame.to_string().into()))
+                        .send_frame(Message::Text(resp_frame.to_string().into()))
                     {
-                        match e {
-                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                                let _ = viewer.tx.try_send(Message::Close(Some(CloseFrame {
-                                    code: 4001,
-                                    reason: "queue overflow".into(),
-                                })));
-                                break;
-                            }
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => break,
-                        }
+                        break;
                     }
                 } else if method == Some("session/load") {
                     viewer.is_honk_aware = true;
@@ -96,10 +139,12 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             "message": "Method not implemented in A7"
                         }
                     });
-                    let _ = viewer
+                    if !viewer
                         .tx
-                        .send(Message::Text(err_resp.to_string().into()))
-                        .await;
+                        .send_frame(Message::Text(err_resp.to_string().into()))
+                    {
+                        break;
+                    }
                 } else {
                     let err_resp = json!({
                         "jsonrpc": "2.0",
@@ -109,14 +154,18 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             "message": "Method not implemented in A7"
                         }
                     });
-                    let _ = viewer
+                    if !viewer
                         .tx
-                        .send(Message::Text(err_resp.to_string().into()))
-                        .await;
+                        .send_frame(Message::Text(err_resp.to_string().into()))
+                    {
+                        break;
+                    }
                 }
             }
             Message::Ping(payload) => {
-                let _ = tx.send(Message::Pong(payload)).await;
+                if !viewer.tx.send_frame(Message::Pong(payload)) {
+                    break;
+                }
             }
             Message::Close(_) => {
                 break;
@@ -125,6 +174,30 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
         }
     }
 
-    drop(tx);
+    drop(viewer);
     let _ = write_task.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_send_frame_overflow_triggers_evict() {
+        let (tx, _rx) = mpsc::channel::<Message>(1);
+        let evict = Arc::new(Notify::new());
+        let viewer_tx = ViewerTx::new(tx, evict.clone());
+
+        // First message fits in buffer
+        assert!(viewer_tx.send_frame(Message::Text("1".into())));
+        // Second message overflows
+        assert!(!viewer_tx.send_frame(Message::Text("2".into())));
+
+        // Verify evict was notified
+        let notified =
+            tokio::time::timeout(std::time::Duration::from_millis(100), evict.notified())
+                .await
+                .is_ok();
+        assert!(notified);
+    }
 }
