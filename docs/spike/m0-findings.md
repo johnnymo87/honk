@@ -50,7 +50,7 @@ follow-ups (patch, config, or recipe), not as failures.
   - Finding on export requirements: `session/load` was **not** needed on the new connection; `_goose/unstable/session/export` directly queries goose's disk session store.
 - Inspected exported session:
   - Total messages: 1 (only the user prompt).
-  - No tool result, no assistant response, and `FINISHED` is absent.
+  - No assistant message was produced at all; the word "FINISHED" appeared solely in the user prompt instructions.
 
 **Decision-rule outcome:**
 - Confirmed design premise: WebSocket transport cancels runs on client disconnect.
@@ -59,18 +59,28 @@ follow-ups (patch, config, or recipe), not as failures.
 
 ## P2 HTTP disconnect
 
-**Question:** Under HTTP+SSE transport, do active turns survive client disconnects? What is the 409 conflict window during reattach? Are frames lost when disconnected during streaming? Does an in-flight turn survive an extended 600s disconnect gap?
+**Question:** Under HTTP+SSE transport, do active turns survive client disconnects? What is the 409 conflict window during reattach? Are frames lost when disconnected during streaming? Does an in-flight turn survive an extended 600s disconnect gap? How does a half-open / blackholed connection behave?
 
-**Verdict:** Yes, in-flight turns survive client disconnects under HTTP+SSE across both immediate reattachment and extended (600s) gaps. Goose buffers stream events in its mailbox and delivers prompt replies and run-end notifications upon reattachment.
+**Verdict:** Yes, in-flight turns survive client disconnects under HTTP+SSE across immediate reattachment, extended gaps (600s), and half-open freezes. However, half-open drops cause persistent 409 Conflict until the stale socket closes, and unread frames (chunks, run-end updates, and prompt replies) written into kernel buffers during the freeze are permanently lost.
+
+**Caveat on P2a/b/c:** P2a, P2b, and P2c operated over local loopback with clean socket teardown (`hard_drop` aborts the client task, causing the OS to immediately send TCP FIN). This represents the easy case where the server learns of the client teardown immediately (0ms 409 window). P2d empirically probes the hard case of an ungraceful, half-open drop.
 
 **Decision-rule outcomes:**
-1. **Turn survival (P2a & P2c):** Turn survives in both P2a (runs 1 & 2) and P2c (600s gap). Design §6 holds; the WS+drain fallback is not required.
-2. **409 reattach window:** On local loopback with clean socket teardown, `hard_drop` aborts the client socket, allowing immediate re-subscription (0ms window observed). Overlapping GET requests verify that goose strictly returns HTTP 409 Conflict when a stream is actively held, confirming that exponential backoff (100ms → 2s, 60s deadline) is mandatory for ungraceful/remote disconnects.
-3. **Frame loss (P2b):** No characters were lost in P2b across either run (`chars_missing: 0`). Prompt replies and run-end notifications arrived reliably after reattachment. Even if frames were lost across dying sockets, honkd reconciliation via session export (P3) can fully recover final turn state.
+1. **Turn survival (P2a, P2c, P2d):** Turn survives across clean drops, long 600s gaps, and half-open socket freezes. Design §6 holds; the WS+drain fallback is not required.
+2. **409 reattach window & half-open persistence:**
+   - Per source analysis (`http_server.rs`) and P2d empirical measurements, Goose strictly returns HTTP 409 Conflict when a stream is already actively held by another subscriber.
+   - When a connection drops cleanly (FIN sent), the 409 window is ~0-1ms.
+   - When a connection is half-open / blackholed (sockets held open without reading or writing), the 409 Conflict persists indefinitely (never cleared within the 180s deadline across both runs).
+   - **Can honkd force Goose to release the stale subscriber by sending DELETE? NO.** Sending DELETE terminates the connection and aborts in-flight runs (as shown in T5). Honkd cannot force Goose to release the stale subscriber from the outside; Goose holds the mailbox subscriber until kernel TCP teardown or write errors occur.
+   - Therefore, honkd must retry with exponential backoff on 409. Reattach latency in half-open scenarios is gated on Goose's socket detection.
+3. **Frame loss & reconciliation (P2b vs P2d):**
+   - On clean drop with immediate reattach (P2b), no characters were lost (`chars_missing: 0`).
+   - On half-open drop (P2d), Goose continues generating and writing frames into the open socket buffer. Because Goose dequeues frames before writing (at-most-once delivery), all chunks streamed during the freeze, the run-end notification, and the prompt reply are permanently lost into the stale socket buffer (`prompt_reply_received: false`, `run_end_received: false`, 213–649 characters missing).
+   - **Implication:** Honkd **must reconcile session state after every reattach** (via session export/reload in P3) rather than relying on stream replay or waiting for prompt replies.
 
 **Probe results:**
 
-### P2a: Quiet drop (tool_call in-flight)
+### P2a: Quiet drop (tool_call in-flight, clean FIN)
 - **Run 1:**
   - Session: `20261010_8` | Connection: `05fcd963-f3b3-498d-a784-33f367a1e5c3`
   - Conn 409 window: 0ms | Session 409 window: 0ms
@@ -84,12 +94,13 @@ follow-ups (patch, config, or recipe), not as failures.
   - Total duration: 42.26s
   - Fixture: `fixtures/goose-1.54.0-patched.2/p2a/1791675187.jsonl`
 
-### P2b: Drop while streaming (after 20 chunks)
+### P2b: Drop while streaming (after 20 chunks, clean FIN)
 - **Run 1:**
   - Session: `20261010_10` | Connection: `7bd9f05c-6e5b-4c79-8d54-331f0c654523`
   - Conn 409 window: 0ms | Session 409 window: 0ms
   - Chunks before drop: 20 | Chunks after drop: 56
-  - Streamed chars total: 869 | Exported all assistant chars: 869 | Chars missing: 0
+  - Streamed chars total: 869 | Exported all assistant chars: 869 | Chars missing: 0 | Chars abs diff: 0
+  - Streamed equals exported all: `true` | Streamed equals exported final: `false` (run had tool calls across multiple assistant turns)
   - Exported final assistant chars: 637
   - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
   - Total duration: 18.76s
@@ -98,19 +109,67 @@ follow-ups (patch, config, or recipe), not as failures.
   - Session: `20261010_11` | Connection: `175cf047-09cc-40ec-a45f-726d099004c8`
   - Conn 409 window: 0ms | Session 409 window: 0ms
   - Chunks before drop: 20 | Chunks after drop: 105
-  - Streamed chars total: 930 | Exported all assistant chars: 930 | Chars missing: 0
+  - Streamed chars total: 930 | Exported all assistant chars: 930 | Chars missing: 0 | Chars abs diff: 0
+  - Streamed equals exported all: `true` | Streamed equals exported final: `false`
   - Exported final assistant chars: 181
   - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
   - Total duration: 79.32s
   - Fixture: `fixtures/goose-1.54.0-patched.2/p2b/1791675319.jsonl`
+- **Run 3:**
+  - Session: `20261011_2` | Connection: `787c8cad-042f-46c5-aa9d-d833a235e7cc`
+  - Conn 409 window: 0ms | Session 409 window: 0ms
+  - Chunks before drop: 20 | Chunks after drop: 43
+  - Streamed chars total: 719 | Exported all assistant chars: 719 | Chars missing: 0 | Chars abs diff: 0
+  - Streamed equals exported all: `true` | Streamed equals exported final: `false`
+  - Exported final assistant chars: 575
+  - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
+  - Total duration: 15.66s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p2b/1791677265.jsonl`
 
-### P2c: Long gap (600s disconnect)
+### P2c: Long gap (600s disconnect, clean FIN)
 - Session: `20261010_7` | Connection: `b95059f6-2660-4afe-9122-7992a898b208`
 - Disconnect gap: 600s (10 minutes)
 - Conn 409 window: 0ms | Session 409 window: 0ms
 - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
 - Total duration: 602.07s
 - Fixture: `fixtures/goose-1.54.0-patched.2/p2c/1791675132.jsonl`
+
+### P2d: Half-open / blackholed drop (TCP proxy freeze)
+- **Methodology:**
+  - A local TCP forwarding proxy ran on an ephemeral port in front of `127.0.0.1:4180`.
+  - Upstream connected through the proxy, started a session, and issued the streaming tides prompt.
+  - After 20 chunks, the proxy froze: stopped reading and writing on both sockets while keeping the TCP connections open in kernel state (no FIN/RST sent to Goose), and client tasks were hard-dropped.
+  - Client immediately attempted to reattach directly to `127.0.0.1:4180` and subscribe with a 180s deadline.
+  - When 409 did not clear within 180s, the proxy dropped the sockets (sending FIN). Time to subscribe after FIN was measured.
+  - Resumed stream read for any arriving frames, exported session, and computed frame loss across streamed vs exported text.
+- **Run 1:**
+  - Session: `20261010_12` | Connection: `14abe2ad-9b78-4b89-9676-7c024f0df279`
+  - Proxy port: 45933 | Half-open 409 probe: 181.255s (timed out; cleared while frozen: `false`)
+  - Conn 409 ms: 181,255ms | Session 409 ms: 181,255ms
+  - Time to subscribe after FIN: 1ms (`subscribe_ms_after_fin: 1`)
+  - Chunks before drop: 20 (231 chars) | Chunks after reattach: 0
+  - Streamed chars total: 231 | Exported all assistant chars: 880 | Exported final assistant chars: 728
+  - Chars missing vs all: 649 | Chars missing vs final: 497 | Chars abs diff: 649
+  - Streamed is prefix: `true` | Streamed is subsequence: `true`
+  - Prompt reply received: `false` (lost to dead socket buffer)
+  - Run-end received: `false` (lost to dead socket buffer)
+  - `FINISHED` present in export: `true` (turn ran to completion on server)
+  - Total duration: 255.45s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p2d/1791676694.jsonl`
+- **Run 2:**
+  - Session: `20261011_1` | Connection: `53ce032d-a60c-4f34-b136-95e560f54a92`
+  - Proxy port: 41099 | Half-open 409 probe: 181.268s (timed out; cleared while frozen: `false`)
+  - Conn 409 ms: 181,268ms | Session 409 ms: 181,268ms
+  - Time to subscribe after FIN: 1ms (`subscribe_ms_after_fin: 1`)
+  - Chunks before drop: 20 (273 chars) | Chunks after reattach: 0
+  - Streamed chars total: 273 | Exported all assistant chars: 486 | Exported final assistant chars: 415
+  - Chars missing vs all: 213 | Chars missing vs final: 142 | Chars abs diff: 213
+  - Streamed is prefix: `true` | Streamed is subsequence: `true`
+  - Prompt reply received: `false` (lost to dead socket buffer)
+  - Run-end received: `false` (lost to dead socket buffer)
+  - `FINISHED` present in export: `true` (turn ran to completion on server)
+  - Total duration: 251.04s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p2d/1791676988.jsonl`
 
 ## P3: Same-connection reload mid-run
 _pending_

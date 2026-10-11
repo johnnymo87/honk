@@ -6,7 +6,7 @@ pub mod record;
 pub mod redact;
 pub mod sse;
 
-pub use conn::{Event, StreamKey, Upstream};
+pub use conn::{Event, StreamKey, Upstream, rpc_id_matches};
 pub use record::{Direction, RecordEntry, Recorder};
 pub use redact::Redactor;
 pub use sse::sse_to_json_stream;
