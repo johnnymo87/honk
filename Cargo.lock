@@ -340,6 +340,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "honk-wire"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "honkd"
+version = "0.0.0"
+dependencies = [
+ "honk-wire",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
