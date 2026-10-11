@@ -35,6 +35,8 @@ if (( 10#$PORT == 4080 )); then
     exit 1
 fi
 
+UNIT="${HONK_SANDBOX_UNIT:-honk-goose-sandbox}"
+
 SECRET_FILE="$SANDBOX/secret"
 if [[ ! -f "$SECRET_FILE" ]]; then
     echo "ERROR: Secret file $SECRET_FILE not found" >&2
@@ -43,9 +45,9 @@ fi
 SECRET=$(cat "$SECRET_FILE")
 
 # 1. Verify systemd unit is running
-pid=$(systemctl --user show -p MainPID --value honk-goose-sandbox 2>/dev/null || true)
+pid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || true)
 if [[ -z "$pid" || "$pid" == "0" ]]; then
-    echo "ERROR: honk-goose-sandbox unit is not running (MainPID: ${pid:-empty})" >&2
+    echo "ERROR: $UNIT unit is not running (MainPID: ${pid:-empty})" >&2
     exit 1
 fi
 
@@ -59,6 +61,17 @@ actual_cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
 if [[ "$actual_cwd" != "$SANDBOX" ]]; then
     echo "ERROR: Process cwd ($actual_cwd) does not match sandbox ($SANDBOX)" >&2
     exit 1
+fi
+
+# 2b. Report which binary is running; with HONK_EXPECT_GOOSE_BIN, require it.
+actual_exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+echo "goose exe: $actual_exe"
+if [[ -n "${HONK_EXPECT_GOOSE_BIN:-}" ]]; then
+    want_exe=$(readlink -f "$HONK_EXPECT_GOOSE_BIN")
+    if [[ "$actual_exe" != "$want_exe" ]]; then
+        echo "ERROR: $UNIT runs $actual_exe, expected $want_exe" >&2
+        exit 1
+    fi
 fi
 
 # 3. POST initialize with bounded retry (up to 15s in case service just started)

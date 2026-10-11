@@ -7,6 +7,11 @@
 #   systemctl --user reset-failed honk-goose-sandbox 2>/dev/null
 #   XDG_RUNTIME_DIR=/run/user/$(id -u) systemd-run --user --unit=honk-goose-sandbox --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" <abs path>/scripts/goose-sandbox.sh
 #
+# A second, isolated sandbox for a specific goose build (e.g. the fork):
+#   systemd-run --user --unit=honk-goose-sandbox-patched --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+#     --setenv=HONK_SANDBOX="$HOME/.local/state/honk-sandbox-patched" --setenv=HONK_SANDBOX_PORT=4181 \
+#     --setenv=GOOSE_BIN=<abs path to goose> <abs path>/scripts/goose-sandbox.sh
+#
 # Read logs:
 #   journalctl --user -u honk-goose-sandbox
 
@@ -138,6 +143,25 @@ if [[ ! -f "$gcloud_creds" ]]; then
     exit 1
 fi
 
+# Which goose to run. Default: whatever `goose` is on PATH (the production build).
+# Set GOOSE_BIN to an absolute path to run a specific build, e.g. a fork release.
+GOOSE_BIN="${GOOSE_BIN:-goose}"
+if [[ "$GOOSE_BIN" != "goose" ]]; then
+    case "$GOOSE_BIN" in
+        /*) ;;
+        *)
+            echo "ERROR: GOOSE_BIN must be an absolute path: $GOOSE_BIN" >&2
+            exit 1
+            ;;
+    esac
+    if [[ ! -x "$GOOSE_BIN" ]]; then
+        echo "ERROR: GOOSE_BIN is not executable: $GOOSE_BIN" >&2
+        exit 1
+    fi
+fi
+goose_resolved=$(command -v "$GOOSE_BIN") || { echo "ERROR: $GOOSE_BIN not found" >&2; exit 1; }
+echo "goose binary: $(readlink -f "$goose_resolved")" >&2
+
 cd "$SANDBOX"
 exec env \
     GOOSE_PATH_ROOT="$SANDBOX" \
@@ -147,4 +171,4 @@ exec env \
     GCP_LOCATION=global \
     GCP_PROJECT_ID="$(cat "$gcp_secret")" \
     GOOGLE_APPLICATION_CREDENTIALS="$gcloud_creds" \
-    goose serve --host 127.0.0.1 --port "$PORT"
+    "$GOOSE_BIN" serve --host 127.0.0.1 --port "$PORT"
