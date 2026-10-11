@@ -147,3 +147,165 @@ async fn orphan_in_state_deleted_on_restart() {
         "orphans must be cleared after restart"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_new_developer_extensions_verbatim_matches_direct_goose() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+
+    // 1. Direct call to goose for baseline
+    let mut direct_up = honk_upstream::Upstream::initialize(
+        &g.url(),
+        g.secret().to_string(),
+        honk_upstream::Recorder::disabled(),
+    )
+    .await
+    .expect("initialize direct upstream");
+    direct_up
+        .subscribe(None)
+        .await
+        .expect("subscribe direct conn");
+
+    let direct_res = direct_up
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": g.cwd().to_str().unwrap(),
+                "mcpServers": [],
+                "_meta": {
+                    "enabledExtensions": [{
+                        "type": "platform",
+                        "name": "developer"
+                    }]
+                }
+            }),
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("call direct session/new");
+
+    let direct_exts = direct_res
+        .pointer("/_meta/extensionResults")
+        .or_else(|| direct_res.get("extensionResults"))
+        .expect("direct extensionResults");
+    assert!(
+        !direct_exts.as_array().expect("array").is_empty(),
+        "expected non-empty developer extension results directly from goose"
+    );
+
+    // 2. Call through honkd
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    let honkd_res = v
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": g.cwd().to_str().unwrap(),
+                "mcpServers": [],
+                "_meta": {
+                    "enabledExtensions": [{
+                        "type": "platform",
+                        "name": "developer"
+                    }]
+                }
+            }),
+        )
+        .await;
+
+    let honkd_exts = honkd_res["result"]
+        .pointer("/_meta/extensionResults")
+        .or_else(|| honkd_res["result"].get("extensionResults"))
+        .expect("honkd extensionResults");
+
+    assert_eq!(
+        honkd_exts, direct_exts,
+        "honkd must return extensionResults verbatim matching direct goose"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_close_and_cancel_request_never_forwarded_upstream() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    // 1. Create session
+    let new_res = v
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": "/tmp",
+                "mcpServers": [],
+                "_meta": { "enabledExtensions": [] }
+            }),
+        )
+        .await;
+    let sid = new_res["result"]["sessionId"].as_str().unwrap();
+
+    let inbound_before = fake.inbound().len();
+
+    // 2. session/close -> answered locally with {}, not forwarded
+    let close_res = v
+        .call("session/close", serde_json::json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(close_res["result"], serde_json::json!({}));
+
+    // 3. $/cancel_request -> dropped, not forwarded
+    v.request(
+        "$/cancel_request",
+        serde_json::json!({ "sessionId": sid, "requestId": 123 }),
+    )
+    .await;
+
+    // Small tick to ensure no errant forward in flight
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let inbound_after = fake.inbound();
+    let new_inbound = &inbound_after[inbound_before..];
+    for frame in new_inbound {
+        let m = frame.get("method").and_then(serde_json::Value::as_str);
+        assert_ne!(
+            m,
+            Some("session/close"),
+            "session/close must never be forwarded upstream"
+        );
+        assert_ne!(
+            m,
+            Some("$/cancel_request"),
+            "$/cancel_request must never be forwarded upstream"
+        );
+    }
+
+    // 4. Verify socket is still open: initialize works
+    let init_res = v
+        .call(
+            "initialize",
+            serde_json::json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+        )
+        .await;
+    assert_eq!(init_res["result"]["_meta"]["honk"]["protocol"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_frame_returns_32600() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    // Missing method, not a response -> invalid
+    let res = v.call("", serde_json::json!({})).await;
+    assert_eq!(res["error"]["code"], -32600);
+}

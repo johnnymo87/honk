@@ -361,7 +361,12 @@ impl Hub {
             .await
             .context("failed to subscribe session stream")?;
 
-        // 6. In one state.mutate: remove orphan; insert HeldSession
+        // 6. SessionLog::create(sessions/<sid>.jsonl, 1, None, []) BEFORE state mutate
+        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
+        let session_log = crate::log::SessionLog::create(&log_path, 1, None, Vec::new())
+            .context("failed to create session log")?;
+
+        // 7. In one state.mutate: remove orphan; insert HeldSession
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -384,11 +389,6 @@ impl Hub {
                 );
             })?;
         }
-
-        // 7. SessionLog::create(sessions/<sid>.jsonl, 1, None, [])
-        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
-        let session_log = crate::log::SessionLog::create(&log_path, 1, None, Vec::new())
-            .context("failed to create session log")?;
 
         // 8. Spawn actor placeholder (Task A9 will fill it in)
         let (up_handle, mut event_rx) = session_upstream.split();

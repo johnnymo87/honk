@@ -35,6 +35,7 @@ impl ViewerTx {
 pub struct Viewer {
     pub id: u64,
     pub is_honk_aware: bool,
+    pub attached_session: Option<String>,
     pub tx: ViewerTx,
 }
 
@@ -77,6 +78,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
     let mut viewer = Viewer {
         id: viewer_id,
         is_honk_aware: false,
+        attached_session: None,
         tx: viewer_tx,
     };
 
@@ -91,14 +93,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                 let frame: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(_) => {
-                        let err_resp = json!({
-                            "jsonrpc": "2.0",
-                            "id": Value::Null,
-                            "error": {
-                                "code": -32700,
-                                "message": "Parse error"
-                            }
-                        });
+                        let err_resp = crate::rpc::error(Value::Null, -32700, "Parse error", None);
                         if !viewer
                             .tx
                             .send_frame(Message::Text(err_resp.to_string().into()))
@@ -109,34 +104,80 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                 };
 
-                let method = frame.get("method").and_then(Value::as_str);
+                let kind = crate::rpc::kind(&frame);
                 let id = frame.get("id").cloned().unwrap_or(Value::Null);
+
+                match kind {
+                    crate::rpc::Kind::Invalid => {
+                        let err_resp = crate::rpc::error(id, -32600, "Invalid Request", None);
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    crate::rpc::Kind::Response => {
+                        // Downstream response to a server request issued by a session (A13).
+                        // Drop with debug log for now; never forward upstream as method "".
+                        tracing::debug!(
+                            "dropping downstream response frame until server request routing in A13: {frame}"
+                        );
+                        continue;
+                    }
+                    crate::rpc::Kind::Request | crate::rpc::Kind::Notification => {}
+                }
+
+                let method = frame.get("method").and_then(Value::as_str);
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
+
+                if method == Some("$/cancel_request") {
+                    // $/cancel_request is dropped per wire facts
+                    continue;
+                }
+
+                if method == Some("session/close") {
+                    // Detach this WS; reply {}; never forwarded; keep socket open
+                    viewer.attached_session = None;
+                    if !id.is_null() {
+                        let resp = crate::rpc::response(id, json!({}));
+                        if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
 
                 if method == Some("initialize") {
                     if params.pointer("/_meta/honk").is_some() {
                         viewer.is_honk_aware = true;
                     }
                     let res = hub.handle_initialize(&params);
-                    let resp_frame = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": res
-                    });
+                    let resp_frame = crate::rpc::response(id, res);
                     if !viewer
                         .tx
                         .send_frame(Message::Text(resp_frame.to_string().into()))
                     {
                         break;
                     }
+                } else if method == Some("session/load") {
+                    viewer.is_honk_aware = true;
+                    let err_resp =
+                        crate::rpc::error(id, -32601, "Method not implemented in A8", None);
+                    if !viewer
+                        .tx
+                        .send_frame(Message::Text(err_resp.to_string().into()))
+                    {
+                        break;
+                    }
                 } else if method == Some("session/new") {
                     match hub.create_session(params).await {
                         Ok(new_res) => {
-                            let resp_frame = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": new_res,
-                            });
+                            if let Some(sid) = new_res.get("sessionId").and_then(Value::as_str) {
+                                viewer.attached_session = Some(sid.to_string());
+                            }
+                            let resp_frame = crate::rpc::response(id, new_res);
                             if !viewer
                                 .tx
                                 .send_frame(Message::Text(resp_frame.to_string().into()))
@@ -145,14 +186,12 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             }
                         }
                         Err(e) => {
-                            let err_resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
-                                    "code": -32603,
-                                    "message": format!("Failed to create session: {e:#}"),
-                                }
-                            });
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32603,
+                                format!("Failed to create session: {e:#}"),
+                                None,
+                            );
                             if !viewer
                                 .tx
                                 .send_frame(Message::Text(err_resp.to_string().into()))
@@ -176,14 +215,12 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             }
                         }
                         Err(e) => {
-                            let err_resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
-                                    "code": -32603,
-                                    "message": format!("Control connection error: {e:#}"),
-                                }
-                            });
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32603,
+                                format!("Control connection error: {e:#}"),
+                                None,
+                            );
                             if !viewer
                                 .tx
                                 .send_frame(Message::Text(err_resp.to_string().into()))
@@ -192,31 +229,9 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             }
                         }
                     }
-                } else if method == Some("session/load") {
-                    viewer.is_honk_aware = true;
-                    let err_resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32601,
-                            "message": "Method not implemented in A8"
-                        }
-                    });
-                    if !viewer
-                        .tx
-                        .send_frame(Message::Text(err_resp.to_string().into()))
-                    {
-                        break;
-                    }
                 } else {
-                    let err_resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": -32601,
-                            "message": "Method not implemented in A8"
-                        }
-                    });
+                    let err_resp =
+                        crate::rpc::error(id, -32601, "Method not implemented in A8", None);
                     if !viewer
                         .tx
                         .send_frame(Message::Text(err_resp.to_string().into()))

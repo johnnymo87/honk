@@ -19,7 +19,10 @@ pub fn kind(value: &Value) -> Kind {
         return Kind::Invalid;
     }
 
-    if let Some(_method) = obj.get("method").and_then(Value::as_str) {
+    if let Some(method) = obj.get("method").and_then(Value::as_str) {
+        if method.is_empty() {
+            return Kind::Invalid;
+        }
         if obj.get("id").is_none_or(Value::is_null) {
             Kind::Notification
         } else {
