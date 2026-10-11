@@ -307,7 +307,7 @@ committed.
 **P2e had to wait for commit.** Its first attempt took over 1 ms after the
 freeze, before goose had written anything into the dead socket, so nothing was
 lost and the control proved nothing. The probe now waits until the turn has
-committed (polling session state until the turn commits) before taking over, which guarantees frames
+committed before taking over (honk commit `1a11d53`), which guarantees frames
 went into the dead socket.
 
 **Deviation from §2: owner-token leases instead of a pump task.** §2 sketched

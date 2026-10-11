@@ -10,7 +10,6 @@
 # A second, isolated sandbox for a specific goose build (e.g. the fork):
 #   systemd-run --user --unit=honk-goose-sandbox-patched --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
 #     --setenv=HONK_SANDBOX="$HOME/.local/state/honk-sandbox-patched" --setenv=HONK_SANDBOX_PORT=4181 \
-#     --setenv=HONK_SANDBOX_UNIT=honk-goose-sandbox-patched \
 #     --setenv=GOOSE_BIN=<abs path to goose> <abs path>/scripts/goose-sandbox.sh
 #
 # Read logs:
@@ -31,40 +30,6 @@ SANDBOX=$(realpath -m "$RAW_SANDBOX")
 if [[ "$SANDBOX" == "$HOME" || "$SANDBOX" == "/" ]]; then
     echo "ERROR: SANDBOX cannot be \$HOME or root (/): $SANDBOX" >&2
     exit 1
-fi
-
-PORT="${HONK_SANDBOX_PORT:-4180}"
-if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: PORT must be numeric: $PORT" >&2
-    exit 1
-fi
-if (( 10#$PORT == 4080 )); then
-    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing port 4080." >&2
-    exit 1
-fi
-
-# When GOOSE_BIN is set, require non-default HONK_SANDBOX, port, and unit
-if [[ -n "${GOOSE_BIN:-}" ]]; then
-    DEFAULT_SANDBOX_RESOLVED=$(realpath -m "$HOME/.local/state/honk-sandbox")
-    if [[ -z "${HONK_SANDBOX:-}" || "$SANDBOX" == "$DEFAULT_SANDBOX_RESOLVED" ]]; then
-        echo "ERROR: GOOSE_BIN is set, but HONK_SANDBOX is default ($SANDBOX). Set HONK_SANDBOX to an isolated path." >&2
-        exit 1
-    fi
-    if [[ -z "${HONK_SANDBOX_PORT:-}" || "$PORT" == "4180" ]]; then
-        echo "ERROR: GOOSE_BIN is set, but HONK_SANDBOX_PORT is default ($PORT). Set HONK_SANDBOX_PORT to an isolated port." >&2
-        exit 1
-    fi
-    UNIT="${HONK_SANDBOX_UNIT:-}"
-    if [[ -z "$UNIT" ]]; then
-        cgroup_unit=$(sed -n 's|.*/\([^/]*\)\.\(service\|scope\)$|\1|p' /proc/self/cgroup 2>/dev/null || true)
-        if [[ -n "$cgroup_unit" ]]; then
-            UNIT="$cgroup_unit"
-        fi
-    fi
-    if [[ -z "$UNIT" || "$UNIT" == "honk-goose-sandbox" || "$UNIT" == "honk-goose-sandbox.service" ]]; then
-        echo "ERROR: GOOSE_BIN is set, but unit is default (${UNIT:-empty}). Set HONK_SANDBOX_UNIT or launch with a distinct systemd-run --unit." >&2
-        exit 1
-    fi
 fi
 
 mkdir -p "$SANDBOX"/{config,data,state}
@@ -154,6 +119,16 @@ if [[ ! -f "$SANDBOX/secret" ]]; then
         fi
     )
     chmod 0600 "$SANDBOX/secret"
+fi
+
+PORT="${HONK_SANDBOX_PORT:-4180}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PORT must be numeric: $PORT" >&2
+    exit 1
+fi
+if (( 10#$PORT == 4080 )); then
+    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing port 4080." >&2
+    exit 1
 fi
 
 gcp_secret="/run/secrets/google_cloud_project"

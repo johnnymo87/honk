@@ -7,9 +7,18 @@ use futures::StreamExt;
 use reqwest::{StatusCode, Url};
 use serde_json::Value;
 
-use crate::guard_url;
 use crate::record::{Direction, Recorder};
 use crate::sse::SseFrame;
+use crate::{HttpStatusError, guard_url_with};
+
+fn http_status_error(op: &'static str, status: StatusCode, body: String) -> anyhow::Error {
+    let err = anyhow::Error::new(HttpStatusError { op, status });
+    if body.trim().is_empty() {
+        err
+    } else {
+        err.context(body)
+    }
+}
 
 /// Timeout applied to all JSON-RPC POST and DELETE requests.
 pub const POST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -175,19 +184,552 @@ pub struct SubscribeOutcome {
     pub features: StreamFeatures,
 }
 
+#[derive(Debug, Clone)]
+pub struct UpstreamOpts {
+    pub allow_production: bool,
+    pub client_capabilities: serde_json::Value,
+}
+
+impl Default for UpstreamOpts {
+    fn default() -> Self {
+        Self {
+            allow_production: false,
+            client_capabilities: serde_json::json!({}),
+        }
+    }
+}
+
+pub(crate) struct UpstreamInner {
+    pub(crate) client: reqwest::Client,
+    pub(crate) url: Url,
+    pub(crate) secret: String,
+    pub(crate) conn_id: String,
+    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    pub(crate) stream_tasks: std::sync::Mutex<HashMap<StreamKey, tokio::task::JoinHandle<()>>>,
+    pub(crate) last_byte_at: std::sync::Arc<std::sync::Mutex<HashMap<StreamKey, Instant>>>,
+    pub(crate) rec: Recorder,
+    pub(crate) features: std::sync::Mutex<Option<StreamFeatures>>,
+    pub(crate) subscribe_deadline: Duration,
+    pub(crate) subscribe_initial_backoff: Duration,
+    pub(crate) subscribe_max_backoff: Duration,
+    pub(crate) subscribe_headers_timeout: Duration,
+}
+
+/// Cloneable; every method takes &self. Subscribing spawns the reader task, which sends into
+/// the shared event channel owned by `EventRx`. Re-subscribing a key aborts that key's old reader.
+#[derive(Clone)]
+pub struct UpstreamHandle {
+    pub(crate) inner: std::sync::Arc<UpstreamInner>,
+}
+
+struct HttpTarget<'a> {
+    client: &'a reqwest::Client,
+    url: &'a Url,
+    secret: &'a str,
+    conn_id: &'a str,
+    rec: &'a Recorder,
+}
+
+struct SubscribeTimeouts {
+    deadline: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    headers_timeout: Duration,
+}
+
+impl UpstreamHandle {
+    fn target(&self) -> HttpTarget<'_> {
+        HttpTarget {
+            client: &self.inner.client,
+            url: &self.inner.url,
+            secret: &self.inner.secret,
+            conn_id: &self.inner.conn_id,
+            rec: &self.inner.rec,
+        }
+    }
+
+    pub fn conn_id(&self) -> &str {
+        &self.inner.conn_id
+    }
+
+    pub fn stream_features(&self) -> Option<StreamFeatures> {
+        *self.inner.features.lock().unwrap()
+    }
+
+    pub fn last_byte_at(&self, key: &StreamKey) -> Option<std::time::Instant> {
+        self.inner.last_byte_at.lock().unwrap().get(key).copied()
+    }
+
+    pub async fn request_with_id(
+        &self,
+        id: serde_json::Value,
+        method: &str,
+        params: serde_json::Value,
+        session: Option<&str>,
+    ) -> anyhow::Result<()> {
+        do_request_with_id(&self.target(), id, method, params, session).await
+    }
+
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        session: Option<&str>,
+    ) -> anyhow::Result<()> {
+        do_notify(&self.target(), method, params, session).await
+    }
+
+    pub async fn respond(
+        &self,
+        id: serde_json::Value,
+        result: serde_json::Value,
+        session: Option<&str>,
+    ) -> anyhow::Result<()> {
+        do_respond(&self.target(), id, result, session).await
+    }
+
+    pub async fn subscribe_with(
+        &self,
+        session: Option<&str>,
+        opts: SubscribeOpts,
+    ) -> anyhow::Result<SubscribeOutcome> {
+        let stream_key = session
+            .map(|s| StreamKey::Session(s.to_string()))
+            .unwrap_or(StreamKey::Conn);
+
+        if let Some(prev) = self.inner.stream_tasks.lock().unwrap().remove(&stream_key) {
+            prev.abort();
+        }
+
+        let timeouts = SubscribeTimeouts {
+            deadline: self.inner.subscribe_deadline,
+            initial_backoff: self.inner.subscribe_initial_backoff,
+            max_backoff: self.inner.subscribe_max_backoff,
+            headers_timeout: self.inner.subscribe_headers_timeout,
+        };
+
+        let (outcome, task_handle) = do_subscribe_with(
+            &self.target(),
+            &self.inner.tx,
+            &self.inner.last_byte_at,
+            session,
+            opts,
+            timeouts,
+        )
+        .await?;
+
+        *self.inner.features.lock().unwrap() = Some(outcome.features);
+        self.inner
+            .stream_tasks
+            .lock()
+            .unwrap()
+            .insert(stream_key, task_handle);
+        Ok(outcome)
+    }
+
+    pub fn hard_drop(&self) {
+        for (_, handle) in self.inner.stream_tasks.lock().unwrap().drain() {
+            handle.abort();
+        }
+        self.inner
+            .rec
+            .record_marker("conn", "hard_drop: aborted all SSE stream tasks");
+    }
+
+    pub fn unsubscribe(&self, session: Option<&str>) {
+        let stream_key = session
+            .map(|s| StreamKey::Session(s.to_string()))
+            .unwrap_or(StreamKey::Conn);
+        if let Some(prev) = self.inner.stream_tasks.lock().unwrap().remove(&stream_key) {
+            prev.abort();
+            self.inner.rec.record_marker(
+                stream_key.stream_record_name(),
+                format!("unsubscribed from {}", stream_key.stream_record_name()),
+            );
+        }
+    }
+
+    pub async fn delete(&self) -> anyhow::Result<reqwest::StatusCode> {
+        self.hard_drop();
+        do_delete(&self.target()).await
+    }
+}
+
+pub struct EventRx {
+    pub(crate) rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub(crate) buffered: VecDeque<Event>,
+}
+
+impl EventRx {
+    pub async fn recv(&mut self) -> Option<Event> {
+        if let Some(event) = self.buffered.pop_front() {
+            return Some(event);
+        }
+        self.rx.recv().await
+    }
+}
+
+async fn do_request_with_id(
+    target: &HttpTarget<'_>,
+    id: Value,
+    method: &str,
+    params: Value,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+
+    let mut req = target
+        .client
+        .post(target.url.clone())
+        .timeout(POST_TIMEOUT)
+        .header("x-secret-key", target.secret)
+        .header("acp-connection-id", target.conn_id)
+        .header("content-type", "application/json");
+
+    if let Some(sid) = session {
+        req = req.header("acp-session-id", sid);
+    }
+
+    let res = req
+        .json(&frame)
+        .send()
+        .await
+        .with_context(|| format!("failed to send POST request '{method}'"))?;
+
+    let status = res.status();
+    target.rec.record(
+        Direction::Out,
+        "post",
+        Some(status.as_u16()),
+        Some(frame),
+        None,
+    );
+
+    if status != StatusCode::ACCEPTED {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(http_status_error("POST request", status, err_text));
+    }
+
+    Ok(())
+}
+
+async fn do_notify(
+    target: &HttpTarget<'_>,
+    method: &str,
+    params: Value,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+
+    let mut req = target
+        .client
+        .post(target.url.clone())
+        .timeout(POST_TIMEOUT)
+        .header("x-secret-key", target.secret)
+        .header("acp-connection-id", target.conn_id)
+        .header("content-type", "application/json");
+
+    if let Some(sid) = session {
+        req = req.header("acp-session-id", sid);
+    }
+
+    let res = req
+        .json(&frame)
+        .send()
+        .await
+        .with_context(|| format!("failed to send POST notification '{method}'"))?;
+
+    let status = res.status();
+    target.rec.record(
+        Direction::Out,
+        "post",
+        Some(status.as_u16()),
+        Some(frame),
+        None,
+    );
+
+    if status != StatusCode::ACCEPTED {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(http_status_error("POST notify", status, err_text));
+    }
+
+    Ok(())
+}
+
+async fn do_respond(
+    target: &HttpTarget<'_>,
+    id: Value,
+    result: Value,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    });
+
+    let mut req = target
+        .client
+        .post(target.url.clone())
+        .timeout(POST_TIMEOUT)
+        .header("x-secret-key", target.secret)
+        .header("acp-connection-id", target.conn_id)
+        .header("content-type", "application/json");
+
+    if let Some(sid) = session {
+        req = req.header("acp-session-id", sid);
+    }
+
+    let res = req
+        .json(&frame)
+        .send()
+        .await
+        .with_context(|| "failed to send POST respond")?;
+
+    let status = res.status();
+    target.rec.record(
+        Direction::Out,
+        "post",
+        Some(status.as_u16()),
+        Some(frame),
+        None,
+    );
+
+    if status != StatusCode::ACCEPTED {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(http_status_error("POST respond", status, err_text));
+    }
+
+    Ok(())
+}
+
+async fn do_delete(target: &HttpTarget<'_>) -> anyhow::Result<StatusCode> {
+    let res = target
+        .client
+        .delete(target.url.clone())
+        .timeout(POST_TIMEOUT)
+        .header("x-secret-key", target.secret)
+        .header("acp-connection-id", target.conn_id)
+        .send()
+        .await
+        .with_context(|| "failed to send DELETE /acp")?;
+
+    let status = res.status();
+    target.rec.record(
+        Direction::Out,
+        "post",
+        Some(status.as_u16()),
+        None,
+        Some("DELETE /acp".into()),
+    );
+
+    if !status.is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(http_status_error("DELETE /acp", status, err_text));
+    }
+
+    Ok(status)
+}
+
+async fn do_subscribe_with(
+    target: &HttpTarget<'_>,
+    tx: &tokio::sync::mpsc::UnboundedSender<Event>,
+    last_byte_at: &std::sync::Arc<std::sync::Mutex<HashMap<StreamKey, Instant>>>,
+    session: Option<&str>,
+    opts: SubscribeOpts,
+    timeouts: SubscribeTimeouts,
+) -> anyhow::Result<(SubscribeOutcome, tokio::task::JoinHandle<()>)> {
+    let stream_key = session
+        .map(|s| StreamKey::Session(s.to_string()))
+        .unwrap_or(StreamKey::Conn);
+
+    let stream_name = stream_key.stream_record_name();
+    let start = Instant::now();
+    let mut first_409: Option<Instant> = None;
+    let mut backoff = timeouts.initial_backoff;
+
+    loop {
+        let mut req = target
+            .client
+            .get(target.url.clone())
+            .header("accept", "text/event-stream")
+            .header("x-secret-key", target.secret)
+            .header("acp-connection-id", target.conn_id);
+
+        if let Some(sid) = session {
+            req = req.header("acp-session-id", sid);
+        }
+        if opts.takeover {
+            req = req.header("acp-takeover", "1");
+        }
+        if let Some(last) = opts.resume_after {
+            req = req.header("last-event-id", last.to_string());
+        }
+
+        let send_fut = req.send();
+        let res = tokio::time::timeout(timeouts.headers_timeout, send_fut)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out after {:?} waiting for headers when subscribing to {stream_name}",
+                    timeouts.headers_timeout
+                )
+            })?
+            .with_context(|| format!("failed to send GET request for {stream_name}"))?;
+
+        let features = StreamFeatures::from_headers(res.headers());
+        let status = res.status();
+        if status == StatusCode::CONFLICT {
+            if first_409.is_none() {
+                first_409 = Some(Instant::now());
+            }
+            target.rec.record_marker(
+                &stream_name,
+                format!("409 Conflict subscribing to {stream_name}"),
+            );
+            if start.elapsed() >= timeouts.deadline {
+                anyhow::bail!(
+                    "timed out after {:?} waiting for 409 conflict to resolve on {stream_name}",
+                    timeouts.deadline
+                );
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = std::cmp::min(backoff * 2, timeouts.max_backoff);
+            continue;
+        }
+
+        if !status.is_success() {
+            let err_text = res.text().await.unwrap_or_default();
+            target.rec.record(
+                Direction::Marker,
+                &stream_name,
+                Some(status.as_u16()),
+                None,
+                Some(format!("GET stream failed with status {status}")),
+            );
+            return Err(http_status_error("GET stream", status, err_text));
+        }
+
+        let conflict_window = first_409.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        let replay = ReplayOutcome::from_headers(opts.resume_after.is_some(), res.headers());
+        let took_over = opts.takeover && features.takeover;
+
+        target.rec.record_marker(
+            &stream_name,
+            format!("subscribed to {stream_name} (409 window: {conflict_window:?})"),
+        );
+
+        if opts.takeover || opts.resume_after.is_some() {
+            target.rec.record_marker(
+                &stream_name,
+                format!(
+                    "stream options: took_over={took_over} resume_after={:?} replay={replay:?} features={features:?}",
+                    opts.resume_after
+                ),
+            );
+        }
+
+        // Set stamp at subscribe time too (I3)
+        if let Ok(mut map) = last_byte_at.lock() {
+            map.insert(stream_key.clone(), Instant::now());
+        }
+
+        let last_byte_at_map = last_byte_at.clone();
+        let stamp_key = stream_key.clone();
+        let stamped_stream = res.bytes_stream().inspect(move |_| {
+            if let Ok(mut map) = last_byte_at_map.lock() {
+                if let Some(entry) = map.get_mut(&stamp_key) {
+                    *entry = Instant::now();
+                } else {
+                    map.insert(stamp_key.clone(), Instant::now());
+                }
+            }
+        });
+
+        let sse_stream = crate::sse::sse_to_frames(stamped_stream);
+        let tx = tx.clone();
+        let rec = target.rec.clone();
+        let key = stream_key.clone();
+        let s_name = stream_name.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut stream = sse_stream;
+            let mut stream_err = None;
+            let mut floor = opts.resume_after;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(SseFrame { id, data }) => {
+                        if let Some(id) = id {
+                            if floor.is_some_and(|f| id <= f) {
+                                rec.record_marker(
+                                    &s_name,
+                                    format!("dropped duplicate event id {id}"),
+                                );
+                                continue;
+                            }
+                            floor = Some(id);
+                        }
+                        rec.record(
+                            Direction::In,
+                            &s_name,
+                            None,
+                            Some(data.clone()),
+                            id.map(|id| format!("event id {id}")),
+                        );
+                        if tx.send(Event::Frame(key.clone(), data, id)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let err_str = err.to_string();
+                        rec.record_marker(&s_name, format!("stream error: {err_str}"));
+                        stream_err = Some(err_str);
+                        break;
+                    }
+                }
+            }
+            rec.record_marker(&s_name, format!("stream {s_name} ended"));
+            let _ = tx.send(Event::StreamEnded {
+                key,
+                error: stream_err,
+            });
+        });
+
+        return Ok((
+            SubscribeOutcome {
+                conflict_window,
+                took_over,
+                replay,
+                features,
+            },
+            handle,
+        ));
+    }
+}
+
 /// Upstream ACP HTTP+SSE client.
 pub struct Upstream {
-    url: Url,
-    secret: String,
-    conn_id: String,
+    pub(crate) url: Url,
+    pub(crate) secret: String,
+    pub(crate) conn_id: String,
     init_result: Option<Value>,
     client: reqwest::Client,
     next_request_id: AtomicU64,
     rec: Recorder,
-    stream_tasks: HashMap<StreamKey, tokio::task::JoinHandle<()>>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
-    buffered_events: VecDeque<Event>,
+    pub(crate) stream_tasks: HashMap<StreamKey, tokio::task::JoinHandle<()>>,
+    pub(crate) last_byte_at: std::sync::Arc<std::sync::Mutex<HashMap<StreamKey, Instant>>>,
+    pub(crate) rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    pub(crate) buffered_events: VecDeque<Event>,
     subscribe_deadline: Duration,
     subscribe_initial_backoff: Duration,
     subscribe_max_backoff: Duration,
@@ -202,9 +744,24 @@ impl Upstream {
     /// Validates `url` via [`guard_url`], sends `initialize` JSON-RPC POST,
     /// stores the resulting `Acp-Connection-Id`, and records all frames.
     pub async fn initialize(url: &str, secret: String, rec: Recorder) -> anyhow::Result<Self> {
-        let parsed_url = guard_url(url)?;
+        Self::initialize_with(url, secret, rec, &UpstreamOpts::default()).await
+    }
+
+    pub async fn initialize_with(
+        url: &str,
+        secret: String,
+        rec: Recorder,
+        opts: &UpstreamOpts,
+    ) -> anyhow::Result<Self> {
+        let parsed_url = guard_url_with(url, opts.allow_production)?;
         let trimmed_secret = secret.trim().to_string();
         let client = build_http_client()?;
+
+        let client_caps = if opts.client_capabilities.is_null() {
+            serde_json::json!({})
+        } else {
+            opts.client_capabilities.clone()
+        };
 
         let init_body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -212,7 +769,7 @@ impl Upstream {
             "method": "initialize",
             "params": {
                 "protocolVersion": 1,
-                "clientCapabilities": {}
+                "clientCapabilities": client_caps,
             }
         });
 
@@ -237,7 +794,7 @@ impl Upstream {
 
         if !status.is_success() {
             let err_text = res.text().await.unwrap_or_default();
-            anyhow::bail!("initialize POST failed with status {status}: {err_text}");
+            return Err(http_status_error("initialize", status, err_text));
         }
 
         let conn_id = res
@@ -267,6 +824,7 @@ impl Upstream {
             next_request_id: AtomicU64::new(2),
             rec,
             stream_tasks: HashMap::new(),
+            last_byte_at: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             rx,
             tx,
             buffered_events: VecDeque::new(),
@@ -286,7 +844,17 @@ impl Upstream {
         conn_id: String,
         rec: Recorder,
     ) -> anyhow::Result<Self> {
-        let parsed_url = guard_url(url)?;
+        Self::resume_with(url, secret, conn_id, rec, &UpstreamOpts::default())
+    }
+
+    pub fn resume_with(
+        url: &str,
+        secret: String,
+        conn_id: String,
+        rec: Recorder,
+        opts: &UpstreamOpts,
+    ) -> anyhow::Result<Self> {
+        let parsed_url = guard_url_with(url, opts.allow_production)?;
         let trimmed_secret = secret.trim().to_string();
         let trimmed_conn_id = conn_id.trim().to_string();
         let client = build_http_client()?;
@@ -303,6 +871,7 @@ impl Upstream {
             next_request_id: AtomicU64::new(1000),
             rec,
             stream_tasks: HashMap::new(),
+            last_byte_at: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             rx,
             tx,
             buffered_events: VecDeque::new(),
@@ -329,6 +898,10 @@ impl Upstream {
 
     pub fn last_call_stream(&self) -> Option<&StreamKey> {
         self.last_call_stream.as_ref()
+    }
+
+    pub fn last_byte_at(&self, key: &StreamKey) -> Option<std::time::Instant> {
+        self.last_byte_at.lock().unwrap().get(key).copied()
     }
 
     pub fn set_subscribe_deadline(&mut self, deadline: Duration) {
@@ -365,46 +938,29 @@ impl Upstream {
     ) -> anyhow::Result<Value> {
         let id_num = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         let id = Value::from(id_num);
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-
-        let mut req = self
-            .client
-            .post(self.url.clone())
-            .timeout(POST_TIMEOUT)
-            .header("x-secret-key", &self.secret)
-            .header("acp-connection-id", &self.conn_id)
-            .header("content-type", "application/json");
-
-        if let Some(sid) = session {
-            req = req.header("acp-session-id", sid);
-        }
-
-        let res = req
-            .json(&frame)
-            .send()
-            .await
-            .with_context(|| format!("failed to send POST request '{method}'"))?;
-
-        let status = res.status();
-        self.rec.record(
-            Direction::Out,
-            "post",
-            Some(status.as_u16()),
-            Some(frame),
-            None,
-        );
-
-        if status != StatusCode::ACCEPTED {
-            let err_text = res.text().await.unwrap_or_default();
-            anyhow::bail!("request '{method}' failed with status {status}: {err_text}");
-        }
-
+        self.request_with_id(id.clone(), method, params, session)
+            .await?;
         Ok(id)
+    }
+
+    fn target(&self) -> HttpTarget<'_> {
+        HttpTarget {
+            client: &self.client,
+            url: &self.url,
+            secret: &self.secret,
+            conn_id: &self.conn_id,
+            rec: &self.rec,
+        }
+    }
+
+    pub async fn request_with_id(
+        &self,
+        id: serde_json::Value,
+        method: &str,
+        params: serde_json::Value,
+        session: Option<&str>,
+    ) -> anyhow::Result<()> {
+        do_request_with_id(&self.target(), id, method, params, session).await
     }
 
     /// Sends a JSON-RPC notification frame (no `id`).
@@ -415,45 +971,7 @@ impl Upstream {
         params: Value,
         session: Option<&str>,
     ) -> anyhow::Result<()> {
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-
-        let mut req = self
-            .client
-            .post(self.url.clone())
-            .timeout(POST_TIMEOUT)
-            .header("x-secret-key", &self.secret)
-            .header("acp-connection-id", &self.conn_id)
-            .header("content-type", "application/json");
-
-        if let Some(sid) = session {
-            req = req.header("acp-session-id", sid);
-        }
-
-        let res = req
-            .json(&frame)
-            .send()
-            .await
-            .with_context(|| format!("failed to send POST notification '{method}'"))?;
-
-        let status = res.status();
-        self.rec.record(
-            Direction::Out,
-            "post",
-            Some(status.as_u16()),
-            Some(frame),
-            None,
-        );
-
-        if status != StatusCode::ACCEPTED {
-            let err_text = res.text().await.unwrap_or_default();
-            anyhow::bail!("notification '{method}' failed with status {status}: {err_text}");
-        }
-
-        Ok(())
+        do_notify(&self.target(), method, params, session).await
     }
 
     /// Sends a JSON-RPC response frame back to the server.
@@ -464,45 +982,7 @@ impl Upstream {
         result: Value,
         session: Option<&str>,
     ) -> anyhow::Result<()> {
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        });
-
-        let mut req = self
-            .client
-            .post(self.url.clone())
-            .timeout(POST_TIMEOUT)
-            .header("x-secret-key", &self.secret)
-            .header("acp-connection-id", &self.conn_id)
-            .header("content-type", "application/json");
-
-        if let Some(sid) = session {
-            req = req.header("acp-session-id", sid);
-        }
-
-        let res = req
-            .json(&frame)
-            .send()
-            .await
-            .with_context(|| "failed to send POST respond")?;
-
-        let status = res.status();
-        self.rec.record(
-            Direction::Out,
-            "post",
-            Some(status.as_u16()),
-            Some(frame),
-            None,
-        );
-
-        if status != StatusCode::ACCEPTED {
-            let err_text = res.text().await.unwrap_or_default();
-            anyhow::bail!("respond failed with status {status}: {err_text}");
-        }
-
-        Ok(())
+        do_respond(&self.target(), id, result, session).await
     }
 
     /// Subscribes to the connection stream (`session == None`) or a session stream (`session == Some(...)`).
@@ -533,156 +1013,73 @@ impl Upstream {
             prev.abort();
         }
 
-        let stream_name = stream_key.stream_record_name();
-        let start = Instant::now();
-        let mut first_409: Option<Instant> = None;
-        let mut backoff = self.subscribe_initial_backoff;
+        let timeouts = SubscribeTimeouts {
+            deadline: self.subscribe_deadline,
+            initial_backoff: self.subscribe_initial_backoff,
+            max_backoff: self.subscribe_max_backoff,
+            headers_timeout: self.subscribe_headers_timeout,
+        };
 
-        loop {
-            let mut req = self
-                .client
-                .get(self.url.clone())
-                .header("accept", "text/event-stream")
-                .header("x-secret-key", &self.secret)
-                .header("acp-connection-id", &self.conn_id);
+        let (outcome, task_handle) = do_subscribe_with(
+            &self.target(),
+            &self.tx,
+            &self.last_byte_at,
+            session,
+            opts,
+            timeouts,
+        )
+        .await?;
 
-            if let Some(sid) = session {
-                req = req.header("acp-session-id", sid);
-            }
-            if opts.takeover {
-                req = req.header("acp-takeover", "1");
-            }
-            if let Some(last) = opts.resume_after {
-                req = req.header("last-event-id", last.to_string());
-            }
+        self.features = Some(outcome.features);
+        self.stream_tasks.insert(stream_key, task_handle);
+        Ok(outcome)
+    }
 
-            let send_fut = req.send();
-            let res = tokio::time::timeout(self.subscribe_headers_timeout, send_fut)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "timed out after {:?} waiting for headers when subscribing to {stream_name}",
-                        self.subscribe_headers_timeout
-                    )
-                })?
-                .with_context(|| format!("failed to send GET request for {stream_name}"))?;
-
-            let status = res.status();
-            if status == StatusCode::OK || status == StatusCode::CONFLICT {
-                self.features = Some(StreamFeatures::from_headers(res.headers()));
-            }
-
-            if status == StatusCode::CONFLICT {
-                if first_409.is_none() {
-                    first_409 = Some(Instant::now());
-                }
-                self.rec.record_marker(
-                    &stream_name,
-                    format!("409 Conflict subscribing to {stream_name}"),
-                );
-                if start.elapsed() >= self.subscribe_deadline {
-                    anyhow::bail!(
-                        "timed out after {:?} waiting for 409 conflict to resolve on {stream_name}",
-                        self.subscribe_deadline
-                    );
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, self.subscribe_max_backoff);
-                continue;
-            }
-
-            if !status.is_success() {
-                self.rec.record(
-                    Direction::Marker,
-                    &stream_name,
-                    Some(status.as_u16()),
-                    None,
-                    Some(format!("GET stream failed with status {status}")),
-                );
-                anyhow::bail!("GET stream for {stream_name} failed with status {status}");
-            }
-
-            let conflict_window = first_409.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-            let replay = ReplayOutcome::from_headers(opts.resume_after.is_some(), res.headers());
-            let features = self.features.unwrap_or_default();
-            let took_over = opts.takeover && features.takeover;
-
-            self.rec.record_marker(
-                &stream_name,
-                format!("subscribed to {stream_name} (409 window: {conflict_window:?})"),
-            );
-
-            if opts.takeover || opts.resume_after.is_some() {
-                self.rec.record_marker(
-                    &stream_name,
-                    format!(
-                        "stream options: took_over={took_over} resume_after={:?} replay={replay:?} features={features:?}",
-                        opts.resume_after
-                    ),
-                );
-            }
-
-            let sse_stream = crate::sse::sse_to_frames(res.bytes_stream());
-            let tx = self.tx.clone();
-            let rec = self.rec.clone();
-            let key = stream_key.clone();
-            let s_name = stream_name.clone();
-
-            let handle = tokio::spawn(async move {
-                let mut stream = sse_stream;
-                let mut stream_err = None;
-                let mut floor = if replay == ReplayOutcome::Complete {
-                    opts.resume_after
-                } else {
-                    None
-                };
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(SseFrame { id, data }) => {
-                            if let Some(id) = id {
-                                if floor.is_some_and(|f| id <= f) {
-                                    rec.record_marker(
-                                        &s_name,
-                                        format!("dropped duplicate event id {id}"),
-                                    );
-                                    continue;
-                                }
-                                floor = Some(id);
-                            }
-                            rec.record(
-                                Direction::In,
-                                &s_name,
-                                None,
-                                Some(data.clone()),
-                                id.map(|id| format!("event id {id}")),
-                            );
-                            if tx.send(Event::Frame(key.clone(), data, id)).is_err() {
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            let err_str = err.to_string();
-                            rec.record_marker(&s_name, format!("stream error: {err_str}"));
-                            stream_err = Some(err_str);
-                            break;
-                        }
-                    }
-                }
-                rec.record_marker(&s_name, format!("stream {s_name} ended"));
-                let _ = tx.send(Event::StreamEnded {
-                    key,
-                    error: stream_err,
-                });
-            });
-
-            self.stream_tasks.insert(stream_key, handle);
-            return Ok(SubscribeOutcome {
-                conflict_window,
-                took_over,
-                replay,
-                features,
-            });
+    /// Cancel-safe: buffered events first, then the channel.
+    pub async fn recv(&mut self) -> Option<Event> {
+        if let Some(event) = self.buffered_events.pop_front() {
+            return Some(event);
         }
+        self.rx.recv().await
+    }
+
+    pub fn unsubscribe(&mut self, session: Option<&str>) {
+        let stream_key = session
+            .map(|s| StreamKey::Session(s.to_string()))
+            .unwrap_or(StreamKey::Conn);
+        if let Some(prev) = self.stream_tasks.remove(&stream_key) {
+            prev.abort();
+            self.rec.record_marker(
+                stream_key.stream_record_name(),
+                format!("unsubscribed from {}", stream_key.stream_record_name()),
+            );
+        }
+    }
+
+    /// I2: split into a cloneable handle (POST/DELETE/subscribe) and the single event receiver.
+    pub fn split(self) -> (UpstreamHandle, EventRx) {
+        let handle = UpstreamHandle {
+            inner: std::sync::Arc::new(UpstreamInner {
+                client: self.client,
+                url: self.url,
+                secret: self.secret,
+                conn_id: self.conn_id,
+                tx: self.tx,
+                stream_tasks: std::sync::Mutex::new(self.stream_tasks),
+                last_byte_at: self.last_byte_at,
+                rec: self.rec,
+                features: std::sync::Mutex::new(self.features),
+                subscribe_deadline: self.subscribe_deadline,
+                subscribe_initial_backoff: self.subscribe_initial_backoff,
+                subscribe_max_backoff: self.subscribe_max_backoff,
+                subscribe_headers_timeout: self.subscribe_headers_timeout,
+            }),
+        };
+        let rx = EventRx {
+            rx: self.rx,
+            buffered: self.buffered_events,
+        };
+        (handle, rx)
     }
 
     /// Reads the next event, checking buffered events first, then waiting on SSE streams up to `timeout`.
@@ -804,26 +1201,7 @@ impl Upstream {
     /// Terminates the connection via DELETE /acp.
     pub async fn delete(mut self) -> anyhow::Result<StatusCode> {
         self.hard_drop();
-        let res = self
-            .client
-            .delete(self.url.clone())
-            .timeout(POST_TIMEOUT)
-            .header("x-secret-key", &self.secret)
-            .header("acp-connection-id", &self.conn_id)
-            .send()
-            .await
-            .with_context(|| "failed to send DELETE /acp")?;
-
-        let status = res.status();
-        self.rec.record(
-            Direction::Out,
-            "post",
-            Some(status.as_u16()),
-            None,
-            Some("DELETE /acp".into()),
-        );
-
-        Ok(status)
+        do_delete(&self.target()).await
     }
 }
 
@@ -1193,17 +1571,14 @@ mod tests {
         }
     }
 
-    async fn one_shot_http_server(
-        status_line: &str,
-        response_headers: &str,
-        body: &str,
+    /// Accepts one GET, returns its lowercased request head, answers with an SSE body.
+    async fn one_shot_sse_server(
+        response_headers: &'static str,
+        body: &'static str,
     ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/acp", listener.local_addr().unwrap());
-        let status_line = status_line.to_string();
-        let response_headers = response_headers.to_string();
-        let body = body.to_string();
         let handle = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 8192];
@@ -1216,22 +1591,13 @@ mod tests {
                 head.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
             let response = format!(
-                "HTTP/1.1 {status_line}\r\nconnection: close\r\n{response_headers}\r\n{body}"
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{response_headers}\r\n{body}"
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             let _ = sock.shutdown().await;
             head.to_ascii_lowercase()
         });
         (url, handle)
-    }
-
-    /// Accepts one GET, returns its lowercased request head, answers with an SSE body.
-    async fn one_shot_sse_server(
-        response_headers: &str,
-        body: &str,
-    ) -> (String, tokio::task::JoinHandle<String>) {
-        let headers = format!("content-type: text/event-stream\r\n{response_headers}");
-        one_shot_http_server("200 OK", &headers, body).await
     }
 
     #[tokio::test]
@@ -1297,92 +1663,225 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_with_gap_does_not_drop_live_frames_below_resume_after() {
-        let (url, server) = one_shot_sse_server(
-            "acp-stream-features: takeover, replay\r\nacp-replay: gap\r\n",
-            "id: 1\ndata: {\"n\":1}\n\nid: 2\ndata: {\"n\":2}\n\n",
-        )
-        .await;
-        let mut up = Upstream::resume(&url, "s".into(), "c".into(), Recorder::disabled()).unwrap();
-        let out = up
-            .subscribe_with(
-                None,
-                SubscribeOpts {
-                    takeover: true,
-                    resume_after: Some(42),
-                },
-            )
-            .await
-            .unwrap();
-        let _head = server.await.unwrap();
-        assert_eq!(out.replay, ReplayOutcome::Gap);
-        let first = up.next(Duration::from_secs(1)).await.unwrap().unwrap();
-        assert_eq!(
-            first.frame(),
-            Some(&serde_json::json!({"n": 1})),
-            "id 1 must not be dropped when replay is Gap"
-        );
-        assert_eq!(first.event_id(), Some(1));
-    }
-
-    #[tokio::test]
-    async fn subscribe_error_does_not_overwrite_features_but_409_does() {
-        // 1. Initial 404 does not set stream_features to Some(unpatched).
-        let (url404, srv404) = one_shot_http_server("404 Not Found", "", "not found").await;
-        let mut up =
-            Upstream::resume(&url404, "s".into(), "c".into(), Recorder::disabled()).unwrap();
-        let res = up.subscribe(None).await;
-        assert!(res.is_err());
-        let _ = srv404.await.unwrap();
-        assert_eq!(up.stream_features(), None, "404 must not set features");
-
-        // 2. 409 conflict DOES update features from headers.
-        let (url409, srv409) = one_shot_http_server(
-            "409 Conflict",
-            "acp-stream-features: takeover, replay\r\n",
-            "conflict",
-        )
-        .await;
-        let mut up409 =
-            Upstream::resume(&url409, "s".into(), "c".into(), Recorder::disabled()).unwrap();
-        up409.set_subscribe_deadline(Duration::ZERO);
-        let res409 = up409.subscribe(None).await;
-        assert!(res409.is_err());
-        let _ = srv409.await.unwrap();
-        assert_eq!(
-            up409.stream_features(),
-            Some(StreamFeatures {
-                takeover: true,
-                replay: true,
-            }),
-            "409 must update features"
-        );
-
-        // 3. A subsequent 404 does not overwrite previously established patched features.
-        let (url404_subsequent, srv404_subsequent) =
-            one_shot_http_server("404 Not Found", "", "not found").await;
-        let mut up_patched = Upstream::resume(
-            &url404_subsequent,
+    async fn recv_drains_buffer_then_channel() {
+        let mut up = Upstream::resume(
+            "http://127.0.0.1:4180/acp",
             "s".into(),
             "c".into(),
             Recorder::disabled(),
         )
         .unwrap();
-        // Manually prime features as if from prior 200/409
-        up_patched.features = Some(StreamFeatures {
-            takeover: true,
-            replay: true,
-        });
-        let res_subsequent = up_patched.subscribe(None).await;
-        assert!(res_subsequent.is_err());
-        let _ = srv404_subsequent.await.unwrap();
-        assert_eq!(
-            up_patched.stream_features(),
-            Some(StreamFeatures {
-                takeover: true,
-                replay: true,
+        up.buffered_events.push_back(Event::Frame(
+            StreamKey::Conn,
+            serde_json::json!({"a": 1}),
+            None,
+        ));
+        up.tx
+            .send(Event::Frame(
+                StreamKey::Conn,
+                serde_json::json!({"b": 2}),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(up.recv().await.unwrap().frame().unwrap()["a"], 1);
+        assert_eq!(up.recv().await.unwrap().frame().unwrap()["b"], 2);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_aborts_only_that_stream() {
+        let mut up = Upstream::resume(
+            "http://127.0.0.1:4180/acp",
+            "s".into(),
+            "c".into(),
+            Recorder::disabled(),
+        )
+        .unwrap();
+        up.stream_tasks
+            .insert(StreamKey::Conn, tokio::spawn(std::future::pending::<()>()));
+        up.stream_tasks.insert(
+            StreamKey::Session("x".into()),
+            tokio::spawn(std::future::pending::<()>()),
+        );
+        up.unsubscribe(Some("x"));
+        assert!(up.stream_tasks.contains_key(&StreamKey::Conn));
+        assert!(
+            !up.stream_tasks
+                .contains_key(&StreamKey::Session("x".into()))
+        );
+    }
+
+    #[test]
+    fn resume_with_opt_in_accepts_production_port() {
+        let opts = UpstreamOpts {
+            allow_production: true,
+            ..Default::default()
+        };
+        assert!(
+            Upstream::resume_with(
+                "http://127.0.0.1:4080/acp",
+                "s".into(),
+                "c".into(),
+                Recorder::disabled(),
+                &opts
+            )
+            .is_ok()
+        );
+        let default_opts = UpstreamOpts::default();
+        assert!(
+            Upstream::resume_with(
+                "http://127.0.0.1:4080/acp",
+                "s".into(),
+                "c".into(),
+                Recorder::disabled(),
+                &default_opts
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn split_handle_concurrent_post_and_unified_events() {
+        use axum::Router;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/acp",
+            post(|| async { StatusCode::ACCEPTED }).get(|headers: HeaderMap| async move {
+                let is_session = headers.get("acp-session-id").is_some();
+                let body = if is_session {
+                    "id: 20\ndata: {\"from\":\"session\"}\n\n"
+                } else {
+                    "id: 10\ndata: {\"from\":\"conn\"}\n\n"
+                };
+                (
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("cache-control", "no-cache"),
+                    ],
+                    body,
+                )
             }),
-            "subsequent 404 must not overwrite existing features"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (h1, mut rx) = upstream.split();
+        let h2 = h1.clone();
+
+        h1.subscribe_with(None, SubscribeOpts::default())
+            .await
+            .unwrap();
+        h2.subscribe_with(Some("s1"), SubscribeOpts::default())
+            .await
+            .unwrap();
+
+        let post1 = h1.request_with_id(
+            serde_json::json!(1),
+            "test_method1",
+            serde_json::json!({}),
+            None,
+        );
+        let post2 = h2.request_with_id(
+            serde_json::json!(2),
+            "test_method2",
+            serde_json::json!({}),
+            Some("s1"),
+        );
+        let (res1, res2) = tokio::join!(post1, post2);
+        res1.unwrap();
+        res2.unwrap();
+
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let ev = rx.recv().await.unwrap();
+            if let Event::Frame(key, data, _) = ev {
+                frames.push((key, data));
+            }
+        }
+
+        let mut keys: Vec<StreamKey> = frames.into_iter().map(|(k, _)| k).collect();
+        keys.sort_by_key(|k| k.stream_record_name());
+        assert_eq!(keys, vec![StreamKey::Conn, StreamKey::Session("s1".into())]);
+    }
+
+    #[tokio::test]
+    async fn last_byte_at_advances_on_keepalive_only_chunk() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+
+        let (tx, rx) =
+            futures::channel::mpsc::unbounded::<Result<bytes::Bytes, std::convert::Infallible>>();
+        let body_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(Body::from_stream(rx))));
+
+        let app = Router::new().route(
+            "/acp",
+            get(move || {
+                let body_holder = body_holder.clone();
+                async move {
+                    let body = body_holder.lock().unwrap().take().unwrap_or_default();
+                    (
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("cache-control", "no-cache"),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (handle, mut rx) = upstream.split();
+
+        handle
+            .subscribe_with(None, SubscribeOpts::default())
+            .await
+            .unwrap();
+
+        let t0 = handle.last_byte_at(&StreamKey::Conn).expect("t0 present");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tx.unbounded_send(Ok(bytes::Bytes::from(": keepalive\n\n")))
+            .unwrap();
+
+        let start = Instant::now();
+        let mut advanced = false;
+        while start.elapsed() < Duration::from_secs(1) {
+            if handle
+                .last_byte_at(&StreamKey::Conn)
+                .is_some_and(|t1| t1 > t0)
+            {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(advanced, "last_byte_at did not advance on keepalive chunk");
+
+        // Keepalive comments should yield no events
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
         );
     }
 }

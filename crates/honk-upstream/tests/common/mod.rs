@@ -85,13 +85,6 @@ pub async fn setup_session_at(
 
     upstream.subscribe(None).await?;
 
-    if fixtures == FIXTURES_PATCHED_3
-        && let Err(err) = require_patched(&upstream)
-    {
-        let _ = upstream.delete().await;
-        return Err(err);
-    }
-
     let temp_dir = tempfile::tempdir()?;
     let cwd = temp_dir.path().to_str().unwrap().to_string();
     let new_res = upstream
@@ -615,83 +608,5 @@ mod tests {
 
         let echo_cmd = ["echo", "P5A_PRIME_DONE"];
         assert!(cmdline_matches(&echo_cmd, "P5A_PRIME_DONE"));
-    }
-
-    #[tokio::test]
-    async fn test_setup_session_at_rejects_unpatched_before_session_new() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let session_new_called = Arc::new(AtomicBool::new(false));
-        let delete_called = Arc::new(AtomicBool::new(false));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/acp");
-
-        let s_new = session_new_called.clone();
-        let d_call = delete_called.clone();
-
-        tokio::spawn(async move {
-            // 1. initialize POST
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req1 = String::from_utf8_lossy(&buf[..n]);
-            assert!(req1.starts_with("POST"), "expected initialize POST");
-            let body1 = "{\"jsonrpc\":\"2.0\"}";
-            let resp1 = format!(
-                "HTTP/1.1 200 OK\r\nacp-connection-id: conn-123\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body1}",
-                body1.len()
-            );
-            sock.write_all(resp1.as_bytes()).await.unwrap();
-
-            // 2. subscribe GET /acp (unpatched: no acp-stream-features)
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req2 = String::from_utf8_lossy(&buf[..n]);
-            assert!(req2.starts_with("GET"), "expected subscribe GET");
-            let resp2 =
-                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: text/event-stream\r\n\r\n";
-            sock.write_all(resp2.as_bytes()).await.unwrap();
-
-            // 3. Next request should be DELETE /acp, NOT session/new
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req3 = String::from_utf8_lossy(&buf[..n]);
-            if req3.contains("session/new") {
-                s_new.store(true, Ordering::SeqCst);
-            }
-            if req3.starts_with("DELETE") {
-                d_call.store(true, Ordering::SeqCst);
-                let resp3 = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
-                sock.write_all(resp3.as_bytes()).await.unwrap();
-            }
-        });
-
-        let temp_fixtures = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("HONK_GOOSE_SECRET", "test-secret");
-            std::env::set_var("HONK_FIXTURES_ROOT", temp_fixtures.path());
-        }
-        let res = setup_session_at(&url, FIXTURES_PATCHED_3, "test_probe", "auto").await;
-        unsafe {
-            std::env::remove_var("HONK_FIXTURES_ROOT");
-        }
-        assert!(
-            res.is_err(),
-            "setup_session_at must fail for unpatched goose"
-        );
-        assert!(
-            !session_new_called.load(Ordering::SeqCst),
-            "session/new must not be called"
-        );
-        assert!(
-            delete_called.load(Ordering::SeqCst),
-            "DELETE must be called to clean up connection"
-        );
     }
 }
