@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use crate::config::Args;
@@ -14,6 +15,7 @@ use crate::state::StateStore;
 pub struct SessionHandle {
     pub sid: String,
     pub conn_id: String,
+    pub tx: tokio::sync::mpsc::Sender<crate::session::SessionMsg>,
 }
 
 pub struct Hub {
@@ -27,6 +29,7 @@ pub struct Hub {
     pub upstream_ids: Arc<Mutex<UpstreamIds>>,
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
+    pub self_weak: std::sync::RwLock<Option<std::sync::Weak<Hub>>>,
 }
 
 impl Hub {
@@ -158,7 +161,7 @@ impl Hub {
 
         // 7. Register session handles from state (Task A12 fills this in)
 
-        Ok(Arc::new(Self {
+        let hub = Arc::new(Self {
             args,
             state,
             state_dir,
@@ -169,7 +172,21 @@ impl Hub {
             upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-        }))
+            self_weak: std::sync::RwLock::new(None),
+        });
+
+        *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
+        Ok(hub)
+    }
+
+    pub fn arc(&self) -> Arc<Hub> {
+        self.self_weak
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .expect("hub alive")
     }
 
     pub fn handle_initialize(&self, _params: &Value) -> Value {
@@ -222,7 +239,7 @@ impl Hub {
             return Err(e).context("failed to send control request");
         }
 
-        let mut resp = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        let mut resp = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(f)) => f,
             Ok(Err(_)) => anyhow::bail!("control response channel closed"),
             Err(_) => {
@@ -270,6 +287,90 @@ impl Hub {
     pub fn is_session_running(&self, _sid: &str) -> bool {
         // Wired for actor lookup in A9; returns false for now
         false
+    }
+
+    pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
+        let init_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
+
+        let recorder = if let Some(rec_path) = &self.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor)?
+        } else {
+            Recorder::disabled()
+        };
+
+        let mut side_up = Upstream::initialize_with(
+            &self.upstream_url,
+            self.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await
+        .context("failed to initialize export side connection")?;
+
+        let conn_id = side_up.conn_id().to_string();
+
+        // 1. Persist orphan first
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })?;
+        }
+
+        // 2. Subscribe session stream (without takeover)
+        side_up
+            .subscribe_with(
+                Some(sid),
+                SubscribeOpts {
+                    takeover: false,
+                    resume_after: None,
+                },
+            )
+            .await
+            .context("failed to subscribe export session stream")?;
+
+        // 3. Call export
+        let export_res = side_up
+            .call(
+                "_goose/unstable/session/export",
+                serde_json::json!({
+                    "sessionId": sid,
+                    "format": "json"
+                }),
+                Some(sid),
+                Duration::from_secs(30),
+            )
+            .await
+            .context("failed to call export on side connection")?;
+
+        // 4. Delete side connection
+        let _ = side_up.delete().await;
+
+        // 5. Remove orphan
+        {
+            let mut s = self.state.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.retain(|id| id != &conn_id);
+            });
+        }
+
+        let data_str = export_res
+            .get("data")
+            .and_then(Value::as_str)
+            .context("export missing data string")?;
+        let session_val: Value =
+            serde_json::from_str(data_str).context("failed to parse export data JSON")?;
+        Ok(session_val)
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
@@ -324,12 +425,7 @@ impl Hub {
         let mut clean_params = params.clone();
         crate::rpc::strip_honk_meta(&mut clean_params);
         let new_res = session_upstream
-            .call(
-                "session/new",
-                clean_params,
-                None,
-                std::time::Duration::from_secs(30),
-            )
+            .call("session/new", clean_params, None, Duration::from_secs(30))
             .await
             .context("failed to call session/new")?;
 
@@ -390,21 +486,37 @@ impl Hub {
             })?;
         }
 
-        // 8. Spawn actor placeholder (Task A9 will fill it in)
-        let (up_handle, mut event_rx) = session_upstream.split();
-        tokio::spawn(async move {
-            let _log = session_log;
-            let _up = up_handle;
-            while let Some(_ev) = event_rx.recv().await {
-                // Placeholder: drains events until actor is wired in A9
-            }
-        });
+        // 8. Spawn actor
+        let (up_handle, event_rx) = session_upstream.split();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
+
+        let boot = { self.state.lock().await.boot };
+        let session = crate::session::Session {
+            sid: sid.clone(),
+            state_dir: self.state_dir.clone(),
+            state_store: self.state.clone(),
+            hub: self.arc(),
+            up: up_handle,
+            events: event_rx,
+            rx: session_rx,
+            self_tx: session_tx.clone(),
+            log: session_log,
+            turn: crate::turn::TurnCore::default(),
+            state: crate::session::ActorState::Live,
+            ids: UpstreamIds::new(boot),
+            last_processed_session_id: None,
+            last_processed_conn_id: None,
+            viewers: HashMap::new(),
+        };
+
+        tokio::spawn(session.run());
 
         self.sessions.write().await.insert(
             sid.clone(),
             SessionHandle {
                 sid: sid.clone(),
                 conn_id: conn_id.clone(),
+                tx: session_tx,
             },
         );
 
