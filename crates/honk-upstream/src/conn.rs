@@ -432,6 +432,13 @@ impl EventRx {
         }
         self.rx.recv().await
     }
+
+    pub fn try_recv(&mut self) -> Result<Event, tokio::sync::mpsc::error::TryRecvError> {
+        if let Some(event) = self.buffered.pop_front() {
+            return Ok(event);
+        }
+        self.rx.try_recv()
+    }
 }
 
 async fn do_request_with_id(

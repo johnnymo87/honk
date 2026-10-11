@@ -152,6 +152,7 @@ struct FakeGooseInner {
     active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     all_sessions: Mutex<HashMap<String, String>>,
     keepalive_interval: Mutex<Duration>,
+    drop_prompt_reply: AtomicBool,
 }
 
 pub struct FakeGoose {
@@ -190,6 +191,7 @@ impl FakeGoose {
             active_prompt_cancels: Mutex::new(HashMap::new()),
             all_sessions: Mutex::new(HashMap::new()),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
+            drop_prompt_reply: AtomicBool::new(false),
         });
 
         let app = Router::new()
@@ -307,6 +309,19 @@ impl FakeGoose {
             }
             conn.conn_stream.sender = None;
         }
+    }
+
+    pub fn clear_ring(&self, sid: &str) {
+        let mut conns = self.state.connections.lock().unwrap();
+        for conn in conns.values_mut() {
+            if let Some(stream) = conn.sessions.get_mut(sid) {
+                stream.ring.clear();
+            }
+        }
+    }
+
+    pub fn set_drop_prompt_reply(&self, drop: bool) {
+        self.state.drop_prompt_reply.store(drop, Ordering::SeqCst);
     }
 
     pub async fn restart(&mut self) {
@@ -667,6 +682,9 @@ async fn handle_post(
                 );
 
                 // 4. Prompt reply
+                if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(id) = req_id_clone {
                     let stop_reason = if cancel_flag.load(Ordering::SeqCst) {
                         "cancelled"

@@ -90,11 +90,6 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
                 "role": "user",
                 "created": 1,
                 "content": [{"type": "text", "text": "go"}]
-            }, {
-                "id": "msg_2",
-                "role": "assistant",
-                "created": 2,
-                "content": [{"type": "text", "text": "turn output text"}]
             }]
         }),
     );
@@ -125,6 +120,25 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
     v.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/gap"))
         .await;
     assert_eq!(v.blocks.resets, 1, "no reset while run is active");
+
+    // The turn completes on fake: assistant response is committed
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "go"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "turn output text"}]
+            }]
+        }),
+    );
 
     // Turn finishes, activeRunId: null processed -> triggers rebuild at turn end
     // Viewer receives _honk/replay_done for epoch 2
@@ -539,4 +553,121 @@ async fn reply_lost_in_gap_synthesizes_end_turn_after_rebuild() {
 
     let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
     assert_eq!(resp["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconsistent_inflight_client_req_id_returns_32000() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Mutate state.json to add an InFlight ledger entry for this session with no turn inflight
+    {
+        let state_path = h.state_dir.path().join("state.json");
+        let content = std::fs::read_to_string(&state_path).expect("read state");
+        let mut parsed: Value = serde_json::from_str(&content).expect("parse state");
+        parsed["ledger"]["lost_crid"] = json!({
+            "state": "in_flight",
+            "session": sid,
+            "upstream_id": "hk_lost",
+        });
+        std::fs::write(&state_path, serde_json::to_string_pretty(&parsed).unwrap())
+            .expect("write state");
+    }
+
+    h.restart().await;
+
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "test", Some("lost_crid")),
+        )
+        .await;
+
+    assert_eq!(resp["error"]["code"], -32000);
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("honkd lost track of this client_req_id; not resending")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_ended_in_gap_synthesizes_end_turn_after_rebuild_without_hang() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // The turn committed on goose with assistant text, but the reply and activeRunId:null were in the gap
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "gap_prompt"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "assistant_gap_reply"}]
+            }]
+        }),
+    );
+
+    fake.gap_on_next_resume(&sid);
+    fake.set_drop_prompt_reply(true);
+
+    let pid = v
+        .request("session/prompt", prompt_params(&sid, "gap_prompt", None))
+        .await;
+
+    // Wait until run starts so prompt is in flight
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // Clear ring to simulate that frames including the prompt reply were evicted from the ring
+    fake.clear_ring(&sid);
+    fake.kick_stream(&sid);
+
+    // Reattach detects turn finished in gap from export, rebuilds immediately, synthesizes end_turn without hang
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp.pointer("/result/_meta/honk/synthesized"),
+        Some(&json!(true))
+    );
 }

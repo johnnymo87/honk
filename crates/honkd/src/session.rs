@@ -154,6 +154,7 @@ impl Session {
 
         loop {
             tokio::select! {
+                biased;
                 ev = self.events.recv(), if !matches!(self.state, ActorState::Gone) => match ev {
                     Some(ev) => {
                         self.on_upstream(ev).await;
@@ -317,8 +318,30 @@ impl Session {
             }
             ReplayOutcome::Gap | ReplayOutcome::Unsupported => {
                 self.gap_evidenced = true;
-                let is_active = self.turn.run.is_some() || self.turn.inflight.is_some();
-                if is_active {
+
+                // Check whether goose is still running the turn live, or if the turn already ended in the gap.
+                // In goose (crates/goose/src/acp/server.rs:2360-2374), activeRunId:null and the prompt response
+                // are sent in-order to the session stream mailbox (vendor/agent-client-protocol-http/src/connection.rs:385-395).
+                // Case (a): If the turn is still running live on goose, export has no turn text for the inflight prompt yet.
+                //           We stay Live, send _honk/gap, and wait for activeRunId:null and real prompt reply to arrive live.
+                // Case (b): If the turn finished inside the gap, export already has the committed assistant message.
+                //           Goose is idle and will never send activeRunId:null live. We trigger rebuild immediately
+                //           and synthesize end_turn upon rebuild completion.
+                let is_turn_running = if let Some(inf) = self.turn.inflight.as_ref() {
+                    let user_text = crate::rpc::extract_user_text(&inf.params);
+                    match self.hub.export(&self.sid).await {
+                        Ok(export_val) => {
+                            let has_completed_turn =
+                                !honk_wire::export::turn_text(&export_val, &user_text).is_empty();
+                            !has_completed_turn
+                        }
+                        Err(_) => self.turn.run.is_some(),
+                    }
+                } else {
+                    self.turn.run.is_some()
+                };
+
+                if is_turn_running {
                     self.state = ActorState::Live;
                     let gap_marker = json!({
                         "jsonrpc": "2.0",
@@ -331,6 +354,7 @@ impl Session {
                     self.rebuild_at_turn_end = true;
                     self.drain_queued_msgs().await;
                 } else {
+                    self.turn.run = None;
                     self.start_rebuild().await;
                 }
             }
@@ -350,6 +374,19 @@ impl Session {
             self.state = ActorState::Gone;
             let actions = self.turn.interrupt("upstream_gone");
             self.execute_actions(actions).await;
+
+            let finalizing = std::mem::take(&mut self.finalizing_waiters);
+            for (_, waiters) in finalizing {
+                for w in waiters {
+                    let err_resp = crate::rpc::error(
+                        w.downstream_id.clone(),
+                        -32000,
+                        "Session is gone (upstream 404)".to_string(),
+                        None,
+                    );
+                    self.send_to_owner(&w, err_resp);
+                }
+            }
 
             let msgs = std::mem::take(&mut self.queued_msgs);
             for m in msgs {
@@ -484,7 +521,6 @@ impl Session {
                 self.log = new_log;
                 let head = self.log.head();
                 self.last_processed_session_id = self.log.last_upstream_id();
-                self.gap_evidenced = false;
 
                 let reset_frame = json!({
                     "jsonrpc": "2.0",
@@ -530,6 +566,11 @@ impl Session {
                 }
 
                 self.suppressed_keys = keys;
+
+                // Drain already-buffered events from the session stream before checking synthesis
+                while let Ok(ev) = self.events.try_recv() {
+                    self.on_upstream(ev).await;
+                }
 
                 if self.gap_evidenced && self.turn.inflight.is_some() {
                     let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
@@ -1168,18 +1209,21 @@ impl Session {
                 }
 
                 if let Some(crid) = &client_req_id {
-                    let is_inflight = {
+                    let is_inconsistent_inflight = {
                         let s = self.state_store.lock().await;
                         matches!(
                             s.ledger.get(crid),
                             Some(crate::state::LedgerEntry::InFlight { session: led_sid, .. }) if led_sid == &self.sid
                         )
                     };
-                    if is_inflight {
-                        self.finalizing_waiters
-                            .entry(crid.clone())
-                            .or_default()
-                            .push(owner);
+                    if is_inconsistent_inflight {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32000,
+                            "honkd lost track of this client_req_id; not resending".to_string(),
+                            None,
+                        );
+                        self.send_to_viewer(viewer_id, err_resp);
                         return;
                     }
                 }
@@ -1336,7 +1380,11 @@ impl Session {
             Reply::Result(mut res) => {
                 if let Some(t) = text {
                     if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
-                        meta.insert("honk".to_string(), json!({ "text": t }));
+                        if let Some(honk) = meta.get_mut("honk").and_then(Value::as_object_mut) {
+                            honk.insert("text".to_string(), Value::String(t));
+                        } else {
+                            meta.insert("honk".to_string(), json!({ "text": t }));
+                        }
                     } else {
                         res["_meta"] = json!({ "honk": { "text": t } });
                     }
