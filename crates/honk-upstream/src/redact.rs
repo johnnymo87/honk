@@ -70,6 +70,11 @@ impl Redactor {
             }
         }
 
+        // 4. Org name
+        for org in ["wonder", "Wonder", "WONDER"] {
+            replacements.push((org.to_string(), "<ORG>".to_string()));
+        }
+
         Self::new(replacements)
     }
 

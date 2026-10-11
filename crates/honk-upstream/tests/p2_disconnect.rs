@@ -1,187 +1,13 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+mod common;
+use common::*;
 
-use honk_upstream::{Event, Recorder, Redactor, Upstream, rpc_id_matches};
-use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use honk_upstream::{Event, rpc_id_matches};
+use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast, watch};
-
-struct TestSession {
-    upstream: Upstream,
-    url: String,
-    secret: String,
-    conn_id: String,
-    sid: String,
-    rec: Recorder,
-    fixture_path: PathBuf,
-    _temp_dir: tempfile::TempDir,
-}
-
-async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSession>> {
-    let secret = match std::env::var("HONK_GOOSE_SECRET") {
-        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => {
-            eprintln!("skipping {probe_name}: HONK_GOOSE_SECRET unset");
-            return Ok(None);
-        }
-    };
-
-    let url =
-        std::env::var("HONK_GOOSE_URL").unwrap_or_else(|_| "http://127.0.0.1:4180/acp".to_string());
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("finding repo root");
-    let fixture_path = repo_root.join(format!(
-        "fixtures/goose-1.54.0-patched.2/{probe_name}/{ts}.jsonl"
-    ));
-    if let Some(parent) = fixture_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let redactor = Redactor::from_env();
-    let rec = Recorder::file(&fixture_path, redactor)?;
-
-    let mut upstream = Upstream::initialize(&url, secret.clone(), rec.clone()).await?;
-    let conn_id = upstream.conn_id().to_string();
-
-    upstream.subscribe(None).await?;
-
-    let temp_dir = tempfile::tempdir()?;
-    let cwd = temp_dir.path().to_str().unwrap().to_string();
-    let new_res = upstream
-        .call(
-            "session/new",
-            json!({
-                "cwd": cwd,
-                "mcpServers": []
-            }),
-            None,
-            Duration::from_secs(30),
-        )
-        .await?;
-
-    let sid = new_res
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .expect("session/new reply missing sessionId")
-        .to_string();
-
-    upstream.subscribe(Some(&sid)).await?;
-
-    upstream
-        .call(
-            "session/set_mode",
-            json!({
-                "sessionId": &sid,
-                "modeId": "auto"
-            }),
-            Some(&sid),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-    upstream
-        .call(
-            "session/set_config_option",
-            json!({
-                "sessionId": &sid,
-                "configId": "model",
-                "value": "claude-haiku-4-5@20251001"
-            }),
-            Some(&sid),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-    Ok(Some(TestSession {
-        upstream,
-        url,
-        secret,
-        conn_id,
-        sid,
-        rec,
-        fixture_path,
-        _temp_dir: temp_dir,
-    }))
-}
-
-async fn export_session(upstream: &mut Upstream, sid: &str) -> anyhow::Result<Value> {
-    let export_res = upstream
-        .call(
-            "_goose/unstable/session/export",
-            json!({
-                "sessionId": sid,
-                "format": "json"
-            }),
-            Some(sid),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-    let data_str = export_res
-        .get("data")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("export response missing data string: {export_res}"))?;
-
-    let session_val: Value = serde_json::from_str(data_str)?;
-    Ok(session_val)
-}
-
-fn extract_assistant_text(session_json: &Value) -> String {
-    let mut text = String::new();
-    if let Some(convo) = session_json.get("conversation").and_then(|v| v.as_array()) {
-        for msg in convo.iter().rev() {
-            if msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                && let Some(contents) = msg.get("content").and_then(|c| c.as_array())
-            {
-                for block in contents {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        text.push_str(t);
-                    }
-                }
-                break;
-            }
-        }
-    }
-    text
-}
-
-fn extract_all_assistant_text(session_json: &Value) -> String {
-    let mut text = String::new();
-    if let Some(convo) = session_json.get("conversation").and_then(|v| v.as_array()) {
-        for msg in convo {
-            if msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                && let Some(contents) = msg.get("content").and_then(|c| c.as_array())
-            {
-                for block in contents {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        text.push_str(t);
-                    }
-                }
-            }
-        }
-    }
-    text
-}
-
-fn is_subsequence(sub: &str, full: &str) -> bool {
-    let mut full_chars = full.chars();
-    for c in sub.chars() {
-        if !full_chars.any(|fc| fc == c) {
-            return false;
-        }
-    }
-    true
-}
 
 async fn wait_for_freeze(f_rx: &mut watch::Receiver<bool>) {
     loop {
@@ -283,6 +109,9 @@ impl Drop for TcpProxy {
     fn drop(&mut self) {
         let _ = self.close_tx.send(());
         self.server_task.abort();
+        if let Ok(mut guard) = self.held_sockets.try_lock() {
+            guard.clear();
+        }
     }
 }
 

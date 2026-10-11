@@ -73,6 +73,7 @@ follow-ups (patch, config, or recipe), not as failures.
    - When a connection is half-open / blackholed (sockets held open without reading or writing), the 409 Conflict persists indefinitely (never cleared within the 180s deadline across both runs).
    - **Can honkd force Goose to release the stale subscriber by sending DELETE? NO.** Sending DELETE terminates the connection and aborts in-flight runs (as shown in T5). Honkd cannot force Goose to release the stale subscriber from the outside; Goose holds the mailbox subscriber until kernel TCP teardown or write errors occur.
    - Therefore, honkd must retry with exponential backoff on 409. Reattach latency in half-open scenarios is gated on Goose's socket detection.
+   - *Loopback note:* On loopback (honkd↔goose on the same host) a crashed/killed honkd closes its sockets (FIN → ~0-1ms window); the half-open case arises when honkd is alive-but-stuck (stalled runtime/deadlock) holding the socket unread — so honkd should keep its SSE read loops independent of slow consumers (never let backpressure stop reading the socket).
 3. **Frame loss & reconciliation (P2b vs P2d):**
    - On clean drop with immediate reattach (P2b), no characters were lost (`chars_missing: 0`).
    - On half-open drop (P2d), Goose continues generating and writing frames into the open socket buffer. Because Goose dequeues frames before writing (at-most-once delivery), all chunks streamed during the freeze, the run-end notification, and the prompt reply are permanently lost into the stale socket buffer (`prompt_reply_received: false`, `run_end_received: false`, 213–649 characters missing).
@@ -172,7 +173,94 @@ follow-ups (patch, config, or recipe), not as failures.
   - Fixture: `fixtures/goose-1.54.0-patched.2/p2d/1791676988.jsonl`
 
 ## P3: Same-connection reload mid-run
-_pending_
+
+**Question:** Is `session/load` on the same (resumed) connection safe to reconcile session state while an agent run is still active? What are the replay semantics, process impact, CWD side effects, and cross-connection behavior?
+
+**Verdict:**
+1. **Reload during active run succeeds:** Goose accepts `session/load` while a turn is actively streaming or executing a tool call (`load_success: true`). The JSON-RPC reply arrives on the session stream (`session:<sid>`), not the connection stream.
+2. **In-memory agent is preserved:** No secondary agent process or threads are spawned (thread diff = 0, child process PIDs unchanged, RSS delta < 120 kB). In-flight sub-processes (such as bash `sleep 40`) continue undisturbed to completion.
+3. **Replay vs. live frames:** Replay frames are emitted before the `session/load` response and represent committed session history. In-flight assistant chunks are not committed to storage mid-run and therefore are not duplicated in the replay (`duplicate_chars: 0`, `overlap: 0`). Replay frames lack any distinguishing marker in `_meta` (they carry standard `created` and `messageId` identical to live frames).
+4. **CWD side effect:** `session/load` rewrites `session.working_dir` in storage whenever the passed `cwd` differs from stored state (`cwd_rewritten: true`). Therefore, honkd must always pass the stored `cwd` queried from `session/list`.
+5. **Cross-connection reload:** When `session/load` is issued on a fresh Connection B while Connection A is running a prompt, the load succeeds on B and receives historical replay, but **all subsequent live streaming chunks remain strictly pinned to Connection A**. Honkd cannot migrate an in-flight stream to a new connection via `session/load`.
+6. **Export reconciliation path:** `_goose/unstable/session/export` succeeds mid-run (`mid_run_export_ok: true`) as a read-only query against committed storage with zero side effects. Waiting for turn end or reconciling via export is cleaner and avoids stitching an in-flight message.
+
+**Decision-rule outcomes:**
+1. **Reload rejected during a run:** Not rejected (`load_success: true`). Goose admits mid-run reloads on the same connection.
+2. **Replay + live duplicates:** Replay does not duplicate in-flight tokens (`duplicate_chars: 0`, `overlap: 0`). However, unbuffered disconnects can leave small character gaps (0–14 chars missing). Because replayed frames carry no `replay: true` metadata, honkd should wait for turn end (detected via `session_info_update` activeRunId null) before reconciling.
+3. **Second agent spawned:** No (`children_changed: false`, thread diff 0). The in-memory agent is reused. However, cross-connection reloads do not divert live frames.
+4. **CWD rewritten by load:** Confirmed (`cwd_rewritten: true`). Honkd must always pass the stored `cwd`.
+
+**Probe results:**
+
+### P3a1: Same-connection reload mid-run (streaming tides)
+- **Run 1:**
+  - Session: `20261011_11` | Connection: `eeb0aace-4cd5-44e2-907c-a2867ed9b9ce`
+  - Chunks before drop: 10 (153 chars) | Reattach 409 window: 0ns
+  - Mid-run export OK: `true` (assistant chars in export: 71, convo len: 4)
+  - `session/load` success: `true` | Reply stream: `session:20261011_11`
+  - Replay frames: 5 (1 user chunk, 2 agent chunks [85 chars]) | Replay `_meta`: `["goose"]`
+  - Live frames after load: 229 (115 live agent chunks [1000 chars])
+  - Proc stats: thread diff: 0, RSS diff: +112 kB, children changed: `false`
+  - Streamed total: 1153 chars | Final export: 1167 chars | Missing: 14 | Duplicate: 0
+  - Subsequence: `true` | Prefix: `false` | `FINISHED` present: `true` | Duration: 61.42s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791678504.jsonl`
+- **Run 2:**
+  - Session: `20261011_15` | Connection: `d7c376db-1a8b-4866-8802-41e6d5aa2534`
+  - Chunks before drop: 10 (121 chars) | Reattach 409 window: 0ns
+  - Mid-run export OK: `true` (assistant chars in export: 71, convo len: 4)
+  - `session/load` success: `true` | Reply stream: `session:20261011_15`
+  - Replay frames: 4 (1 user chunk, 1 agent chunk [71 chars]) | Replay `_meta`: `["goose"]`
+  - Live frames after load: 282 (156 live agent chunks [1451 chars])
+  - Proc stats: thread diff: 0, RSS diff: +8 kB, children changed: `false`
+  - Streamed total: 1572 chars | Final export: 1572 chars | Missing: 0 | Duplicate: 0
+  - Subsequence: `true` | Prefix: `true` | `FINISHED` present: `true` | Duration: 82.70s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791678637.jsonl`
+
+### P3a2: Same-connection reload mid-run (tool call sleep 40)
+- **Run 1:**
+  - Session: `20261011_12` | Connection: `3e96a2ce-709a-492a-9377-8940d3fc433e`
+  - Pre-load children: `["2684253 bash -c sleep 40 && echo done"]`
+  - Post-load children: `["2684253 bash -c sleep 40 && echo done"]` (tool call process preserved)
+  - `session/load` success: `true` | Reply stream: `session:20261011_12`
+  - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true` | Duration: 43.02s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a_sleep/1791678568.jsonl`
+- **Run 2:**
+  - Session: `20261011_16` | Connection: `3ecb017c-cb3b-4a97-8c21-18bfc2b18e11`
+  - Pre-load children: `["2746300 bash -c sleep 40 && echo done"]`
+  - Post-load children: `["2746300 bash -c sleep 40 && echo done"]` (tool call process preserved)
+  - `session/load` success: `true` | Reply stream: `session:20261011_16`
+  - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true` | Duration: 42.74s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a_sleep/1791678727.jsonl`
+
+### P3b: Stored CWD rewrite check
+- **Run 1:**
+  - Session: `20261011_13`
+  - Initial CWD: `/tmp/nix-shell.Otyswj/.tmpuifGeh` | New CWD: `/tmp/nix-shell.Otyswj/.tmpxhDIUi`
+  - Updated CWD from `session/list`: `/tmp/nix-shell.Otyswj/.tmpxhDIUi` | CWD rewritten: `true` | Duration: 0.66s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3b/1791678614.jsonl`
+- **Run 2:**
+  - Session: `20261011_17`
+  - Initial CWD: `/tmp/nix-shell.dSVuGT/.tmp8eskcd` | New CWD: `/tmp/nix-shell.dSVuGT/.tmpL3VkvT`
+  - Updated CWD from `session/list`: `/tmp/nix-shell.dSVuGT/.tmpL3VkvT` | CWD rewritten: `true` | Duration: 1.09s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3b/1791678773.jsonl`
+
+### P3c: Cross-connection reload mid-run
+- **Run 1:**
+  - Session: `20261011_14` | Conn A: `08f2ca22-69d0-43af-8c8d-e1c9b70d1e29` | Conn B: `c2bf4926-f979-48aa-af54-cc6e9dfbbc13`
+  - Conn B session stream 409 conflict: `false` (mailboxes scoped to connection)
+  - Conn B `session/load` success: `true` | Reply stream: `session:20261011_14`
+  - Live chunks after load on Conn A: 46 | Live chunks after load on Conn B: 1 (load replay only, 0 live stream deltas)
+  - Conn A run-end received: `true` | Conn B run-end received: `false`
+  - Total duration: 12.93s
+  - Fixtures: `fixtures/goose-1.54.0-patched.2/p3c/1791678621.jsonl` & `p3c_b/1791678631.jsonl`
+- **Run 2:**
+  - Session: `20261011_18` | Conn A: `0671ae21-ba57-4444-949a-84ff2f9c282e` | Conn B: `1efa43ac-e2d2-4c03-8775-7de79451e923`
+  - Conn B session stream 409 conflict: `false`
+  - Conn B `session/load` success: `true` | Reply stream: `session:20261011_18`
+  - Live chunks after load on Conn A: 48 | Live chunks after load on Conn B: 1 (load replay only, 0 live stream deltas)
+  - Conn A run-end received: `true` | Conn B run-end received: `false`
+  - Total duration: 12.52s
+  - Fixtures: `fixtures/goose-1.54.0-patched.2/p3c/1791678776.jsonl` & `p3c_b/1791678785.jsonl`
 
 ## P4: Pending permission with no listener
 _pending_
