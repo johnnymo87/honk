@@ -23,7 +23,7 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - [x] T10 P5: cancel works from any conn (54-79ms, leaks orphan shell descendants); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, export works before load.
 - [x] T11 P6: Message IDs and toolCallIds completely stable (block id = messageId); replayTail:1 covers last turn; goose ~0.5-1.7 MB/session RSS, 0 child procs; honkd TTL 15m, max 16 conns.
 - [x] T12 hydra (optional): skipped (isolation cost not worth it given P2-P6 settled the design)
-- [ ] T13 findings + M1 plan + goose-patch plan: steps 1-3 done (findings summary, amendments, design revisions); M1 plan + goose patch plan pending
+- [x] T13 findings, design amendments, M1 plan + goose-patch plan (66dae62, 86ff5a3, a692b40, 84642ce, bd505ce)
 
 ## Carry-forward from reviews
 - Wire learnings: modes `auto|approve|smart_approve|chat` (default auto); `configOptions` array with `options:[{name,value}]`, `currentValue`; cheap model `claude-haiku-4-5@20251001` via `session/set_config_option {configId:"model"}`; run start/end visible as `session_info_update` `_meta.goose.activeRunId` set/null; prompt reply has `stopReason` + usage.
