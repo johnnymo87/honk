@@ -59,6 +59,8 @@ async fn p5a_prime_cancel_leaves_no_orphans() -> anyhow::Result<()> {
     let mut survivors = Vec::new();
     for _ in 0..15 {
         survivors = [pgrep_user("sleep 61")?, pgrep_user("sleep 62")?].concat();
+        survivors.sort_unstable();
+        survivors.dedup();
         if survivors.is_empty() {
             break;
         }

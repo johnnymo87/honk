@@ -323,12 +323,31 @@ pub struct ProcStats {
     pub children: Vec<String>,
 }
 
-pub fn get_sandbox_unit() -> String {
-    std::env::var("HONK_SANDBOX_UNIT").unwrap_or_else(|_| "honk-goose-sandbox".to_string())
+pub fn resolve_sandbox_unit(sandbox_unit_env: Option<&str>, port: u16) -> anyhow::Result<String> {
+    if let Some(unit) = sandbox_unit_env
+        && !unit.trim().is_empty()
+    {
+        return Ok(unit.trim().to_string());
+    }
+    match port {
+        4180 => Ok("honk-goose-sandbox".to_string()),
+        4181 => Ok("honk-goose-sandbox-patched".to_string()),
+        other => anyhow::bail!(
+            "cannot infer sandbox systemd unit for port {other} from HONK_GOOSE_URL; \
+             set HONK_SANDBOX_UNIT explicitly"
+        ),
+    }
+}
+
+pub fn get_sandbox_unit() -> anyhow::Result<String> {
+    resolve_sandbox_unit(
+        std::env::var("HONK_SANDBOX_UNIT").ok().as_deref(),
+        goose_port(),
+    )
 }
 
 pub fn get_sandbox_cgroup() -> anyhow::Result<PathBuf> {
-    let unit = get_sandbox_unit();
+    let unit = get_sandbox_unit()?;
     let output = std::process::Command::new("systemctl")
         .args(["--user", "show", "-p", "ControlGroup", "--value", &unit])
         .output()?;
@@ -369,6 +388,23 @@ pub fn get_sandbox_cgroup_pids() -> anyhow::Result<Vec<u32>> {
     Ok(pids)
 }
 
+pub fn cmdline_matches(args: &[&str], pattern: &str) -> bool {
+    // For sleep N patterns, only the exact-argv sleep command may match.
+    // Parent shells running `bash -c "sleep N ..."` must never match.
+    if let Some(sec_str) = pattern.strip_prefix("sleep ") {
+        if let Some(cmd) = args.first()
+            && (*cmd == "sleep" || cmd.ends_with("/sleep"))
+            && args.get(1) == Some(&sec_str)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    let cmd_str = args.join(" ");
+    cmd_str.contains(pattern)
+}
+
 pub fn sandbox_pids_matching(pattern: &str) -> anyhow::Result<Vec<u32>> {
     let cgroup_pids = get_sandbox_cgroup_pids()?;
     let mut matching = Vec::new();
@@ -380,18 +416,7 @@ pub fn sandbox_pids_matching(pattern: &str) -> anyhow::Result<Vec<u32>> {
                 .filter(|a| !a.is_empty())
                 .map(|a| std::str::from_utf8(a).unwrap_or(""))
                 .collect();
-            // Match exact sleep N command
-            if let Some(sec_str) = pattern.strip_prefix("sleep ")
-                && let Some(cmd) = args.first()
-                && (*cmd == "sleep" || cmd.ends_with("/sleep"))
-                && args.get(1) == Some(&sec_str)
-            {
-                matching.push(pid);
-                continue;
-            }
-
-            let cmd_str = args.join(" ");
-            if cmd_str.contains(pattern) {
+            if cmdline_matches(&args, pattern) {
                 matching.push(pid);
             }
         }
@@ -404,7 +429,7 @@ pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
 }
 
 pub fn get_goose_sandbox_pid() -> anyhow::Result<u32> {
-    let unit = get_sandbox_unit();
+    let unit = get_sandbox_unit()?;
     let output = std::process::Command::new("systemctl")
         .args(["--user", "show", "-p", "MainPID", "--value", &unit])
         .output()?;
@@ -540,5 +565,48 @@ mod tests {
             None,
             Some(tmp.path()),
         );
+    }
+
+    #[test]
+    fn test_resolve_sandbox_unit_from_env_or_port() {
+        assert_eq!(
+            resolve_sandbox_unit(Some("custom-unit"), 4180).unwrap(),
+            "custom-unit"
+        );
+        assert_eq!(
+            resolve_sandbox_unit(Some("custom-unit"), 4181).unwrap(),
+            "custom-unit"
+        );
+        assert_eq!(
+            resolve_sandbox_unit(None, 4180).unwrap(),
+            "honk-goose-sandbox"
+        );
+        assert_eq!(
+            resolve_sandbox_unit(None, 4181).unwrap(),
+            "honk-goose-sandbox-patched"
+        );
+        assert!(resolve_sandbox_unit(None, 4080).is_err());
+        assert!(resolve_sandbox_unit(None, 4182).is_err());
+    }
+
+    #[test]
+    fn test_cmdline_matches_exact_sleep_and_rejects_parent_bash() {
+        let bash_parent = ["bash", "-c", "sleep 61 & sleep 62; echo P5A_PRIME_DONE"];
+        assert!(!cmdline_matches(&bash_parent, "sleep 61"));
+        assert!(!cmdline_matches(&bash_parent, "sleep 62"));
+
+        let sleep61 = ["sleep", "61"];
+        assert!(cmdline_matches(&sleep61, "sleep 61"));
+        assert!(!cmdline_matches(&sleep61, "sleep 62"));
+
+        let nix_sleep = ["/nix/store/abc/bin/sleep", "62"];
+        assert!(cmdline_matches(&nix_sleep, "sleep 62"));
+        assert!(!cmdline_matches(&nix_sleep, "sleep 61"));
+
+        let sleep610 = ["sleep", "610"];
+        assert!(!cmdline_matches(&sleep610, "sleep 61"));
+
+        let echo_cmd = ["echo", "P5A_PRIME_DONE"];
+        assert!(cmdline_matches(&echo_cmd, "P5A_PRIME_DONE"));
     }
 }
