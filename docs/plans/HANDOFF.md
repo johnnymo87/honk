@@ -9,7 +9,7 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - Author is busy; agent uses best judgement, author reviews afterwards.
 - P1 rubric written by agent (`docs/spike/m0-findings.md` §P1); author runs the goose day later. Probe/build work does not wait on it.
 - Sandbox model traffic goes through claude-failover-proxy like production, with a distinct session header (`x-honk-sandbox-session`) so cfp does not pin/collide.
-- Build honkd AND carry goose patches in the fork (johnnymo87/goose, branch `patched/v1.54.0`, local `/home/dev/projects/goose-patched`). Upstream proposal only after practice. Goose *deploy* (workstation pkgs bump, restart goose-serve) is author-gated.
+- Build honkd AND carry goose patches in the fork (johnnymo87/goose, branch `patched/v1.54.0`, local `~/projects/goose-patched`). Upstream proposal only after practice. Goose *deploy* (workstation pkgs bump, restart goose-serve) is author-gated.
 
 ## Status
 - [x] T1+T2 nix shell, workspace, CI (c7cb527, 5d01f88, 3827fe0)
@@ -17,12 +17,13 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - [x] T4 honk-upstream HTTP+SSE client (5984d8e), live smoke passes.
 - [x] T5 WS manual check
 - [x] T6 P2: Turn survives disconnects; clean reattach 409 is 0-1ms, half-open persists; frame loss in dead socket requires post-reattach reconciliation.
-- [ ] T7 goose patch notes
+- [x] T7 goose patch notes (d3ec06a + later additions in docs/spike/goose-patches.md)
 - [x] T8 P3: Same-conn reload mid-run safe, agent preserved, no replay duplicates; CWD rewritten (honkd must pass stored CWD); cross-conn reload does not redirect live stream.
 - [x] T9 P4: No SSE redelivery or load re-send of pending permissions; same-conn survives 90s listener drop and finishes; lost frames unrecoverable; teardown answers execute nothing.
 - [x] T10 P5: cancel works from any conn (54-79ms, leaks orphan shell descendants); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, export works before load.
 - [x] T11 P6: Message IDs and toolCallIds completely stable (block id = messageId); replayTail:1 covers last turn; goose ~0.5-1.7 MB/session RSS, 0 child procs; honkd TTL 15m, max 16 conns.
-- [ ] T12 hydra (optional)  - [ ] T13 findings + M1 plan + goose-patch plan
+- [x] T12 hydra (optional): skipped (isolation cost not worth it given P2-P6 settled the design)
+- [ ] T13 findings + M1 plan + goose-patch plan: steps 1-3 done (findings summary, amendments, design revisions); M1 plan + goose patch plan pending
 
 ## Carry-forward from reviews
 - Wire learnings: modes `auto|approve|smart_approve|chat` (default auto); `configOptions` array with `options:[{name,value}]`, `currentValue`; cheap model `claude-haiku-4-5@20251001` via `session/set_config_option {configId:"model"}`; run start/end visible as `session_info_update` `_meta.goose.activeRunId` set/null; prompt reply has `stopReason` + usage.
