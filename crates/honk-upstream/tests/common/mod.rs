@@ -17,7 +17,10 @@ pub struct TestSession {
     pub temp_dir: tempfile::TempDir,
 }
 
-pub async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSession>> {
+pub async fn setup_session_with_mode(
+    probe_name: &str,
+    mode: &str,
+) -> anyhow::Result<Option<TestSession>> {
     let secret = match std::env::var("HONK_GOOSE_SECRET") {
         Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
@@ -81,7 +84,7 @@ pub async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSessio
             "session/set_mode",
             json!({
                 "sessionId": &sid,
-                "modeId": "auto"
+                "modeId": mode
             }),
             Some(&sid),
             Duration::from_secs(30),
@@ -111,6 +114,14 @@ pub async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSessio
         fixture_path,
         temp_dir,
     }))
+}
+
+pub async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSession>> {
+    setup_session_with_mode(probe_name, "auto").await
+}
+
+pub async fn setup_approve_session(probe_name: &str) -> anyhow::Result<Option<TestSession>> {
+    setup_session_with_mode(probe_name, "approve").await
 }
 
 pub async fn export_session(upstream: &mut Upstream, sid: &str) -> anyhow::Result<Value> {

@@ -269,7 +269,119 @@ follow-ups (patch, config, or recipe), not as failures.
   - Fixtures: `fixtures/goose-1.54.0-patched.2/p3c/1791678776.jsonl` & `p3c_b/1791678785.jsonl`
 
 ## P4: Pending permission with no listener
-_pending_
+
+**Question:** What happens when a tool execution requires confirmation in `approve` mode while no client is listening? Does goose hold the permission request or redeliver it upon reconnection? If dropped before delivery, does `session/load` re-send it? Can an answer be submitted after a 90s listener disconnect, and does the turn finish? After a cancel-style teardown (connection DELETE), is a persisted permission re-sent on a new connection, and does answering it execute anything (with state machine off vs on)?
+
+**Verdict:**
+1. **No redelivery over SSE:** When a connection drops while a `session/request_permission` is pending, the request frame is not redelivered over the resumed SSE stream (`redelivered: false`). Frames are at-most-once in `agent-client-protocol-http` (dequeued from internal mpsc before writing).
+2. **`session/load` does NOT re-send permission requests during active runs:** Calling `session/load` on the resumed connection does NOT re-send `session/request_permission` (`resent_on_load: false`).
+3. **Pending request survives on the same connection:** Goose's in-memory `ConnectionTo` holds the pending `SentRequest` route, and `ToolConfirmationRouter` continues awaiting confirmation indefinitely (tested across a 90-second listener drop without timing out). When the client answers the original request ID (`orig_perm_id`) on the resumed connection, goose accepts it (`respond_ok: true`), routes the answer to the waiting tool execution task, runs the tool (`P4OK` output captured in export), and completes the turn (`FINISHED`, `stopReason: end_turn`) in ~1.2–1.8 seconds post-answer!
+4. **Lost permission frame is fatal to the turn:** If the connection drops before the client reads the permission request (e.g. right as `tool_call` notification appears), the client never learns the request ID. Because neither SSE resume nor `session/load` redelivers the request, the turn is stuck awaiting confirmation until timeout or cancellation. The client cannot complete the turn.
+5. **Teardown (DELETE) cancels the run; cross-connection answering is ineffective:** When Connection A is DELETED, the active run is cancelled. On a new Connection B, `session/load` does NOT re-send any persisted permission requests (`is_resent_on_conn_b: false`), regardless of whether the state machine was enabled on the prompt (`_meta: { goose: { unrolledAgentLoop: true } }`) or disabled (`_meta: { goose: { unrolledAgentLoop: false } }`). If Connection B sends a `respond` to the old permission ID, the HTTP server returns 202 Accepted, but goose executes nothing (`tool_ran: false`, `activity_events: 0`, `turn_finished: false`).
+6. **Elicitation forms (P4d):** Marked untested per spike plan §P4.4 (sandbox only carries the developer extension; no eliciting MCP is installed).
+
+**Decision-rule outcomes:**
+1. **Redelivery works:** FALSE. Goose does NOT redeliver pending request frames on SSE stream re-attachment.
+2. **`session/load` re-sends:** FALSE. Mid-run `session/load` does not re-send pending tool permissions in the running agent.
+3. **Implication for honkd:** Because neither redelivery nor `session/load` re-sends the request frame, **honkd must never lose or drop its internal permission request handle while waiting for user interaction**. If honkd itself drops the frame or crashes before recording the request ID, the request is permanently lost; honkd must surface "request lost; cancel and re-prompt" to viewers rather than waiting indefinitely. However, if honkd holds the request ID in memory/state, it CAN safely buffer and hold pending requests while no TUI/viewer is attached, re-attach to the same connection, and submit the decision even after long delays (90s+).
+4. **An answer after reload/teardown executes nothing:** Confirmed. Submitting an answer on a new connection after teardown returns HTTP 202 but triggers no execution. Honkd must surface "request is stale, re-prompt" to viewers rather than presenting an answerable dialog for torn-down runs.
+
+**Source References:**
+- `goose-patched/crates/goose/src/acp/server.rs`:
+  - `handle_tool_permission_request` (lines 1570–1635): Sends `RequestPermissionRequest` with options `[AllowAlways, AllowOnce, RejectOnce, RejectAlways]`, registers callback via `cx.send_request(...).on_receiving_result(...)`, which delivers result to `agent.submit_tool_confirmation`.
+  - Lines 2324–2339 & 422–427: `use_state_machine_from_meta` checks `_meta.goose.unrolledAgentLoop`, falling back to `crate::agents::state_machine::enabled()` (`GOOSE_STATE_MACHINE` env var).
+- `goose-patched/crates/goose/src/acp/server/load_session.rs`:
+  - Lines 455–482: `handle_load_session` checks `crate::agents::state_machine::enabled()` (which only checks env var `GOOSE_STATE_MACHINE`, not prompt `_meta`). When disabled, calls `resend_pending_tool_permissions`, which inspects `session.conversation` for `ActionRequiredData::ToolConfirmation`. In a cancelled/torn down turn, uncommitted action items are not persisted, so no confirmations are re-sent.
+- `goose-patched/crates/goose/src/agents/tool_confirmation_router.rs`:
+  - Lines 8–52: `ToolConfirmationRouter` uses in-memory `tokio::sync::oneshot` channels keyed by `(session_id, request_id)`. Pending oneshots survive connection drops as long as the agent task remains alive.
+- `/tmp/opencode/acphttp/agent-client-protocol-http-2.2.0/src/`:
+  - `http_server.rs:370-396`: SSE receiver pulls frames from an internal mpsc channel. Once dequeued, frames are not preserved for new stream subscribers.
+  - `connection.rs:307-355`: `pending_routes` maps request IDs to response routes within the same connection.
+- `/tmp/opencode/acp-schema/agent-client-protocol-schema-1.9.1/src/v1/client.rs`:
+  - Lines 1111–1178: `RequestPermissionResponse` expects `{"outcome": {"outcome": "selected", "optionId": "allow_once"}}`.
+
+**Probe results:**
+
+### P4a: No listener (90s drop while permission pending, reattach same connection)
+- **Run 1:**
+  - Session: `20261011_29` | Connection: `4cca73c1-7a78-43f4-8691-e5af42af88c9`
+  - Original permission request ID: `dba7dcad-e605-48b2-9018-b01090c04141`
+  - Options offered: `["allow_always", "allow_once", "reject_once", "reject_always"]`
+  - Drop elapsed: 90.00s | Redelivered on stream: `false` | Re-sent on load: `false`
+  - Answering original ID: `respond_ok: true`
+  - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
+  - Tool output in export: `true` (`P4OK` found in shell `toolResponse`)
+  - Post-answer duration: 1.81s | Total duration: 102.66s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4a/1791680707.jsonl`
+- **Run 2:**
+  - Session: `20261011_30` | Connection: `0b8fd744-f604-4960-a1fd-cbe57ae072bb`
+  - Original permission request ID: `4b3c915f-9ee7-4673-b1e6-a0dd38caed5b`
+  - Options offered: `["allow_always", "allow_once", "reject_once", "reject_always"]`
+  - Drop elapsed: 90.00s | Redelivered on stream: `false` | Re-sent on load: `false`
+  - Answering original ID: `respond_ok: true`
+  - Prompt reply received: `true` | Run-end received: `true` | `FINISHED` present: `true`
+  - Tool output in export: `true` (`P4OK` found in shell `toolResponse`)
+  - Post-answer duration: 1.18s | Total duration: 102.09s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4a/1791680818.jsonl`
+
+### P4b: Lost-permission frame (drop on tool_call before permission frame read)
+- **Run 1:**
+  - Session: `20261011_23` | Connection: `65b70671-3984-44b9-825d-ba1214576b1e`
+  - Permission read before drop: `false`
+  - Permission delivered on resumed stream: `null` (`false`)
+  - `session/load` success: `true` | Permission re-sent after load: `false`
+  - No permission ID available to answer: turn parked awaiting confirmation
+  - Tool ran: `false` | Turn finished: `false` | Total duration: 73.95s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4b/1791680408.jsonl`
+- **Run 2:**
+  - Session: `20261011_24` | Connection: `3afebeeb-a242-4728-87f5-7cb04a52fbb6`
+  - Permission read before drop: `false`
+  - Permission delivered on resumed stream: `null` (`false`)
+  - `session/load` success: `true` | Permission re-sent after load: `false`
+  - No permission ID available to answer: turn parked awaiting confirmation
+  - Tool ran: `false` | Turn finished: `false` | Total duration: 73.64s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4b/1791680518.jsonl`
+
+### P4c: Teardown (DELETE connection, new connection, session/load)
+- **Run 1 (State machine OFF):**
+  - Session: `20261011_25` | Conn A: `1716539c-83f1-40eb-892a-aa2986c2ef2e` | Conn B: `354e3fe9-17d7-4569-a6be-bb1136a0b3d7`
+  - Conn A permission ID: `288b7a65-5d8d-4c20-84f8-b0b711a36a5f`
+  - Conn A DELETED (cancelling run)
+  - Conn B `session/load`: `true` | Persisted permission re-sent on Conn B: `false`
+  - Respond to Conn A ID on Conn B: HTTP 202 (`true`)
+  - Conn B activity events: 0 | Tool executed: `false` | Turn finished: `false`
+  - Total duration: 22.07s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4c_sm_off/1791680599.jsonl`
+- **Run 2 (State machine OFF):**
+  - Session: `20261011_26` | Conn A: `81c86f22-f828-47c4-9f97-59761ac75899` | Conn B: `44fbe62f-2764-42b6-9728-7db9f7a68431`
+  - Conn A permission ID: `dad7b304-d8eb-47ba-8cd9-df8f019f5b77`
+  - Conn A DELETED (cancelling run)
+  - Conn B `session/load`: `true` | Persisted permission re-sent on Conn B: `false`
+  - Respond to Conn A ID on Conn B: HTTP 202 (`true`)
+  - Conn B activity events: 0 | Tool executed: `false` | Turn finished: `false`
+  - Total duration: 20.90s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4c_sm_off/1791680626.jsonl`
+- **Run 3 (State machine ON via `_meta.goose.unrolledAgentLoop: true`):**
+  - Session: `20261011_27` | Conn A: `24a8d5a3-2930-4ebc-9459-e18535345cbd` | Conn B: `d6aa0e26-2dfa-4616-be33-ee6153e6e483`
+  - Conn A permission ID: `b5b0a22b-bd02-4539-9b4f-6a3601556902`
+  - Conn A DELETED (cancelling run)
+  - Conn B `session/load`: `true` | Persisted permission re-sent on Conn B: `false`
+  - Respond to Conn A ID on Conn B: HTTP 202 (`true`)
+  - Conn B activity events: 0 | Tool executed: `false` | Turn finished: `false`
+  - Total duration: 20.95s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4c_sm_on/1791680651.jsonl`
+- **Run 4 (State machine ON via `_meta.goose.unrolledAgentLoop: true`):**
+  - Session: `20261011_28` | Conn A: `761c824c-e15e-4c87-81ef-322e2d2e0997` | Conn B: `85aefb73-a086-4784-ba40-6c4d3a8e66cc`
+  - Conn A permission ID: `119856dc-6fdc-4502-bf69-b986e539f9e2`
+  - Conn A DELETED (cancelling run)
+  - Conn B `session/load`: `true` | Persisted permission re-sent on Conn B: `false`
+  - Respond to Conn A ID on Conn B: HTTP 202 (`true`)
+  - Conn B activity events: 0 | Tool executed: `false` | Turn finished: `false`
+  - Total duration: 21.67s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p4c_sm_on/1791680681.jsonl`
+
+### P4d: Elicitation forms
+- Marked untested per spike plan §P4.4: Sandbox carries only the developer extension (no eliciting MCP server installed).
 
 ## P5: Cancel, steer, restart
 _pending_
