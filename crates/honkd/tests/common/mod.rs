@@ -2,7 +2,7 @@
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +25,15 @@ pub struct Honkd {
 
 impl Honkd {
     pub async fn spawn(upstream: &str, upstream_secret: &Path, extra: &[&str]) -> Self {
+        Self::spawn_with_env(upstream, upstream_secret, extra, &[]).await
+    }
+
+    pub async fn spawn_with_env(
+        upstream: &str,
+        upstream_secret: &Path,
+        extra: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let state_dir = tempfile::tempdir().expect("create temp dir");
         let (child, addr, stderr_buf) = spawn_process(
             None, // listen on 127.0.0.1:0
@@ -32,6 +41,7 @@ impl Honkd {
             upstream_secret,
             state_dir.path(),
             extra,
+            env,
         )
         .await;
 
@@ -73,6 +83,10 @@ impl Honkd {
     }
 
     pub async fn restart(&mut self) {
+        self.restart_with_env(&[]).await;
+    }
+
+    pub async fn restart_with_env(&mut self, env: &[(&str, &str)]) {
         self.kill9();
 
         let bind_start = Instant::now();
@@ -98,6 +112,7 @@ impl Honkd {
             &self.upstream_secret,
             self.state_dir.path(),
             &extra_refs,
+            env,
         )
         .await;
 
@@ -162,8 +177,12 @@ async fn spawn_process(
     upstream_secret: &Path,
     state_dir: &Path,
     extra: &[&str],
+    env: &[(&str, &str)],
 ) -> (Child, SocketAddr, Arc<Mutex<String>>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_honkd"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let mut has_listen = false;
     for arg in extra {
         if *arg == "--listen" || arg.starts_with("--listen=") {
@@ -196,15 +215,11 @@ async fn spawn_process(
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let stderr_clone = stderr_buf.clone();
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut buf = String::new();
-        while let Ok(n) = reader.read_to_string(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        let reader = BufReader::new(stderr);
+        for l in reader.lines().map_while(Result::ok) {
             if let Ok(mut lock) = stderr_clone.lock() {
-                lock.push_str(&buf);
-                buf.clear();
+                lock.push_str(&l);
+                lock.push('\n');
             }
         }
     });
@@ -480,4 +495,44 @@ impl Viewer {
             self.accumulated_agent_text.clone()
         }
     }
+}
+
+pub fn prompt_params(sid: &str, text: &str, client_req_id: Option<&str>) -> Value {
+    let mut p = json!({
+        "sessionId": sid,
+        "prompt": [{
+            "type": "text",
+            "text": text,
+        }]
+    });
+    if let Some(crid) = client_req_id {
+        p["_meta"] = json!({
+            "honk": {
+                "client_req_id": crid
+            }
+        });
+    }
+    p
+}
+
+pub async fn new_session(v: &mut Viewer, cwd: &str) -> String {
+    let res = v
+        .call(
+            "session/new",
+            json!({
+                "cwd": cwd,
+                "mcpServers": [],
+                "_meta": {
+                    "enabledExtensions": [{
+                        "type": "platform",
+                        "name": "developer"
+                    }]
+                }
+            }),
+        )
+        .await;
+    res["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId string")
+        .to_string()
 }

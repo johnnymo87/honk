@@ -293,6 +293,22 @@ impl FakeGoose {
         *self.state.keepalive_interval.lock().unwrap() = interval;
     }
 
+    pub fn kick_stream(&self, sid: &str) {
+        let mut conns = self.state.connections.lock().unwrap();
+        for conn in conns.values_mut() {
+            if let Some(stream) = conn.sessions.get_mut(sid) {
+                if let Some(evict) = stream.evict_tx.take() {
+                    let _ = evict.send(());
+                }
+                stream.sender = None;
+            }
+            if let Some(evict) = conn.conn_stream.evict_tx.take() {
+                let _ = evict.send(());
+            }
+            conn.conn_stream.sender = None;
+        }
+    }
+
     pub async fn restart(&mut self) {
         self.state.connections.lock().unwrap().clear();
     }

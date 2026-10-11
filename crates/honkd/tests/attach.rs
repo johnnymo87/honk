@@ -409,8 +409,8 @@ async fn log_file_holds_every_frame_with_event_id() {
 
     assert_eq!(
         lines.len(),
-        6,
-        "exact line count: header + 4 frames + 1 processed response"
+        10,
+        "exact line count: header + 8 frames + 1 processed response"
     );
     // Line 0 is header
     let header: Value = serde_json::from_str(lines[0]).expect("parse header");

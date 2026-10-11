@@ -1,7 +1,8 @@
-use honk_upstream::{Event, EventRx, StreamKey, UpstreamHandle};
+use honk_upstream::{Event, EventRx, ReplayOutcome, StreamKey, SubscribeOpts, UpstreamHandle};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -77,6 +78,18 @@ pub enum SessionMsg {
         params: Value,
     },
     // from spawned recovery / helper tasks (I1)
+    Reattached {
+        outcome: honk_upstream::SubscribeOutcome,
+    },
+    ReattachFailed {
+        gone: bool,
+        error: String,
+    },
+    Rebuilt {
+        frames: Vec<Value>,
+        keys: std::collections::HashSet<honk_wire::BlockKey>,
+        resume_from: Option<u64>,
+    },
     ReplyText {
         owners: Vec<OwnerRef>,
         body: Reply,
@@ -102,12 +115,40 @@ pub struct Session {
     pub viewers: HashMap<ViewerId, (ViewerTx, bool)>,
     pub pending_requests: HashMap<String, PendingSessionRequest>,
     pub init_result: Value,
+    pub queued_msgs: VecDeque<SessionMsg>,
+    pub rebuilding_buffered_frames: Vec<(Option<u64>, Value)>,
+    pub rebuild_at_turn_end: bool,
+    pub suppressed_keys: HashSet<honk_wire::BlockKey>,
+    pub gap_evidenced: bool,
+    pub start_reattach: bool,
+    pub needs_rebuild: bool,
+    pub inflight_needs_delivery_check: bool,
 }
 
 impl Session {
     pub async fn run(mut self) {
         let mut watchdog = tokio::time::interval(Duration::from_secs(5));
         let mut idle = tokio::time::interval(Duration::from_secs(60));
+
+        if self.start_reattach {
+            self.start_reattach = false;
+            // Check if sidecar has reply for inflight
+            if let Some(inf) = self.turn.inflight.as_ref() {
+                let sidecar_path = self
+                    .state_dir
+                    .join("sessions")
+                    .join(format!("{}.replies.jsonl", self.sid));
+                let replies = load_reply_sidecar(&sidecar_path);
+                if let Some(reply) = replies.get(&inf.upstream_id) {
+                    let upstream_id = inf.upstream_id.clone();
+                    let actions = self
+                        .turn
+                        .on_prompt_reply(&upstream_id, reply, &mut self.ids);
+                    self.execute_actions(actions).await;
+                }
+            }
+            self.trigger_reattach().await;
+        }
 
         loop {
             tokio::select! {
@@ -123,7 +164,7 @@ impl Session {
                     None => break,
                 },
                 _ = watchdog.tick() => {
-                    self.check_streams();
+                    self.check_streams().await;
                 }
                 _ = idle.tick() => {
                     self.on_idle();
@@ -133,8 +174,335 @@ impl Session {
         self.return_undelivered_to_hub().await;
     }
 
-    fn check_streams(&mut self) {
-        // Stub for I3 watchdog in A12
+    async fn check_streams(&mut self) {
+        if self.state != ActorState::Live {
+            return;
+        }
+        let dead_secs = Duration::from_secs(self.hub.args.stream_dead_secs);
+        let now = std::time::Instant::now();
+
+        let session_key = StreamKey::Session(self.sid.clone());
+        let conn_key = StreamKey::Conn;
+
+        let session_dead = self
+            .up
+            .last_byte_at(&session_key)
+            .map(|t| now.duration_since(t) > dead_secs)
+            .unwrap_or(false);
+        let conn_dead = self
+            .up
+            .last_byte_at(&conn_key)
+            .map(|t| now.duration_since(t) > dead_secs)
+            .unwrap_or(false);
+
+        if session_dead || conn_dead {
+            tracing::warn!(
+                "Session {} watchdog detected dead/half-open stream (session_dead={}, conn_dead={}); reattaching",
+                self.sid,
+                session_dead,
+                conn_dead
+            );
+            self.trigger_reattach().await;
+        }
+    }
+
+    async fn trigger_reattach(&mut self) {
+        if self.state == ActorState::Gone || self.state == ActorState::Reattaching {
+            return;
+        }
+        self.state = ActorState::Reattaching;
+
+        let session_resume = Some(self.log.last_upstream_id().unwrap_or(0));
+        let conn_resume = Some(self.last_processed_conn_id.unwrap_or(0));
+        let is_patched = self
+            .up
+            .stream_features()
+            .map(|f| f.is_patched())
+            .unwrap_or(false);
+
+        if is_patched {
+            let session_res = self
+                .up
+                .subscribe_with(
+                    Some(&self.sid),
+                    SubscribeOpts {
+                        takeover: true,
+                        resume_after: session_resume,
+                    },
+                )
+                .await;
+
+            let outcome = match session_res {
+                Ok(out) => out,
+                Err(e) => {
+                    let gone = honk_upstream::is_gone(&e);
+                    self.on_reattach_failed(gone, e.to_string()).await;
+                    return;
+                }
+            };
+
+            let _ = self
+                .up
+                .subscribe_with(
+                    None,
+                    SubscribeOpts {
+                        takeover: true,
+                        resume_after: conn_resume,
+                    },
+                )
+                .await;
+
+            self.on_reattached(outcome).await;
+        } else {
+            let up = self.up.clone();
+            let sid = self.sid.clone();
+            let self_tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                let session_res = up
+                    .subscribe_with(
+                        Some(&sid),
+                        SubscribeOpts {
+                            takeover: true,
+                            resume_after: session_resume,
+                        },
+                    )
+                    .await;
+
+                let outcome = match session_res {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let gone = honk_upstream::is_gone(&e);
+                        let _ = self_tx
+                            .send(SessionMsg::ReattachFailed {
+                                gone,
+                                error: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                let _ = up
+                    .subscribe_with(
+                        None,
+                        SubscribeOpts {
+                            takeover: true,
+                            resume_after: conn_resume,
+                        },
+                    )
+                    .await;
+
+                let _ = self_tx.send(SessionMsg::Reattached { outcome }).await;
+            });
+        }
+    }
+
+    async fn on_reattached(&mut self, outcome: honk_upstream::SubscribeOutcome) {
+        if std::mem::take(&mut self.inflight_needs_delivery_check) {
+            self.check_restored_inflight_delivery().await;
+        }
+
+        if self.needs_rebuild {
+            self.needs_rebuild = false;
+            self.start_rebuild().await;
+            return;
+        }
+
+        match outcome.replay {
+            ReplayOutcome::Complete => {
+                self.state = ActorState::Live;
+                self.drain_queued_msgs().await;
+            }
+            ReplayOutcome::Gap | ReplayOutcome::Unsupported => {
+                self.gap_evidenced = true;
+                if self.turn.run.is_some() {
+                    self.state = ActorState::Live;
+                    let gap_marker = json!({
+                        "jsonrpc": "2.0",
+                        "method": "_honk/gap",
+                        "params": {
+                            "sessionId": self.sid,
+                        }
+                    });
+                    self.fan_out_stamped(&gap_marker, true);
+                    self.rebuild_at_turn_end = true;
+                    self.drain_queued_msgs().await;
+                } else {
+                    self.start_rebuild().await;
+                }
+            }
+            ReplayOutcome::NotRequested => {
+                self.state = ActorState::Live;
+                self.drain_queued_msgs().await;
+            }
+        }
+    }
+
+    async fn on_reattach_failed(&mut self, gone: bool, error: String) {
+        tracing::error!(
+            "Session {} reattach failed: gone={gone}, err={error}",
+            self.sid
+        );
+        if gone {
+            self.state = ActorState::Gone;
+        } else {
+            self.state = ActorState::Live;
+        }
+    }
+
+    async fn check_restored_inflight_delivery(&mut self) {
+        let Some(inf) = self.turn.inflight.as_ref() else {
+            return;
+        };
+        let user_text = crate::rpc::extract_user_text(&inf.params);
+        match self.hub.export(&self.sid).await {
+            Ok(export_val) => {
+                if !export_has_user_text(&export_val, &user_text) {
+                    let actions = self.turn.interrupt("not_delivered");
+                    self.execute_actions(actions).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to export session {} for inflight check: {e:#}",
+                    self.sid
+                );
+            }
+        }
+    }
+
+    async fn start_rebuild(&mut self) {
+        if self.state == ActorState::Gone || self.state == ActorState::Rebuilding {
+            return;
+        }
+        self.state = ActorState::Rebuilding;
+        self.rebuilding_buffered_frames.clear();
+
+        let hub = self.hub.clone();
+        let sid = self.sid.clone();
+        let self_tx = self.self_tx.clone();
+        let resume_from = self.last_processed_session_id;
+
+        tokio::spawn(async move {
+            match hub.export(&sid).await {
+                Ok(export_val) => {
+                    let frames = honk_wire::export::to_updates(&export_val, &sid);
+                    let mut keys = HashSet::new();
+                    for f in &frames {
+                        if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key)
+                        {
+                            keys.insert(k);
+                        }
+                    }
+                    let _ = self_tx
+                        .send(SessionMsg::Rebuilt {
+                            frames,
+                            keys,
+                            resume_from,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("rebuild export failed for {sid}: {e:#}");
+                }
+            }
+        });
+    }
+
+    async fn on_rebuilt(
+        &mut self,
+        frames: Vec<Value>,
+        keys: HashSet<honk_wire::BlockKey>,
+        resume_from: Option<u64>,
+    ) {
+        let sid = self.sid.clone();
+        let current_epoch = self.log.epoch();
+        let mut next_epoch = current_epoch + 1;
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                if let Some(h) = st.sessions.get_mut(&sid) {
+                    next_epoch = h.epoch.max(current_epoch) + 1;
+                    h.epoch = next_epoch;
+                } else if let Some(ret) = st.retired_epochs.get(&sid) {
+                    next_epoch = ret.max(&current_epoch) + 1;
+                }
+            });
+        }
+
+        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
+        let mut combined: Vec<(Option<u64>, Value)> = Vec::new();
+        for f in frames {
+            combined.push((None, f));
+        }
+        for (id_opt, f) in std::mem::take(&mut self.rebuilding_buffered_frames) {
+            let key = f.pointer("/params/update").and_then(honk_wire::block_key);
+            if let Some(k) = key
+                && keys.contains(&k)
+            {
+                continue;
+            }
+            combined.push((id_opt, f));
+        }
+
+        match crate::log::SessionLog::create(&log_path, next_epoch, resume_from, combined) {
+            Ok(new_log) => {
+                self.log = new_log;
+                let head = self.log.head();
+                self.last_processed_session_id = self.log.last_upstream_id();
+                self.gap_evidenced = false;
+
+                let reset_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/reset",
+                    "params": {
+                        "sessionId": self.sid,
+                        "epoch": head.epoch,
+                    }
+                });
+                let replay_done_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": {
+                        "sessionId": self.sid,
+                        "epoch": head.epoch,
+                        "seq": head.seq,
+                    }
+                });
+
+                let honk_aware_vids: Vec<ViewerId> = self
+                    .viewers
+                    .iter()
+                    .filter_map(|(vid, (_, is_honk))| if *is_honk { Some(*vid) } else { None })
+                    .collect();
+
+                let log_frames: Vec<Value> =
+                    self.log.entries().iter().map(|e| e.frame.clone()).collect();
+
+                for vid in honk_aware_vids {
+                    self.send_to_viewer(vid, reset_frame.clone());
+                    for frame in &log_frames {
+                        self.send_to_viewer(vid, frame.clone());
+                    }
+                    self.send_to_viewer(vid, replay_done_frame.clone());
+                }
+
+                self.suppressed_keys = keys;
+            }
+            Err(e) => {
+                tracing::error!("failed to create session log during rebuild of {sid}: {e:#}");
+            }
+        }
+
+        self.state = ActorState::Live;
+        self.drain_queued_msgs().await;
+    }
+
+    async fn drain_queued_msgs(&mut self) {
+        let msgs = std::mem::take(&mut self.queued_msgs);
+        for m in msgs {
+            Box::pin(self.on_msg(m)).await;
+        }
     }
 
     fn on_idle(&mut self) {
@@ -175,10 +543,30 @@ impl Session {
         }
     }
 
+    fn fan_out_legacy(&mut self, frame: &Value) {
+        let legacy_vids: Vec<ViewerId> = self
+            .viewers
+            .iter()
+            .filter_map(|(vid, (_, is_honk))| if !*is_honk { Some(*vid) } else { None })
+            .collect();
+        for vid in legacy_vids {
+            self.send_to_viewer(vid, frame.clone());
+        }
+    }
+
     async fn on_upstream(&mut self, ev: Event) {
         let (key, frame, id_opt) = match ev {
             Event::Frame(key, frame, id_opt) => (key, frame, id_opt),
-            _ => return,
+            Event::StreamEnded { key, error } => {
+                tracing::warn!(
+                    "Session {} stream ended: key={key:?}, error={error:?}",
+                    self.sid
+                );
+                if self.state == ActorState::Live {
+                    self.trigger_reattach().await;
+                }
+                return;
+            }
         };
 
         // 1. Dedupe
@@ -205,6 +593,61 @@ impl Session {
         let is_session_stream = matches!(&key, StreamKey::Session(_));
         let kind = crate::rpc::kind(&frame);
 
+        let block_k = if is_session_stream {
+            frame
+                .pointer("/params/update")
+                .and_then(honk_wire::block_key)
+        } else {
+            None
+        };
+        let is_suppressed = block_k
+            .as_ref()
+            .is_some_and(|k| self.suppressed_keys.contains(k));
+
+        if self.state == ActorState::Rebuilding {
+            if is_session_stream {
+                if kind == crate::rpc::Kind::Notification {
+                    if let Some(update) = frame.pointer("/params/update") {
+                        if update.get("sessionUpdate").and_then(Value::as_str)
+                            == Some("user_message_chunk")
+                            && let Some(msg_id) = update
+                                .get("messageId")
+                                .or_else(|| update.pointer("/_meta/goose/messageId"))
+                                .and_then(Value::as_str)
+                        {
+                            self.turn.on_user_message(msg_id);
+                        }
+
+                        if let Some(run_opt) = honk_wire::run_state(update) {
+                            let actions = self.turn.on_run_state(run_opt, &mut self.ids);
+                            self.execute_actions(actions).await;
+                        }
+                    }
+
+                    let mut legacy_frame = frame.clone();
+                    crate::rpc::strip_honk_meta(&mut legacy_frame);
+                    self.fan_out_legacy(&legacy_frame);
+
+                    self.rebuilding_buffered_frames.push((id_opt, frame));
+                } else if let Some(id) = id_opt {
+                    let _ = self.log.mark_processed(id);
+                }
+                if let Some(id) = id_opt {
+                    self.last_processed_session_id = Some(id);
+                }
+            } else if let Some(id) = id_opt {
+                self.last_processed_conn_id = Some(id);
+                let sid = self.sid.clone();
+                let mut s = self.state_store.lock().await;
+                let _ = s.mutate(|st| {
+                    if let Some(h) = st.sessions.get_mut(&sid) {
+                        h.last_conn_event_id = Some(id);
+                    }
+                });
+            }
+            return;
+        }
+
         if is_session_stream {
             if let Some(update) = frame.pointer("/params/update") {
                 // If user_message_chunk, notify turn core of live user message
@@ -218,8 +661,40 @@ impl Session {
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
-                    let actions = self.turn.on_run_state(run_opt, &mut self.ids);
+                    let actions = self.turn.on_run_state(run_opt.clone(), &mut self.ids);
                     self.execute_actions(actions).await;
+
+                    if run_opt.is_none() {
+                        self.suppressed_keys.clear();
+
+                        if self.gap_evidenced && self.turn.inflight.is_some() {
+                            let upstream_id =
+                                self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                            let synth_reply = json!({
+                                "jsonrpc": "2.0",
+                                "id": upstream_id,
+                                "result": {
+                                    "stopReason": "end_turn",
+                                    "_meta": {
+                                        "honk": {
+                                            "synthesized": true
+                                        }
+                                    }
+                                }
+                            });
+                            let reply_actions = self.turn.on_prompt_reply(
+                                &upstream_id,
+                                &synth_reply,
+                                &mut self.ids,
+                            );
+                            self.execute_actions(reply_actions).await;
+                        }
+
+                        if self.rebuild_at_turn_end {
+                            self.rebuild_at_turn_end = false;
+                            self.start_rebuild().await;
+                        }
+                    }
                 }
             } else if kind == crate::rpc::Kind::Response {
                 // Check if this is a response to pending steer or forward
@@ -259,6 +734,12 @@ impl Session {
 
                     if is_inflight_reply {
                         let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                        let sidecar_path = self
+                            .state_dir
+                            .join("sessions")
+                            .join(format!("{}.replies.jsonl", self.sid));
+                        let _ = append_reply_sidecar(&sidecar_path, &upstream_id, &frame);
+
                         let actions =
                             self.turn
                                 .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
@@ -281,15 +762,24 @@ impl Session {
         // 3. Record & 4. Fan out stamped frame
         if is_session_stream {
             if kind == crate::rpc::Kind::Notification {
-                let stamped = match self.log.append(vec![(id_opt, frame)]) {
-                    Ok(entries) => entries.last().map(|e| e.frame.clone()),
-                    Err(e) => {
-                        tracing::error!("failed to append frame to session log: {e:#}");
-                        None
+                if is_suppressed {
+                    if let Some(id) = id_opt {
+                        let _ = self.log.mark_processed(id);
                     }
-                };
-                if let Some(frame) = stamped {
-                    self.fan_out_stamped(&frame, false);
+                    let mut legacy_frame = frame.clone();
+                    crate::rpc::strip_honk_meta(&mut legacy_frame);
+                    self.fan_out_legacy(&legacy_frame);
+                } else {
+                    let stamped = match self.log.append(vec![(id_opt, frame)]) {
+                        Ok(entries) => entries.last().map(|e| e.frame.clone()),
+                        Err(e) => {
+                            tracing::error!("failed to append frame to session log: {e:#}");
+                            None
+                        }
+                    };
+                    if let Some(frame) = stamped {
+                        self.fan_out_stamped(&frame, false);
+                    }
                 }
             } else if let Some(id) = id_opt {
                 let _ = self.log.mark_processed(id);
@@ -340,6 +830,11 @@ impl Session {
                         });
                     }
 
+                    #[cfg(any(test, debug_assertions))]
+                    if std::env::var("HONKD_TEST_CRASH_BEFORE_POST").as_deref() == Ok("1") {
+                        std::process::abort();
+                    }
+
                     let mut clean_params = params;
                     crate::rpc::strip_honk_meta(&mut clean_params);
 
@@ -354,6 +849,10 @@ impl Session {
                         )
                         .await
                     {
+                        if honk_upstream::is_gone(&e) {
+                            self.state = ActorState::Gone;
+                        }
+
                         // Prompt POST failed -> remove failed prompt's ledger entries AND clear inflight in one mutate
                         let failed_inf = self.turn.inflight.as_ref().map(|i| i.to_persisted());
                         {
@@ -450,32 +949,37 @@ impl Session {
                         }
                     }
                     Reply::Result(result_val) => {
-                        let hub = self.hub.clone();
-                        let sid = self.sid.clone();
-                        let self_tx = self.self_tx.clone();
-                        tokio::spawn(async move {
-                            let export_res = hub.export(&sid).await;
-                            let text = match export_res {
-                                Ok(exp) => {
-                                    let u_text = user_text.as_deref().unwrap_or("");
-                                    let t = honk_wire::export::turn_text(&exp, u_text);
-                                    if t.is_empty() { None } else { Some(t) }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "failed to export session {sid} for turn_text: {e:#}"
-                                    );
-                                    None
-                                }
-                            };
-                            let _ = self_tx
-                                .send(SessionMsg::ReplyText {
-                                    owners,
-                                    body: Reply::Result(result_val),
-                                    text,
-                                })
+                        if user_text.is_none() {
+                            self.handle_reply_text(owners, Reply::Result(result_val), None)
                                 .await;
-                        });
+                        } else {
+                            let hub = self.hub.clone();
+                            let sid = self.sid.clone();
+                            let self_tx = self.self_tx.clone();
+                            tokio::spawn(async move {
+                                let export_res = hub.export(&sid).await;
+                                let text = match export_res {
+                                    Ok(exp) => {
+                                        let u_text = user_text.as_deref().unwrap_or("");
+                                        let t = honk_wire::export::turn_text(&exp, u_text);
+                                        if t.is_empty() { None } else { Some(t) }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "failed to export session {sid} for turn_text: {e:#}"
+                                        );
+                                        None
+                                    }
+                                };
+                                let _ = self_tx
+                                    .send(SessionMsg::ReplyText {
+                                        owners,
+                                        body: Reply::Result(result_val),
+                                        text,
+                                    })
+                                    .await;
+                            });
+                        }
                     }
                 },
                 Action::NotifySteerUnconsumed { viewer, message_id } => {
@@ -546,21 +1050,67 @@ impl Session {
                 if !self.viewers.contains_key(&viewer_id) {
                     self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
                 }
+                if self.state == ActorState::Reattaching {
+                    self.queued_msgs.push_back(SessionMsg::Prompt {
+                        viewer_id,
+                        viewer,
+                        is_honk_aware,
+                        id,
+                        params,
+                    });
+                    return;
+                }
                 let client_req_id = honk_wire::honk_meta(&params).client_req_id;
+
+                if let Some(crid) = &client_req_id {
+                    let cached_resp = {
+                        let s = self.state_store.lock().await;
+                        if let Some(crate::state::LedgerEntry::Done { response, .. }) =
+                            s.ledger.get(crid)
+                        {
+                            let mut resp = response.clone();
+                            resp["id"] = id.clone();
+                            Some(resp)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(resp) = cached_resp {
+                        self.send_to_viewer(viewer_id, resp);
+                        return;
+                    }
+                }
+
                 let owner = OwnerRef {
                     viewer: Some(viewer_id),
                     downstream_id: id,
-                    client_req_id,
+                    client_req_id: client_req_id.clone(),
                 };
+
+                if let Some(crid) = &client_req_id
+                    && self.turn.attach_waiter(crid, owner.clone())
+                {
+                    return;
+                }
+
                 let actions = self.turn.on_prompt(owner, params, &mut self.ids);
                 self.execute_actions(actions).await;
             }
             SessionMsg::Steer {
                 viewer_id,
-                viewer: _,
+                viewer,
                 id,
                 params,
             } => {
+                if self.state == ActorState::Reattaching {
+                    self.queued_msgs.push_back(SessionMsg::Steer {
+                        viewer_id,
+                        viewer,
+                        id,
+                        params,
+                    });
+                    return;
+                }
                 let up_id = self.ids.next();
                 self.pending_requests.insert(
                     up_id.clone(),
@@ -592,23 +1142,38 @@ impl Session {
                 }
             }
             SessionMsg::Cancel => {
+                if self.state == ActorState::Reattaching {
+                    self.queued_msgs.push_back(SessionMsg::Cancel);
+                    return;
+                }
                 let actions = self.turn.on_cancel();
                 self.execute_actions(actions).await;
                 // TODO(A13/A15): answer any pending server requests with "cancelled"
             }
-            SessionMsg::Answer {
-                viewer_id: _,
-                frame: _,
-            } => {
+            SessionMsg::Answer { viewer_id, frame } => {
+                if self.state == ActorState::Reattaching {
+                    self.queued_msgs
+                        .push_back(SessionMsg::Answer { viewer_id, frame });
+                }
                 // Server request answer (A10/A13)
             }
             SessionMsg::Forward {
                 viewer_id,
-                viewer: _,
+                viewer,
                 id,
                 method,
                 params,
             } => {
+                if self.state == ActorState::Reattaching {
+                    self.queued_msgs.push_back(SessionMsg::Forward {
+                        viewer_id,
+                        viewer,
+                        id,
+                        method,
+                        params,
+                    });
+                    return;
+                }
                 let up_id = self.ids.next();
                 self.pending_requests.insert(
                     up_id.clone(),
@@ -634,73 +1199,85 @@ impl Session {
                     self.send_to_viewer(viewer_id, err_resp);
                 }
             }
+            SessionMsg::Reattached { outcome } => {
+                self.on_reattached(outcome).await;
+            }
+            SessionMsg::ReattachFailed { gone, error } => {
+                self.on_reattach_failed(gone, error).await;
+            }
+            SessionMsg::Rebuilt {
+                frames,
+                keys,
+                resume_from,
+            } => {
+                self.on_rebuilt(frames, keys, resume_from).await;
+            }
             SessionMsg::ReplyText { owners, body, text } => {
-                match body {
-                    Reply::Result(mut res) => {
-                        if let Some(t) = text {
-                            if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut)
-                            {
-                                meta.insert(
-                                    "honk".to_string(),
-                                    json!({
-                                        "text": t,
-                                    }),
-                                );
-                            } else {
-                                res["_meta"] = json!({
-                                    "honk": {
-                                        "text": t,
-                                    }
-                                });
-                            }
-                        }
+                self.handle_reply_text(owners, body, text).await;
+            }
+        }
+    }
 
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
-                        for o in &owners {
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": o.downstream_id,
-                                "result": res,
-                            });
-
-                            // Ledger: InFlight -> Done{response}
-                            if let Some(crid) = &o.client_req_id {
-                                let sid = self.sid.clone();
-                                let mut s = self.state_store.lock().await;
-                                let _ = s.mutate(|st| {
-                                    st.ledger.insert(
-                                        crid.clone(),
-                                        crate::state::LedgerEntry::Done {
-                                            session: sid,
-                                            response: resp.clone(),
-                                            done_unix: now,
-                                        },
-                                    );
-                                });
-                            }
-
-                            self.send_to_owner(o, resp);
-                        }
-                    }
-                    Reply::Error(err) => {
-                        for o in &owners {
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": o.downstream_id,
-                                "error": err,
-                            });
-                            self.send_to_owner(o, resp);
-                        }
+    async fn handle_reply_text(
+        &mut self,
+        owners: Vec<OwnerRef>,
+        body: Reply,
+        text: Option<String>,
+    ) {
+        match body {
+            Reply::Result(mut res) => {
+                if let Some(t) = text {
+                    if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
+                        meta.insert("honk".to_string(), json!({ "text": t }));
+                    } else {
+                        res["_meta"] = json!({ "honk": { "text": t } });
                     }
                 }
 
-                self.sync_inflight().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                for o in &owners {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": o.downstream_id,
+                        "result": res,
+                    });
+
+                    // Ledger: InFlight -> Done{response}
+                    if let Some(crid) = &o.client_req_id {
+                        let sid = self.sid.clone();
+                        let mut s = self.state_store.lock().await;
+                        let _ = s.mutate(|st| {
+                            st.ledger.insert(
+                                crid.clone(),
+                                crate::state::LedgerEntry::Done {
+                                    session: sid,
+                                    response: resp.clone(),
+                                    done_unix: now,
+                                },
+                            );
+                        });
+                    }
+
+                    self.send_to_owner(o, resp);
+                }
+            }
+            Reply::Error(err) => {
+                for o in &owners {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": o.downstream_id,
+                        "error": err,
+                    });
+                    self.send_to_owner(o, resp);
+                }
             }
         }
+
+        self.sync_inflight().await;
     }
 
     fn attach_live(&mut self, viewer_id: ViewerId, viewer: ViewerTx, is_honk_aware: bool) {
@@ -765,4 +1342,71 @@ impl Session {
             self.send_to_viewer(vid, frame.clone());
         }
     }
+}
+
+pub(crate) fn append_reply_sidecar(
+    path: &Path,
+    upstream_id: &str,
+    reply: &Value,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    let line = json!({
+        "upstream_id": upstream_id,
+        "reply": reply,
+    });
+    let mut s = serde_json::to_string(&line)?;
+    s.push('\n');
+    file.write_all(s.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn load_reply_sidecar(path: &Path) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in content.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line)
+            && let Some(uid) = v.get("upstream_id").and_then(Value::as_str)
+            && let Some(reply) = v.get("reply")
+        {
+            map.insert(uid.to_string(), reply.clone());
+        }
+    }
+    map
+}
+
+fn export_has_user_text(export: &Value, expected_text: &str) -> bool {
+    let Some(conversation) = export.get("conversation").and_then(Value::as_array) else {
+        return false;
+    };
+    for msg in conversation {
+        if msg.get("role").and_then(Value::as_str) == Some("user") {
+            let mut text = String::new();
+            if let Some(content) = msg.get("content").and_then(Value::as_array) {
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(t) = block.get("text").and_then(Value::as_str)
+                    {
+                        text.push_str(t);
+                    }
+                }
+            }
+            if text == expected_text {
+                return true;
+            }
+        }
+    }
+    false
 }

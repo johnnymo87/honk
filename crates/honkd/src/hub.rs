@@ -92,7 +92,7 @@ impl Hub {
         let mut control_upstream = Upstream::initialize_with(
             &upstream_url,
             upstream_secret.clone(),
-            recorder,
+            recorder.clone(),
             &upstream_opts,
         )
         .await
@@ -176,6 +176,106 @@ impl Hub {
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
+
+        let held_sessions: Vec<(String, crate::state::HeldSession)> = {
+            let s = hub.state.lock().await;
+            s.sessions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let mut session_handles = HashMap::new();
+
+        for (sid, held) in held_sessions {
+            let log_path = hub.state_dir.join("sessions").join(format!("{sid}.jsonl"));
+            let (session_log, needs_rebuild) = if log_path.exists() {
+                match crate::log::SessionLog::open(&log_path) {
+                    Ok(l) => (l, false),
+                    Err(e) => {
+                        tracing::warn!("corrupt or invalid log for {sid}, rebuilding: {e:#}");
+                        let l =
+                            crate::log::SessionLog::create(&log_path, held.epoch, None, Vec::new())
+                                .context("create new log for rebuild")?;
+                        (l, true)
+                    }
+                }
+            } else {
+                let l = crate::log::SessionLog::create(&log_path, held.epoch, None, Vec::new())
+                    .context("create missing log for rebuild")?;
+                (l, true)
+            };
+
+            let session_upstream = match Upstream::resume_with(
+                &hub.upstream_url,
+                hub.upstream_secret.clone(),
+                held.conn_id.clone(),
+                recorder.clone(),
+                &upstream_opts,
+            ) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::error!("failed to resume upstream connection for {sid}: {e:#}");
+                    continue;
+                }
+            };
+
+            let (up_handle, event_rx) = session_upstream.split();
+            let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
+
+            let last_processed_session = session_log.last_upstream_id();
+            let last_processed_conn = held.last_conn_event_id;
+
+            let mut turn = crate::turn::TurnCore::default();
+            if let Some(inf) = &held.inflight {
+                turn.inflight = Some(crate::turn::Inflight::from_persisted(inf.clone()));
+            }
+
+            let session = crate::session::Session {
+                sid: sid.clone(),
+                state_dir: hub.state_dir.clone(),
+                state_store: hub.state.clone(),
+                hub: hub.arc(),
+                up: up_handle,
+                events: event_rx,
+                rx: session_rx,
+                self_tx: session_tx.clone(),
+                log: session_log,
+                turn,
+                state: crate::session::ActorState::Live,
+                ids: UpstreamIds::new(boot),
+                last_processed_session_id: last_processed_session,
+                last_processed_conn_id: last_processed_conn,
+                viewers: HashMap::new(),
+                pending_requests: HashMap::new(),
+                init_result: held
+                    .init_result
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                queued_msgs: std::collections::VecDeque::new(),
+                rebuilding_buffered_frames: Vec::new(),
+                rebuild_at_turn_end: needs_rebuild,
+                suppressed_keys: std::collections::HashSet::new(),
+                gap_evidenced: false,
+                start_reattach: true,
+                needs_rebuild,
+                inflight_needs_delivery_check: held.inflight.is_some(),
+            };
+
+            tokio::spawn(session.run());
+
+            session_handles.insert(
+                sid.clone(),
+                SessionHandle {
+                    sid: sid.clone(),
+                    conn_id: held.conn_id.clone(),
+                    tx: session_tx,
+                },
+            );
+        }
+
+        *hub.sessions.write().await = session_handles;
+
         Ok(hub)
     }
 
@@ -518,6 +618,14 @@ impl Hub {
             viewers: HashMap::new(),
             pending_requests: HashMap::new(),
             init_result: new_res.clone(),
+            queued_msgs: std::collections::VecDeque::new(),
+            rebuilding_buffered_frames: Vec::new(),
+            rebuild_at_turn_end: false,
+            suppressed_keys: std::collections::HashSet::new(),
+            gap_evidenced: false,
+            start_reattach: false,
+            needs_rebuild: false,
+            inflight_needs_delivery_check: false,
         };
 
         tokio::spawn(session.run());
