@@ -74,13 +74,21 @@ pub fn notification(method: impl Into<String>, params: Value) -> Value {
 }
 
 pub fn strip_honk_meta(value: &mut Value) -> &mut Value {
-    if let Some(obj) = value.get_mut("_meta").and_then(Value::as_object_mut) {
+    if let Some(top) = value.as_object_mut()
+        && let Some(obj) = top.get_mut("_meta").and_then(Value::as_object_mut)
+    {
         obj.remove("honk");
+        if obj.is_empty() {
+            top.remove("_meta");
+        }
     }
     if let Some(params) = value.get_mut("params").and_then(Value::as_object_mut)
         && let Some(obj) = params.get_mut("_meta").and_then(Value::as_object_mut)
     {
         obj.remove("honk");
+        if obj.is_empty() {
+            params.remove("_meta");
+        }
     }
     value
 }
@@ -257,6 +265,23 @@ mod tests {
             top_meta.pointer("/_meta/goose/activeRunId"),
             Some(&json!("run_1"))
         );
+    }
+
+    #[test]
+    fn test_strip_honk_meta_removes_empty_meta() {
+        let mut val = json!({
+            "_meta": {
+                "honk": { "client_req_id": "c1" }
+            },
+            "params": {
+                "_meta": {
+                    "honk": { "client_req_id": "c2" }
+                }
+            }
+        });
+        strip_honk_meta(&mut val);
+        assert!(val.get("_meta").is_none());
+        assert!(val.pointer("/params/_meta").is_none());
     }
 
     #[test]

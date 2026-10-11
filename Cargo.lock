@@ -192,6 +192,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,9 +361,12 @@ dependencies = [
 name = "honkd"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "fs4",
  "honk-wire",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
