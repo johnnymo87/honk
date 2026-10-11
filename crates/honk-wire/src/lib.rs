@@ -122,7 +122,7 @@ impl Blocks {
                     self.active_run = rs;
                 }
                 let Some(key) = block_key(u) else { return };
-                if !self.order.contains(&key) {
+                if self.order.last() != Some(&key) && !self.order.contains(&key) {
                     self.order.push(key.clone());
                 }
                 match &key {

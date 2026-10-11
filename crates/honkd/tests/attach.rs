@@ -305,13 +305,11 @@ async fn legacy_viewer_never_gets_reset_or_replay() {
         b.blocks.resets, 0,
         "legacy viewer must never receive _honk/reset"
     );
-    for frame in &b.raw_frames {
-        if let Some(m) = frame.get("method").and_then(Value::as_str) {
-            assert!(
-                !m.starts_with("_honk/"),
-                "legacy viewer received _honk method: {m}"
-            );
-        }
+    for m in &b.raw_methods {
+        assert!(
+            !m.starts_with("_honk/"),
+            "legacy viewer received _honk method: {m}"
+        );
     }
 }
 

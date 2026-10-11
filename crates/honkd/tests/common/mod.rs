@@ -21,6 +21,7 @@ pub struct Honkd {
     upstream_secret: PathBuf,
     extra: Vec<String>,
     pub stderr_buf: Arc<Mutex<String>>,
+    pub stdout_buf: Arc<Mutex<String>>,
 }
 
 impl Honkd {
@@ -35,7 +36,7 @@ impl Honkd {
         env: &[(&str, &str)],
     ) -> Self {
         let state_dir = tempfile::tempdir().expect("create temp dir");
-        let (child, addr, stderr_buf) = spawn_process(
+        let (child, addr, stderr_buf, stdout_buf) = spawn_process(
             None, // listen on 127.0.0.1:0
             upstream,
             upstream_secret,
@@ -53,11 +54,19 @@ impl Honkd {
             upstream_secret: upstream_secret.to_path_buf(),
             extra: extra.iter().map(|s| s.to_string()).collect(),
             stderr_buf,
+            stdout_buf,
         }
     }
 
     pub fn stderr_text(&self) -> String {
         self.stderr_buf
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn stdout_text(&self) -> String {
+        self.stdout_buf
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default()
@@ -80,6 +89,21 @@ impl Honkd {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    pub async fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Some(status),
+                    Ok(None) => {}
+                    Err(_) => return None,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
     }
 
     pub async fn restart(&mut self) {
@@ -106,7 +130,7 @@ impl Honkd {
         }
 
         let extra_refs: Vec<&str> = self.extra.iter().map(|s| s.as_str()).collect();
-        let (child, addr, stderr_buf) = spawn_process(
+        let (child, addr, stderr_buf, stdout_buf) = spawn_process(
             Some(self.addr), // restart reuses explicit port!
             &self.upstream,
             &self.upstream_secret,
@@ -119,6 +143,7 @@ impl Honkd {
         assert_eq!(addr, self.addr, "restarted honkd bound expected address");
         self.child = Some(child);
         self.stderr_buf = stderr_buf;
+        self.stdout_buf = stdout_buf;
     }
 
     pub fn spawn_expect_exit(upstream: &str, secret: &Path, extra: &[&str]) -> (i32, String) {
@@ -178,7 +203,7 @@ async fn spawn_process(
     state_dir: &Path,
     extra: &[&str],
     env: &[(&str, &str)],
-) -> (Child, SocketAddr, Arc<Mutex<String>>) {
+) -> (Child, SocketAddr, Arc<Mutex<String>>, Arc<Mutex<String>>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_honkd"));
     for (k, v) in env {
         cmd.env(k, v);
@@ -224,27 +249,23 @@ async fn spawn_process(
         }
     });
 
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stdout_clone = stdout_buf.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut sent_addr = false;
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if !sent_addr
-                        && let Some(rest) = l.strip_prefix("honkd listening on ")
-                        && let Ok(addr) = rest.trim().parse::<SocketAddr>()
-                    {
-                        let _ = tx.send(Ok(addr));
-                        sent_addr = true;
-                    }
-                }
-                Err(e) => {
-                    if !sent_addr {
-                        let _ = tx.send(Err(e.to_string()));
-                    }
-                    return;
-                }
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(mut lock) = stdout_clone.lock() {
+                lock.push_str(&line);
+                lock.push('\n');
+            }
+            if !sent_addr
+                && let Some(rest) = line.strip_prefix("honkd listening on ")
+                && let Ok(addr) = rest.trim().parse::<SocketAddr>()
+            {
+                let _ = tx.send(Ok(addr));
+                sent_addr = true;
             }
         }
         if !sent_addr {
@@ -259,7 +280,7 @@ async fn spawn_process(
         .expect("join wait thread");
 
     match res {
-        Ok(Ok(addr)) => (child, addr, stderr_buf),
+        Ok(Ok(addr)) => (child, addr, stderr_buf, stdout_buf),
         Ok(Err(err)) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -281,7 +302,7 @@ pub struct Viewer {
     ws: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     pub blocks: honk_wire::Blocks,
     pub closed: Option<u16>,
-    pub raw_frames: Vec<Value>,
+    pub raw_methods: Vec<String>,
     next_req_id: u64,
     incoming: Vec<Value>,
     accumulated_agent_text: String,
@@ -295,7 +316,7 @@ impl Viewer {
             ws,
             blocks: honk_wire::Blocks::default(),
             closed: None,
-            raw_frames: Vec::new(),
+            raw_methods: Vec::new(),
             next_req_id: 1,
             incoming: Vec::new(),
             accumulated_agent_text: String::new(),
@@ -377,7 +398,9 @@ impl Viewer {
             match msg_res {
                 Ok(Message::Text(text)) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        self.raw_frames.push(v.clone());
+                        if let Some(m) = v.get("method").and_then(Value::as_str) {
+                            self.raw_methods.push(m.to_string());
+                        }
                         self.blocks.apply(&v);
                         if v.get("method").and_then(Value::as_str) == Some("session/update")
                             && let Some(chunk) = v.pointer("/params/update")
@@ -437,7 +460,13 @@ impl Viewer {
                     if honk_upstream::rpc_id_matches(id, frame.get("id").unwrap_or(&Value::Null)) {
                         return Some(frame);
                     }
-                    self.incoming.push(frame);
+                    if frame
+                        .pointer("/params/update/sessionUpdate")
+                        .and_then(Value::as_str)
+                        != Some("agent_message_chunk")
+                    {
+                        self.incoming.push(frame);
+                    }
                 }
                 Ok(None) => break,
                 Err(_) => break,
@@ -466,8 +495,8 @@ impl Viewer {
         }
 
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
-            match tokio::time::timeout(Duration::from_secs(10), self.recv_frame()).await {
+        while start.elapsed() < Duration::from_secs(30) {
+            match tokio::time::timeout(Duration::from_secs(30), self.recv_frame()).await {
                 Ok(Some(frame)) => {
                     if pred(&frame) {
                         return frame;

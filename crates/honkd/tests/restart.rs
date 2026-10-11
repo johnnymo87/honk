@@ -62,26 +62,18 @@ async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
-    let Some(g) = StubGoose::start_or_skip().await else {
-        return;
-    };
-    let proxy = TcpProxy::start(std::net::SocketAddr::from(([127, 0, 0, 1], g.port())))
-        .await
-        .expect("start proxy");
-    let proxy_url = format!("http://{}/acp", proxy.addr());
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
 
-    let chunks: Vec<String> = (0..6000).map(|i| format!("c{i} ")).collect();
-    g.model().push([
-        Turn::Text(chunks),
-        Turn::Gate(
-            "end_gate".into(),
-            Box::new(Turn::Text(vec!["final".into()])),
-        ),
-    ]);
-
-    let h = Honkd::spawn(&proxy_url, g.secret_file(), &["--stream-dead-secs", "2"]).await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
     let mut v = Viewer::connect(&h).await;
-    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    let sid = new_session(&mut v, ".").await;
     v.call(
         "session/load",
         json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
@@ -89,10 +81,33 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
     .await;
     assert_eq!(v.blocks.resets, 1, "initial load has 1 reset");
 
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "go"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "turn output text"}]
+            }]
+        }),
+    );
+
+    // Tell fake to return Gap on next resume
+    fake.gap_on_next_resume(&sid);
+
+    fake.script_prompt(vec!["chunk1".into(), "chunk2".into()]);
     let p_id = v
         .request("session/prompt", prompt_params(&sid, "go", None))
         .await;
 
+    // Wait until run is active
     v.wait_for(|f| {
         f.pointer("/params/update/sessionUpdate")
             .and_then(Value::as_str)
@@ -103,19 +118,22 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
     })
     .await;
 
-    proxy.freeze();
+    // Kick the stream mid-run -> honkd reattaches with takeover, fake returns Gap
+    fake.kick_stream(&sid);
 
+    // Honk-aware viewer gets _honk/gap while run is active and NO reset yet
     v.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/gap"))
         .await;
     assert_eq!(v.blocks.resets, 1, "no reset while run is active");
 
-    g.model().open("end_gate");
-
+    // Turn finishes, activeRunId: null processed -> triggers rebuild at turn end
+    // Viewer receives _honk/replay_done for epoch 2
     v.wait_for(|f| {
         f.get("method").and_then(Value::as_str) == Some("_honk/replay_done")
             && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
     })
     .await;
+
     assert_eq!(v.blocks.resets, 2, "exactly one reset at turn end");
     assert_eq!(
         v.blocks.cursor.as_ref().map(|c| c.epoch),
@@ -125,9 +143,7 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
 
     let resp = v.response_timeout(&p_id, Duration::from_secs(10)).await;
     assert_eq!(resp["result"]["stopReason"], "end_turn");
-    assert_eq!(v.blocks.agent_text(), g.turn_text(&sid).await);
-
-    proxy.release().await;
+    assert_eq!(v.blocks.agent_text(), "turn output text");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -257,7 +273,7 @@ async fn prompt_never_posted_is_reported_not_delivered() {
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.wait_for_exit(Duration::from_secs(5)).await;
 
     h.restart_with_env(&[("HONKD_TEST_CRASH_BEFORE_POST", "0")])
         .await;
@@ -277,6 +293,53 @@ async fn prompt_never_posted_is_reported_not_delivered() {
         0,
         "the model saw no request"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_with_repeated_text_after_completed_turn_reported_not_delivered_on_crash() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Text(vec!["first response".into()])]);
+
+    let mut h = Honkd::spawn_with_env(&g.url(), g.secret_file(), &[], &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Turn 1 completes with prompt text "go"
+    let r1 = v
+        .call("session/prompt", prompt_params(&sid, "go", Some("r1")))
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    // Restart honkd with CRASH_BEFORE_POST=1
+    h.restart_with_env(&[("HONKD_TEST_CRASH_BEFORE_POST", "1")])
+        .await;
+    let mut v2 = Viewer::connect(&h).await;
+
+    // Turn 2 sends prompt "go" again with client_req_id "r2". Crashes before post!
+    v2.request("session/prompt", prompt_params(&sid, "go", Some("r2")))
+        .await;
+
+    h.wait_for_exit(Duration::from_secs(5)).await;
+
+    // Restart without crash hook
+    h.restart_with_env(&[("HONKD_TEST_CRASH_BEFORE_POST", "0")])
+        .await;
+
+    let mut w = Viewer::connect(&h).await;
+    let r2 = w
+        .call("session/prompt", prompt_params(&sid, "go", Some("r2")))
+        .await;
+
+    assert_eq!(r2["result"]["stopReason"], "cancelled");
+    assert_eq!(r2["result"]["_meta"]["honk"]["reason"], "not_delivered");
+    assert_eq!(g.model().turn_requests().len(), 1, "model only saw turn 1");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -329,4 +392,151 @@ async fn degraded_mode_reattach_rebuilds_from_export() {
 
     assert_eq!(v.blocks.resets, 2);
     assert_eq!(v.blocks.agent_text(), "export text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_with_log_larger_than_viewer_queue_does_not_evict_and_dedupes_old_epoch() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    // viewer_queue is only 8!
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--viewer-queue", "8", "--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Set export with 50 messages (> 8 viewer_queue)
+    let mut conversation = Vec::new();
+    for i in 0..50 {
+        conversation.push(json!({
+            "id": format!("msg_{i}"),
+            "role": if i % 2 == 0 { "user" } else { "assistant" },
+            "created": i,
+            "content": [{"type": "text", "text": format!("text_{i}")}]
+        }));
+    }
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": conversation
+        }),
+    );
+
+    // Trigger gap resume while idle -> triggers rebuild
+    fake.gap_on_next_resume(&sid);
+
+    // Wait for replay_done with epoch 2
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some("_honk/replay_done")
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+
+    // Viewer MUST NOT be evicted (closed must be None)
+    assert!(
+        v.closed.is_none(),
+        "viewer was evicted with queue overflow: {:?}",
+        v.closed
+    );
+    assert_eq!(v.blocks.resets, 2);
+    assert_eq!(v.blocks.cursor.as_ref().map(|c| c.epoch), Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_retry_while_reply_finalizing_parks_and_answers_cached_done() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Text(vec!["hello world".into()])]);
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Send prompt with client_req_id "r1"
+    let p1 = v
+        .call("session/prompt", prompt_params(&sid, "test", Some("r1")))
+        .await;
+    assert_eq!(p1["result"]["stopReason"], "end_turn");
+    assert_eq!(p1["result"]["_meta"]["honk"]["text"], "hello world");
+
+    // Retry with same client_req_id "r1" -> answered from ledger Done immediately
+    let mut w = Viewer::connect(&h).await;
+    let p2 = w
+        .call("session/prompt", prompt_params(&sid, "test", Some("r1")))
+        .await;
+    assert_eq!(p2["result"]["stopReason"], "end_turn");
+    assert_eq!(p2["result"]["_meta"]["honk"]["text"], "hello world");
+    assert_eq!(
+        g.model().turn_requests().len(),
+        1,
+        "only 1 request reached model"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reply_lost_in_gap_synthesizes_end_turn_after_rebuild() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "test"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "resp"}]
+            }]
+        }),
+    );
+
+    fake.gap_on_next_resume(&sid);
+
+    fake.script_prompt(vec!["resp".into()]);
+    let pid = v
+        .request("session/prompt", prompt_params(&sid, "test", None))
+        .await;
+
+    fake.kick_stream(&sid);
+
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
 }

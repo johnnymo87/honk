@@ -85,6 +85,7 @@ pub enum SessionMsg {
         gone: bool,
         error: String,
     },
+    RetryReattach,
     Rebuilt {
         frames: Vec<Value>,
         keys: std::collections::HashSet<honk_wire::BlockKey>,
@@ -123,6 +124,7 @@ pub struct Session {
     pub start_reattach: bool,
     pub needs_rebuild: bool,
     pub inflight_needs_delivery_check: bool,
+    pub finalizing_waiters: HashMap<String, Vec<OwnerRef>>,
 }
 
 impl Session {
@@ -315,7 +317,8 @@ impl Session {
             }
             ReplayOutcome::Gap | ReplayOutcome::Unsupported => {
                 self.gap_evidenced = true;
-                if self.turn.run.is_some() {
+                let is_active = self.turn.run.is_some() || self.turn.inflight.is_some();
+                if is_active {
                     self.state = ActorState::Live;
                     let gap_marker = json!({
                         "jsonrpc": "2.0",
@@ -345,8 +348,33 @@ impl Session {
         );
         if gone {
             self.state = ActorState::Gone;
+            let actions = self.turn.interrupt("upstream_gone");
+            self.execute_actions(actions).await;
+
+            let msgs = std::mem::take(&mut self.queued_msgs);
+            for m in msgs {
+                match m {
+                    SessionMsg::Prompt { viewer_id, id, .. }
+                    | SessionMsg::Steer { viewer_id, id, .. }
+                    | SessionMsg::Forward { viewer_id, id, .. } => {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32000,
+                            "Session is gone (upstream 404)".to_string(),
+                            None,
+                        );
+                        self.send_to_viewer(viewer_id, err_resp);
+                    }
+                    _ => {}
+                }
+            }
         } else {
-            self.state = ActorState::Live;
+            self.state = ActorState::Reattaching;
+            let self_tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = self_tx.send(SessionMsg::RetryReattach).await;
+            });
         }
     }
 
@@ -445,7 +473,13 @@ impl Session {
             combined.push((id_opt, f));
         }
 
-        match crate::log::SessionLog::create(&log_path, next_epoch, resume_from, combined) {
+        let max_resume = match (resume_from, self.last_processed_session_id) {
+            (Some(r), Some(l)) => Some(r.max(l)),
+            (None, l) => l,
+            (r, None) => r,
+        };
+
+        match crate::log::SessionLog::create(&log_path, next_epoch, max_resume, combined) {
             Ok(new_log) => {
                 self.log = new_log;
                 let head = self.log.head();
@@ -470,24 +504,53 @@ impl Session {
                     }
                 });
 
-                let honk_aware_vids: Vec<ViewerId> = self
-                    .viewers
-                    .iter()
-                    .filter_map(|(vid, (_, is_honk))| if *is_honk { Some(*vid) } else { None })
-                    .collect();
+                let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
+                msgs.push(axum::extract::ws::Message::Text(
+                    reset_frame.to_string().into(),
+                ));
+                for entry in self.log.entries() {
+                    msgs.push(axum::extract::ws::Message::Text(
+                        entry.frame.to_string().into(),
+                    ));
+                }
+                msgs.push(axum::extract::ws::Message::Text(
+                    replay_done_frame.to_string().into(),
+                ));
 
-                let log_frames: Vec<Value> =
-                    self.log.entries().iter().map(|e| e.frame.clone()).collect();
-
-                for vid in honk_aware_vids {
-                    self.send_to_viewer(vid, reset_frame.clone());
-                    for frame in &log_frames {
-                        self.send_to_viewer(vid, frame.clone());
+                for (tx, is_honk_aware) in self.viewers.values() {
+                    if *is_honk_aware {
+                        let batch = crate::viewer::ReplayBatch {
+                            session_id: self.sid.clone(),
+                            head: head.clone(),
+                            msgs: msgs.clone(),
+                            done_tx: None,
+                        };
+                        let _ = tx.send_replay(batch);
                     }
-                    self.send_to_viewer(vid, replay_done_frame.clone());
                 }
 
                 self.suppressed_keys = keys;
+
+                if self.gap_evidenced && self.turn.inflight.is_some() {
+                    let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                    let synth_reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": upstream_id,
+                        "result": {
+                            "stopReason": "end_turn",
+                            "_meta": {
+                                "honk": {
+                                    "synthesized": true
+                                }
+                            }
+                        }
+                    });
+                    let reply_actions =
+                        self.turn
+                            .on_prompt_reply(&upstream_id, &synth_reply, &mut self.ids);
+                    self.execute_actions(reply_actions).await;
+                }
+                self.gap_evidenced = false;
             }
             Err(e) => {
                 tracing::error!("failed to create session log during rebuild of {sid}: {e:#}");
@@ -604,46 +667,33 @@ impl Session {
             .as_ref()
             .is_some_and(|k| self.suppressed_keys.contains(k));
 
-        if self.state == ActorState::Rebuilding {
-            if is_session_stream {
-                if kind == crate::rpc::Kind::Notification {
-                    if let Some(update) = frame.pointer("/params/update") {
-                        if update.get("sessionUpdate").and_then(Value::as_str)
-                            == Some("user_message_chunk")
-                            && let Some(msg_id) = update
-                                .get("messageId")
-                                .or_else(|| update.pointer("/_meta/goose/messageId"))
-                                .and_then(Value::as_str)
-                        {
-                            self.turn.on_user_message(msg_id);
-                        }
-
-                        if let Some(run_opt) = honk_wire::run_state(update) {
-                            let actions = self.turn.on_run_state(run_opt, &mut self.ids);
-                            self.execute_actions(actions).await;
-                        }
-                    }
-
-                    let mut legacy_frame = frame.clone();
-                    crate::rpc::strip_honk_meta(&mut legacy_frame);
-                    self.fan_out_legacy(&legacy_frame);
-
-                    self.rebuilding_buffered_frames.push((id_opt, frame));
-                } else if let Some(id) = id_opt {
-                    let _ = self.log.mark_processed(id);
+        if self.state == ActorState::Rebuilding
+            && is_session_stream
+            && kind == crate::rpc::Kind::Notification
+        {
+            if let Some(update) = frame.pointer("/params/update") {
+                if update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                    && let Some(msg_id) = update
+                        .get("messageId")
+                        .or_else(|| update.pointer("/_meta/goose/messageId"))
+                        .and_then(Value::as_str)
+                {
+                    self.turn.on_user_message(msg_id);
                 }
-                if let Some(id) = id_opt {
-                    self.last_processed_session_id = Some(id);
+
+                if let Some(run_opt) = honk_wire::run_state(update) {
+                    let actions = self.turn.on_run_state(run_opt, &mut self.ids);
+                    self.execute_actions(actions).await;
                 }
-            } else if let Some(id) = id_opt {
-                self.last_processed_conn_id = Some(id);
-                let sid = self.sid.clone();
-                let mut s = self.state_store.lock().await;
-                let _ = s.mutate(|st| {
-                    if let Some(h) = st.sessions.get_mut(&sid) {
-                        h.last_conn_event_id = Some(id);
-                    }
-                });
+            }
+
+            let mut legacy_frame = frame.clone();
+            crate::rpc::strip_honk_meta(&mut legacy_frame);
+            self.fan_out_legacy(&legacy_frame);
+
+            self.rebuilding_buffered_frames.push((id_opt, frame));
+            if let Some(id) = id_opt {
+                self.last_processed_session_id = Some(id);
             }
             return;
         }
@@ -666,29 +716,6 @@ impl Session {
 
                     if run_opt.is_none() {
                         self.suppressed_keys.clear();
-
-                        if self.gap_evidenced && self.turn.inflight.is_some() {
-                            let upstream_id =
-                                self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                            let synth_reply = json!({
-                                "jsonrpc": "2.0",
-                                "id": upstream_id,
-                                "result": {
-                                    "stopReason": "end_turn",
-                                    "_meta": {
-                                        "honk": {
-                                            "synthesized": true
-                                        }
-                                    }
-                                }
-                            });
-                            let reply_actions = self.turn.on_prompt_reply(
-                                &upstream_id,
-                                &synth_reply,
-                                &mut self.ids,
-                            );
-                            self.execute_actions(reply_actions).await;
-                        }
 
                         if self.rebuild_at_turn_end {
                             self.rebuild_at_turn_end = false;
@@ -953,6 +980,11 @@ impl Session {
                             self.handle_reply_text(owners, Reply::Result(result_val), None)
                                 .await;
                         } else {
+                            for o in &owners {
+                                if let Some(crid) = &o.client_req_id {
+                                    self.finalizing_waiters.entry(crid.clone()).or_default();
+                                }
+                            }
                             let hub = self.hub.clone();
                             let sid = self.sid.clone();
                             let self_tx = self.self_tx.clone();
@@ -1003,6 +1035,15 @@ impl Session {
         self.sync_inflight().await;
     }
 
+    fn queue_msg(&mut self, viewer_id: ViewerId, id: Value, msg: SessionMsg) {
+        if self.queued_msgs.len() >= 1024 {
+            let err = crate::rpc::error(id, -32603, "Session message queue full", None);
+            self.send_to_viewer(viewer_id, err);
+        } else {
+            self.queued_msgs.push_back(msg);
+        }
+    }
+
     async fn on_msg(&mut self, msg: SessionMsg) {
         match msg {
             SessionMsg::Attach {
@@ -1050,40 +1091,66 @@ impl Session {
                 if !self.viewers.contains_key(&viewer_id) {
                     self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
                 }
-                if self.state == ActorState::Reattaching {
-                    self.queued_msgs.push_back(SessionMsg::Prompt {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    self.queue_msg(
                         viewer_id,
-                        viewer,
-                        is_honk_aware,
-                        id,
-                        params,
-                    });
+                        id.clone(),
+                        SessionMsg::Prompt {
+                            viewer_id,
+                            viewer,
+                            is_honk_aware,
+                            id,
+                            params,
+                        },
+                    );
                     return;
                 }
                 let client_req_id = honk_wire::honk_meta(&params).client_req_id;
 
                 if let Some(crid) = &client_req_id {
-                    let cached_resp = {
+                    let cached = {
                         let s = self.state_store.lock().await;
-                        if let Some(crate::state::LedgerEntry::Done { response, .. }) =
-                            s.ledger.get(crid)
-                        {
-                            let mut resp = response.clone();
-                            resp["id"] = id.clone();
-                            Some(resp)
-                        } else {
-                            None
+                        match s.ledger.get(crid) {
+                            Some(crate::state::LedgerEntry::Done { response, .. }) => {
+                                let mut resp = response.clone();
+                                resp["id"] = id.clone();
+                                Some(Ok(resp))
+                            }
+                            Some(crate::state::LedgerEntry::InFlight {
+                                session: led_sid, ..
+                            }) => {
+                                if led_sid != &self.sid {
+                                    Some(Err(crate::rpc::error(
+                                        id.clone(),
+                                        -32602,
+                                        format!(
+                                            "client_req_id {crid} already in flight in another session"
+                                        ),
+                                        None,
+                                    )))
+                                } else {
+                                    None
+                                }
+                            }
+                            None => None,
                         }
                     };
-                    if let Some(resp) = cached_resp {
-                        self.send_to_viewer(viewer_id, resp);
-                        return;
+                    match cached {
+                        Some(Ok(resp)) => {
+                            self.send_to_viewer(viewer_id, resp);
+                            return;
+                        }
+                        Some(Err(err_resp)) => {
+                            self.send_to_viewer(viewer_id, err_resp);
+                            return;
+                        }
+                        None => {}
                     }
                 }
 
                 let owner = OwnerRef {
                     viewer: Some(viewer_id),
-                    downstream_id: id,
+                    downstream_id: id.clone(),
                     client_req_id: client_req_id.clone(),
                 };
 
@@ -1091,6 +1158,30 @@ impl Session {
                     && self.turn.attach_waiter(crid, owner.clone())
                 {
                     return;
+                }
+
+                if let Some(crid) = &client_req_id
+                    && let Some(waiters) = self.finalizing_waiters.get_mut(crid)
+                {
+                    waiters.push(owner);
+                    return;
+                }
+
+                if let Some(crid) = &client_req_id {
+                    let is_inflight = {
+                        let s = self.state_store.lock().await;
+                        matches!(
+                            s.ledger.get(crid),
+                            Some(crate::state::LedgerEntry::InFlight { session: led_sid, .. }) if led_sid == &self.sid
+                        )
+                    };
+                    if is_inflight {
+                        self.finalizing_waiters
+                            .entry(crid.clone())
+                            .or_default()
+                            .push(owner);
+                        return;
+                    }
                 }
 
                 let actions = self.turn.on_prompt(owner, params, &mut self.ids);
@@ -1102,13 +1193,17 @@ impl Session {
                 id,
                 params,
             } => {
-                if self.state == ActorState::Reattaching {
-                    self.queued_msgs.push_back(SessionMsg::Steer {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    self.queue_msg(
                         viewer_id,
-                        viewer,
-                        id,
-                        params,
-                    });
+                        id.clone(),
+                        SessionMsg::Steer {
+                            viewer_id,
+                            viewer,
+                            id,
+                            params,
+                        },
+                    );
                     return;
                 }
                 let up_id = self.ids.next();
@@ -1142,7 +1237,9 @@ impl Session {
                 }
             }
             SessionMsg::Cancel => {
-                if self.state == ActorState::Reattaching {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding)
+                    && self.queued_msgs.len() < 1024
+                {
                     self.queued_msgs.push_back(SessionMsg::Cancel);
                     return;
                 }
@@ -1151,7 +1248,9 @@ impl Session {
                 // TODO(A13/A15): answer any pending server requests with "cancelled"
             }
             SessionMsg::Answer { viewer_id, frame } => {
-                if self.state == ActorState::Reattaching {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding)
+                    && self.queued_msgs.len() < 1024
+                {
                     self.queued_msgs
                         .push_back(SessionMsg::Answer { viewer_id, frame });
                 }
@@ -1164,14 +1263,18 @@ impl Session {
                 method,
                 params,
             } => {
-                if self.state == ActorState::Reattaching {
-                    self.queued_msgs.push_back(SessionMsg::Forward {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    self.queue_msg(
                         viewer_id,
-                        viewer,
-                        id,
-                        method,
-                        params,
-                    });
+                        id.clone(),
+                        SessionMsg::Forward {
+                            viewer_id,
+                            viewer,
+                            id,
+                            method,
+                            params,
+                        },
+                    );
                     return;
                 }
                 let up_id = self.ids.next();
@@ -1204,6 +1307,11 @@ impl Session {
             }
             SessionMsg::ReattachFailed { gone, error } => {
                 self.on_reattach_failed(gone, error).await;
+            }
+            SessionMsg::RetryReattach => {
+                if self.state == ActorState::Reattaching {
+                    self.trigger_reattach().await;
+                }
             }
             SessionMsg::Rebuilt {
                 frames,
@@ -1260,6 +1368,15 @@ impl Session {
                                 },
                             );
                         });
+                        drop(s);
+
+                        if let Some(waiters) = self.finalizing_waiters.remove(crid) {
+                            for w in waiters {
+                                let mut w_resp = resp.clone();
+                                w_resp["id"] = w.downstream_id.clone();
+                                self.send_to_owner(&w, w_resp);
+                            }
+                        }
                     }
 
                     self.send_to_owner(o, resp);
@@ -1272,6 +1389,15 @@ impl Session {
                         "id": o.downstream_id,
                         "error": err,
                     });
+                    if let Some(crid) = &o.client_req_id
+                        && let Some(waiters) = self.finalizing_waiters.remove(crid)
+                    {
+                        for w in waiters {
+                            let mut w_resp = resp.clone();
+                            w_resp["id"] = w.downstream_id.clone();
+                            self.send_to_owner(&w, w_resp);
+                        }
+                    }
                     self.send_to_owner(o, resp);
                 }
             }
@@ -1391,7 +1517,17 @@ fn export_has_user_text(export: &Value, expected_text: &str) -> bool {
     let Some(conversation) = export.get("conversation").and_then(Value::as_array) else {
         return false;
     };
-    for msg in conversation {
+    // Only consider trailing user messages after the last completed assistant turn
+    let last_assistant_idx = conversation
+        .iter()
+        .rposition(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"));
+
+    let start_idx = match last_assistant_idx {
+        Some(idx) => idx + 1,
+        None => 0,
+    };
+
+    for msg in &conversation[start_idx..] {
         if msg.get("role").and_then(Value::as_str) == Some("user") {
             let mut text = String::new();
             if let Some(content) = msg.get("content").and_then(Value::as_array) {

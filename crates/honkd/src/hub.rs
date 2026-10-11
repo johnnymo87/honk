@@ -260,6 +260,7 @@ impl Hub {
                 start_reattach: true,
                 needs_rebuild,
                 inflight_needs_delivery_check: held.inflight.is_some(),
+                finalizing_waiters: HashMap::new(),
             };
 
             tokio::spawn(session.run());
@@ -626,6 +627,7 @@ impl Hub {
             start_reattach: false,
             needs_rebuild: false,
             inflight_needs_delivery_check: false,
+            finalizing_waiters: HashMap::new(),
         };
 
         tokio::spawn(session.run());

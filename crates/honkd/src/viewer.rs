@@ -15,12 +15,21 @@ static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct ViewerTx {
     tx: mpsc::Sender<Message>,
+    replay_tx: mpsc::Sender<ReplayBatch>,
     evict: Arc<Notify>,
 }
 
 impl ViewerTx {
-    pub fn new(tx: mpsc::Sender<Message>, evict: Arc<Notify>) -> Self {
-        Self { tx, evict }
+    pub fn new(
+        tx: mpsc::Sender<Message>,
+        replay_tx: mpsc::Sender<ReplayBatch>,
+        evict: Arc<Notify>,
+    ) -> Self {
+        Self {
+            tx,
+            replay_tx,
+            evict,
+        }
     }
 
     pub fn send_frame(&self, msg: Message) -> bool {
@@ -32,6 +41,10 @@ impl ViewerTx {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    pub fn send_replay(&self, batch: ReplayBatch) -> bool {
+        self.replay_tx.try_send(batch).is_ok()
     }
 
     pub fn offer(&self, msg: Message) -> bool {
@@ -63,8 +76,7 @@ fn is_duplicate(msg: &Message, heads: &HashMap<String, honk_wire::Cursor>) -> bo
         return false;
     };
     if let Some(cursor) = honk_wire::frame_cursor(&frame)
-        && cursor.epoch == head.epoch
-        && cursor.seq <= head.seq
+        && (cursor.epoch < head.epoch || (cursor.epoch == head.epoch && cursor.seq <= head.seq))
     {
         return true;
     }
@@ -159,7 +171,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
         }
     });
 
-    let viewer_tx = ViewerTx::new(tx, evict);
+    let viewer_tx = ViewerTx::new(tx, replay_tx.clone(), evict);
 
     let mut viewer = Viewer {
         id: viewer_id,
@@ -670,8 +682,9 @@ mod tests {
     #[tokio::test]
     async fn test_send_frame_overflow_triggers_evict() {
         let (tx, _rx) = mpsc::channel::<Message>(1);
+        let (replay_tx, _replay_rx) = mpsc::channel::<ReplayBatch>(1);
         let evict = Arc::new(Notify::new());
-        let viewer_tx = ViewerTx::new(tx, evict.clone());
+        let viewer_tx = ViewerTx::new(tx, replay_tx, evict.clone());
 
         // First message fits in buffer
         assert!(viewer_tx.send_frame(Message::Text("1".into())));
