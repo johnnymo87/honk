@@ -1,7 +1,7 @@
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Notify, mpsc};
@@ -33,6 +33,39 @@ impl ViewerTx {
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
+
+    pub fn offer(&self, msg: Message) -> bool {
+        self.send_frame(msg)
+    }
+}
+
+pub struct ReplayBatch {
+    pub session_id: String,
+    pub head: honk_wire::Cursor,
+    pub msgs: Vec<Message>,
+    pub done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn is_duplicate(msg: &Message, heads: &HashMap<String, honk_wire::Cursor>) -> bool {
+    let Message::Text(text) = msg else {
+        return false;
+    };
+    let Ok(frame) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(sid) = frame.pointer("/params/sessionId").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(head) = heads.get(sid) else {
+        return false;
+    };
+    if let Some(cursor) = honk_wire::frame_cursor(&frame)
+        && cursor.epoch == head.epoch
+        && cursor.seq <= head.seq
+    {
+        return true;
+    }
+    false
 }
 
 pub struct Viewer {
@@ -46,10 +79,12 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
     let viewer_id = NEXT_VIEWER_ID.fetch_add(1, Ordering::SeqCst);
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(hub.args.viewer_queue);
+    let (replay_tx, mut replay_rx) = mpsc::channel::<ReplayBatch>(16);
     let evict = Arc::new(Notify::new());
     let evict_clone = evict.clone();
 
     let write_task = tokio::spawn(async move {
+        let mut replayed_heads: HashMap<String, honk_wire::Cursor> = HashMap::new();
         loop {
             tokio::select! {
                 biased;
@@ -62,10 +97,55 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         .await;
                     break;
                 }
+                Some(batch) = replay_rx.recv() => {
+                    let mut evicted = false;
+                    for msg in batch.msgs {
+                        tokio::select! {
+                            biased;
+                            _ = evict_clone.notified() => {
+                                let _ = ws_sender
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: 4001,
+                                        reason: "queue overflow".into(),
+                                    })))
+                                    .await;
+                                evicted = true;
+                                break;
+                            }
+                            res = ws_sender.send(msg) => {
+                                if res.is_err() {
+                                    evicted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if evicted {
+                        break;
+                    }
+                    replayed_heads.insert(batch.session_id, batch.head);
+                    if let Some(done_tx) = batch.done_tx {
+                        let _ = done_tx.send(());
+                    }
+                }
                 msg = rx.recv() => {
                     match msg {
                         Some(m) => {
-                            if ws_sender.send(m).await.is_err() {
+                            if !is_duplicate(&m, &replayed_heads)
+                                && ws_sender.feed(m).await.is_err()
+                            {
+                                break;
+                            }
+                            let mut err = false;
+                            while let Ok(m) = rx.try_recv() {
+                                if !is_duplicate(&m, &replayed_heads)
+                                    && ws_sender.feed(m).await.is_err()
+                                {
+                                    err = true;
+                                    break;
+                                }
+                            }
+                            if err || ws_sender.flush().await.is_err() {
                                 break;
                             }
                         }
@@ -215,12 +295,146 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                 } else if method == Some("session/load") {
                     viewer.is_honk_aware = true;
-                    let err_resp =
-                        crate::rpc::error(id, -32601, "Method not implemented in A8", None);
-                    if !viewer
-                        .tx
-                        .send_frame(Message::Text(err_resp.to_string().into()))
+                    let sid_opt = params.get("sessionId").and_then(Value::as_str);
+                    let Some(sid) = sid_opt else {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32602,
+                            "Missing sessionId in session/load",
+                            None,
+                        );
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    };
+
+                    let session_tx = {
+                        let sessions = hub.sessions.read().await;
+                        sessions.get(sid).map(|h| h.tx.clone())
+                    };
+
+                    let Some(tx) = session_tx else {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32602,
+                            format!("Session not found or not held: {sid}"),
+                            None,
+                        );
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    };
+
+                    let after = honk_wire::honk_meta(&params).after;
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx
+                        .send(crate::session::SessionMsg::Attach {
+                            viewer_id: viewer.id,
+                            viewer: viewer.tx.clone(),
+                            after,
+                            reply: reply_tx,
+                        })
+                        .await;
+
+                    let snapshot = match reply_rx.await {
+                        Ok(s) => s,
+                        Err(_) => {
+                            let err_resp =
+                                crate::rpc::error(id, -32603, "Session actor terminated", None);
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let mut msgs = Vec::new();
+                    if snapshot.reset {
+                        let reset_frame = json!({
+                            "jsonrpc": "2.0",
+                            "method": "_honk/reset",
+                            "params": {
+                                "sessionId": sid,
+                                "epoch": snapshot.head.epoch,
+                            }
+                        });
+                        msgs.push(Message::Text(reset_frame.to_string().into()));
+                    }
+
+                    for entry in snapshot.entries {
+                        msgs.push(Message::Text(entry.frame.to_string().into()));
+                    }
+
+                    let mut load_res = snapshot.init_result;
+                    if !load_res.is_object() {
+                        load_res = json!({ "sessionId": sid });
+                    }
+                    if let Some(meta) = load_res.get_mut("_meta").and_then(Value::as_object_mut) {
+                        meta.insert(
+                            "honk".to_string(),
+                            json!({
+                                "epoch": snapshot.head.epoch,
+                                "seq": snapshot.head.seq,
+                            }),
+                        );
+                    } else {
+                        load_res["_meta"] = json!({
+                            "honk": {
+                                "epoch": snapshot.head.epoch,
+                                "seq": snapshot.head.seq,
+                            }
+                        });
+                    }
+                    let load_reply_frame = crate::rpc::response(id, load_res);
+                    msgs.push(Message::Text(load_reply_frame.to_string().into()));
+
+                    let replay_done_frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "_honk/replay_done",
+                        "params": {
+                            "sessionId": sid,
+                            "epoch": snapshot.head.epoch,
+                            "seq": snapshot.head.seq,
+                        }
+                    });
+                    msgs.push(Message::Text(replay_done_frame.to_string().into()));
+
+                    for p in snapshot.pending {
+                        let pending_frame = json!({
+                            "jsonrpc": "2.0",
+                            "id": p.id,
+                            "method": p.method,
+                            "params": p.params,
+                        });
+                        msgs.push(Message::Text(pending_frame.to_string().into()));
+                    }
+
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    if replay_tx
+                        .send(ReplayBatch {
+                            session_id: sid.to_string(),
+                            head: snapshot.head,
+                            msgs,
+                            done_tx: Some(done_tx),
+                        })
+                        .await
+                        .is_err()
                     {
+                        break;
+                    }
+                    viewer.attached_sessions.insert(sid.to_string());
+                    if done_rx.await.is_err() {
                         break;
                     }
                 } else if method == Some("session/new") {
@@ -302,7 +516,10 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 format!("Session not found: {sid}"),
                                 None,
                             );
-                            if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
                                 break;
                             }
                         }
@@ -313,7 +530,10 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             "Missing sessionId in session/prompt",
                             None,
                         );
-                        if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
                             break;
                         }
                     }
@@ -363,7 +583,10 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             format!("Session not found: {sid}"),
                             None,
                         );
-                        if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
                             break;
                         }
                     }

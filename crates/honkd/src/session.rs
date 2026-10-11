@@ -26,8 +26,23 @@ pub struct PendingSessionRequest {
     pub is_steer: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct AttachSnapshot {
+    pub reset: bool,
+    pub entries: Vec<crate::log::Entry>,
+    pub head: honk_wire::Cursor,
+    pub init_result: Value,
+    pub pending: Vec<crate::state::PendingRequest>,
+}
+
 pub enum SessionMsg {
     // from viewers / hub
+    Attach {
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        after: Option<honk_wire::Cursor>,
+        reply: tokio::sync::oneshot::Sender<AttachSnapshot>,
+    },
     AttachLive {
         viewer_id: ViewerId,
         viewer: ViewerTx,
@@ -86,6 +101,7 @@ pub struct Session {
     pub last_processed_conn_id: Option<u64>,
     pub viewers: HashMap<ViewerId, (ViewerTx, bool)>,
     pub pending_requests: HashMap<String, PendingSessionRequest>,
+    pub init_result: Value,
 }
 
 impl Session {
@@ -96,7 +112,10 @@ impl Session {
         loop {
             tokio::select! {
                 ev = self.events.recv(), if !matches!(self.state, ActorState::Gone) => match ev {
-                    Some(ev) => self.on_upstream(ev).await,
+                    Some(ev) => {
+                        self.on_upstream(ev).await;
+                        tokio::task::yield_now().await;
+                    }
                     None => break,
                 },
                 msg = self.rx.recv() => match msg {
@@ -132,10 +151,10 @@ impl Session {
         let target = self.turn.to_persisted();
         let sid = &self.sid;
         let mut s = self.state_store.lock().await;
-        if let Some(h) = s.sessions.get(sid) {
-            if h.inflight == target {
-                return;
-            }
+        if let Some(h) = s.sessions.get(sid)
+            && h.inflight == target
+        {
+            return;
         }
         let _ = s.mutate(|st| {
             if let Some(h) = st.sessions.get_mut(sid) {
@@ -189,8 +208,7 @@ impl Session {
         if is_session_stream {
             if let Some(update) = frame.pointer("/params/update") {
                 // If user_message_chunk, notify turn core of live user message
-                if update.get("sessionUpdate").and_then(Value::as_str)
-                    == Some("user_message_chunk")
+                if update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
                     && let Some(msg_id) = update
                         .get("messageId")
                         .or_else(|| update.pointer("/_meta/goose/messageId"))
@@ -225,8 +243,7 @@ impl Session {
                         && let Some(msg_id) =
                             frame.pointer("/result/messageId").and_then(Value::as_str)
                     {
-                        let actions =
-                            self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
+                        let actions = self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
                         self.execute_actions(actions).await;
                     }
 
@@ -242,9 +259,9 @@ impl Session {
 
                     if is_inflight_reply {
                         let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                        let actions = self
-                            .turn
-                            .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
+                        let actions =
+                            self.turn
+                                .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
                         self.execute_actions(actions).await;
                     } else {
                         // Unmatched upstream response -> warn with upstream id only
@@ -357,9 +374,9 @@ impl Session {
                             "code": -32603,
                             "message": format!("Prompt POST failed: {e:#}"),
                         });
-                        let fail_actions = self
-                            .turn
-                            .on_prompt_send_failed(&upstream_id, err_val, &mut self.ids);
+                        let fail_actions =
+                            self.turn
+                                .on_prompt_send_failed(&upstream_id, err_val, &mut self.ids);
                         for a in fail_actions.into_iter().rev() {
                             queue.push_front(a);
                         }
@@ -379,6 +396,10 @@ impl Session {
                 Action::SynthUser { params, owner } => {
                     let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
+                    let msg_id = crid
+                        .as_ref()
+                        .map(|c| format!("synth_{c}"))
+                        .unwrap_or_else(|| format!("synth_{}", self.ids.next()));
                     let mut synth_frame = json!({
                         "jsonrpc": "2.0",
                         "method": "session/update",
@@ -386,6 +407,7 @@ impl Session {
                             "sessionId": self.sid,
                             "update": {
                                 "sessionUpdate": "user_message_chunk",
+                                "messageId": msg_id,
                                 "content": {
                                     "type": "text",
                                     "text": user_text,
@@ -479,6 +501,31 @@ impl Session {
 
     async fn on_msg(&mut self, msg: SessionMsg) {
         match msg {
+            SessionMsg::Attach {
+                viewer_id,
+                viewer,
+                after,
+                reply,
+            } => {
+                let (reset, entries) = match self.log.resume(after.as_ref()) {
+                    crate::log::Resume::Reset(e) => (true, e.to_vec()),
+                    crate::log::Resume::Delta(e) => (false, e.to_vec()),
+                };
+                let head = self.log.head();
+
+                self.viewers.insert(viewer_id, (viewer, true));
+
+                let init_result = self.init_result.clone();
+                let pending = Vec::new(); // Stub until A13
+
+                let _ = reply.send(AttachSnapshot {
+                    reset,
+                    entries,
+                    head,
+                    init_result,
+                    pending,
+                });
+            }
             SessionMsg::AttachLive {
                 viewer_id,
                 viewer,

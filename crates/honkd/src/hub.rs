@@ -483,6 +483,7 @@ impl Hub {
                         pending: Vec::new(),
                         inflight: None,
                         last_active_unix: now,
+                        init_result: Some(new_res.clone()),
                     },
                 );
             })?;
@@ -516,6 +517,7 @@ impl Hub {
             last_processed_conn_id: last_processed_conn,
             viewers: HashMap::new(),
             pending_requests: HashMap::new(),
+            init_result: new_res.clone(),
         };
 
         tokio::spawn(session.run());

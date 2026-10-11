@@ -504,10 +504,15 @@ fn build_sse_response(turn: Turn) -> Response {
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
+    let frames_len = frames.len();
     tokio::spawn(async move {
         for frame in frames {
             let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            if frames_len <= 100 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
     });
 

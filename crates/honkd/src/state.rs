@@ -55,6 +55,8 @@ pub struct HeldSession {
     pub pending: Vec<PendingRequest>,
     pub inflight: Option<InflightPrompt>,
     pub last_active_unix: u64,
+    #[serde(default)]
+    pub init_result: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

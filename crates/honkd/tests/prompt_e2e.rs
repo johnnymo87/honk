@@ -417,19 +417,14 @@ async fn busy_rejection_leaves_state_inflight_intact() {
     assert_eq!(r2["error"]["code"], -32602);
 
     // Read state.json again: held.inflight MUST STILL BE Some with p1's upstream id!
-    let state_bytes2 =
-        std::fs::read(h.state_dir.path().join("state.json")).expect("read state 2");
-    let state2: honkd::state::State =
-        serde_json::from_slice(&state_bytes2).expect("parse state 2");
+    let state_bytes2 = std::fs::read(h.state_dir.path().join("state.json")).expect("read state 2");
+    let state2: honkd::state::State = serde_json::from_slice(&state_bytes2).expect("parse state 2");
     let held2 = state2.sessions.get(&sid).expect("held session 2");
     assert!(
         held2.inflight.is_some(),
         "busy rejection must NOT clear running prompt's inflight in state"
     );
-    assert_eq!(
-        held2.inflight.as_ref().unwrap().upstream_id,
-        p1_upstream_id
-    );
+    assert_eq!(held2.inflight.as_ref().unwrap().upstream_id, p1_upstream_id);
     // crid_2 was never sent upstream so it was never inserted into ledger
     assert!(
         !state2.ledger.contains_key("crid_2"),
@@ -442,10 +437,8 @@ async fn busy_rejection_leaves_state_inflight_intact() {
     assert_eq!(r1["result"]["stopReason"], "end_turn");
 
     // Read state.json after prompt 1 completes: held.inflight is now None, and crid_1 is Done
-    let state_bytes3 =
-        std::fs::read(h.state_dir.path().join("state.json")).expect("read state 3");
-    let state3: honkd::state::State =
-        serde_json::from_slice(&state_bytes3).expect("parse state 3");
+    let state_bytes3 = std::fs::read(h.state_dir.path().join("state.json")).expect("read state 3");
+    let state3: honkd::state::State = serde_json::from_slice(&state_bytes3).expect("parse state 3");
     let held3 = state3.sessions.get(&sid).expect("held session 3");
     assert!(
         held3.inflight.is_none(),

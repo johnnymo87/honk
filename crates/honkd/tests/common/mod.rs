@@ -20,12 +20,13 @@ pub struct Honkd {
     upstream: String,
     upstream_secret: PathBuf,
     extra: Vec<String>,
+    pub stderr_buf: Arc<Mutex<String>>,
 }
 
 impl Honkd {
     pub async fn spawn(upstream: &str, upstream_secret: &Path, extra: &[&str]) -> Self {
         let state_dir = tempfile::tempdir().expect("create temp dir");
-        let (child, addr) = spawn_process(
+        let (child, addr, stderr_buf) = spawn_process(
             None, // listen on 127.0.0.1:0
             upstream,
             upstream_secret,
@@ -41,7 +42,15 @@ impl Honkd {
             upstream: upstream.to_string(),
             upstream_secret: upstream_secret.to_path_buf(),
             extra: extra.iter().map(|s| s.to_string()).collect(),
+            stderr_buf,
         }
+    }
+
+    pub fn stderr_text(&self) -> String {
+        self.stderr_buf
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     pub fn secret(&self) -> String {
@@ -83,7 +92,7 @@ impl Honkd {
         }
 
         let extra_refs: Vec<&str> = self.extra.iter().map(|s| s.as_str()).collect();
-        let (child, addr) = spawn_process(
+        let (child, addr, stderr_buf) = spawn_process(
             Some(self.addr), // restart reuses explicit port!
             &self.upstream,
             &self.upstream_secret,
@@ -94,6 +103,7 @@ impl Honkd {
 
         assert_eq!(addr, self.addr, "restarted honkd bound expected address");
         self.child = Some(child);
+        self.stderr_buf = stderr_buf;
     }
 
     pub fn spawn_expect_exit(upstream: &str, secret: &Path, extra: &[&str]) -> (i32, String) {
@@ -152,7 +162,7 @@ async fn spawn_process(
     upstream_secret: &Path,
     state_dir: &Path,
     extra: &[&str],
-) -> (Child, SocketAddr) {
+) -> (Child, SocketAddr, Arc<Mutex<String>>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_honkd"));
     let mut has_listen = false;
     for arg in extra {
@@ -202,25 +212,31 @@ async fn spawn_process(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        let mut sent_addr = false;
         for line in reader.lines() {
             match line {
                 Ok(l) => {
-                    if let Some(rest) = l.strip_prefix("honkd listening on ")
+                    if !sent_addr
+                        && let Some(rest) = l.strip_prefix("honkd listening on ")
                         && let Ok(addr) = rest.trim().parse::<SocketAddr>()
                     {
                         let _ = tx.send(Ok(addr));
-                        return;
+                        sent_addr = true;
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e.to_string()));
+                    if !sent_addr {
+                        let _ = tx.send(Err(e.to_string()));
+                    }
                     return;
                 }
             }
         }
-        let _ = tx.send(Err(
-            "process exited without 'honkd listening on <addr>'".to_string()
-        ));
+        if !sent_addr {
+            let _ = tx.send(Err(
+                "process exited without 'honkd listening on <addr>'".to_string()
+            ));
+        }
     });
 
     let res = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
@@ -228,7 +244,7 @@ async fn spawn_process(
         .expect("join wait thread");
 
     match res {
-        Ok(Ok(addr)) => (child, addr),
+        Ok(Ok(addr)) => (child, addr, stderr_buf),
         Ok(Err(err)) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -383,27 +399,39 @@ impl Viewer {
     }
 
     pub async fn response(&mut self, id: &Value) -> Value {
+        self.response_timeout(id, Duration::from_secs(10)).await
+    }
+
+    pub async fn try_response_timeout(&mut self, id: &Value, timeout: Duration) -> Option<Value> {
         if let Some(pos) = self
             .incoming
             .iter()
             .position(|v| honk_upstream::rpc_id_matches(id, v.get("id").unwrap_or(&Value::Null)))
         {
-            return self.incoming.remove(pos);
+            return Some(self.incoming.remove(pos));
         }
 
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
-            match tokio::time::timeout(Duration::from_secs(10), self.recv_frame()).await {
+        while start.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            match tokio::time::timeout(remaining, self.recv_frame()).await {
                 Ok(Some(frame)) => {
                     if honk_upstream::rpc_id_matches(id, frame.get("id").unwrap_or(&Value::Null)) {
-                        return frame;
+                        return Some(frame);
                     }
                     self.incoming.push(frame);
                 }
-                _ => break,
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
-        panic!("timed out waiting for response to id {id}");
+        None
+    }
+
+    pub async fn response_timeout(&mut self, id: &Value, timeout: Duration) -> Value {
+        self.try_response_timeout(id, timeout)
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for response to id {id}"))
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> Value {
