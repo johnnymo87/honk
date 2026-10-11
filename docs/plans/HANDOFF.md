@@ -58,3 +58,6 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - A0.5 DONE: 40a4dd8 + review fixes c1d53ba, 15e1c25 (abort-on-drop, generation-guarded resubscribe, no URLs in errors).
 - A1 DONE: stub-model spike, all 6 checks pass on patched-1.54.0.3 → stub-goose is the main test upstream (39dde5a, ece7451; docs/spike/m1-stub-model.md).
 - A2 DONE: StubGoose API, FakeGoose (fidelity-checked vs vendored acp-http), TcpProxy, CI live-stub job (63fc931, 72c9107). Live job unverified until CI runs on a pushed PR/branch.
+- A3 DONE: honk-wire (block keys, cursors, reducer, export mapping w/ goose visibility filter) + honkd::rpc (3c34fd7).
+- A4/A5 DONE: locked atomic state file; durable per-session log (4b06ade, 35947e4, fixes 33b0644: 0600 at create, corrupt middle line refuses open, transactional mutate).
+- A6 DONE: pure turn core (7970a10, fixes 6ce9ae2, e5b1ceb: no cancel_pending leak across turns; steer reply/consume ordering races; consumed-steer ids kept until next run start).
