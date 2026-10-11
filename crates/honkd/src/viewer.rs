@@ -47,6 +47,9 @@ pub struct ReplayBatch {
 }
 
 fn is_duplicate(msg: &Message, heads: &HashMap<String, honk_wire::Cursor>) -> bool {
+    if heads.is_empty() {
+        return false;
+    }
     let Message::Text(text) = msg else {
         return false;
     };

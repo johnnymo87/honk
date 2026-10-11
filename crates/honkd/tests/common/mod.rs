@@ -266,6 +266,7 @@ pub struct Viewer {
     ws: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     pub blocks: honk_wire::Blocks,
     pub closed: Option<u16>,
+    pub raw_frames: Vec<Value>,
     next_req_id: u64,
     incoming: Vec<Value>,
     accumulated_agent_text: String,
@@ -279,6 +280,7 @@ impl Viewer {
             ws,
             blocks: honk_wire::Blocks::default(),
             closed: None,
+            raw_frames: Vec::new(),
             next_req_id: 1,
             incoming: Vec::new(),
             accumulated_agent_text: String::new(),
@@ -360,6 +362,7 @@ impl Viewer {
             match msg_res {
                 Ok(Message::Text(text)) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        self.raw_frames.push(v.clone());
                         self.blocks.apply(&v);
                         if v.get("method").and_then(Value::as_str) == Some("session/update")
                             && let Some(chunk) = v.pointer("/params/update")

@@ -188,7 +188,8 @@ async fn two_viewers_converge() {
     })
     .await;
 
-    assert_eq!(a.blocks.agent_text(), b.blocks.agent_text());
+    assert_eq!(a.blocks.agent_text(), "done");
+    assert_eq!(b.blocks.agent_text(), "done");
     assert_eq!(a.blocks.tool_status, b.blocks.tool_status);
 }
 
@@ -304,6 +305,14 @@ async fn legacy_viewer_never_gets_reset_or_replay() {
         b.blocks.resets, 0,
         "legacy viewer must never receive _honk/reset"
     );
+    for frame in &b.raw_frames {
+        if let Some(m) = frame.get("method").and_then(Value::as_str) {
+            assert!(
+                !m.starts_with("_honk/"),
+                "legacy viewer received _honk method: {m}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -398,7 +407,11 @@ async fn log_file_holds_every_frame_with_event_id() {
     let log_content = std::fs::read_to_string(&log_path).expect("read log");
     let lines: Vec<&str> = log_content.lines().collect();
 
-    assert!(!lines.is_empty(), "log file must not be empty");
+    assert_eq!(
+        lines.len(),
+        6,
+        "exact line count: header + 4 frames + 1 processed response"
+    );
     // Line 0 is header
     let header: Value = serde_json::from_str(lines[0]).expect("parse header");
     assert_eq!(header["epoch"], 1);
