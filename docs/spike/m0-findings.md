@@ -556,7 +556,96 @@ follow-ups (patch, config, or recipe), not as failures.
   - Fixture: `fixtures/goose-1.54.0-patched.2/p5e/1791682292.jsonl`
 
 ## P6: Message ids, resource cost, fixtures
-_pending_
+
+**Question:** Are message IDs and tool call IDs stable across a live turn and subsequent `session/load` replays? What update kinds exist in live streaming vs replay? What does `replayTail: 1` cover exactly (single message vs last turn)? What is the resource cost of active goose sessions (VmRSS, thread count, child processes) before, during, and after connection teardown, and what idle-eviction TTL / max held sessions should honkd set?
+
+**Verdict:**
+1. **Message IDs and Tool Call IDs are completely stable:** Every streamed `messageId` and `toolCallId` during the live turn matches the replayed frames on subsequent connections exactly, in the exact same order. In addition, the message and tool IDs in `_goose/unstable/session/export` match both the live and replayed stream IDs.
+2. **Thinking is supported on Haiku:** Goose config options in `session/new` include `thinking_effort` (`off|low|medium|high|max`). Setting `thinking_effort: "low"` on `claude-haiku-4-5@20251001` succeeds and emits `sessionUpdate: "agent_thought_chunk"` with a stable `messageId` matching replay.
+3. **Update Kinds in Live vs Replay:**
+   - **Live stream:** `agent_thought_chunk`, `agent_message_chunk` (token-by-token deltas), `tool_call`, `tool_call_update` (both intermediate `in_progress` live output chunks and final `completed` status), `usage_update`, `session_info_update` (`activeRunId` start and `null` finish), `config_option_update`, and `current_mode_update`.
+   - **Replay stream:** `user_message_chunk` (the user prompt, which is omitted on the live connection to the sender), `agent_thought_chunk` (accumulated thought block), `agent_message_chunk` (accumulated message block), `tool_call` (one per tool call), `tool_call_update` (final `completed` status only, with return content and locations), `usage_update`, and `available_commands_update`.
+   - **Notable diffs:** Live streams token deltas and intermediate `in_progress` tool updates, plus `session_info_update` lifecycle events. Replay delivers aggregated blocks, omits `session_info_update` and intermediate output chunks, and includes `user_message_chunk`.
+4. **`replayTail: 1` covers the LAST TURN:**
+   In `goose-patched/crates/goose/src/acp/server/load_session.rs`, `replay_start_index` walks backwards from `len - tail` to the nearest turn boundary: `message.role == Role::User && !message.is_tool_response()`.
+   - In a single-turn session: `replayTail: 1` replays the entire turn (all 14 frames), preserving the turn boundary without splitting tool calls.
+   - In a multi-turn session: `replayTail: 1` skips prior turns (`_meta.replaySkipped > 0`), delivering only the trailing turn.
+5. **Resource Cost & Extension Architecture:**
+   - Baseline goose sandbox: ~183–202 MB VmRSS, ~35–41 threads, 0 child processes.
+   - 5 active sessions on 5 connections: VmRSS increases by only ~1.8–8.4 MB total (~0.35–1.7 MB per session). Thread count increases by ~45–58 threads (~9–12 threads per active connection for tokio workers, SSE mpsc queues, and ConnectionTo actors).
+   - Child processes: Exactly 0 child processes. The builtin `developer` extension runs strictly in-process inside goose. Shell commands (`ls`, `bash`) execute via transient subprocesses that exit immediately upon completion.
+   - Upon connection DELETE: Connection handler threads are immediately reaped (thread count drops back to baseline 36 threads). VmRSS drops slightly (~0.7–1.0 MB), with heap memory retained in the allocator arena for future allocations.
+
+**Decision-rule outcomes:**
+1. **Transcript Block ID:** Because IDs are completely stable across live and replay, honkd's transcript block ID is:
+   `block_id = messageId` (or `messageId:toolCallId` for individual tool calls within an assistant turn). No synthetic `(turn_index, item_index)` fallback is needed.
+2. **honkd Session Management (TTL & Max Held Sessions):**
+   - Memory footprint per session is negligible (~0.5–1.7 MB VmRSS).
+   - The primary resource held by an active session connection is OS threads (~9–12 threads per connection).
+   - Recommended settings for honkd:
+     - **Idle-eviction TTL: 15 minutes (900s).** An inactive connection is torn down via DELETE. Sessions are persisted in goose's SQLite DB (`sessions.db`) and re-hydrate seamlessly in <30ms via `session/load`.
+     - **Max held connections: 16 concurrent sessions** (~160 threads and ~25–30 MB memory overhead above baseline). When a 17th session is activated, honkd evicts the least-recently-used idle connection via DELETE.
+
+**Source References:**
+- `goose-patched/crates/goose/src/acp/server/load_session.rs`:
+  - Lines 91–100: `replay_start_index` walks backwards from `len - tail` to nearest turn boundary (`message.role == Role::User && !message.is_tool_response()`).
+  - Lines 102–106: `replay_tail_from_meta` extracts `meta.get("replayTail")`.
+  - Lines 108–220: `replay_conversation_to_client` emits `UserMessageChunk`, `AgentThoughtChunk`, `AgentMessageChunk`, `ToolCall`, `ToolCallUpdate`.
+  - Lines 447–453: Emits `_meta.replaySkipped` when `replayed_from > 0`.
+- `goose-patched/crates/goose/src/acp/response_builder.rs`:
+  - Lines 278–331: Exposes config options `provider`, `mode`, `model`, and `thinking_effort`.
+  - Lines 386–405: `thinking_effort_values` offers `[off, low, medium, high, max]` for reasoning models.
+- `goose-patched/crates/goose/src/acp/server.rs`:
+  - Lines 1403–1411: Streams thinking as `SessionUpdate::AgentThoughtChunk(content_chunk_for_message(...))`.
+
+**Probe results:**
+
+### P6a: ID Stability & Canonical Replay Comparison
+
+| Property | Live Stream | Replay (Full) | Replay (`replayTail: 1`) | Stability Verdict |
+|---|---|---|---|---|
+| User Prompt | Sent by client (omitted on live SSE) | `user_message_chunk` (`msg_...`) | `user_message_chunk` (`msg_...`) | User ID persisted in SQLite |
+| Extended Thinking | `agent_thought_chunk` (`msg_vrtx_...`) | `agent_thought_chunk` (`msg_vrtx_...`) | `agent_thought_chunk` (`msg_vrtx_...`) | **STABLE** (exact match) |
+| Tool 1 (`shell · ls`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | **STABLE** (exact match) |
+| Tool 1 Result | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | **STABLE** (exact match) |
+| Tool 2 (`write · notes.md`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | **STABLE** (exact match) |
+| Tool 2 Result | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | **STABLE** (exact match) |
+| Tool 3 (`edit · notes.md`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | `tool_call` (`toolu_vrtx_...`) | **STABLE** (exact match) |
+| Tool 3 Result | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | `tool_call_update` (`completed`) | **STABLE** (exact match) |
+| Final Text (3-row table) | `agent_message_chunk` (`msg_vrtx_...`) | `agent_message_chunk` (`msg_vrtx_...`) | `agent_message_chunk` (`msg_vrtx_...`) | **STABLE** (exact match) |
+| Run Lifecycle | `session_info_update` (`activeRunId`) | Omitted in replay | Omitted in replay | Expected (live-only) |
+| Intermediate Outputs | `tool_call_update` (`in_progress`) | Omitted in replay | Omitted in replay | Expected (live-only) |
+
+- **Run 1 (Canonical):**
+  - Session: `20261011_76`
+  - Live events: 82 | Replay-full events: 14 | Replay-tail1 events: 14
+  - Message IDs: 4 assistant/thought IDs in live matched identically in replay-full and replay-tail1 in identical order.
+  - Tool Call IDs: 3 tool calls (`shell`, `write`, `edit`) matched identically across live, replay-full, and replay-tail1.
+  - Export: 9 messages in `conversation` (1 user prompt, 1 system injection, 3 assistant tool requests, 3 user tool responses, 1 assistant final text). All IDs match live stream.
+  - Fixtures:
+    - `fixtures/goose-1.54.0-patched.2/canonical/live.jsonl`
+    - `fixtures/goose-1.54.0-patched.2/canonical/replay-full.jsonl`
+    - `fixtures/goose-1.54.0-patched.2/canonical/replay-tail1.jsonl`
+    - `fixtures/goose-1.54.0-patched.2/canonical/export.json`
+- **Run 2 (Repeatability):**
+  - Session: `20261011_77`
+  - Live events: 107 | Replay-full events: 13 | Replay-tail1 events: 13
+  - Message IDs stable: `true` | Order preserved: `true`
+  - Tool Call IDs stable: `true`
+  - Fixtures: `fixtures/goose-1.54.0-patched.2/p6/1791683239_{live,replay-full,replay-tail1}.jsonl` & `export.json`
+- **Multi-turn ReplayTail Test:**
+  - 2-turn session: Turn 1 ("TURN1_DONE") and Turn 2 ("TURN2_DONE").
+  - `session/load` with `replayTail: 1` returned `_meta.replaySkipped = 2`.
+  - Replayed only Turn 2 user chunk: `["Reply with only TURN2_DONE."]`. Turn 1 was cleanly skipped.
+
+### P6b: Goose Resource Footprint
+
+| Metric | Baseline | 5 Active Sessions | After DELETE (all 5) | Net Delta vs Baseline |
+|---|---|---|---|---|
+| **VmRSS (MB)** | 202.54 MB | 205.35 MB (+2.82 MB, ~0.56 MB/session) | 204.34 MB | +1.80 MB |
+| **Thread Count** | 41 threads | 99 threads (+58 threads, ~11.6 threads/session) | 36 threads | -5 threads (41 -> 36) |
+| **Child Processes** | 0 | 0 | 0 | 0 |
+| **Per-session Extension Children** | N/A | 0 (developer extension is in-process built-in) | 0 | 0 |
 
 ## P7: hydra-acp (optional)
 _pending_
