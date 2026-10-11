@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[derive(Debug, Clone, Default)]
+pub struct StubGooseConfig {
+    pub extra_extensions: Vec<String>,
+}
+
 pub struct StubGoose {
     pub(crate) child: Option<tokio::process::Child>,
     pub(crate) pid: u32,
@@ -25,7 +30,19 @@ impl StubGoose {
         Self::start_with_model_or_skip(model).await
     }
 
+    pub async fn start_with_config_or_skip(config: StubGooseConfig) -> Option<Self> {
+        let model = StubModel::start().await;
+        Self::start_with_model_and_config_or_skip(model, config).await
+    }
+
     pub async fn start_with_model_or_skip(model: StubModel) -> Option<Self> {
+        Self::start_with_model_and_config_or_skip(model, StubGooseConfig::default()).await
+    }
+
+    pub async fn start_with_model_and_config_or_skip(
+        model: StubModel,
+        config: StubGooseConfig,
+    ) -> Option<Self> {
         let goose_bin = match std::env::var("HONK_GOOSE_BIN") {
             Ok(b) if !b.trim().is_empty() => PathBuf::from(b.trim()),
             _ => {
@@ -57,7 +74,7 @@ impl StubGoose {
 
         let config_dir = root_dir.join("config");
         std::fs::create_dir_all(&config_dir).expect("create config_dir");
-        let config_yaml = r#"extensions:
+        let mut config_yaml = r#"extensions:
   developer:
     enabled: true
     type: platform
@@ -66,7 +83,22 @@ impl StubGoose {
     display_name: Developer
     bundled: true
     available_tools: []
-"#;
+"#
+        .to_string();
+
+        for ext in &config.extra_extensions {
+            config_yaml.push_str(&format!(
+                r#"  {ext}:
+    enabled: true
+    type: platform
+    name: {ext}
+    description: {ext}
+    display_name: {ext}
+    bundled: true
+    available_tools: []
+"#
+            ));
+        }
         std::fs::write(config_dir.join("config.yaml"), config_yaml).expect("write config.yaml");
 
         let mut rand_bytes = [0u8; 16];

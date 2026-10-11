@@ -5,5 +5,5 @@ pub mod stub_model;
 
 pub use fake::FakeGoose;
 pub use proxy::TcpProxy;
-pub use stub_goose::StubGoose;
+pub use stub_goose::{StubGoose, StubGooseConfig};
 pub use stub_model::{StubModel, Turn};
