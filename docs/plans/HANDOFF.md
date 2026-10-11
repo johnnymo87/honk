@@ -48,3 +48,7 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - Tasks 0-8 done (honk commits: Task 1 scripts, Task 7 honk-upstream ids/resume/features, Task 8 probes + fixes). Pre-tag gate PASS: P2e x2 (after control fix), P2f x3, P4b' x2, P5a' x2, pigeon WS probes x3 on the patched sandbox unit `honk-goose-sandbox-patched` (:4181, ~/.local/state/honk-sandbox-patched).
 - Tasks 9-11 DONE: release run 38116818991 green; assets verified; release binary packaged at ~/.local/state/honk-goose-bin/patched-1.54.0.3/pkg (GC root); all probes + pigeon WS qualification PASS on it (logs /tmp/opencode/pigeon-qual-release-*.log); fixtures committed. `honk-goose-sandbox-patched` left running on the release binary for M1.
 - Production deploy of patched-1.54.0.3 is AUTHOR-ONLY (plan "Production deploy" section); gate evidence = Task 10 pigeon-qual-release logs.
+
+## Open PR status / next (2026-10-11)
+- M0 PR (m0 -> main) NOT opened: pre-PR adversarial review found the org name in pushed history (133bf83..b2443a5); opening a PR pins refs/pull/N/head permanently. Waiting on the author: rewrite history (needs force-push OK) or accept. Review fixes landed on m0 (2a3707e). Branches m0 -> goose-patch-track -> m1a are stacked; all carry the same history.
+- M1a executes in worktree ../honk-m1a (branch m1a off goose-patch-track) per docs/plans/2026-10-11-honk-m1-plan.md; patched sandbox `honk-goose-sandbox-patched` on :4181 runs the release binary.
