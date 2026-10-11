@@ -1,6 +1,46 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+/// Resolves the file path for custom redaction needles:
+/// 1. `$HONK_REDACT_FILE`
+/// 2. `$XDG_CONFIG_HOME/honk/redact.txt`
+/// 3. `$HOME/.config/honk/redact.txt`
+pub fn resolve_redact_file() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("HONK_REDACT_FILE") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join("honk/redact.txt"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(".config/honk/redact.txt"));
+        }
+    }
+    None
+}
+
+/// Parses redaction needles from a file: one needle per line, ignoring
+/// blank lines and `#` comments. Missing file returns empty list.
+pub fn parse_redact_file(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Redactor {
@@ -22,6 +62,7 @@ impl Redactor {
     /// - `HONK_GOOSE_SECRET` or `$HOME/.local/state/honk-sandbox/secret`
     /// - contents of `/run/secrets/google_cloud_project` or GCP env vars
     /// - `$HOME`
+    /// - extra needles from `$HONK_REDACT_FILE` or default config file
     pub fn from_env() -> Self {
         let mut replacements = Vec::new();
 
@@ -70,9 +111,11 @@ impl Redactor {
             }
         }
 
-        // 4. Org name
-        for org in ["wonder", "Wonder", "WONDER"] {
-            replacements.push((org.to_string(), "<ORG>".to_string()));
+        // 4. Extra needles from config file (modeled as <ORG>)
+        if let Some(path) = resolve_redact_file() {
+            for needle in parse_redact_file(&path) {
+                replacements.push((needle, "<ORG>".to_string()));
+            }
         }
 
         Self::new(replacements)
@@ -167,5 +210,38 @@ mod tests {
             r.apply(json!({"path": "/home/dev/special/file"})),
             json!({"path": "$SPECIAL/file"})
         );
+    }
+
+    #[test]
+    fn parses_redact_file_with_comments_and_blank_lines() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "# Comment line").unwrap();
+        writeln!(tmp).unwrap();
+        writeln!(tmp, "  acme  ").unwrap();
+        writeln!(tmp, "# Another comment").unwrap();
+        writeln!(tmp, "ACME_CORP").unwrap();
+        writeln!(tmp).unwrap();
+
+        let needles = parse_redact_file(tmp.path());
+        assert_eq!(needles, vec!["acme", "ACME_CORP"]);
+
+        let r = Redactor::new(
+            needles
+                .into_iter()
+                .map(|n| (n, "<ORG>".to_string()))
+                .collect(),
+        );
+        assert_eq!(
+            r.apply(json!({"msg": "Welcome to acme and ACME_CORP!"})),
+            json!({"msg": "Welcome to <ORG> and <ORG>!"})
+        );
+    }
+
+    #[test]
+    fn missing_redact_file_returns_empty() {
+        let p = Path::new("/path/that/does/not/exist/honk_test_missing.txt");
+        let needles = parse_redact_file(p);
+        assert!(needles.is_empty());
     }
 }
