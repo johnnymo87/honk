@@ -129,6 +129,69 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     {
                         break;
                     }
+                } else if method == Some("session/new") {
+                    match hub.create_session(params).await {
+                        Ok(new_res) => {
+                            let resp_frame = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": new_res,
+                            });
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(resp_frame.to_string().into()))
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let err_resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32603,
+                                    "message": format!("Failed to create session: {e:#}"),
+                                }
+                            });
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                } else if method == Some("session/list")
+                    || !params
+                        .as_object()
+                        .is_some_and(|o| o.contains_key("sessionId"))
+                {
+                    match hub
+                        .control_request(method.unwrap_or(""), params, id.clone())
+                        .await
+                    {
+                        Ok(resp) => {
+                            if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let err_resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32603,
+                                    "message": format!("Control connection error: {e:#}"),
+                                }
+                            });
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                        }
+                    }
                 } else if method == Some("session/load") {
                     viewer.is_honk_aware = true;
                     let err_resp = json!({
@@ -136,7 +199,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         "id": id,
                         "error": {
                             "code": -32601,
-                            "message": "Method not implemented in A7"
+                            "message": "Method not implemented in A8"
                         }
                     });
                     if !viewer
@@ -151,7 +214,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         "id": id,
                         "error": {
                             "code": -32601,
-                            "message": "Method not implemented in A7"
+                            "message": "Method not implemented in A8"
                         }
                     });
                     if !viewer

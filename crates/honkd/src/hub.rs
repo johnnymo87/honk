@@ -1,19 +1,32 @@
 use anyhow::Context;
 use honk_upstream::{Recorder, Redactor, SubscribeOpts, Upstream, UpstreamHandle, UpstreamOpts};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 use crate::config::Args;
+use crate::rpc::UpstreamIds;
 use crate::state::StateStore;
+
+#[derive(Clone, Debug)]
+pub struct SessionHandle {
+    pub sid: String,
+    pub conn_id: String,
+}
 
 pub struct Hub {
     pub args: Arc<Args>,
     pub state: Arc<Mutex<StateStore>>,
+    pub state_dir: PathBuf,
     pub upstream_url: String,
     pub upstream_secret: String,
     pub control: UpstreamHandle,
     pub control_init_result: Value,
+    pub upstream_ids: Arc<Mutex<UpstreamIds>>,
+    pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
 }
 
 impl Hub {
@@ -22,6 +35,8 @@ impl Hub {
         state_store: StateStore,
         upstream_secret: String,
     ) -> anyhow::Result<Arc<Self>> {
+        let state_dir = state_store.dir().to_path_buf();
+        let boot = state_store.boot;
         let state = Arc::new(Mutex::new(state_store));
         let upstream_url = args.upstream.clone();
 
@@ -118,9 +133,26 @@ impl Hub {
 
         // 6. Split control connection
         let (control_handle, mut control_rx) = control_upstream.split();
+        let pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_clone = pending_control.clone();
+
         tokio::spawn(async move {
-            while let Some(_event) = control_rx.recv().await {
-                // Control connection conn stream events
+            while let Some(ev) = control_rx.recv().await {
+                if let Some(frame) = ev.frame()
+                    && let Some(id_val) = frame.get("id")
+                {
+                    let mut pending = pending_clone.lock().await;
+                    let found_key = pending
+                        .keys()
+                        .find(|k| honk_upstream::rpc_id_matches(&serde_json::json!(k), id_val))
+                        .cloned();
+                    if let Some(k) = found_key
+                        && let Some(tx) = pending.remove(&k)
+                    {
+                        let _ = tx.send(frame.clone());
+                    }
+                }
             }
         });
 
@@ -129,10 +161,14 @@ impl Hub {
         Ok(Arc::new(Self {
             args,
             state,
+            state_dir,
             upstream_url,
             upstream_secret,
             control: control_handle,
             control_init_result,
+            upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
+            pending_control,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }))
     }
 
@@ -163,5 +199,215 @@ impl Hub {
         }
 
         result_obj
+    }
+
+    pub async fn control_request(
+        &self,
+        method: &str,
+        mut params: Value,
+        downstream_id: Value,
+    ) -> anyhow::Result<Value> {
+        let up_id = self.upstream_ids.lock().await.next();
+        let (tx, rx) = oneshot::channel();
+        self.pending_control.lock().await.insert(up_id.clone(), tx);
+
+        crate::rpc::strip_honk_meta(&mut params);
+
+        if let Err(e) = self
+            .control
+            .request_with_id(serde_json::json!(up_id), method, params, None)
+            .await
+        {
+            self.pending_control.lock().await.remove(&up_id);
+            return Err(e).context("failed to send control request");
+        }
+
+        let mut resp = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(_)) => anyhow::bail!("control response channel closed"),
+            Err(_) => {
+                self.pending_control.lock().await.remove(&up_id);
+                anyhow::bail!("control request timed out waiting for upstream reply");
+            }
+        };
+
+        resp["id"] = downstream_id;
+
+        if method == "session/list" {
+            let held_sids: std::collections::HashSet<String> = {
+                let s = self.state.lock().await;
+                s.sessions.keys().cloned().collect()
+            };
+
+            if let Some(sessions_arr) = resp
+                .pointer_mut("/result/sessions")
+                .and_then(Value::as_array_mut)
+            {
+                for entry in sessions_arr {
+                    let sid = entry.get("sessionId").and_then(Value::as_str).unwrap_or("");
+                    let is_held = held_sids.contains(sid);
+                    let is_running = self.is_session_running(sid);
+                    if let Some(meta_obj) = entry.get_mut("_meta").and_then(Value::as_object_mut) {
+                        meta_obj.insert(
+                            "honk".to_string(),
+                            serde_json::json!({ "held": is_held, "running": is_running }),
+                        );
+                    } else {
+                        entry["_meta"] = serde_json::json!({
+                            "honk": {
+                                "held": is_held,
+                                "running": is_running,
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(resp)
+    }
+
+    pub fn is_session_running(&self, _sid: &str) -> bool {
+        // Wired for actor lookup in A9; returns false for now
+        false
+    }
+
+    pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
+        // 1. Upstream::initialize_with
+        let init_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
+        let recorder = if let Some(rec_path) = &self.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor)?
+        } else {
+            Recorder::disabled()
+        };
+        let mut session_upstream = Upstream::initialize_with(
+            &self.upstream_url,
+            self.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await
+        .context("failed to initialize session upstream")?;
+        let conn_id = session_upstream.conn_id().to_string();
+
+        // 2. Persist orphan BEFORE first subscribe (A15)
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })?;
+        }
+
+        // 3. Subscribe to the conn stream with takeover
+        session_upstream
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: None,
+                },
+            )
+            .await
+            .context("failed to subscribe session conn stream")?;
+
+        // 4. call("session/new", strip_honk_meta(params))
+        let mut clean_params = params.clone();
+        crate::rpc::strip_honk_meta(&mut clean_params);
+        let new_res = session_upstream
+            .call(
+                "session/new",
+                clean_params,
+                None,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .context("failed to call session/new")?;
+
+        let sid = new_res
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .context("session/new missing sessionId")?
+            .to_string();
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        // 5. Subscribe to session stream with takeover and resume_after: Some(0)
+        // Note: In patched goose (vendor/agent-client-protocol-http/src/http_mailbox.rs),
+        // sequence numbers start at 1 (next_seq = 1, trimmed_through = 0).
+        // Calling resume_after(0) acknowledges nothing and replays all retained frames
+        // from seq 1 onwards. For a brand-new session stream, this guarantees all initial
+        // frames are replayed without creating a gap.
+        session_upstream
+            .subscribe_with(
+                Some(&sid),
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(0),
+                },
+            )
+            .await
+            .context("failed to subscribe session stream")?;
+
+        // 6. In one state.mutate: remove orphan; insert HeldSession
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.retain(|id| id != &conn_id);
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: conn_id.clone(),
+                        cwd: cwd.clone(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: now,
+                    },
+                );
+            })?;
+        }
+
+        // 7. SessionLog::create(sessions/<sid>.jsonl, 1, None, [])
+        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
+        let session_log = crate::log::SessionLog::create(&log_path, 1, None, Vec::new())
+            .context("failed to create session log")?;
+
+        // 8. Spawn actor placeholder (Task A9 will fill it in)
+        let (up_handle, mut event_rx) = session_upstream.split();
+        tokio::spawn(async move {
+            let _log = session_log;
+            let _up = up_handle;
+            while let Some(_ev) = event_rx.recv().await {
+                // Placeholder: drains events until actor is wired in A9
+            }
+        });
+
+        self.sessions.write().await.insert(
+            sid.clone(),
+            SessionHandle {
+                sid: sid.clone(),
+                conn_id: conn_id.clone(),
+            },
+        );
+
+        Ok(new_res)
     }
 }
