@@ -52,3 +52,9 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 ## Open PR status / next (2026-10-11)
 - M0 PR (m0 -> main) NOT opened: pre-PR adversarial review found the org name in pushed history (133bf83..b2443a5); opening a PR pins refs/pull/N/head permanently. Waiting on the author: rewrite history (needs force-push OK) or accept. Review fixes landed on m0 (2a3707e). Branches m0 -> goose-patch-track -> m1a are stacked; all carry the same history.
 - M1a executes in worktree ../honk-m1a (branch m1a off goose-patch-track) per docs/plans/2026-10-11-honk-m1-plan.md; patched sandbox `honk-goose-sandbox-patched` on :4181 runs the release binary.
+
+## M1a progress (branch m1a, worktree ../honk-m1a)
+- A0 preflight PASS (patched :4181 advertises `takeover, replay`; upstream tests green). Branch is `m1a`, not the plan's `m1`.
+- A0.5 DONE: 40a4dd8 + review fixes c1d53ba, 15e1c25 (abort-on-drop, generation-guarded resubscribe, no URLs in errors).
+- A1 DONE: stub-model spike, all 6 checks pass on patched-1.54.0.3 → stub-goose is the main test upstream (39dde5a, ece7451; docs/spike/m1-stub-model.md).
+- A2 DONE: StubGoose API, FakeGoose (fidelity-checked vs vendored acp-http), TcpProxy, CI live-stub job (63fc931, 72c9107). Live job unverified until CI runs on a pushed PR/branch.
