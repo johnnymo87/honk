@@ -19,13 +19,18 @@ pub struct Inflight {
 
 impl Inflight {
     pub fn to_persisted(&self) -> crate::state::InflightPrompt {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut client_req_ids = Vec::new();
+        for o in &self.owners {
+            if let Some(id) = &o.client_req_id
+                && seen.insert(id.clone())
+            {
+                client_req_ids.push(id.clone());
+            }
+        }
         crate::state::InflightPrompt {
             upstream_id: self.upstream_id.clone(),
-            client_req_ids: self
-                .owners
-                .iter()
-                .filter_map(|o| o.client_req_id.clone())
-                .collect(),
+            client_req_ids,
             params: self.params.clone(),
             announced: self.announced,
         }
@@ -98,6 +103,7 @@ pub struct TurnCore {
     pub parked: Vec<(OwnerRef, Value)>,
     pub cancel_pending: bool,
     pub steers: Vec<(String, ViewerId)>,
+    pub consumed_steers: std::collections::BTreeSet<String>,
 }
 
 impl TurnCore {
@@ -162,6 +168,7 @@ impl TurnCore {
             }
             None => {
                 self.run = None;
+                self.consumed_steers.clear();
                 for (message_id, viewer) in self.steers.drain(..) {
                     out.push(Action::NotifySteerUnconsumed { viewer, message_id });
                 }
@@ -182,17 +189,16 @@ impl TurnCore {
         let Some(inf) = self.inflight.take_if(|i| i.upstream_id == upstream_id) else {
             return vec![];
         };
+        self.cancel_pending = false;
         if let Some(run) = crate::rpc::busy_run_id(frame) {
             self.run = Some(run);
         } else {
             self.run = None;
+            self.consumed_steers.clear();
         }
-        let body = if let Some(e) = frame.get("error") {
-            Reply::Error(e.clone())
-        } else if frame.get("code").is_some() && frame.get("result").is_none() {
-            Reply::Error(frame.clone())
-        } else {
-            Reply::Result(frame.get("result").cloned().unwrap_or_default())
+        let body = match frame.get("error") {
+            Some(e) => Reply::Error(e.clone()),
+            None => Reply::Result(frame.get("result").cloned().unwrap_or(Value::Null)),
         };
         let mut out = vec![Action::Reply {
             owners: inf.owners,
@@ -212,12 +218,20 @@ impl TurnCore {
         self.on_prompt(owner, params, ids)
     }
 
-    pub fn on_steer_ok(&mut self, message_id: String, viewer: ViewerId) {
+    pub fn on_steer_ok(&mut self, message_id: String, viewer: ViewerId) -> Vec<Action> {
+        if self.consumed_steers.contains(&message_id) {
+            return vec![];
+        }
+        if self.run.is_none() {
+            return vec![Action::NotifySteerUnconsumed { viewer, message_id }];
+        }
         self.steers.push((message_id, viewer));
+        vec![]
     }
 
     pub fn on_user_message(&mut self, message_id: &str) {
         self.steers.retain(|(m, _)| m != message_id);
+        self.consumed_steers.insert(message_id.to_string());
     }
 
     pub fn on_cancel(&mut self) -> Vec<Action> {
@@ -231,6 +245,7 @@ impl TurnCore {
         self.run = None;
         self.cancel_pending = false;
         self.steers.clear();
+        self.consumed_steers.clear();
         let owners: Vec<OwnerRef> = self
             .inflight
             .take()
@@ -459,8 +474,8 @@ mod tests {
             ..Default::default()
         };
 
-        core.on_steer_ok("steer_consumed".into(), 10);
-        core.on_steer_ok("steer_unconsumed".into(), 20);
+        let _ = core.on_steer_ok("steer_consumed".into(), 10);
+        let _ = core.on_steer_ok("steer_unconsumed".into(), 20);
 
         // Live user message chunk consumes steer_consumed
         core.on_user_message("steer_consumed");
@@ -488,8 +503,8 @@ mod tests {
         let owner2 = make_owner(Some(2), 20, Some("req_2"));
         let _ = core.on_prompt(owner2.clone(), json!({"prompt": "second"}), &mut ids);
 
-        core.on_steer_ok("steer_1".into(), 30);
         core.run = Some("run_1".into());
+        let _ = core.on_steer_ok("steer_1".into(), 30);
 
         let actions = core.interrupt("goose restart");
         assert_eq!(
@@ -558,13 +573,17 @@ mod tests {
         let owner1 = make_owner(Some(1), 10, Some("req_1"));
         let _ = core.on_prompt(owner1.clone(), json!({"prompt": "hi"}), &mut ids);
 
-        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+        // Attach a second waiter with duplicate req_1, and another with req_2
+        let owner2 = make_owner(Some(2), 20, Some("req_1"));
         assert!(core.attach_waiter("req_1", owner2));
+        let owner3 = make_owner(Some(3), 30, Some("req_2"));
+        assert!(core.attach_waiter("req_1", owner3));
 
         let persisted = core.to_persisted();
         assert!(persisted.is_some());
         let p = persisted.clone().unwrap();
         assert_eq!(p.upstream_id, "hk1-1");
+        // Deduplicated preserving order: req_1 was seen first, then req_2.
         assert_eq!(p.client_req_ids, vec!["req_1", "req_2"]);
         assert_eq!(p.params, json!({"prompt": "hi"}));
         assert!(!p.announced);
@@ -602,6 +621,88 @@ mod tests {
         assert_eq!(empty_core.to_persisted(), None);
         let restored_empty = TurnCore::from_persisted(None);
         assert!(restored_empty.inflight.is_none());
+    }
+
+    #[test]
+    fn test_early_cancel_cleared_on_prompt_reply_no_leak_to_next_turn() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1, json!({"prompt": "p1"}), &mut ids);
+
+        // Cancel while p1 is unannounced
+        let cancel_actions = core.on_cancel();
+        assert_eq!(cancel_actions, vec![Action::SendCancel]);
+        assert!(core.cancel_pending);
+
+        // p1 completes without run announcement (e.g. error or simple result)
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {"status": "ok"},
+        });
+        let _ = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert!(!core.cancel_pending);
+
+        // Next turn: p2 starts
+        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+        let _ = core.on_prompt(owner2.clone(), json!({"prompt": "p2"}), &mut ids);
+
+        // p2 is announced -> MUST NOT emit SendCancel
+        let run_actions = core.on_run_state(Some("run_2".into()), &mut ids);
+        assert_eq!(
+            run_actions,
+            vec![Action::SynthUser {
+                params: json!({"prompt": "p2"}),
+                owner: owner2,
+            }]
+        );
+        assert!(!core.cancel_pending);
+    }
+
+    #[test]
+    fn test_steer_ok_after_run_end_immediately_notifies_unconsumed() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        // Run is active then ends
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+        let _ = core.on_run_state(None, &mut ids);
+
+        // Steer reply arrives after activeRunId: null
+        let actions = core.on_steer_ok("steer_late".into(), 42);
+        assert_eq!(
+            actions,
+            vec![Action::NotifySteerUnconsumed {
+                viewer: 42,
+                message_id: "steer_late".into(),
+            }]
+        );
+        assert!(core.steers.is_empty());
+    }
+
+    #[test]
+    fn test_steer_consumed_before_steer_ok_records_nothing() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        // Run starts
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+
+        // user_message_chunk arrives before steer reply
+        core.on_user_message("steer_early");
+        assert!(core.consumed_steers.contains("steer_early"));
+
+        // steer reply arrives late
+        let actions = core.on_steer_ok("steer_early".into(), 42);
+        assert!(actions.is_empty());
+        assert!(core.steers.is_empty());
+
+        // Run ends -> nothing unconsumed notified
+        let end_actions = core.on_run_state(None, &mut ids);
+        assert!(end_actions.is_empty());
+        assert!(core.consumed_steers.is_empty());
     }
 
     #[test]
