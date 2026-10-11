@@ -6,10 +6,6 @@ use std::time::{Duration, Instant};
 use honk_upstream::{Event, Upstream, rpc_id_matches};
 use serde_json::{Value, json};
 
-fn is_permission_request(frame: &Value) -> bool {
-    frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
-}
-
 fn get_permission_options(frame: &Value) -> Vec<String> {
     frame
         .pointer("/params/options")
@@ -25,35 +21,6 @@ fn get_permission_options(frame: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn is_tool_call_chunk(frame: &Value) -> bool {
-    let update_type = frame
-        .pointer("/params/update/sessionUpdate")
-        .and_then(|v| v.as_str());
-    update_type == Some("tool_call") || update_type == Some("tool_call_update")
-}
-
-fn is_run_end(frame: &Value) -> bool {
-    if frame
-        .pointer("/params/update/sessionUpdate")
-        .and_then(|v| v.as_str())
-        == Some("session_info_update")
-    {
-        let active_run = frame.pointer("/params/update/_meta/goose/activeRunId");
-        active_run == Some(&Value::Null) || active_run.is_none()
-    } else {
-        false
-    }
-}
-
-fn allow_once_outcome() -> Value {
-    json!({
-        "outcome": {
-            "outcome": "selected",
-            "optionId": "allow_once"
-        }
-    })
 }
 
 fn check_export_tool_output(session_json: &Value, needle: &str) -> bool {

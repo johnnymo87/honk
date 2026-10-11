@@ -1,9 +1,17 @@
 #![allow(dead_code, unused_imports)]
 
+pub mod proxy;
+
+pub const FIXTURES_PATCHED_2: &str = "goose-1.54.0-patched.2";
+pub const FIXTURES_PATCHED_3: &str = "goose-1.54.0-patched.3";
+
 pub use std::path::{Path, PathBuf};
 pub use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub use honk_upstream::{Event, Recorder, Redactor, StreamKey, Upstream, rpc_id_matches};
+pub use honk_upstream::{
+    Event, Recorder, Redactor, ReplayOutcome, StreamFeatures, StreamKey, SubscribeOpts,
+    SubscribeOutcome, Upstream, rpc_id_matches,
+};
 pub use serde_json::{Value, json};
 
 pub struct TestSession {
@@ -17,7 +25,34 @@ pub struct TestSession {
     pub temp_dir: tempfile::TempDir,
 }
 
-pub async fn setup_session_with_mode(
+pub fn goose_url() -> String {
+    std::env::var("HONK_GOOSE_URL").unwrap_or_else(|_| "http://127.0.0.1:4180/acp".into())
+}
+
+pub fn goose_port() -> u16 {
+    reqwest::Url::parse(&goose_url())
+        .ok()
+        .and_then(|u| u.port())
+        .unwrap_or(4180)
+}
+
+pub fn fixtures_root() -> PathBuf {
+    if let Ok(root) = std::env::var("HONK_FIXTURES_ROOT")
+        && !root.trim().is_empty()
+    {
+        return PathBuf::from(root.trim());
+    }
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("finding repo root");
+    repo_root.join("fixtures")
+}
+
+pub async fn setup_session_at(
+    url: &str,
+    fixtures: &str,
     probe_name: &str,
     mode: &str,
 ) -> anyhow::Result<Option<TestSession>> {
@@ -29,22 +64,15 @@ pub async fn setup_session_with_mode(
         }
     };
 
-    let url =
-        std::env::var("HONK_GOOSE_URL").unwrap_or_else(|_| "http://127.0.0.1:4180/acp".to_string());
-
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("finding repo root");
-    let fixture_path = repo_root.join(format!(
-        "fixtures/goose-1.54.0-patched.2/{probe_name}/{ts}.jsonl"
-    ));
+    let fixture_path = fixtures_root()
+        .join(fixtures)
+        .join(probe_name)
+        .join(format!("{ts}.jsonl"));
     if let Some(parent) = fixture_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -52,7 +80,7 @@ pub async fn setup_session_with_mode(
     let redactor = Redactor::from_env();
     let rec = Recorder::file(&fixture_path, redactor)?;
 
-    let mut upstream = Upstream::initialize(&url, secret.clone(), rec.clone()).await?;
+    let mut upstream = Upstream::initialize(url, secret.clone(), rec.clone()).await?;
     let conn_id = upstream.conn_id().to_string();
 
     upstream.subscribe(None).await?;
@@ -106,7 +134,7 @@ pub async fn setup_session_with_mode(
 
     Ok(Some(TestSession {
         upstream,
-        url,
+        url: url.to_string(),
         secret,
         conn_id,
         sid,
@@ -114,6 +142,13 @@ pub async fn setup_session_with_mode(
         fixture_path,
         temp_dir,
     }))
+}
+
+pub async fn setup_session_with_mode(
+    probe_name: &str,
+    mode: &str,
+) -> anyhow::Result<Option<TestSession>> {
+    setup_session_at(&goose_url(), FIXTURES_PATCHED_2, probe_name, mode).await
 }
 
 pub async fn setup_session(probe_name: &str) -> anyhow::Result<Option<TestSession>> {
@@ -183,6 +218,94 @@ pub fn extract_all_assistant_text(session_json: &Value) -> String {
     text
 }
 
+pub fn is_permission_request(frame: &Value) -> bool {
+    frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
+}
+
+pub fn is_tool_call_chunk(frame: &Value) -> bool {
+    let update_type = frame
+        .pointer("/params/update/sessionUpdate")
+        .and_then(|v| v.as_str());
+    update_type == Some("tool_call") || update_type == Some("tool_call_update")
+}
+
+pub fn is_run_end(frame: &Value) -> bool {
+    if frame
+        .pointer("/params/update/sessionUpdate")
+        .and_then(|v| v.as_str())
+        == Some("session_info_update")
+    {
+        let active_run = frame.pointer("/params/update/_meta/goose/activeRunId");
+        active_run == Some(&Value::Null) || active_run.is_none()
+    } else {
+        false
+    }
+}
+
+pub fn is_agent_chunk(frame: &Value) -> bool {
+    frame
+        .pointer("/params/update/sessionUpdate")
+        .and_then(|v| v.as_str())
+        == Some("agent_message_chunk")
+}
+
+pub fn allow_once_outcome() -> Value {
+    json!({
+        "outcome": {
+            "outcome": "selected",
+            "optionId": "allow_once"
+        }
+    })
+}
+
+pub fn chunk_text(frame: &Value) -> Option<&str> {
+    if !is_agent_chunk(frame) {
+        return None;
+    }
+    frame
+        .pointer("/params/update/content/text")
+        .and_then(|v| v.as_str())
+}
+
+/// Fails loudly if the sandbox is not running the patched build.
+pub fn require_patched(upstream: &Upstream) -> anyhow::Result<()> {
+    let features = upstream
+        .stream_features()
+        .ok_or_else(|| anyhow::anyhow!("no GET /acp has been made yet"))?;
+    anyhow::ensure!(
+        features.is_patched(),
+        "goose at {} does not advertise `Acp-Stream-Features: takeover, replay` (got {features:?}); \
+         point HONK_GOOSE_URL at honk-goose-sandbox-patched (port 4181)",
+        goose_url()
+    );
+    Ok(())
+}
+
+/// Polls export on a fresh connection until the turn's FINISHED reply is committed
+/// (export reads sqlite and works on any connection, A6). Returns the wait.
+pub async fn wait_until_turn_committed(
+    ts: &TestSession,
+    within: Duration,
+) -> anyhow::Result<Duration> {
+    let t0 = Instant::now();
+    let mut probe = Upstream::initialize(&goose_url(), ts.secret.clone(), ts.rec.clone()).await?;
+    probe.subscribe(None).await?;
+    probe.subscribe(Some(&ts.sid)).await?;
+    loop {
+        let export = export_session(&mut probe, &ts.sid).await?;
+        if extract_all_assistant_text(&export).contains("FINISHED") {
+            break;
+        }
+        anyhow::ensure!(
+            t0.elapsed() < within,
+            "turn not committed within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let _ = probe.delete().await;
+    Ok(t0.elapsed())
+}
+
 pub fn is_subsequence(sub: &str, full: &str) -> bool {
     let mut full_chars = full.chars();
     for c in sub.chars() {
@@ -200,16 +323,90 @@ pub struct ProcStats {
     pub children: Vec<String>,
 }
 
-pub fn get_goose_sandbox_pid() -> anyhow::Result<u32> {
+pub fn get_sandbox_unit() -> String {
+    std::env::var("HONK_SANDBOX_UNIT").unwrap_or_else(|_| "honk-goose-sandbox".to_string())
+}
+
+pub fn get_sandbox_cgroup() -> anyhow::Result<PathBuf> {
+    let unit = get_sandbox_unit();
     let output = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "-p",
-            "MainPID",
-            "--value",
-            "honk-goose-sandbox",
-        ])
+        .args(["--user", "show", "-p", "ControlGroup", "--value", &unit])
+        .output()?;
+    let cg = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cg.is_empty() {
+        anyhow::bail!("no ControlGroup found for unit '{unit}'");
+    }
+    let base = Path::new("/sys/fs/cgroup");
+    Ok(base.join(cg.trim_start_matches('/')))
+}
+
+fn read_cgroup_procs_recursive(dir: &Path, pids: &mut Vec<u32>) {
+    let procs_file = dir.join("cgroup.procs");
+    if let Ok(content) = std::fs::read_to_string(&procs_file) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type()
+                && ft.is_dir()
+            {
+                read_cgroup_procs_recursive(&entry.path(), pids);
+            }
+        }
+    }
+}
+
+pub fn get_sandbox_cgroup_pids() -> anyhow::Result<Vec<u32>> {
+    let cg_dir = get_sandbox_cgroup()?;
+    let mut pids = Vec::new();
+    read_cgroup_procs_recursive(&cg_dir, &mut pids);
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+pub fn sandbox_pids_matching(pattern: &str) -> anyhow::Result<Vec<u32>> {
+    let cgroup_pids = get_sandbox_cgroup_pids()?;
+    let mut matching = Vec::new();
+    for pid in cgroup_pids {
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        if let Ok(raw) = std::fs::read(&cmdline_path) {
+            let args: Vec<&str> = raw
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| std::str::from_utf8(a).unwrap_or(""))
+                .collect();
+            // Match exact sleep N command
+            if let Some(sec_str) = pattern.strip_prefix("sleep ")
+                && let Some(cmd) = args.first()
+                && (*cmd == "sleep" || cmd.ends_with("/sleep"))
+                && args.get(1) == Some(&sec_str)
+            {
+                matching.push(pid);
+                continue;
+            }
+
+            let cmd_str = args.join(" ");
+            if cmd_str.contains(pattern) {
+                matching.push(pid);
+            }
+        }
+    }
+    Ok(matching)
+}
+
+pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
+    sandbox_pids_matching(pattern)
+}
+
+pub fn get_goose_sandbox_pid() -> anyhow::Result<u32> {
+    let unit = get_sandbox_unit();
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "MainPID", "--value", &unit])
         .output()?;
     let s = String::from_utf8(output.stdout)?.trim().to_string();
     let pid: u32 = s.parse()?;
