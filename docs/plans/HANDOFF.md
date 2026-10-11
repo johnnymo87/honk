@@ -1,4 +1,4 @@
-# honk M0 handoff (living document)
+# honk handoff (living document)
 
 Executing `docs/plans/2026-10-10-honk-m0-plan.md` with subagent-driven development
 (implementer subagent per task; then spec + code-quality review; fixes re-reviewed).
@@ -33,3 +33,11 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - Public repo: fixtures must be grep-checked for secret, `/home/dev`, project id (compare to /run/secrets/google_cloud_project without printing), org names.
 - Bash tool 120s default timeout; long probe waits via longer timeouts or systemd-run.
 - Pigeon likely bug (unverified at runtime): its goose runner assumes turns survive disconnect; on WS they are cancelled. Report to author; not fixed.
+
+## Post-M0 (2026-10-11)
+- M0 probes done; findings + amendments A1-A16 in docs/spike/m0-findings.md; design revised (86ff5a3).
+- Plans written and reviewed (adversarial x2 + oracle): docs/plans/2026-10-11-goose-patches-plan.md (verdict: execute) and docs/plans/2026-10-11-honk-m1-plan.md (split M1a/M1b/M1c; honkd REQUIRES patched goose; round-2 fixes applied).
+- Order: execute the goose patch plan first (Tasks 0-11; stop at published release patched-1.54.0.3 + author-only deploy runbook), then M1a (A0 depends on the patch release).
+- Org-name leak: commits 133bf83..ee1781b (pushed, public) contained the org name in redact.rs; fixed forward in b2443a5 (needles now in ~/.config/honk/redact.txt). History NOT rewritten — author decides.
+- goose bug found (P5a): cancel orphans shell descendants — affects production goose; patch 1 of the patch plan fixes it.
+- Open questions for author: GOOSE_STATE_MACHINE in production? widened extension set on re-activation acceptable? in-file Apache notice on shell.rs?

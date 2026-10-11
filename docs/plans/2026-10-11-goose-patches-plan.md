@@ -47,6 +47,19 @@ applied in this revision:
 - Probes run before tagging.
 - Several minor fixes.
 
+Round 2 (2026-10-11, adversarial review of 84642ce): verdict **execute**, minors
+only. Applied:
+- P2e now asserts `chars_missing > 0`, so it works as the control for P2f.
+- The ring always keeps its newest frame, so a single frame over
+  `REPLAY_RING_MAX_BYTES` can't self-evict into a permanent gap (new mailbox test).
+  "The ring records at dequeue only" is now stated.
+- The capability section matches the M1 plan:
+  - degraded mode means an export rebuild;
+  - pending requests and the ledger live in `state.json`, with idempotent replay;
+  - the last processed id lives in the per-session log, with id-only lines.
+- The memory analysis covers session mailboxes and rings on long-lived connections,
+  and says honkd runs exports on short-lived side connections.
+
 ---
 
 ## Ground rules
@@ -1408,7 +1421,11 @@ git -C "$FORK_WT" commit -m "acp-http: Acp-Takeover: 1 on GET /acp takes a held 
   stream and each session stream count separately. Keepalives carry no id.
 - **Ring.** When a frame is dequeued for writing, it is also appended to that stream's
   ring, atomically under the same lock. The ring keeps at most `REPLAY_RING_MAX_FRAMES
-  = 4096` frames and `REPLAY_RING_MAX_BYTES = 1 MiB`, evicting oldest first.
+  = 4096` frames and `REPLAY_RING_MAX_BYTES = 1 MiB`, evicting oldest first. It always
+  keeps the newest frame, so a single frame larger than 1 MiB is retained until the
+  next dequeue instead of evicting itself, which would make every resume after it a
+  gap. The ring records frames **at dequeue only**: a frame still queued in the
+  mailbox is not in the ring, and is simply delivered on the next subscribe.
 - **Resume.** A request header **`Last-Event-ID: k`** on `GET /acp` does three things:
   1. It decides whether there is a gap.
   2. It drops ring entries `≤ k`, which is an implicit ack.
@@ -1433,6 +1450,14 @@ git -C "$FORK_WT" commit -m "acp-http: Acp-Takeover: 1 on GET /acp takes a held 
   16 MiB, plus up to 1 MiB per connection stream. Compare A14's measured 0.5-1.7 MB RSS
   per active session: the rings could dominate goose's per-session cost by up to about
   10×.
+- **Long-lived connections.** Any long-lived connection that subscribes many session
+  streams keeps one mailbox **and one ring** per session until it is DELETEd, because
+  mailboxes are never removed (`connection.rs:322-333`). A long-lived honkd "control"
+  connection used for exports would grow without bound across sessions. So honkd does
+  **not** do that: every export (turn text, rebuild) runs on a **short-lived side
+  connection**. It initializes, subscribes the session stream, exports, then DELETEs,
+  which frees the mailbox and ring. honkd's long-lived control connection only uses
+  its conn stream (`session/list`).
 - **Why it is acceptable.** It is bounded, and honkd's idle-TTL DELETE frees it.
 - **Revisit after P2f** records actual turn sizes. A 256-512 KiB cap would likely
   suffice.
@@ -1494,7 +1519,19 @@ git -C "$FORK_WT" commit -m "acp-http: Acp-Takeover: 1 on GET /acp takes a held 
 
         let mut resumed = mailbox.try_acquire().unwrap();
         assert_eq!(resumed.resume_after(0), Replay::Gap);
-        assert_eq!(resumed.recv_frame().await, Some((2, "bbbbbb".to_string())));
+    }
+
+    #[tokio::test]
+    async fn ring_keeps_a_single_frame_larger_than_the_byte_budget() {
+        let mailbox = HttpMailbox::with_ring_limits(usize::MAX, 10);
+        mailbox.push("x".repeat(64)).unwrap();
+        let mut lease = mailbox.try_acquire().unwrap();
+        lease.recv_frame().await.unwrap();
+        drop(lease);
+
+        let mut resumed = mailbox.try_acquire().unwrap();
+        assert_eq!(resumed.resume_after(0), Replay::Complete, "the oversize frame is retained");
+        assert_eq!(resumed.recv_frame().await, Some((1, "x".repeat(64))));
     }
 
     #[tokio::test]
@@ -1688,7 +1725,11 @@ impl MailboxState {
     fn record_dequeued(&mut self, seq: u64, msg: &str) {
         self.ring.push_back((seq, msg.to_owned()));
         self.ring_bytes += msg.len();
-        while self.ring.len() > self.max_ring_frames || self.ring_bytes > self.max_ring_bytes {
+        // Always keep the newest frame: a single frame larger than the byte budget must
+        // not evict itself (that would turn every resume after it into a gap).
+        while self.ring.len() > 1
+            && (self.ring.len() > self.max_ring_frames || self.ring_bytes > self.max_ring_bytes)
+        {
             let Some((evicted, old)) = self.ring.pop_front() else { break };
             self.ring_bytes -= old.len();
             self.trimmed_through = evicted;
@@ -2532,7 +2573,10 @@ async fn p2e_half_open_takeover() -> anyhow::Result<()> {
     assert_eq!(sess.conflict_window, Duration::ZERO);
     assert!(conn.took_over && sess.took_over);
     assert!(reattach < Duration::from_millis(100), "takeover reattach took {reattach:?}");
-    // Loss is expected and recorded, not asserted: takeover fixes availability, not delivery.
+    // P2e is the CONTROL for P2f: takeover without Last-Event-ID must still lose what the
+    // frozen socket had dequeued (P2d). If nothing was lost, the freeze landed too late and
+    // P2f's `chars_missing == 0` would prove nothing.
+    assert!(missing > 0, "control failed: no loss without replay (freeze landed after goose finished writing?)");
     drop(h.proxy);
     Ok(())
 }
@@ -2776,8 +2820,10 @@ three logs. Each probe runs twice in total (the M0 convention), so repeat the lo
 after the first round passes.
 
 Expected:
-- **P2e:** 409 window 0 on both streams, reattach < 100 ms, `took_over` true. Loss is
-  recorded, not asserted.
+- **P2e:** 409 window 0 on both streams, reattach < 100 ms, `took_over` true, and
+  `chars_missing > 0`. P2e is the control for P2f: without replay the frozen socket's
+  frames are lost. If P2e shows no loss, re-run with an earlier freeze before trusting
+  P2f.
 - **P2f:** `Complete` on both streams, `replayed_frames > 0`, the prompt reply and
   run-end replayed, `chars_missing == 0`.
 - **P4b′:** the permission is replayed, and answering it finishes the run (`P4OK` in
@@ -2973,9 +3019,10 @@ SSE `GET /acp` response, `200` and `409`. Unpatched goose sends nothing.
 - After its first subscribe on each goose process, honkd checks
   `stream_features().is_patched()`. If that is false, it **refuses to serve**, with an
   error naming the release to deploy.
-- The escape hatch is **`--allow-unpatched-upstream`**. It makes honkd run in M0
-  degraded mode instead: 409 backoff, reconcile after every reattach (A2/A3), and
-  lost-permission detection with cancel (A8 fallback).
+- The escape hatch is **`--allow-unpatched-upstream`**. It makes honkd run in
+  degraded mode instead: 409 backoff with no DELETE (A2), and every reattach treated
+  as a gap, i.e. a coarse rebuild from export (A3). There is no precise in-flight
+  recovery and no lost-permission heuristic (M1 plan, Task A12; refinement in M1c).
 - honkd re-checks after every `404`, i.e. after a goose restart (A13). A restart may
   have swapped the binary in either direction.
 
@@ -2987,20 +3034,23 @@ SSE `GET /acp` response, `200` and `409`. Unpatched goose sends nothing.
 
 | goose advertises | On a dead stream (no bytes for > 20 s; goose keeps alive every 15 s) | After reattach |
 |---|---|---|
-| nothing (unpatched): only with `--allow-unpatched-upstream` | 409 retry with backoff, never DELETE (A2) | Always reconcile (A3, A5) |
-| `takeover` only (not a released combination; treat as degraded) | `subscribe_with{takeover}` | Always reconcile |
-| `takeover, replay` (`patched-1.54.0.3`+) | `subscribe_with{takeover, resume_after: Some(last processed id, or 0)}` | Reconcile **only** if `replay.needs_reconcile()` (`Gap`/`Unsupported`), or after a 404 |
+| nothing (unpatched): only with `--allow-unpatched-upstream` | 409 retry with backoff, never DELETE (A2) | Always rebuild from export (gap) |
+| `takeover` only (not a released combination; treat as degraded) | `subscribe_with{takeover}` | Always rebuild from export |
+| `takeover, replay` (`patched-1.54.0.3`+) | `subscribe_with{takeover, resume_after: Some(last processed id, or 0)}` | Rebuild from export **only** on the session stream's `Gap`/`Unsupported` (at turn end if a run is active), or on any new connection (404, activation) |
 
-**Where honkd persists the last processed event id.** Keep it in **the session's own
-append-only log**, written in the same record as the effect of the frame it processed.
-Do not keep it in the global state file.
-- The id and the state it describes then commit together, and can never disagree after
-  a crash.
-- The state file is not rewritten on every frame.
-- On restart, the last id in the session log is exactly what to pass as
+**Where honkd persists what (matches the M1 plan).**
+- **The last processed session-stream event id lives in the session's append-only log**
+  (`<state>/sessions/<sid>.jsonl`). Each line is appended *after* its frame was
+  processed. Frames that aren't logged (responses, requests) get an id-only line
+  `{"seq":null,"id":N}`. On restart, the last id in the log is exactly what to pass as
   `resume_after`.
-- The connection stream is low-rate (`session/new` replies and connection-level
-  notifications). Its id can live next to the connection id in the state file (A15).
+- **Effects that must survive a crash live in `state.json`**: pending permissions (A8)
+  and the prompt ledger, each written *before* fan-out or POST. The log line comes
+  after, so a crash in between re-delivers the frame on resume. Re-processing is
+  therefore **idempotent**: pending requests dedupe by id, prompt replies by upstream
+  id, and the actor drops any frame with an id ≤ the stream's last processed id.
+- **The connection stream** is low-rate (`session/new` replies). Its last id lives
+  next to the connection id in `state.json` (A15).
 
 **Still required with replay:**
 - Persisted pending permissions (A8). Replay only helps while the connection lives; a
