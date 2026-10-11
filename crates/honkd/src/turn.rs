@@ -214,6 +214,27 @@ impl TurnCore {
         out
     }
 
+    pub fn on_prompt_send_failed(
+        &mut self,
+        upstream_id: &str,
+        error: Value,
+        ids: &mut crate::rpc::UpstreamIds,
+    ) -> Vec<Action> {
+        let Some(inf) = self.inflight.take_if(|i| i.upstream_id == upstream_id) else {
+            return vec![];
+        };
+        self.cancel_pending = false;
+        let mut out = vec![Action::Reply {
+            owners: inf.owners,
+            body: Reply::Error(error),
+            user_text: None,
+        }];
+        if self.run.is_none() {
+            out.extend(self.dispatch_parked(ids));
+        }
+        out
+    }
+
     fn dispatch_parked(&mut self, ids: &mut crate::rpc::UpstreamIds) -> Vec<Action> {
         if self.parked.is_empty() {
             return vec![];
@@ -809,5 +830,54 @@ mod tests {
         );
         assert!(core.parked.is_empty());
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
+    }
+
+    #[test]
+    fn test_on_prompt_send_failed_takes_inflight_and_dispatches_parked() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "p1"}), &mut ids);
+
+        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+        let _ = core.on_prompt(owner2.clone(), json!({"prompt": "p2"}), &mut ids);
+        assert_eq!(core.parked.len(), 1);
+
+        let err = json!({"code": -32603, "message": "network error"});
+        let actions = core.on_prompt_send_failed("hk1-1", err.clone(), &mut ids);
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Reply {
+                    owners: vec![owner1],
+                    body: Reply::Error(err),
+                    user_text: None,
+                },
+                Action::SendPrompt {
+                    upstream_id: "hk1-2".into(),
+                    params: json!({"prompt": "p2"}),
+                },
+            ]
+        );
+        assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
+        assert!(core.parked.is_empty());
+        assert!(!core.cancel_pending);
+    }
+
+    #[test]
+    fn test_on_prompt_send_failed_mismatched_id_ignored() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "p1"}), &mut ids);
+
+        let err = json!({"code": -32603, "message": "network error"});
+        let actions = core.on_prompt_send_failed("hk1-999", err, &mut ids);
+
+        assert_eq!(actions, vec![]);
+        assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-1");
     }
 }

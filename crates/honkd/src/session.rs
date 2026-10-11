@@ -128,6 +128,34 @@ impl Session {
         }
     }
 
+    async fn sync_inflight(&self) {
+        let target = self.turn.to_persisted();
+        let sid = &self.sid;
+        let mut s = self.state_store.lock().await;
+        if let Some(h) = s.sessions.get(sid) {
+            if h.inflight == target {
+                return;
+            }
+        }
+        let _ = s.mutate(|st| {
+            if let Some(h) = st.sessions.get_mut(sid) {
+                h.inflight = target;
+            }
+        });
+    }
+
+    fn send_to_viewer(&mut self, viewer_id: ViewerId, frame: Value) -> bool {
+        if let Some((tx, _)) = self.viewers.get(&viewer_id) {
+            if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
+                self.viewers.remove(&viewer_id);
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     async fn on_upstream(&mut self, ev: Event) {
         let (key, frame, id_opt) = match ev {
             Event::Frame(key, frame, id_opt) => (key, frame, id_opt),
@@ -161,7 +189,8 @@ impl Session {
         if is_session_stream {
             if let Some(update) = frame.pointer("/params/update") {
                 // If user_message_chunk, notify turn core of live user message
-                if update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("user_message_chunk")
                     && let Some(msg_id) = update
                         .get("messageId")
                         .or_else(|| update.pointer("/_meta/goose/messageId"))
@@ -196,15 +225,12 @@ impl Session {
                         && let Some(msg_id) =
                             frame.pointer("/result/messageId").and_then(Value::as_str)
                     {
-                        let actions = self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
+                        let actions =
+                            self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
                         self.execute_actions(actions).await;
                     }
 
-                    if let Some((tx, _)) = self.viewers.get(&pending.viewer_id)
-                        && !tx.send_frame(axum::extract::ws::Message::Text(resp.to_string().into()))
-                    {
-                        self.viewers.remove(&pending.viewer_id);
-                    }
+                    self.send_to_viewer(pending.viewer_id, resp);
                 } else {
                     // Check if response to inflight prompt
                     let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
@@ -216,10 +242,17 @@ impl Session {
 
                     if is_inflight_reply {
                         let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                        let actions =
-                            self.turn
-                                .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
+                        let actions = self
+                            .turn
+                            .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
                         self.execute_actions(actions).await;
+                    } else {
+                        // Unmatched upstream response -> warn with upstream id only
+                        let id_disp = frame
+                            .get("id")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "null".into());
+                        tracing::warn!("unmatched upstream response for id: {id_disp}");
                     }
                 }
             } else if kind == crate::rpc::Kind::Request {
@@ -263,7 +296,8 @@ impl Session {
     }
 
     async fn execute_actions(&mut self, actions: Vec<Action>) {
-        for action in actions {
+        let mut queue = std::collections::VecDeque::from(actions);
+        while let Some(action) = queue.pop_front() {
             match action {
                 Action::SendPrompt {
                     upstream_id,
@@ -303,29 +337,31 @@ impl Session {
                         )
                         .await
                     {
-                        // Prompt POST failed -> reply error to owners + clear inflight/ledger
+                        // Prompt POST failed -> remove failed prompt's ledger entries AND clear inflight in one mutate
+                        let failed_inf = self.turn.inflight.as_ref().map(|i| i.to_persisted());
                         {
                             let mut s = self.state_store.lock().await;
                             let _ = s.mutate(|st| {
                                 if let Some(h) = st.sessions.get_mut(&sid) {
                                     h.inflight = None;
                                 }
+                                if let Some(inf) = &failed_inf {
+                                    for crid in &inf.client_req_ids {
+                                        st.ledger.remove(crid);
+                                    }
+                                }
                             });
                         }
-                        let owners = self
+
+                        let err_val = json!({
+                            "code": -32603,
+                            "message": format!("Prompt POST failed: {e:#}"),
+                        });
+                        let fail_actions = self
                             .turn
-                            .inflight
-                            .take()
-                            .map(|i| i.owners)
-                            .unwrap_or_default();
-                        for o in owners {
-                            let err_resp = crate::rpc::error(
-                                o.downstream_id.clone(),
-                                -32603,
-                                format!("Prompt POST failed: {e:#}"),
-                                None,
-                            );
-                            self.send_to_owner(&o, err_resp);
+                            .on_prompt_send_failed(&upstream_id, err_val, &mut self.ids);
+                        for a in fail_actions.into_iter().rev() {
+                            queue.push_front(a);
                         }
                     }
                 }
@@ -382,20 +418,11 @@ impl Session {
                     user_text,
                 } => match body {
                     Reply::Error(err) => {
-                        let sid = self.sid.clone();
-                        {
-                            let mut s = self.state_store.lock().await;
-                            let _ = s.mutate(|st| {
-                                if let Some(h) = st.sessions.get_mut(&sid) {
-                                    h.inflight = None;
-                                }
-                            });
-                        }
                         for o in owners {
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": o.downstream_id,
-                                "error": err,
+                                "error": err.clone(),
                             });
                             self.send_to_owner(&o, resp);
                         }
@@ -430,7 +457,7 @@ impl Session {
                     }
                 },
                 Action::NotifySteerUnconsumed { viewer, message_id } => {
-                    if let Some((tx, is_honk_aware)) = self.viewers.get(&viewer)
+                    if let Some((_, is_honk_aware)) = self.viewers.get(&viewer)
                         && *is_honk_aware
                     {
                         let notify_frame = json!({
@@ -441,13 +468,13 @@ impl Session {
                                 "messageId": message_id,
                             }
                         });
-                        tx.send_frame(axum::extract::ws::Message::Text(
-                            notify_frame.to_string().into(),
-                        ));
+                        self.send_to_viewer(viewer, notify_frame);
                     }
                 }
             }
         }
+
+        self.sync_inflight().await;
     }
 
     async fn on_msg(&mut self, msg: SessionMsg) {
@@ -483,7 +510,7 @@ impl Session {
             }
             SessionMsg::Steer {
                 viewer_id,
-                viewer,
+                viewer: _,
                 id,
                 params,
             } => {
@@ -514,9 +541,7 @@ impl Session {
                     self.pending_requests.remove(&up_id);
                     let err_resp =
                         crate::rpc::error(id, -32603, format!("Steer POST failed: {e:#}"), None);
-                    viewer.send_frame(axum::extract::ws::Message::Text(
-                        err_resp.to_string().into(),
-                    ));
+                    self.send_to_viewer(viewer_id, err_resp);
                 }
             }
             SessionMsg::Cancel => {
@@ -532,7 +557,7 @@ impl Session {
             }
             SessionMsg::Forward {
                 viewer_id,
-                viewer,
+                viewer: _,
                 id,
                 method,
                 params,
@@ -559,22 +584,10 @@ impl Session {
                     self.pending_requests.remove(&up_id);
                     let err_resp =
                         crate::rpc::error(id, -32603, format!("Forward POST failed: {e:#}"), None);
-                    viewer.send_frame(axum::extract::ws::Message::Text(
-                        err_resp.to_string().into(),
-                    ));
+                    self.send_to_viewer(viewer_id, err_resp);
                 }
             }
             SessionMsg::ReplyText { owners, body, text } => {
-                let sid = self.sid.clone();
-                {
-                    let mut s = self.state_store.lock().await;
-                    let _ = s.mutate(|st| {
-                        if let Some(h) = st.sessions.get_mut(&sid) {
-                            h.inflight = None;
-                        }
-                    });
-                }
-
                 match body {
                     Reply::Result(mut res) => {
                         if let Some(t) = text {
@@ -594,26 +607,51 @@ impl Session {
                                 });
                             }
                         }
-                        for o in owners {
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        for o in &owners {
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": o.downstream_id,
                                 "result": res,
                             });
-                            self.send_to_owner(&o, resp);
+
+                            // Ledger: InFlight -> Done{response}
+                            if let Some(crid) = &o.client_req_id {
+                                let sid = self.sid.clone();
+                                let mut s = self.state_store.lock().await;
+                                let _ = s.mutate(|st| {
+                                    st.ledger.insert(
+                                        crid.clone(),
+                                        crate::state::LedgerEntry::Done {
+                                            session: sid,
+                                            response: resp.clone(),
+                                            done_unix: now,
+                                        },
+                                    );
+                                });
+                            }
+
+                            self.send_to_owner(o, resp);
                         }
                     }
                     Reply::Error(err) => {
-                        for o in owners {
+                        for o in &owners {
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": o.downstream_id,
                                 "error": err,
                             });
-                            self.send_to_owner(&o, resp);
+                            self.send_to_owner(o, resp);
                         }
                     }
                 }
+
+                self.sync_inflight().await;
             }
         }
     }
@@ -647,51 +685,37 @@ impl Session {
     }
 
     fn send_to_owner(&mut self, owner: &OwnerRef, frame: Value) {
-        if let Some(vid) = owner.viewer
-            && let Some((tx, _)) = self.viewers.get(&vid)
-            && !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into()))
-        {
-            self.viewers.remove(&vid);
+        if let Some(vid) = owner.viewer {
+            self.send_to_viewer(vid, frame);
         }
     }
 
     fn fan_out_stamped(&mut self, stamped_frame: &Value, honk_aware_only: bool) {
-        let mut dead = Vec::new();
+        let mut to_send = Vec::new();
         let mut legacy_frame = None;
 
-        for (vid, (tx, is_honk_aware)) in &self.viewers {
+        for (vid, (_, is_honk_aware)) in &self.viewers {
             if *is_honk_aware {
-                if !tx.send_frame(axum::extract::ws::Message::Text(
-                    stamped_frame.to_string().into(),
-                )) {
-                    dead.push(*vid);
-                }
+                to_send.push((*vid, stamped_frame.clone()));
             } else if !honk_aware_only {
                 let frame = legacy_frame.get_or_insert_with(|| {
                     let mut f = stamped_frame.clone();
                     crate::rpc::strip_honk_meta(&mut f);
                     f
                 });
-                if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
-                    dead.push(*vid);
-                }
+                to_send.push((*vid, frame.clone()));
             }
         }
 
-        for vid in dead {
-            self.viewers.remove(&vid);
+        for (vid, frame) in to_send {
+            self.send_to_viewer(vid, frame);
         }
     }
 
     fn forward_raw(&mut self, frame: &Value) {
-        let mut dead = Vec::new();
-        for (vid, (tx, _)) in &self.viewers {
-            if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
-                dead.push(*vid);
-            }
-        }
-        for vid in dead {
-            self.viewers.remove(&vid);
+        let viewer_ids: Vec<ViewerId> = self.viewers.keys().copied().collect();
+        for vid in viewer_ids {
+            self.send_to_viewer(vid, frame.clone());
         }
     }
 }

@@ -358,3 +358,104 @@ async fn honk_aware_viewer_receives_stamped_frames_and_legacy_without() {
         "legacy viewer must never receive _meta.honk in session/update: {legacy_frame}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_rejection_leaves_state_inflight_intact() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Gate(
+        "gate_busy_test".into(),
+        Box::new(Turn::Text(vec!["done".into()])),
+    )]);
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v1 = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v1, g.cwd().to_str().unwrap()).await;
+
+    // Send first prompt with client_req_id
+    let p1_id = v1
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "first prompt", Some("crid_1")),
+        )
+        .await;
+
+    // Wait event-driven until run is active
+    v1.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // Check state.json: held.inflight is Some, crid_1 is in ledger as InFlight
+    let state_bytes = std::fs::read(h.state_dir.path().join("state.json")).expect("read state");
+    let state: honkd::state::State = serde_json::from_slice(&state_bytes).expect("parse state");
+    let held = state.sessions.get(&sid).expect("held session");
+    assert!(
+        held.inflight.is_some(),
+        "first prompt must be inflight in state"
+    );
+    let p1_upstream_id = held.inflight.as_ref().unwrap().upstream_id.clone();
+    assert!(matches!(
+        state.ledger.get("crid_1"),
+        Some(honkd::state::LedgerEntry::InFlight { .. })
+    ));
+
+    // Send second prompt with crid_2 while first prompt is running -> rejected with busy error
+    let mut v2 = Viewer::connect_pigeon(&h).await;
+    let r2 = v2
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "second prompt", Some("crid_2")),
+        )
+        .await;
+    assert_eq!(r2["error"]["code"], -32602);
+
+    // Read state.json again: held.inflight MUST STILL BE Some with p1's upstream id!
+    let state_bytes2 =
+        std::fs::read(h.state_dir.path().join("state.json")).expect("read state 2");
+    let state2: honkd::state::State =
+        serde_json::from_slice(&state_bytes2).expect("parse state 2");
+    let held2 = state2.sessions.get(&sid).expect("held session 2");
+    assert!(
+        held2.inflight.is_some(),
+        "busy rejection must NOT clear running prompt's inflight in state"
+    );
+    assert_eq!(
+        held2.inflight.as_ref().unwrap().upstream_id,
+        p1_upstream_id
+    );
+    // crid_2 was never sent upstream so it was never inserted into ledger
+    assert!(
+        !state2.ledger.contains_key("crid_2"),
+        "busy rejection must not create ledger entry"
+    );
+
+    // Release gate and complete prompt 1
+    g.model().open("gate_busy_test");
+    let r1 = v1.response(&p1_id).await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    // Read state.json after prompt 1 completes: held.inflight is now None, and crid_1 is Done
+    let state_bytes3 =
+        std::fs::read(h.state_dir.path().join("state.json")).expect("read state 3");
+    let state3: honkd::state::State =
+        serde_json::from_slice(&state_bytes3).expect("parse state 3");
+    let held3 = state3.sessions.get(&sid).expect("held session 3");
+    assert!(
+        held3.inflight.is_none(),
+        "inflight must be cleared after prompt reply"
+    );
+    assert!(
+        matches!(
+            state3.ledger.get("crid_1"),
+            Some(honkd::state::LedgerEntry::Done { .. })
+        ),
+        "ledger entry must be Done"
+    );
+}

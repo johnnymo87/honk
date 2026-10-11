@@ -181,6 +181,26 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     continue;
                 }
 
+                if method == Some("session/cancel") {
+                    let sid = params.get("sessionId").and_then(Value::as_str);
+                    if let Some(sid) = sid {
+                        let session_tx = {
+                            let sessions = hub.sessions.read().await;
+                            sessions.get(sid).map(|h| h.tx.clone())
+                        };
+                        if let Some(tx) = session_tx {
+                            let _ = tx.send(crate::session::SessionMsg::Cancel).await;
+                        }
+                    }
+                    if !id.is_null() {
+                        let resp = crate::rpc::response(id, json!({}));
+                        if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
                 if method == Some("initialize") {
                     if params.pointer("/_meta/honk").is_some() {
                         viewer.is_honk_aware = true;
@@ -282,10 +302,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 format!("Session not found: {sid}"),
                                 None,
                             );
-                            if !viewer
-                                .tx
-                                .send_frame(Message::Text(err_resp.to_string().into()))
-                            {
+                            if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
                                 break;
                             }
                         }
@@ -296,10 +313,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             "Missing sessionId in session/prompt",
                             None,
                         );
-                        if !viewer
-                            .tx
-                            .send_frame(Message::Text(err_resp.to_string().into()))
-                        {
+                        if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
                             break;
                         }
                     }
@@ -331,8 +345,6 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     params,
                                 })
                                 .await;
-                        } else if method == Some("session/cancel") {
-                            let _ = tx.send(crate::session::SessionMsg::Cancel).await;
                         } else {
                             let _ = tx
                                 .send(crate::session::SessionMsg::Forward {
@@ -351,10 +363,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             format!("Session not found: {sid}"),
                             None,
                         );
-                        if !viewer
-                            .tx
-                            .send_frame(Message::Text(err_resp.to_string().into()))
-                        {
+                        if !viewer.tx.send_frame(Message::Text(err_resp.to_string().into())) {
                             break;
                         }
                     }
