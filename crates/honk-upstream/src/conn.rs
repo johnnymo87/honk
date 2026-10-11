@@ -230,6 +230,11 @@ pub(crate) struct UpstreamInner {
 
 impl Drop for UpstreamInner {
     fn drop(&mut self) {
+        if let Ok(mut gens) = self.generations.lock() {
+            for generation in gens.values_mut() {
+                *generation += 1;
+            }
+        }
         if let Ok(mut tasks) = self.stream_tasks.lock() {
             for (_, handle) in tasks.drain() {
                 handle.abort();
@@ -330,10 +335,6 @@ impl UpstreamHandle {
             *generation
         };
 
-        if let Some(prev) = self.inner.stream_tasks.lock().unwrap().remove(&stream_key) {
-            prev.abort();
-        }
-
         let timeouts = SubscribeTimeouts {
             deadline: self.inner.subscribe_deadline,
             initial_backoff: self.inner.subscribe_initial_backoff,
@@ -363,10 +364,16 @@ impl UpstreamHandle {
             }
 
             let mut tasks = self.inner.stream_tasks.lock().unwrap();
-            if let Some(displaced) = tasks.insert(stream_key, task_handle) {
+            if let Some(displaced) = tasks.insert(stream_key.clone(), task_handle) {
                 displaced.abort();
             }
         }
+
+        self.inner
+            .last_byte_at
+            .lock()
+            .unwrap()
+            .insert(stream_key, Instant::now());
 
         *self.inner.features.lock().unwrap() = Some(outcome.features);
         Ok(outcome)
@@ -394,6 +401,12 @@ impl UpstreamHandle {
     }
 
     pub async fn delete(&self) -> anyhow::Result<reqwest::StatusCode> {
+        {
+            let mut gens = self.inner.generations.lock().unwrap();
+            for generation in gens.values_mut() {
+                *generation += 1;
+            }
+        }
         if let Ok(mut tasks) = self.inner.stream_tasks.lock() {
             for (_, handle) in tasks.drain() {
                 handle.abort();
@@ -690,20 +703,13 @@ async fn do_subscribe_with(
             );
         }
 
-        // Set stamp at subscribe time too (I3)
-        if let Ok(mut map) = last_byte_at.lock() {
-            map.insert(stream_key.clone(), Instant::now());
-        }
-
         let last_byte_at_map = last_byte_at.clone();
         let stamp_key = stream_key.clone();
         let stamped_stream = res.bytes_stream().inspect(move |_| {
-            if let Ok(mut map) = last_byte_at_map.lock() {
-                if let Some(entry) = map.get_mut(&stamp_key) {
-                    *entry = Instant::now();
-                } else {
-                    map.insert(stamp_key.clone(), Instant::now());
-                }
+            if let Ok(mut map) = last_byte_at_map.lock()
+                && let Some(entry) = map.get_mut(&stamp_key)
+            {
+                *entry = Instant::now();
             }
         });
 
@@ -1097,11 +1103,6 @@ impl Upstream {
             *generation
         };
 
-        // Cancel previous task for this key if one was active
-        if let Some(prev) = self.stream_tasks.remove(&stream_key) {
-            prev.abort();
-        }
-
         let timeouts = SubscribeTimeouts {
             deadline: self.subscribe_deadline,
             initial_backoff: self.subscribe_initial_backoff,
@@ -1128,9 +1129,14 @@ impl Upstream {
             );
         }
 
-        if let Some(displaced) = self.stream_tasks.insert(stream_key, task_handle) {
+        if let Some(displaced) = self.stream_tasks.insert(stream_key.clone(), task_handle) {
             displaced.abort();
         }
+
+        self.last_byte_at
+            .lock()
+            .unwrap()
+            .insert(stream_key, Instant::now());
 
         self.features = Some(outcome.features);
         Ok(outcome)
@@ -1309,6 +1315,9 @@ impl Upstream {
 
     /// Aborts all running SSE stream tasks without sending a DELETE request to the server.
     pub fn hard_drop(&mut self) {
+        for generation in self.generations.values_mut() {
+            *generation += 1;
+        }
         for (_, handle) in self.stream_tasks.drain() {
             handle.abort();
         }
@@ -1319,6 +1328,7 @@ impl Upstream {
 
     /// Terminates the connection via DELETE /acp.
     pub async fn delete(mut self) -> anyhow::Result<StatusCode> {
+        self.split_done = true;
         self.hard_drop();
         do_delete(&self.target()).await
     }
@@ -2185,5 +2195,179 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_subscribes_newer_survives_when_older_completes_last() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::routing::get;
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(Some(gate_rx)));
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let (_sub2_body_tx, sub2_body_rx) =
+            futures::channel::mpsc::unbounded::<Result<bytes::Bytes, std::convert::Infallible>>();
+        let sub2_body_holder =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(Body::from_stream(sub2_body_rx))));
+
+        let app = Router::new().route(
+            "/acp",
+            get({
+                let gate = gate.clone();
+                let request_count = request_count.clone();
+                let sub2_body_holder = sub2_body_holder.clone();
+                move |_: Request| {
+                    let gate = gate.clone();
+                    let count = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sub2_body_holder = sub2_body_holder.clone();
+                    async move {
+                        if count == 0 {
+                            // First request (older subscribe): wait on gate
+                            let rx = gate.lock().await.take();
+                            if let Some(rx) = rx {
+                                let _ = rx.await;
+                            }
+                            (
+                                [
+                                    ("content-type", "text/event-stream"),
+                                    ("cache-control", "no-cache"),
+                                ],
+                                Body::from("id: 1\ndata: {}\n\n"),
+                            )
+                        } else {
+                            // Second request (newer subscribe): stream stays open
+                            let body = sub2_body_holder.lock().unwrap().take().unwrap_or_default();
+                            (
+                                [
+                                    ("content-type", "text/event-stream"),
+                                    ("cache-control", "no-cache"),
+                                ],
+                                body,
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (handle, _rx) = upstream.split();
+
+        let h1 = handle.clone();
+        let task1 =
+            tokio::spawn(async move { h1.subscribe_with(None, SubscribeOpts::default()).await });
+
+        // Ensure task1 has started and is waiting on gate
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let h2 = handle.clone();
+        // Second subscribe (newer, higher generation): completes immediately
+        let sub2_res = h2.subscribe_with(None, SubscribeOpts::default()).await;
+        assert!(sub2_res.is_ok());
+
+        // Release the gate for task1 so older subscribe completes second
+        let _ = gate_tx.send(());
+
+        let sub1_res = tokio::time::timeout(Duration::from_secs(2), task1)
+            .await
+            .expect("task1 timed out")
+            .expect("join failed");
+
+        // The older subscribe must fail because its generation was superseded
+        assert!(
+            sub1_res.is_err(),
+            "expected older subscribe to fail as superseded"
+        );
+
+        // The newer subscribe's task in stream_tasks must survive and not be finished
+        let tasks = handle.inner.stream_tasks.lock().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task = tasks.get(&StreamKey::Conn).expect("Conn task present");
+        assert!(
+            !task.is_finished(),
+            "newer task was unexpectedly aborted or finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_invalidates_in_flight_subscribes() {
+        use axum::Router;
+        use axum::extract::Request;
+        use axum::routing::{delete, get};
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(Some(gate_rx)));
+
+        let app = Router::new()
+            .route(
+                "/acp",
+                get({
+                    let gate = gate.clone();
+                    move |_: Request| {
+                        let gate = gate.clone();
+                        async move {
+                            let rx = gate.lock().await.take();
+                            if let Some(rx) = rx {
+                                let _ = rx.await;
+                            }
+                            (
+                                [
+                                    ("content-type", "text/event-stream"),
+                                    ("cache-control", "no-cache"),
+                                ],
+                                "id: 1\ndata: {}\n\n",
+                            )
+                        }
+                    }
+                }),
+            )
+            .route("/acp", delete(|| async { StatusCode::OK }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/acp");
+        let upstream =
+            Upstream::resume(&url, "sec".into(), "c1".into(), Recorder::disabled()).unwrap();
+        let (handle, _rx) = upstream.split();
+
+        let h = handle.clone();
+        let join_sub =
+            tokio::spawn(async move { h.subscribe_with(None, SubscribeOpts::default()).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Delete while subscribe is in-flight
+        let del_res = handle.delete().await;
+        assert!(del_res.is_ok());
+
+        // Release gate
+        let _ = gate_tx.send(());
+
+        let sub_res = tokio::time::timeout(Duration::from_secs(2), join_sub)
+            .await
+            .expect("subscribe_with timed out")
+            .expect("join failed");
+
+        assert!(
+            sub_res.is_err(),
+            "in-flight subscribe should fail after delete"
+        );
+        assert!(handle.inner.stream_tasks.lock().unwrap().is_empty());
+        assert!(handle.inner.last_byte_at.lock().unwrap().is_empty());
     }
 }
