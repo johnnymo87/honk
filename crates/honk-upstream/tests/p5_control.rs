@@ -134,18 +134,84 @@ pub fn check_child_processes(pid: u32) -> anyhow::Result<Vec<String>> {
     Ok(stats.children)
 }
 
-pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
-    let uid_out = std::process::Command::new("id").arg("-u").output()?;
-    let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
-    let output = std::process::Command::new("pgrep")
-        .args(["-u", &uid, "-f", pattern])
+pub fn get_sandbox_unit() -> String {
+    std::env::var("HONK_SANDBOX_UNIT").unwrap_or_else(|_| "honk-goose-sandbox".to_string())
+}
+
+pub fn get_sandbox_cgroup() -> anyhow::Result<PathBuf> {
+    let unit = get_sandbox_unit();
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "ControlGroup", "--value", &unit])
         .output()?;
-    let s = String::from_utf8_lossy(&output.stdout);
-    let pids: Vec<u32> = s
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .collect();
+    let cg = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cg.is_empty() {
+        anyhow::bail!("no ControlGroup found for unit '{unit}'");
+    }
+    let base = Path::new("/sys/fs/cgroup");
+    Ok(base.join(cg.trim_start_matches('/')))
+}
+
+fn read_cgroup_procs_recursive(dir: &Path, pids: &mut Vec<u32>) {
+    let procs_file = dir.join("cgroup.procs");
+    if let Ok(content) = std::fs::read_to_string(&procs_file) {
+        for line in content.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type()
+                && ft.is_dir()
+            {
+                read_cgroup_procs_recursive(&entry.path(), pids);
+            }
+        }
+    }
+}
+
+pub fn get_sandbox_cgroup_pids() -> anyhow::Result<Vec<u32>> {
+    let cg_dir = get_sandbox_cgroup()?;
+    let mut pids = Vec::new();
+    read_cgroup_procs_recursive(&cg_dir, &mut pids);
+    pids.sort_unstable();
+    pids.dedup();
     Ok(pids)
+}
+
+pub fn sandbox_pids_matching(pattern: &str) -> anyhow::Result<Vec<u32>> {
+    let cgroup_pids = get_sandbox_cgroup_pids()?;
+    let mut matching = Vec::new();
+    for pid in cgroup_pids {
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        if let Ok(raw) = std::fs::read(&cmdline_path) {
+            let args: Vec<&str> = raw
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| std::str::from_utf8(a).unwrap_or(""))
+                .collect();
+            // Match exact sleep N command
+            if let Some(sec_str) = pattern.strip_prefix("sleep ")
+                && let Some(cmd) = args.first()
+                && (*cmd == "sleep" || cmd.ends_with("/sleep"))
+                && args.get(1) == Some(&sec_str)
+            {
+                matching.push(pid);
+                continue;
+            }
+
+            let cmd_str = args.join(" ");
+            if cmd_str.contains(pattern) {
+                matching.push(pid);
+            }
+        }
+    }
+    Ok(matching)
+}
+
+pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
+    sandbox_pids_matching(pattern)
 }
 
 pub async fn restart_sandbox_unit() -> anyhow::Result<()> {
@@ -255,7 +321,7 @@ async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result
         }
     }
 
-    // Confirm sleep child process exists via system-wide pgrep
+    // Confirm sleep child process exists via sandbox cgroup matching
     let marker_pattern = format!("sleep {sleep_secs}");
     let mut initial_pids = Vec::new();
     for _ in 0..15 {
@@ -465,7 +531,7 @@ async fn run_p5a_conn_b_case(
         }
     }
 
-    // Confirm sleep child
+    // Confirm sleep child via sandbox cgroup matching
     let marker_pattern = format!("sleep {sleep_secs}");
     let mut initial_pids = Vec::new();
     for _ in 0..15 {
@@ -1326,14 +1392,12 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
     // Check if sleep child process survived restart
     let new_children = check_child_processes(new_goose_pid)?;
     let sleep_survived_under_new_pid = new_children.iter().any(|c| c.contains("sleep"));
-    // Also check pgrep across user
-    let pgrep_output = std::process::Command::new("pgrep")
-        .args(["-f", "sleep 40"])
-        .output();
-    let sleep_survived_system = pgrep_output.map(|o| !o.stdout.is_empty()).unwrap_or(false);
+    // Also check sandbox cgroup for the exact sleep process
+    let sleep_pids = sandbox_pids_matching("sleep 40")?;
+    let sleep_survived_sandbox = !sleep_pids.is_empty();
 
     println!(
-        "[{case_name}] Sleep child survived under goose: {sleep_survived_under_new_pid}, system-wide: {sleep_survived_system}"
+        "[{case_name}] Sleep child survived under goose: {sleep_survived_under_new_pid}, in sandbox cgroup: {sleep_survived_sandbox}"
     );
 
     // Subscribe new_upstream to session so we can receive RPC replies on session stream
@@ -1415,7 +1479,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
         "get_status_with_old_conn": get_status,
         "init_recovery_duration_ms": init_recovery_duration.as_millis(),
         "sleep_survived_under_goose": sleep_survived_under_new_pid,
-        "sleep_survived_system_wide": sleep_survived_system,
+        "sleep_survived_sandbox": sleep_survived_sandbox,
         "export_before_load_ok": export_before_load_ok,
         "export_before_load_summary": export_summary_before,
         "session_load_ok": load_res.is_ok(),
@@ -1433,7 +1497,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
     assert_eq!(post_status, 404, "expected 404 for POST with old conn_id");
     assert_eq!(get_status, 404, "expected 404 for GET with old conn_id");
     assert!(
-        !sleep_survived_system,
+        !sleep_survived_sandbox,
         "sleep process should not survive unit restart"
     );
     assert!(

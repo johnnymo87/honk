@@ -42,20 +42,65 @@ pub fn parse_redact_file(path: &Path) -> Vec<String> {
     }
 }
 
+fn replace_ascii_case_insensitive(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
+    }
+    let from_bytes = from.as_bytes();
+    let from_len = from_bytes.len();
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut i = 0;
+    while i + from_len <= text.len() {
+        if text.is_char_boundary(i)
+            && text.is_char_boundary(i + from_len)
+            && text.as_bytes()[i..i + from_len].eq_ignore_ascii_case(from_bytes)
+        {
+            result.push_str(&text[last_end..i]);
+            result.push_str(to);
+            i += from_len;
+            last_end = i;
+            continue;
+        }
+        i += 1;
+    }
+    result.push_str(&text[last_end..]);
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactRule {
+    pub from: String,
+    pub to: String,
+    pub case_insensitive: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Redactor {
-    replacements: Vec<(String, String)>,
+    rules: Vec<RedactRule>,
 }
 
 impl Redactor {
     /// Creates a new `Redactor` with a list of `(needle, replacement)` pairs.
     ///
     /// Empty needles are discarded. Replacements are ordered from longest to shortest
-    /// needles to prevent prefix clobbering.
-    pub fn new(mut replacements: Vec<(String, String)>) -> Self {
-        replacements.retain(|(from, _)| !from.is_empty());
-        replacements.sort_by_key(|(a, _)| std::cmp::Reverse(a.len()));
-        Self { replacements }
+    /// needles to prevent prefix clobbering. Needles with replacement `<ORG>` are treated
+    /// as org needles and matched ASCII case-insensitively.
+    pub fn new(replacements: Vec<(String, String)>) -> Self {
+        let mut rules: Vec<RedactRule> = replacements
+            .into_iter()
+            .filter(|(from, _)| !from.is_empty())
+            .map(|(from, to)| {
+                let case_insensitive = to == "<ORG>";
+                RedactRule {
+                    from,
+                    to,
+                    case_insensitive,
+                }
+            })
+            .collect();
+        rules.sort_by_key(|r| std::cmp::Reverse(r.from.len()));
+        Self { rules }
     }
 
     /// Builds a `Redactor` from environment context:
@@ -124,31 +169,59 @@ impl Redactor {
     /// Appends an extra replacement pair.
     pub fn add(&mut self, from: impl Into<String>, to: impl Into<String>) {
         let from = from.into();
+        let to = to.into();
         if !from.is_empty() {
-            self.replacements.push((from, to.into()));
-            self.replacements
-                .sort_by_key(|(a, _)| std::cmp::Reverse(a.len()));
+            let case_insensitive = to == "<ORG>";
+            self.rules.push(RedactRule {
+                from,
+                to,
+                case_insensitive,
+            });
+            self.rules.sort_by_key(|r| std::cmp::Reverse(r.from.len()));
         }
     }
 
-    /// Recursively applies string replacements to all string values in `value`.
-    /// Object keys are never modified.
+    /// Appends an org needle with replacement `<ORG>` and ASCII case-insensitive matching.
+    pub fn add_org_needle(&mut self, needle: impl Into<String>) {
+        self.add(needle, "<ORG>");
+    }
+
+    /// Returns true if this redactor contains at least one org needle.
+    pub fn has_org_needles(&self) -> bool {
+        self.rules.iter().any(|r| r.to == "<ORG>")
+    }
+
+    /// Applies redaction to a single string.
+    pub fn redact_string(&self, s: &str) -> String {
+        let mut out = s.to_string();
+        for rule in &self.rules {
+            if rule.case_insensitive {
+                out = replace_ascii_case_insensitive(&out, &rule.from, &rule.to);
+            } else {
+                out = out.replace(&rule.from, &rule.to);
+            }
+        }
+        out
+    }
+
+    /// Recursively applies string replacements to all string values and object keys in `value`.
     pub fn apply(&self, value: Value) -> Value {
         match value {
-            Value::String(s) => {
-                let mut out = s;
-                for (from, to) in &self.replacements {
-                    out = out.replace(from, to);
-                }
-                Value::String(out)
-            }
+            Value::String(s) => Value::String(self.redact_string(&s)),
             Value::Array(items) => {
                 Value::Array(items.into_iter().map(|item| self.apply(item)).collect())
             }
             Value::Object(map) => {
                 let mut new_map = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map {
-                    new_map.insert(k, self.apply(v));
+                    let base_key = self.redact_string(&k);
+                    let mut candidate_key = base_key.clone();
+                    let mut counter = 2;
+                    while new_map.contains_key(&candidate_key) {
+                        candidate_key = format!("{base_key}#{counter}");
+                        counter += 1;
+                    }
+                    new_map.insert(candidate_key, self.apply(v));
                 }
                 Value::Object(new_map)
             }
@@ -163,23 +236,89 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn replaces_substrings_in_values_but_leaves_keys_untouched() {
+    fn redacts_substrings_in_values_and_object_keys() {
         let r = Redactor::new(vec![
             ("s3cret".into(), "<SECRET>".into()),
             ("/home/dev".into(), "$HOME".into()),
         ]);
         assert_eq!(
-            r.apply(json!({"a":"s3cret","cwd":"/home/dev/x","n":1})),
-            json!({"a":"<SECRET>","cwd":"$HOME/x","n":1})
+            r.apply(json!({"a":"s3cret","cwd":"/home/dev/x","s3cret_key":1})),
+            json!({"a":"<SECRET>","cwd":"$HOME/x","<SECRET>_key":1})
         );
     }
 
     #[test]
-    fn leaves_object_keys_untouched() {
+    fn redacts_nested_object_keys() {
         let r = Redactor::new(vec![("s3cret".into(), "<SECRET>".into())]);
         assert_eq!(
             r.apply(json!({"s3cret": "value", "nested": {"s3cret": 42}})),
-            json!({"s3cret": "value", "nested": {"s3cret": 42}})
+            json!({"<SECRET>": "value", "nested": {"<SECRET>": 42}})
+        );
+    }
+
+    #[test]
+    fn org_needles_match_case_insensitively_for_ascii() {
+        let r = Redactor::new(vec![("acme".into(), "<ORG>".into())]);
+        assert_eq!(
+            r.apply(json!({
+                "AcMe_key": "Welcome to ACME, acme, and AcMe!",
+                "nested": {"ACME_CORP": "acme"}
+            })),
+            json!({
+                "<ORG>_key": "Welcome to <ORG>, <ORG>, and <ORG>!",
+                "nested": {"<ORG>_CORP": "<ORG>"}
+            })
+        );
+    }
+
+    #[test]
+    fn non_org_needles_match_case_sensitively() {
+        let r = Redactor::new(vec![("s3cret".into(), "<SECRET>".into())]);
+        assert_eq!(
+            r.apply(json!({"s3cret": "s3cret", "S3CRET": "S3CRET"})),
+            json!({"<SECRET>": "<SECRET>", "S3CRET": "S3CRET"})
+        );
+    }
+
+    #[test]
+    fn colliding_redacted_keys_are_disambiguated() {
+        let mut r = Redactor::default();
+        r.add_org_needle("alice");
+        r.add_org_needle("bob");
+        r.add_org_needle("charlie");
+        let val = json!({
+            "alice": 1,
+            "bob": 2,
+            "charlie": 3,
+        });
+        let redacted = r.apply(val);
+        assert_eq!(
+            redacted,
+            json!({
+                "<ORG>": 1,
+                "<ORG>#2": 2,
+                "<ORG>#3": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn org_needles_with_utf8_text_and_substring_overlap() {
+        let mut r = Redactor::default();
+        r.add_org_needle("acme corp");
+        r.add_org_needle("acme");
+        assert!(r.has_org_needles());
+
+        // Longest needle "acme corp" should be replaced first, and UTF-8 chars around it preserved
+        assert_eq!(
+            r.apply(json!({
+                "föö_ACME CORP_bär": "Hello 🦀 ACME CORP and aCmE! 🚀",
+                "nested": ["ACME", "other"]
+            })),
+            json!({
+                "föö_<ORG>_bär": "Hello 🦀 <ORG> and <ORG>! 🚀",
+                "nested": ["<ORG>", "other"]
+            })
         );
     }
 

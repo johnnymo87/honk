@@ -218,9 +218,10 @@ upstream (`session/load` with the **stored** cwd from `session/list`, `mcpServer
 
 **Sequencing and IDs.** Every logged event carries `(epoch, seq)`; `epoch` changes on each
 honkd start and on every upstream reconcile. A cursor from another epoch gets `_honk/reset` +
-full replay, never a merge. `messageId` and `toolCallId` are completely stable and match in
-identical order across live stream, replay, and export (P6a; A7), so transcript block id =
-`messageId` (tool blocks: `toolCallId`). Replay delivers accumulated blocks and includes
+full replay, never a merge. Text/thought `messageId`s and all `toolCallId`s are stable and match
+in identical order across live stream, replay, and export (P6a; A7); the `messageId` carried on a
+tool call is NOT stable between live and replay, so transcript block id = `messageId` for
+text/thought blocks and `toolCallId` for tool blocks (never `messageId:toolCallId`). Replay delivers accumulated blocks and includes
 `user_message_chunk`, but omits `session_info_update` and intermediate `tool_call_update` chunks
 (P6a; A7). `_meta.replayTail: N` cuts at turn boundaries (last turn for N=1).
 
@@ -395,4 +396,4 @@ Empirical probes on `goose` v1.54.0 (`docs/spike/m0-findings.md`) drove design a
 - **Connection binding (A4):** Live stream frames are pinned to the prompting connection (P3c). honkd must prompt on and reattach to the same persisted connection ID.
 - **Permissions (A8):** Pending permissions are NOT persisted mid-turn and NOT re-sent by `session/load`, but wait indefinitely in memory on the same connection (P4a). honkd persists pending requests in its state file before viewer fan-out to answer across restarts; lost requests require cancel-via-DELETE.
 - **Cancellation (A9, A11):** `session/cancel` works across connections (54–79ms) but does not unblock permission-parked runs without an explicit `cancelled` outcome answer (P5a, P5c). Cancel performs both. Orphan descendant leak identified as goose bug (patch candidate #5).
-- **IDs & Limits (A7, A14, A15):** `messageId` and `toolCallId` are completely stable across live, replay, export (P6), confirming `block_id = messageId`. Resource cost (~0.5–1.7 MB RSS, ~9–12 threads/conn) sets initial limits at 15m idle TTL and max 16 held sessions. Orphaned connections managed via state file DELETE on startup.
+- **IDs & Limits (A7, A14, A15):** text `messageId`s and `toolCallId`s are stable across live, replay, export (P6), so `block_id = messageId` for text and `toolCallId` for tools (a tool call's own `messageId` differs between live and replay). Resource cost (~0.5–1.7 MB RSS, ~9–12 threads/conn) sets initial limits at 15m idle TTL and max 16 held sessions. Orphaned connections managed via state file DELETE on startup.

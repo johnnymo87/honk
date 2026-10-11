@@ -216,6 +216,39 @@ pub fn get_goose_sandbox_pid() -> anyhow::Result<u32> {
     Ok(pid)
 }
 
+pub fn require_redact_needles_for_fixtures_with_env(
+    path: &Path,
+    allow_no_redact: Option<&str>,
+    redact_file: Option<&Path>,
+) {
+    let is_fixtures = path.components().any(|c| c.as_os_str() == "fixtures");
+    if !is_fixtures {
+        return;
+    }
+    if allow_no_redact == Some("1") {
+        return;
+    }
+    let has_needles = match redact_file {
+        Some(p) if p.is_file() => !honk_upstream::parse_redact_file(p).is_empty(),
+        _ => false,
+    };
+    if !has_needles {
+        let path_str = redact_file
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.config/honk/redact.txt ($HONK_REDACT_FILE)".to_string());
+        panic!(
+            "probe recorder writing under fixtures/ requires a non-empty needle file at {path_str}. \
+             Set HONK_ALLOW_NO_REDACT=1 to override."
+        );
+    }
+}
+
+pub fn require_redact_needles_for_fixtures(path: &Path) {
+    let allow = std::env::var("HONK_ALLOW_NO_REDACT").ok();
+    let file = honk_upstream::resolve_redact_file();
+    require_redact_needles_for_fixtures_with_env(path, allow.as_deref(), file.as_deref());
+}
+
 pub fn get_proc_stats(pid: u32) -> anyhow::Result<ProcStats> {
     let status_path = format!("/proc/{pid}/status");
     let status_content = std::fs::read_to_string(&status_path).unwrap_or_default();
@@ -247,4 +280,68 @@ pub fn get_proc_stats(pid: u32) -> anyhow::Result<ProcStats> {
         vm_rss_kb,
         children,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    #[should_panic(
+        expected = "probe recorder writing under fixtures/ requires a non-empty needle file"
+    )]
+    fn test_fixtures_recorder_panics_without_needle_file() {
+        require_redact_needles_for_fixtures_with_env(
+            Path::new("repo/fixtures/p1/out.jsonl"),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "probe recorder writing under fixtures/ requires a non-empty needle file"
+    )]
+    fn test_fixtures_recorder_panics_with_empty_needle_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "# comment only").unwrap();
+        writeln!(tmp).unwrap();
+
+        require_redact_needles_for_fixtures_with_env(
+            Path::new("repo/fixtures/p1/out.jsonl"),
+            Some("0"),
+            Some(tmp.path()),
+        );
+    }
+
+    #[test]
+    fn test_fixtures_recorder_allows_override() {
+        require_redact_needles_for_fixtures_with_env(
+            Path::new("repo/fixtures/p1/out.jsonl"),
+            Some("1"),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_non_fixtures_path_does_not_panic() {
+        require_redact_needles_for_fixtures_with_env(
+            Path::new("repo/other_dir/out.jsonl"),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_fixtures_recorder_succeeds_with_valid_needle_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "my_org_needle").unwrap();
+
+        require_redact_needles_for_fixtures_with_env(
+            Path::new("repo/fixtures/p1/out.jsonl"),
+            None,
+            Some(tmp.path()),
+        );
+    }
 }

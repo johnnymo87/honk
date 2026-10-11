@@ -18,10 +18,10 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - [x] T5 WS manual check
 - [x] T6 P2: Turn survives disconnects; clean reattach 409 is 0-1ms, half-open persists; frame loss in dead socket requires post-reattach reconciliation.
 - [x] T7 goose patch notes (d3ec06a + later additions in docs/spike/goose-patches.md)
-- [x] T8 P3: Same-conn reload mid-run safe, agent preserved, no replay duplicates; CWD rewritten (honkd must pass stored CWD); cross-conn reload does not redirect live stream.
+- [x] T8 P3: Same-conn reload mid-run safe, agent preserved; replay re-sends committed steps of the in-flight turn (never the uncommitted message), so clients must dedupe/replace by messageId; CWD rewritten (honkd must pass stored CWD); cross-conn reload does not redirect live stream.
 - [x] T9 P4: No SSE redelivery or load re-send of pending permissions; same-conn survives 90s listener drop and finishes; lost frames unrecoverable; teardown answers execute nothing.
 - [x] T10 P5: cancel works from any conn (54-79ms, leaks orphan shell descendants); $/cancel_request ignored; cancel while parked requires answering cancelled; late steer consumed via exit_chat reset; restart returns 404, export works before load.
-- [x] T11 P6: Message IDs and toolCallIds completely stable (block id = messageId); replayTail:1 covers last turn; goose ~0.5-1.7 MB/session RSS, 0 child procs; honkd TTL 15m, max 16 conns.
+- [x] T11 P6: live text/thought messageIds and toolCallIds stable across live/replay/export (block id = messageId; tool blocks = toolCallId, since tool_call frame messageId is not stable); replayTail:1 covers last turn (source + unrecorded multi-turn run; fixtures single-turn); goose ~0.5-1.7 MB/session RSS, 0 child procs (unrecorded); honkd TTL 15m, max 16 conns.
 - [x] T12 hydra (optional): skipped (isolation cost not worth it given P2-P6 settled the design)
 - [x] T13 findings, design amendments, M1 plan + goose-patch plan (66dae62, 86ff5a3, a692b40, 84642ce, bd505ce)
 

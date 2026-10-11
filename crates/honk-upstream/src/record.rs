@@ -42,6 +42,23 @@ pub struct Recorder {
     inner: Option<Arc<Inner>>,
 }
 
+fn path_has_fixtures_component(path: &Path) -> bool {
+    if path.components().any(|c| c.as_os_str() == "fixtures") {
+        return true;
+    }
+    if let Ok(abs) = std::path::absolute(path)
+        && abs.components().any(|c| c.as_os_str() == "fixtures")
+    {
+        return true;
+    }
+    if let Ok(canon) = std::fs::canonicalize(path)
+        && canon.components().any(|c| c.as_os_str() == "fixtures")
+    {
+        return true;
+    }
+    false
+}
+
 impl Recorder {
     /// Creates a disabled recorder that discards all recorded events.
     pub fn disabled() -> Self {
@@ -49,8 +66,20 @@ impl Recorder {
     }
 
     /// Creates a recorder that appends JSONL lines to `path`.
+    ///
+    /// When writing to any path with a `fixtures` component, refuses unless the redactor has
+    /// org needles configured or `HONK_ALLOW_NO_REDACT=1` is set.
     pub fn file(path: impl AsRef<Path>, redactor: Redactor) -> anyhow::Result<Self> {
         let path = path.as_ref();
+        if path_has_fixtures_component(path)
+            && std::env::var("HONK_ALLOW_NO_REDACT").as_deref() != Ok("1")
+            && !redactor.has_org_needles()
+        {
+            panic!(
+                "probe recorder writing under fixtures/ requires a non-empty needle file at ~/.config/honk/redact.txt \
+                 (or $HONK_REDACT_FILE). Set HONK_ALLOW_NO_REDACT=1 to override."
+            );
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create dir '{}'", parent.display()))?;
@@ -89,6 +118,7 @@ impl Recorder {
 
         let t_ms = inner.start.elapsed().as_millis() as u64;
         let frame = frame.map(|f| inner.redactor.apply(f));
+        let note = note.map(|n| inner.redactor.redact_string(&n));
         let entry = RecordEntry {
             t_ms,
             dir,
@@ -190,6 +220,68 @@ mod tests {
         assert_eq!(entries[2].frame, Some(json!({"result": "ok"})));
 
         Ok(())
+    }
+
+    #[test]
+    fn note_is_redacted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("test_note.jsonl");
+
+        let redactor = Redactor::new(vec![
+            ("s3cret".into(), "<SECRET>".into()),
+            ("acme".into(), "<ORG>".into()),
+        ]);
+        let rec = Recorder::file(&file_path, redactor)?;
+
+        rec.record_marker("conn", "encountered s3cret at ACME corp");
+        rec.record(
+            Direction::Marker,
+            "stream",
+            None,
+            None,
+            Some("another s3cret note".to_string()),
+        );
+
+        let file = std::fs::File::open(&file_path)?;
+        let reader = std::io::BufReader::new(file);
+        let entries: Vec<RecordEntry> = reader
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].note.as_deref(),
+            Some("encountered <SECRET> at <ORG> corp")
+        );
+        assert_eq!(entries[1].note.as_deref(), Some("another <SECRET> note"));
+
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "probe recorder writing under fixtures/ requires a non-empty needle file"
+    )]
+    fn fixtures_recorder_panics_without_org_needles() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures_dir = dir.path().join("fixtures");
+        let file_path = fixtures_dir.join("test.jsonl");
+
+        let redactor = Redactor::default();
+        let _ = Recorder::file(&file_path, redactor);
+    }
+
+    #[test]
+    fn fixtures_recorder_succeeds_with_org_needles() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures_dir = dir.path().join("fixtures");
+        let file_path = fixtures_dir.join("test.jsonl");
+
+        let mut redactor = Redactor::default();
+        redactor.add_org_needle("acme");
+        let rec = Recorder::file(&file_path, redactor);
+        assert!(rec.is_ok());
     }
 
     #[test]

@@ -23,11 +23,9 @@ where
                     if data.is_empty() {
                         None
                     } else {
-                        Some(
-                            serde_json::from_str::<Value>(data).with_context(|| {
-                                format!("failed to parse SSE data as JSON: {data}")
-                            }),
-                        )
+                        Some(serde_json::from_str::<Value>(data).with_context(|| {
+                            format!("failed to parse SSE data as JSON (length: {})", data.len())
+                        }))
                     }
                 }
                 Err(err) => Some(Err(anyhow::anyhow!("SSE stream error: {err}"))),
@@ -106,13 +104,24 @@ mod tests {
 
     #[tokio::test]
     async fn non_json_data_yields_error_not_panic() {
+        let raw_payload = "super_secret_not_json";
         let chunks: Vec<Result<Bytes, std::io::Error>> =
-            vec![Ok(Bytes::from("data: not json at all\n\n"))];
+            vec![Ok(Bytes::from(format!("data: {raw_payload}\n\n")))];
         let stream = futures::stream::iter(chunks);
         let mut json_stream = sse_to_json_stream(stream);
 
         let item = json_stream.next().await.expect("expected error item");
-        assert!(item.is_err());
+        let err = item.expect_err("expected error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains(&format!("length: {}", raw_payload.len())),
+            "expected error to mention length {}, got: {err_msg}",
+            raw_payload.len()
+        );
+        assert!(
+            !err_msg.contains(raw_payload),
+            "error should not leak raw data, got: {err_msg}"
+        );
         assert!(json_stream.next().await.is_none());
     }
 }

@@ -8,7 +8,7 @@ pub mod sse;
 
 pub use conn::{Event, StreamKey, Upstream, rpc_id_matches};
 pub use record::{Direction, RecordEntry, Recorder};
-pub use redact::Redactor;
+pub use redact::{Redactor, parse_redact_file, resolve_redact_file};
 pub use sse::sse_to_json_stream;
 
 /// Production goose serve port; probes must never talk to it.

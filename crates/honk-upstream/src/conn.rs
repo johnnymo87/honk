@@ -13,6 +13,21 @@ use crate::record::{Direction, Recorder};
 /// Timeout applied to all JSON-RPC POST and DELETE requests.
 pub const POST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Connection timeout applied when establishing HTTP connections.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout applied to subscribe GET request waiting for response headers.
+pub const SUBSCRIBE_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn build_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .context("failed to build reqwest client")
+}
+
 /// Identifies whether a stream belongs to the connection mailbox or a specific session mailbox.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamKey {
@@ -85,6 +100,7 @@ pub struct Upstream {
     subscribe_deadline: Duration,
     subscribe_initial_backoff: Duration,
     subscribe_max_backoff: Duration,
+    subscribe_headers_timeout: Duration,
     last_call_stream: Option<StreamKey>,
 }
 
@@ -96,7 +112,7 @@ impl Upstream {
     pub async fn initialize(url: &str, secret: String, rec: Recorder) -> anyhow::Result<Self> {
         let parsed_url = guard_url(url)?;
         let trimmed_secret = secret.trim().to_string();
-        let client = reqwest::Client::builder().build()?;
+        let client = build_http_client()?;
 
         let init_body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -165,6 +181,7 @@ impl Upstream {
             subscribe_deadline: Duration::from_secs(60),
             subscribe_initial_backoff: Duration::from_millis(100),
             subscribe_max_backoff: Duration::from_secs(2),
+            subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
         })
     }
@@ -179,7 +196,7 @@ impl Upstream {
         let parsed_url = guard_url(url)?;
         let trimmed_secret = secret.trim().to_string();
         let trimmed_conn_id = conn_id.trim().to_string();
-        let client = reqwest::Client::builder().build()?;
+        let client = build_http_client()?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         rec.record_marker("conn", format!("resumed connection {trimmed_conn_id}"));
@@ -199,6 +216,7 @@ impl Upstream {
             subscribe_deadline: Duration::from_secs(60),
             subscribe_initial_backoff: Duration::from_millis(100),
             subscribe_max_backoff: Duration::from_secs(2),
+            subscribe_headers_timeout: SUBSCRIBE_HEADERS_TIMEOUT,
             last_call_stream: None,
         })
     }
@@ -217,6 +235,10 @@ impl Upstream {
 
     pub fn set_subscribe_deadline(&mut self, deadline: Duration) {
         self.subscribe_deadline = deadline;
+    }
+
+    pub fn set_subscribe_headers_timeout(&mut self, timeout: Duration) {
+        self.subscribe_headers_timeout = timeout;
     }
 
     pub fn set_subscribe_backoff(&mut self, initial: Duration, max: Duration) {
@@ -418,9 +440,15 @@ impl Upstream {
                 req = req.header("acp-session-id", sid);
             }
 
-            let res = req
-                .send()
+            let send_fut = req.send();
+            let res = tokio::time::timeout(self.subscribe_headers_timeout, send_fut)
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "timed out after {:?} waiting for headers when subscribing to {stream_name}",
+                        self.subscribe_headers_timeout
+                    )
+                })?
                 .with_context(|| format!("failed to send GET request for {stream_name}"))?;
 
             let status = res.status();
@@ -797,5 +825,159 @@ mod tests {
 
         upstream.hard_drop();
         assert!(upstream.stream_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_times_out_when_server_does_not_send_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Server accepts connection and holds it open without sending response headers
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            use tokio::io::AsyncWriteExt;
+            let _ = socket.shutdown().await;
+        });
+
+        let mut upstream = Upstream::resume(
+            &format!("http://127.0.0.1:{port}/acp"),
+            "secret".into(),
+            "conn-test".into(),
+            Recorder::disabled(),
+        )
+        .expect("resume ok");
+        upstream.set_subscribe_headers_timeout(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let res = upstream.subscribe(None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.is_err(),
+            "expected subscribe to error on header timeout"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("timed out") && err_msg.contains("50ms"),
+            "expected error to mention timeout after 50ms, got: {err_msg}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(30) && elapsed < Duration::from_millis(400),
+            "elapsed time was {elapsed:?}, expected ~50ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_does_not_follow_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/redirected\r\nContent-Length: 0\r\n\r\n";
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let mut upstream = Upstream::resume(
+            &format!("http://127.0.0.1:{port}/acp"),
+            "secret".into(),
+            "conn-test".into(),
+            Recorder::disabled(),
+        )
+        .expect("resume ok");
+
+        let res = upstream.subscribe(None).await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("302"),
+            "expected error to mention 302, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_does_not_follow_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/redirected\r\nContent-Length: 0\r\n\r\n";
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let res = Upstream::initialize(
+            &format!("http://127.0.0.1:{port}/acp"),
+            "secret".into(),
+            Recorder::disabled(),
+        )
+        .await;
+
+        let Err(err) = res else {
+            panic!("expected initialize to fail on 302");
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("302"),
+            "expected initialize error to mention 302, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_body_without_overall_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let frame1 = "data: {\"frame\": 1}\n\n";
+            socket.write_all(frame1.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let frame2 = "data: {\"frame\": 2}\n\n";
+            socket.write_all(frame2.as_bytes()).await.unwrap();
+        });
+
+        let mut upstream = Upstream::resume(
+            &format!("http://127.0.0.1:{port}/acp"),
+            "secret".into(),
+            "conn-test".into(),
+            Recorder::disabled(),
+        )
+        .expect("resume ok");
+
+        upstream.subscribe(None).await.expect("subscribe ok");
+
+        let first = upstream
+            .next(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first,
+            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 1}))
+        );
+
+        let second = upstream
+            .next(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second,
+            Event::Frame(StreamKey::Conn, serde_json::json!({"frame": 2}))
+        );
     }
 }
