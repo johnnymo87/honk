@@ -178,15 +178,15 @@ follow-ups (patch, config, or recipe), not as failures.
 
 **Verdict:**
 1. **Reload during active run succeeds:** Goose accepts `session/load` while a turn is actively streaming or executing a tool call (`load_success: true`). The JSON-RPC reply arrives on the session stream (`session:<sid>`), not the connection stream.
-2. **In-memory agent is preserved:** No secondary agent process or threads are spawned (thread diff = 0, child process PIDs unchanged, RSS delta < 120 kB). In-flight sub-processes (such as bash `sleep 40`) continue undisturbed to completion.
-3. **Replay vs. live frames:** Replay frames are emitted before the `session/load` response and represent committed session history. In-flight assistant chunks are not committed to storage mid-run and therefore are not duplicated in the replay (`duplicate_chars: 0`, `overlap: 0`). Replay frames lack any distinguishing marker in `_meta` (they carry standard `created` and `messageId` identical to live frames).
+2. **In-memory agent is preserved:** No secondary agent process or threads are spawned (thread diff = 0, child process PIDs unchanged, RSS delta < 125 kB). In-flight sub-processes (such as bash `sleep 40`) continue undisturbed to completion.
+3. **Replay vs. live frames:** Replay re-sends **COMMITTED** messages of the in-flight turn (earlier steps already streamed live), never the uncommitted in-flight message; a client must replace/dedupe by `messageId`, not append. In-flight assistant chunks are not committed to storage mid-run and continue streaming live. While `session/load` is being processed, live chunks can interleave before the load reply. When live frames are classified properly (by checking whether `messageId` belongs to committed storage), all streamed live text (before drop + live after resume) matches final export with **0 missing characters** across both runs (`exact_match: true`). The previously observed "14 chars missing" was an artifact of lumping an interleaved in-flight live chunk (`' count and add'`) into replay frames.
 4. **CWD side effect:** `session/load` rewrites `session.working_dir` in storage whenever the passed `cwd` differs from stored state (`cwd_rewritten: true`). Therefore, honkd must always pass the stored `cwd` queried from `session/list`.
 5. **Cross-connection reload:** When `session/load` is issued on a fresh Connection B while Connection A is running a prompt, the load succeeds on B and receives historical replay, but **all subsequent live streaming chunks remain strictly pinned to Connection A**. Honkd cannot migrate an in-flight stream to a new connection via `session/load`.
 6. **Export reconciliation path:** `_goose/unstable/session/export` succeeds mid-run (`mid_run_export_ok: true`) as a read-only query against committed storage with zero side effects. Waiting for turn end or reconciling via export is cleaner and avoids stitching an in-flight message.
 
 **Decision-rule outcomes:**
 1. **Reload rejected during a run:** Not rejected (`load_success: true`). Goose admits mid-run reloads on the same connection.
-2. **Replay + live duplicates:** Replay does not duplicate in-flight tokens (`duplicate_chars: 0`, `overlap: 0`). However, unbuffered disconnects can leave small character gaps (0–14 chars missing). Because replayed frames carry no `replay: true` metadata, honkd should wait for turn end (detected via `session_info_update` activeRunId null) before reconciling.
+2. **Replay + live duplicates:** Replay re-sends earlier committed steps of the turn (overlapping 100% with the corresponding messageId already streamed before drop, e.g. 71–79 chars across `msg_vrtx_...`), but never the in-flight uncommitted message (`replay_contained_inflight: false`). If a client naively appends replay to live chunks, it duplicates earlier steps; a client must replace/dedupe by `messageId`. Live streaming chunks suffered zero loss across the disconnect when properly partitioned (`missing_chars: 0`, `exact_match: true`).
 3. **Second agent spawned:** No (`children_changed: false`, thread diff 0). The in-memory agent is reused. However, cross-connection reloads do not divert live frames.
 4. **CWD rewritten by load:** Confirmed (`cwd_rewritten: true`). Honkd must always pass the stored `cwd`.
 
@@ -194,27 +194,33 @@ follow-ups (patch, config, or recipe), not as failures.
 
 ### P3a1: Same-connection reload mid-run (streaming tides)
 - **Run 1:**
-  - Session: `20261011_11` | Connection: `eeb0aace-4cd5-44e2-907c-a2867ed9b9ce`
-  - Chunks before drop: 10 (153 chars) | Reattach 409 window: 0ns
-  - Mid-run export OK: `true` (assistant chars in export: 71, convo len: 4)
-  - `session/load` success: `true` | Reply stream: `session:20261011_11`
-  - Replay frames: 5 (1 user chunk, 2 agent chunks [85 chars]) | Replay `_meta`: `["goose"]`
-  - Live frames after load: 229 (115 live agent chunks [1000 chars])
-  - Proc stats: thread diff: 0, RSS diff: +112 kB, children changed: `false`
-  - Streamed total: 1153 chars | Final export: 1167 chars | Missing: 14 | Duplicate: 0
-  - Subsequence: `true` | Prefix: `false` | `FINISHED` present: `true` | Duration: 61.42s
-  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791678504.jsonl`
-- **Run 2:**
-  - Session: `20261011_15` | Connection: `d7c376db-1a8b-4866-8802-41e6d5aa2534`
-  - Chunks before drop: 10 (121 chars) | Reattach 409 window: 0ns
-  - Mid-run export OK: `true` (assistant chars in export: 71, convo len: 4)
-  - `session/load` success: `true` | Reply stream: `session:20261011_15`
+  - Session: `20261011_19` | Connection: `edda307f-4fbc-4c92-bb96-1313ae8cff7a`
+  - Chunks before drop: 10 (120 chars, in-flight msg: `msg_vrtx_011CfuXSAARKzsZdzs6hStFo`) | Reattach 409 window: 0ns
+  - Mid-run export OK: `true` (committed msg IDs: 4, assistant chars in export: 71, convo len: 4)
+  - `session/load` success: `true` | Reply stream: `session:20261011_19`
   - Replay frames: 4 (1 user chunk, 1 agent chunk [71 chars]) | Replay `_meta`: `["goose"]`
-  - Live frames after load: 282 (156 live agent chunks [1451 chars])
-  - Proc stats: thread diff: 0, RSS diff: +8 kB, children changed: `false`
-  - Streamed total: 1572 chars | Final export: 1572 chars | Missing: 0 | Duplicate: 0
-  - Subsequence: `true` | Prefix: `true` | `FINISHED` present: `true` | Duration: 82.70s
-  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791678637.jsonl`
+  - Replay overlap with before-drop text: 71 chars across `["msg_vrtx_011CfuXRX31sFezWMr4PY7Ym"]` (100% duplicate of committed step)
+  - Replay contained in-flight msg: `false`
+  - Interleaved live chunks before load reply: 1 (10 chars)
+  - Live chunks after drop: 104 (973 chars)
+  - Proc stats: thread diff: 0, RSS diff: +124 kB, children changed: `false`
+  - Total streamed live text: 1093 chars (120 before drop + 973 live) | Final export: 1093 chars | Missing: 0 | Exact match: `true`
+  - Subsequence: `true` | Prefix: `true` | `FINISHED` present: `true` | Duration: 35.07s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791679514.jsonl`
+- **Run 2:**
+  - Session: `20261011_20` | Connection: `d4f076b7-b65d-4a78-966c-e937bf8ab1a6`
+  - Chunks before drop: 10 (103 chars, in-flight msg: `msg_vrtx_011CfuXV3G2BSTLUgwj79cGe`) | Reattach 409 window: 0ns
+  - Mid-run export OK: `true` (committed msg IDs: 4, assistant chars in export: 79, convo len: 4)
+  - `session/load` success: `true` | Reply stream: `session:20261011_20`
+  - Replay frames: 4 (1 user chunk, 1 agent chunk [79 chars]) | Replay `_meta`: `["goose"]`
+  - Replay overlap with before-drop text: 79 chars across `["msg_vrtx_011CfuXUM3aPuHJD6tNZFg2t"]` (100% duplicate of committed step)
+  - Replay contained in-flight msg: `false`
+  - Interleaved live chunks before load reply: 1 (16 chars)
+  - Live chunks after drop: 68 (690 chars)
+  - Proc stats: thread diff: 0, RSS diff: +4 kB, children changed: `false`
+  - Total streamed live text: 793 chars (103 before drop + 690 live) | Final export: 793 chars | Missing: 0 | Exact match: `true`
+  - Subsequence: `true` | Prefix: `true` | `FINISHED` present: `true` | Duration: 20.95s
+  - Fixture: `fixtures/goose-1.54.0-patched.2/p3a/1791679554.jsonl`
 
 ### P3a2: Same-connection reload mid-run (tool call sleep 40)
 - **Run 1:**

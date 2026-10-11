@@ -44,6 +44,15 @@ fn get_chunk_text(frame: &Value) -> Option<String> {
     }
 }
 
+fn get_message_id(frame: &Value) -> Option<String> {
+    frame
+        .pointer("/params/update/messageId")
+        .or_else(|| frame.pointer("/params/update/_meta/goose/messageId"))
+        .or_else(|| frame.pointer("/params/update/meta/goose/messageId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 fn is_agent_chunk(frame: &Value) -> bool {
     frame
         .pointer("/params/update/sessionUpdate")
@@ -77,16 +86,6 @@ fn check_no_permission_request(frame: &Value, context: &str) {
     }
 }
 
-fn find_overlap(a: &str, b: &str) -> usize {
-    let max_possible = std::cmp::min(a.len(), b.len());
-    for len in (1..=max_possible).rev() {
-        if a.ends_with(&b[..len]) {
-            return len;
-        }
-    }
-    0
-}
-
 #[tokio::test]
 #[ignore]
 async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
@@ -116,6 +115,9 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
 
     let mut chunks_before_drop = 0usize;
     let mut text_before_drop = String::new();
+    let mut text_by_msg_before_drop: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut in_flight_msg_id: Option<String> = None;
     let wait_start = Instant::now();
     let timeout = Duration::from_secs(60);
 
@@ -133,13 +135,21 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
             if is_agent_chunk(frame) {
                 if let Some(t) = get_chunk_text(frame) {
                     text_before_drop.push_str(&t);
+                    if let Some(mid) = get_message_id(frame) {
+                        text_by_msg_before_drop
+                            .entry(mid.clone())
+                            .or_default()
+                            .push_str(&t);
+                        in_flight_msg_id = Some(mid);
+                    }
                 }
                 chunks_before_drop += 1;
                 if chunks_before_drop >= 10 {
                     println!(
-                        "[P3a1] Reached {} chunks before drop ({} chars), hard-dropping connection",
+                        "[P3a1] Reached {} chunks before drop ({} chars, in-flight msg: {:?}), hard-dropping connection",
                         chunks_before_drop,
-                        text_before_drop.len()
+                        text_before_drop.len(),
+                        in_flight_msg_id,
                     );
                     break;
                 }
@@ -172,10 +182,18 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
 
     // Check mid-run export
     let mid_run_export_res = export_session(&mut resumed, &ts.sid).await;
+    let mut committed_msg_ids = std::collections::HashSet::new();
     let (mid_run_export_ok, mid_run_export_assistant_chars, mid_run_convo_len) =
         match &mid_run_export_res {
             Ok(v) => {
                 let ast = extract_all_assistant_text(v);
+                if let Some(convo) = v.get("conversation").and_then(|c| c.as_array()) {
+                    for msg in convo {
+                        if let Some(id) = msg.get("id").and_then(|i| i.as_str()) {
+                            committed_msg_ids.insert(id.to_string());
+                        }
+                    }
+                }
                 let len = v
                     .get("conversation")
                     .and_then(|c| c.as_array())
@@ -189,8 +207,8 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
             }
         };
     println!(
-        "[P3a1] Mid-run export ok: {}, in-flight assistant chars in export: {}, convo len: {}",
-        mid_run_export_ok, mid_run_export_assistant_chars, mid_run_convo_len
+        "[P3a1] Mid-run export ok: {}, committed msg ids: {:?}, in-flight assistant chars in export: {}, convo len: {}",
+        mid_run_export_ok, committed_msg_ids, mid_run_export_assistant_chars, mid_run_convo_len
     );
 
     let stats_before_load = get_proc_stats(goose_pid)?;
@@ -210,7 +228,9 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
         .await?;
 
     let mut replay_frames: Vec<Value> = Vec::new();
-    let mut live_frames_after_load: Vec<Value> = Vec::new();
+    let mut live_frames_after_drop: Vec<Value> = Vec::new();
+    let mut interleaved_live_before_load_reply = 0usize;
+    let mut interleaved_live_text = String::new();
     let mut load_reply_stream: Option<StreamKey> = None;
     let mut load_reply_frame: Option<Value> = None;
     let mut stats_after_load: Option<ProcStats> = None;
@@ -254,10 +274,27 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
                 run_end_frame = Some(frame.clone());
             }
 
-            if load_reply_frame.is_none() {
+            // Classification:
+            // Replay frames are emitted as part of session/load handling (before load reply)
+            // AND carry a messageId that belongs to committed history on disk.
+            // In-flight chunks (whose messageId is NOT in committed_msg_ids) are LIVE chunks,
+            // even if they arrive before the load reply!
+            let msg_id = get_message_id(&frame);
+            let is_replayed = load_reply_frame.is_none()
+                && msg_id
+                    .as_ref()
+                    .is_some_and(|id| committed_msg_ids.contains(id));
+
+            if is_replayed {
                 replay_frames.push(frame);
             } else {
-                live_frames_after_load.push(frame);
+                if load_reply_frame.is_none() && is_agent_chunk(&frame) {
+                    interleaved_live_before_load_reply += 1;
+                    if let Some(t) = get_chunk_text(&frame) {
+                        interleaved_live_text.push_str(&t);
+                    }
+                }
+                live_frames_after_drop.push(frame);
             }
 
             if prompt_reply_frame.is_some() && run_end_frame.is_some() {
@@ -265,7 +302,7 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
                 while let Ok(Some(Event::Frame(_, extra))) =
                     resumed.next(Duration::from_millis(200)).await
                 {
-                    live_frames_after_load.push(extra);
+                    live_frames_after_drop.push(extra);
                 }
                 break;
             }
@@ -284,6 +321,8 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
     let mut replay_user_chunks = 0usize;
     let mut replay_agent_chunks = 0usize;
     let mut replay_assistant_text = String::new();
+    let mut replay_text_by_msg: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut replay_meta_fields = std::collections::HashSet::new();
 
     for f in &replay_frames {
@@ -294,6 +333,9 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
             replay_agent_chunks += 1;
             if let Some(t) = get_chunk_text(f) {
                 replay_assistant_text.push_str(&t);
+                if let Some(mid) = get_message_id(f) {
+                    replay_text_by_msg.entry(mid).or_default().push_str(&t);
+                }
             }
         }
         if let Some(meta) = f.pointer("/params/update/_meta").or_else(|| {
@@ -307,14 +349,20 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
         }
     }
 
-    // Analyze live frames after load
+    // Analyze live frames after drop (including any interleaved before load reply)
     let mut live_agent_chunks = 0usize;
     let mut live_assistant_text = String::new();
-    for f in &live_frames_after_load {
+    let mut live_text_by_msg: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for f in &live_frames_after_drop {
         if is_agent_chunk(f) {
             live_agent_chunks += 1;
             if let Some(t) = get_chunk_text(f) {
                 live_assistant_text.push_str(&t);
+                if let Some(mid) = get_message_id(f) {
+                    live_text_by_msg.entry(mid).or_default().push_str(&t);
+                }
             }
         }
     }
@@ -331,13 +379,37 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
     let final_all_text = extract_all_assistant_text(&final_export);
     let _final_last_text = extract_assistant_text(&final_export);
 
-    let combined_streamed = format!("{text_before_drop}{live_assistant_text}");
-    let overlap = find_overlap(&text_before_drop, &live_assistant_text);
-    let missing_chars = final_all_text.len().saturating_sub(combined_streamed.len());
-    let duplicate_chars = overlap;
-    let is_prefix = final_all_text.starts_with(&combined_streamed);
-    let is_subseq = is_subsequence(&combined_streamed, &final_all_text);
+    // All streamed live text = before-drop + live after drop (including interleaved)
+    let total_streamed_live = format!("{text_before_drop}{live_assistant_text}");
+    let missing_chars = final_all_text
+        .len()
+        .saturating_sub(total_streamed_live.len());
+    let exact_match = total_streamed_live == final_all_text;
+    let is_prefix = final_all_text.starts_with(&total_streamed_live);
+    let is_subseq = is_subsequence(&total_streamed_live, &final_all_text);
     let finished_present = final_all_text.contains("FINISHED");
+
+    // Overlap measurement: replayed text vs text already streamed before drop
+    let mut replayed_overlap_chars = 0usize;
+    let mut overlapping_msg_ids = Vec::new();
+    for (mid, r_text) in &replay_text_by_msg {
+        if let Some(b_text) = text_by_msg_before_drop.get(mid) {
+            overlapping_msg_ids.push(mid.clone());
+            if b_text == r_text {
+                replayed_overlap_chars += r_text.len();
+            } else {
+                let common = b_text
+                    .chars()
+                    .zip(r_text.chars())
+                    .filter(|(a, b)| a == b)
+                    .count();
+                replayed_overlap_chars += common;
+            }
+        }
+    }
+    let replay_contained_inflight = in_flight_msg_id
+        .as_ref()
+        .is_some_and(|id| replay_text_by_msg.contains_key(id));
 
     println!("[P3a1] Replay frames count: {}", replay_frames.len());
     println!(
@@ -351,8 +423,17 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
         replay_meta_fields.iter().collect::<Vec<_>>()
     );
     println!(
-        "[P3a1] Live frames after load: {}, live agent chunks: {}, live text len: {}",
-        live_frames_after_load.len(),
+        "[P3a1] Replayed overlap with before-drop text: {} chars across {:?}, replay contained in-flight msg: {}",
+        replayed_overlap_chars, overlapping_msg_ids, replay_contained_inflight
+    );
+    println!(
+        "[P3a1] Interleaved live chunks before load reply: {} ({} chars)",
+        interleaved_live_before_load_reply,
+        interleaved_live_text.len()
+    );
+    println!(
+        "[P3a1] Live frames after drop: {}, live agent chunks: {}, live text len: {}",
+        live_frames_after_drop.len(),
         live_agent_chunks,
         live_assistant_text.len()
     );
@@ -361,11 +442,11 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
         thread_diff, rss_diff_kb, children_changed
     );
     println!(
-        "[P3a1] Combined streamed len = {}, final export len = {}, missing = {}, overlap = {}",
-        combined_streamed.len(),
+        "[P3a1] Total streamed live len = {}, final export len = {}, missing = {}, exact_match = {}",
+        total_streamed_live.len(),
         final_all_text.len(),
         missing_chars,
-        overlap
+        exact_match
     );
 
     let summary = json!({
@@ -379,16 +460,21 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
         "mid_run_export_assistant_chars": mid_run_export_assistant_chars,
         "chunks_before_drop": chunks_before_drop,
         "text_before_drop_chars": text_before_drop.len(),
+        "interleaved_live_before_load_reply": interleaved_live_before_load_reply,
+        "interleaved_live_chars": interleaved_live_text.len(),
         "replay_frames_count": replay_frames.len(),
         "replay_user_chunks": replay_user_chunks,
         "replay_agent_chunks": replay_agent_chunks,
         "replay_assistant_chars": replay_assistant_text.len(),
+        "replayed_overlap_chars": replayed_overlap_chars,
+        "overlapping_msg_ids": overlapping_msg_ids,
+        "replay_contained_inflight": replay_contained_inflight,
         "live_agent_chunks": live_agent_chunks,
         "live_assistant_chars": live_assistant_text.len(),
-        "combined_streamed_chars": combined_streamed.len(),
+        "total_streamed_chars": total_streamed_live.len(),
         "final_export_chars": final_all_text.len(),
         "missing_chars": missing_chars,
-        "duplicate_chars": duplicate_chars,
+        "exact_match": exact_match,
         "is_prefix": is_prefix,
         "is_subsequence": is_subseq,
         "finished_present": finished_present,
@@ -405,6 +491,14 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
     assert!(
         finished_present,
         "turn must complete successfully and include FINISHED"
+    );
+    assert!(
+        !replay_contained_inflight,
+        "replay must never re-send uncommitted in-flight message"
+    );
+    assert_eq!(
+        missing_chars, 0,
+        "all streamed live text must completely match final export without missing chars"
     );
 
     Ok(())

@@ -157,6 +157,9 @@ drain on close).
 
 **Size:** about 80-120 LOC plus 2 tests.
 
+**Connection binding note (per P3c):**
+Live frames are bound to the `ConnectionTo<Client>` that sent `session/prompt` (`crates/goose/src/acp/server.rs:on_prompt` → `forward_agent_stream`). Takeover is strictly same-connection-id and cannot move a live run to a new connection; cross-connection would need the `session/subscribe` patch.
+
 ## 3. Redelivery: per-stream replay ring plus `Last-Event-ID`
 
 **Problem.** Delivery is at-most-once. The frame is dequeued at
