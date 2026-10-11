@@ -61,3 +61,6 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - A3 DONE: honk-wire (block keys, cursors, reducer, export mapping w/ goose visibility filter) + honkd::rpc (3c34fd7).
 - A4/A5 DONE: locked atomic state file; durable per-session log (4b06ade, 35947e4, fixes 33b0644: 0600 at create, corrupt middle line refuses open, transactional mutate).
 - A6 DONE: pure turn core (7970a10, fixes 6ce9ae2, e5b1ceb: no cancel_pending leak across turns; steer reply/consume ordering races; consumed-steer ids kept until next run start).
+- A7 DONE: honkd binary, WS downstream (token/header auth, 401/406), control conn, patched-upstream gate (daa5783; fixes 8a15413 out-of-band 4001 eviction, harness binds :0).
+- A8 DONE: per-session upstream connections persisted before use; session/list with _meta.honk (4510a35; fix 0ab3fb0 routing: session/close local, $/cancel_request dropped).
+- A9 DONE: session actor + native prompt passthrough + receipt text from side-connection export (53db39c; fixes 9acef0b, c4fc3fd: stamped fan-out after record, inline ordered POSTs, multi-session viewers, steer/forward id remap, prompt-send failure via turn core, persisted inflight mirrors turn core).
