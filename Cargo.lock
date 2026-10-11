@@ -307,6 +307,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "honk-testgoose"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "honk-upstream",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "honk-upstream"
 version = "0.0.0"
 dependencies = [
