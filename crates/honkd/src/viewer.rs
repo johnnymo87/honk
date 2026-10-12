@@ -606,6 +606,26 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         }
                     }
                 } else if method == Some("session/prompt") {
+                    if hub
+                        .upstream_unpatched_refused
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        tracing::error!("upstream goose is no longer patched");
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32000,
+                            "upstream goose is no longer patched",
+                            None,
+                        );
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
                     let sid_opt = params.get("sessionId").and_then(Value::as_str);
                     if let Some(sid) = sid_opt {
                         let session_tx = {

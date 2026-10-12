@@ -173,6 +173,30 @@ impl StubGoose {
         })
     }
 
+    pub fn log_text(&self) -> String {
+        let p = self.temp_dir.path().join("goose.log");
+        let p2 = self
+            .temp_dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| self.temp_dir.path().to_path_buf())
+            .join("goose.log");
+        let s = std::fs::read_to_string(&p)
+            .or_else(|_| std::fs::read_to_string(&p2))
+            .unwrap_or_default();
+        if s.is_empty() {
+            format!(
+                "[empty, exists p={}: {:?}, p2={}: {:?}]",
+                p.exists(),
+                std::fs::metadata(&p),
+                p2.exists(),
+                std::fs::metadata(&p2)
+            )
+        } else {
+            s
+        }
+    }
+
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}/acp", self.port)
     }
@@ -253,6 +277,7 @@ impl StubGoose {
 
     pub async fn restart(&mut self) {
         self.kill9();
+        self.model.open_all();
 
         // Wait until port is released and available to bind again (retrying if in TIME_WAIT)
         let bind_start = Instant::now();
@@ -354,6 +379,7 @@ fn spawn_child(
     cmd.env("GOOSE_TELEMETRY_ENABLED", "false");
     cmd.env("GOOSE_DISABLE_SESSION_NAMING", "true");
     cmd.env("GOOSE_DISABLE_KEYRING", "1");
+    cmd.env("RUST_LOG", "debug");
     cmd.current_dir(dirs.cwd_dir);
 
     cmd.process_group(0);

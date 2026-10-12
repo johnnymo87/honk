@@ -489,7 +489,7 @@ async fn steer_probe_post_failure_404_transitions_to_gone() {
     assert_eq!(
         resp.pointer("/result/_meta/honk/reason")
             .and_then(Value::as_str),
-        Some("upstream_gone")
+        Some("upstream_restart")
     );
 }
 

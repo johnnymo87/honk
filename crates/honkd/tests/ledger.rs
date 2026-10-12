@@ -744,11 +744,16 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
     fake.kick_stream(&sid);
 
     // Watchdog or stream ended causes reattach -> gap -> steer probe POST returns 404 -> ReattachFailed { gone: true } -> Gone!
-    // The in-flight prompt should get cancelled with reason upstream_gone
+    // The in-flight prompt should get cancelled with reason upstream_restart
     let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
     assert_eq!(resp["result"]["stopReason"], "cancelled");
+    assert_eq!(
+        resp.pointer("/result/_meta/honk/reason")
+            .and_then(Value::as_str),
+        Some("upstream_restart")
+    );
 
-    // Check state.json: crid-gone is resolved to Done with upstream_gone
+    // Check state.json: crid-gone is resolved to Done with cancelled upstream_restart reply
     let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
     let state: Value = serde_json::from_str(&state_content).unwrap();
     let entry = &state["ledger"]["crid-gone"];
@@ -757,11 +762,14 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
         "InFlight must be resolved to Done on Gone"
     );
     assert_eq!(
-        entry["response"]["error"]["data"]["reason"], "upstream_gone",
-        "cached response must indicate upstream_gone"
+        entry
+            .pointer("/response/result/_meta/honk/reason")
+            .and_then(Value::as_str),
+        Some("upstream_restart"),
+        "cached response must indicate upstream_restart"
     );
 
-    // When client retries with the same client_req_id, it gets a clear error answer instead of lost track
+    // When client retries with the same client_req_id, it gets the cached cancelled reply
     let mut v2 = Viewer::connect(&h).await;
     let r2 = v2
         .call(
@@ -771,12 +779,14 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
         .await;
 
     assert_eq!(
-        r2["error"]["code"], -32000,
-        "retry gets -32000 error: {r2:?}"
+        r2["result"]["stopReason"], "cancelled",
+        "retry gets cached cancelled: {r2:?}"
     );
     assert_eq!(
-        r2["error"]["data"]["reason"], "upstream_gone",
-        "retry error data has reason upstream_gone"
+        r2.pointer("/result/_meta/honk/reason")
+            .and_then(Value::as_str),
+        Some("upstream_restart"),
+        "retry result has reason upstream_restart"
     );
 }
 

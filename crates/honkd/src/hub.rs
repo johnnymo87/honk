@@ -40,8 +40,13 @@ pub struct Hub {
     pub state_dir: PathBuf,
     pub upstream_url: String,
     pub upstream_secret: String,
-    pub control: UpstreamHandle,
-    pub control_init_result: Value,
+    pub control: Arc<RwLock<UpstreamHandle>>,
+    pub control_init_result: Arc<std::sync::RwLock<Value>>,
+    pub is_control_connected: Arc<std::sync::atomic::AtomicBool>,
+    pub upstream_unpatched_refused: Arc<std::sync::atomic::AtomicBool>,
+    pub control_connected_notify: Arc<tokio::sync::Notify>,
+    pub control_reconnecting: Arc<std::sync::atomic::AtomicBool>,
+    pub reactivation_slot: Arc<Mutex<tokio::time::Instant>>,
     pub upstream_ids: Arc<Mutex<UpstreamIds>>,
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
@@ -171,26 +176,16 @@ impl Hub {
         let (control_handle, mut control_rx) = control_upstream.split();
         let pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let pending_clone = pending_control.clone();
 
-        tokio::spawn(async move {
-            while let Some(ev) = control_rx.recv().await {
-                if let Some(frame) = ev.frame()
-                    && let Some(id_val) = frame.get("id")
-                {
-                    let mut pending = pending_clone.lock().await;
-                    let found_key = pending
-                        .keys()
-                        .find(|k| honk_upstream::rpc_id_matches(&serde_json::json!(k), id_val))
-                        .cloned();
-                    if let Some(k) = found_key
-                        && let Some(tx) = pending.remove(&k)
-                    {
-                        let _ = tx.send(frame.clone());
-                    }
-                }
-            }
-        });
+        let control = Arc::new(RwLock::new(control_handle));
+        let control_init_result = Arc::new(std::sync::RwLock::new(control_init_result));
+        let is_control_connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let upstream_unpatched_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let control_connected_notify = Arc::new(tokio::sync::Notify::new());
+        let control_reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reactivation_slot = Arc::new(Mutex::new(
+            tokio::time::Instant::now() - Duration::from_millis(500),
+        ));
 
         // 7. Register session handles from state (Task A12 fills this in)
 
@@ -200,8 +195,13 @@ impl Hub {
             state_dir,
             upstream_url,
             upstream_secret,
-            control: control_handle,
+            control,
             control_init_result,
+            is_control_connected,
+            upstream_unpatched_refused,
+            control_connected_notify,
+            control_reconnecting,
+            reactivation_slot,
             upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -212,6 +212,35 @@ impl Hub {
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
+
+        let pending_clone = hub.pending_control.clone();
+        let hub_for_rx = hub.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = control_rx.recv().await {
+                match ev {
+                    honk_upstream::Event::Frame(_key, frame, _id) => {
+                        if let Some(id_val) = frame.get("id") {
+                            let mut pending = pending_clone.lock().await;
+                            let found_key = pending
+                                .keys()
+                                .find(|k| {
+                                    honk_upstream::rpc_id_matches(&serde_json::json!(k), id_val)
+                                })
+                                .cloned();
+                            if let Some(k) = found_key
+                                && let Some(tx) = pending.remove(&k)
+                            {
+                                let _ = tx.send(frame.clone());
+                            }
+                        }
+                    }
+                    honk_upstream::Event::StreamEnded { .. } => {
+                        break;
+                    }
+                }
+            }
+            hub_for_rx.trigger_control_reconnect();
+        });
 
         let held_sessions: Vec<(String, crate::state::HeldSession)> = {
             let s = hub.state.lock().await;
@@ -334,9 +363,10 @@ impl Hub {
     }
 
     pub fn handle_initialize(&self, _params: &Value) -> Value {
-        let mut result_obj = match self.control_init_result.get("result") {
+        let init_val = self.control_init_result.read().unwrap().clone();
+        let mut result_obj = match init_val.get("result") {
             Some(res) => res.clone(),
-            None => self.control_init_result.clone(),
+            None => init_val,
         };
         if !result_obj.is_object() {
             result_obj = serde_json::json!({});
@@ -362,30 +392,245 @@ impl Hub {
         result_obj
     }
 
+    pub fn trigger_control_reconnect(&self) {
+        if self
+            .control_reconnecting
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.is_control_connected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let hub = self.arc();
+        tokio::spawn(async move {
+            hub.run_control_reconnect().await;
+        });
+    }
+
+    async fn run_control_reconnect(&self) {
+        tracing::warn!("Upstream control connection lost; re-initializing with backoff");
+        let mut backoff = Duration::from_millis(200);
+        let max_backoff = Duration::from_secs(5);
+
+        let upstream_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            ..Default::default()
+        };
+
+        loop {
+            let recorder = if let Some(rec_path) = &self.args.record {
+                let redactor = Redactor::from_env();
+                Recorder::file(rec_path, redactor).unwrap_or_else(|_| Recorder::disabled())
+            } else {
+                Recorder::disabled()
+            };
+
+            let init_res = Upstream::initialize_with(
+                &self.upstream_url,
+                self.upstream_secret.clone(),
+                recorder,
+                &upstream_opts,
+            )
+            .await;
+
+            let mut control_upstream = match init_res {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::debug!(
+                        "control initialize_with failed: {e:#}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue;
+                }
+            };
+
+            let new_conn_id = control_upstream.conn_id().to_string();
+
+            // Persist new control conn id BEFORE subscribing
+            {
+                let mut s = self.state.lock().await;
+                if let Err(e) = s.mutate(|st| {
+                    st.control_conn = Some(new_conn_id.clone());
+                }) {
+                    tracing::error!("failed to persist reconnected control conn in state: {e:#}");
+                }
+            }
+
+            // Subscribe conn stream
+            let sub_res = control_upstream
+                .subscribe_with(
+                    None,
+                    SubscribeOpts {
+                        takeover: true,
+                        resume_after: None,
+                    },
+                )
+                .await;
+
+            if let Err(e) = sub_res {
+                tracing::debug!("control subscribe_with failed: {e:#}; retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
+
+            // Re-check Acp-Stream-Features
+            let features = control_upstream.stream_features();
+            let is_patched = features.map(|f| f.is_patched()).unwrap_or(false);
+            if !is_patched && !self.args.allow_unpatched_upstream {
+                self.upstream_unpatched_refused
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!("upstream goose is no longer patched");
+            } else {
+                self.upstream_unpatched_refused
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            let new_init_res = control_upstream
+                .init_result()
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let (control_handle, mut control_rx) = control_upstream.split();
+
+            *self.control.write().await = control_handle;
+            *self.control_init_result.write().unwrap() = new_init_res;
+            self.is_control_connected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.control_reconnecting
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.control_connected_notify.notify_waiters();
+            tracing::info!("Upstream control connection re-initialized successfully");
+
+            let pending_clone = self.pending_control.clone();
+            let hub_clone = self.arc();
+            tokio::spawn(async move {
+                while let Some(ev) = control_rx.recv().await {
+                    match ev {
+                        honk_upstream::Event::Frame(_key, frame, _id) => {
+                            if let Some(id_val) = frame.get("id") {
+                                let mut pending = pending_clone.lock().await;
+                                let found_key = pending
+                                    .keys()
+                                    .find(|k| {
+                                        honk_upstream::rpc_id_matches(&serde_json::json!(k), id_val)
+                                    })
+                                    .cloned();
+                                if let Some(k) = found_key
+                                    && let Some(tx) = pending.remove(&k)
+                                {
+                                    let _ = tx.send(frame.clone());
+                                }
+                            }
+                        }
+                        honk_upstream::Event::StreamEnded { .. } => {
+                            break;
+                        }
+                    }
+                }
+                hub_clone.trigger_control_reconnect();
+            });
+
+            break;
+        }
+    }
+
+    pub async fn wait_for_control_connected(&self) {
+        loop {
+            if self
+                .is_control_connected
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let notified = self.control_connected_notify.notified();
+            if self
+                .is_control_connected
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn acquire_reactivation_slot(&self) {
+        let mut last_slot = self.reactivation_slot.lock().await;
+        let now = tokio::time::Instant::now();
+        let target = (*last_slot + Duration::from_millis(500)).max(now);
+        *last_slot = target;
+        drop(last_slot);
+        if target > now {
+            tokio::time::sleep_until(target).await;
+        }
+    }
+
+    pub async fn get_stored_cwd(&self, sid: &str) -> Result<String, ActivationError> {
+        let list_res = self
+            .control_request("session/list", json!({}), json!(1))
+            .await
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("control session/list failed: {e:#}"),
+            })?;
+
+        let sessions = list_res
+            .pointer("/result/sessions")
+            .and_then(Value::as_array);
+        let stored_cwd = sessions
+            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
+            .and_then(|s| s["cwd"].as_str())
+            .map(|s| s.to_string());
+
+        stored_cwd.ok_or_else(|| ActivationError {
+            code: -32602,
+            message: format!("Session not found: {sid}"),
+        })
+    }
+
     pub async fn control_request(
         &self,
         method: &str,
         mut params: Value,
         downstream_id: Value,
     ) -> anyhow::Result<Value> {
+        if !self
+            .is_control_connected
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("control connection is down");
+        }
+
         let up_id = self.upstream_ids.lock().await.next();
         let (tx, rx) = oneshot::channel();
         self.pending_control.lock().await.insert(up_id.clone(), tx);
 
         crate::rpc::strip_honk_meta(&mut params);
 
-        if let Err(e) = self
-            .control
+        let control_handle = self.control.read().await.clone();
+        if let Err(e) = control_handle
             .request_with_id(serde_json::json!(up_id), method, params, None)
             .await
         {
             self.pending_control.lock().await.remove(&up_id);
+            if honk_upstream::is_gone(&e) || honk_upstream::is_connect(&e) {
+                self.trigger_control_reconnect();
+            }
             return Err(e).context("failed to send control request");
         }
 
         let mut resp = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(f)) => f,
-            Ok(Err(_)) => anyhow::bail!("control response channel closed"),
+            Ok(Err(_)) => {
+                anyhow::bail!("control response channel closed");
+            }
             Err(_) => {
                 self.pending_control.lock().await.remove(&up_id);
                 anyhow::bail!("control request timed out waiting for upstream reply");
@@ -520,6 +765,13 @@ impl Hub {
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
+        if !self
+            .is_control_connected
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("upstream control connection is down");
+        }
+
         struct CreatingGuard(Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for CreatingGuard {
             fn drop(&mut self) {
@@ -828,31 +1080,7 @@ impl Hub {
 
     async fn activate_session_inner(&self, sid: &str) -> Result<SessionHandle, ActivationError> {
         // Step 1: Find cwd in session/list on control connection
-        let list_res = self
-            .control_request("session/list", json!({}), json!(1))
-            .await
-            .map_err(|e| ActivationError {
-                code: -32603,
-                message: format!("control session/list failed: {e:#}"),
-            })?;
-
-        let sessions = list_res
-            .pointer("/result/sessions")
-            .and_then(Value::as_array);
-        let stored_cwd = sessions
-            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
-            .and_then(|s| s["cwd"].as_str())
-            .map(|s| s.to_string());
-
-        let stored_cwd = match stored_cwd {
-            Some(cwd) => cwd,
-            None => {
-                return Err(ActivationError {
-                    code: -32602,
-                    message: format!("Session not found: {sid}"),
-                });
-            }
-        };
+        let stored_cwd = self.get_stored_cwd(sid).await?;
 
         // Step 2: Create a new connection, persisting its id first
         let init_opts = UpstreamOpts {

@@ -28,6 +28,7 @@ struct AppState {
     turns: Arc<Mutex<VecDeque<Turn>>>,
     gates: Arc<Mutex<HashSet<String>>>,
     gate_notify: Arc<Notify>,
+    open_all: Arc<std::sync::atomic::AtomicBool>,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
     turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -39,6 +40,7 @@ pub struct StubModel {
     pub(crate) turns: Arc<Mutex<VecDeque<Turn>>>,
     pub(crate) gates: Arc<Mutex<HashSet<String>>>,
     pub(crate) gate_notify: Arc<Notify>,
+    pub(crate) open_all: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) requests: Arc<Mutex<Vec<serde_json::Value>>>,
     pub(crate) turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     pub(crate) classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -56,6 +58,7 @@ impl StubModel {
         let turns = Arc::new(Mutex::new(VecDeque::new()));
         let gates = Arc::new(Mutex::new(HashSet::new()));
         let gate_notify = Arc::new(Notify::new());
+        let open_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let turn_requests = Arc::new(Mutex::new(Vec::new()));
         let classification_log = Arc::new(Mutex::new(Vec::new()));
@@ -65,6 +68,7 @@ impl StubModel {
             turns: turns.clone(),
             gates: gates.clone(),
             gate_notify: gate_notify.clone(),
+            open_all: open_all.clone(),
             requests: requests.clone(),
             turn_requests: turn_requests.clone(),
             classification_log: classification_log.clone(),
@@ -91,6 +95,7 @@ impl StubModel {
             turns,
             gates,
             gate_notify,
+            open_all,
             requests,
             turn_requests,
             classification_log,
@@ -113,6 +118,18 @@ impl StubModel {
     pub fn open(&self, gate: &str) {
         self.gates.lock().unwrap().insert(gate.to_string());
         self.gate_notify.notify_waiters();
+    }
+
+    pub fn open_all(&self) {
+        self.open_all
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.gate_notify.notify_waiters();
+    }
+
+    pub fn reset_gates(&self) {
+        self.open_all
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.gates.lock().unwrap().clear();
     }
 
     pub fn requests(&self) -> Vec<serde_json::Value> {
@@ -238,7 +255,9 @@ async fn chat_completions(
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if state.gates.lock().unwrap().contains(&gate_name) {
+            if state.open_all.load(std::sync::atomic::Ordering::SeqCst)
+                || state.gates.lock().unwrap().contains(&gate_name)
+            {
                 break;
             }
 

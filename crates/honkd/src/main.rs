@@ -11,7 +11,10 @@ async fn main() {
     let args = Args::parse();
 
     // 1. Initialize JSON tracing. No request URIs or headers are ever logged.
-    tracing_subscriber::fmt().json().init();
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .init();
 
     // 2. Refuse a non-loopback listen, then call guard_url_with(upstream, allow_production_upstream)
     if !args.listen.ip().is_loopback() {

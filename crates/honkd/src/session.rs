@@ -1,9 +1,13 @@
-use honk_upstream::{Event, EventRx, ReplayOutcome, StreamKey, SubscribeOpts, UpstreamHandle};
+use honk_upstream::{
+    Event, EventRx, Recorder, Redactor, ReplayOutcome, StreamKey, SubscribeOpts, Upstream,
+    UpstreamHandle, UpstreamOpts,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
@@ -258,14 +262,23 @@ impl Session {
         }
 
         loop {
+            if self.state == ActorState::Gone {
+                break;
+            }
             tokio::select! {
                 biased;
-                ev = self.events.recv(), if !matches!(self.state, ActorState::Gone) => match ev {
+                ev = self.events.recv(), if self.state == ActorState::Live => match ev {
                     Some(ev) => {
                         self.on_upstream(ev).await;
                         tokio::task::yield_now().await;
                     }
-                    None => break,
+                    None => {
+                        tracing::warn!(
+                            "Session {} upstream event stream closed; triggering reattach",
+                            self.sid
+                        );
+                        self.trigger_reattach().await;
+                    }
                 },
                 msg = self.rx.recv() => match msg {
                     Some(m) => self.on_msg(m).await,
@@ -328,7 +341,10 @@ impl Session {
             return;
         }
         self.state = ActorState::Reattaching;
+        self.do_reattach().await;
+    }
 
+    async fn do_reattach(&mut self) {
         let session_resume = Some(self.log.last_upstream_id().unwrap_or(0));
         let conn_resume = Some(self.last_processed_conn_id.unwrap_or(0));
         let is_patched = self
@@ -537,6 +553,23 @@ impl Session {
         }
     }
 
+    // In honkd, a 404 (Not Found) returned by goose for a session-scoped connection (POST, GET,
+    // or reattach) indicates that the upstream goose process was restarted or its in-memory
+    // connection table was cleared. Goose persists session conversation history in its SQLite
+    // database, but connection state exists only in memory. When goose restarts:
+    // 1. All prior connection IDs return 404 (Not Found).
+    // 2. The session itself remains intact in SQLite.
+    // 3. honkd treats connection-level 404s as an upstream restart ("upstream_restart"),
+    //    cleans up the dead connection without calling DELETE, and re-activates the session
+    //    via A16 using its stored cwd and export transcript.
+    //
+    // Other potential "Gone" / Not Found causes:
+    // - A session that does not exist in SQLite (e.g. deleted or never created) fails at the
+    //   session level during session/list or session/load with error -32602 ("Session not found"),
+    //   not as a connection-level 404.
+    // - Explicit upstream connection deletion by an external actor similarly invalidates the
+    //   in-memory connection ID (404), which is handled identically by re-activating a fresh
+    //   connection to the persistent session.
     async fn on_reattach_failed(&mut self, gone: bool, error: String) {
         tracing::error!(
             "Session {} reattach failed: gone={gone}, err={error}",
@@ -544,42 +577,7 @@ impl Session {
         );
         self.active_probe_id = None;
         if gone {
-            self.state = ActorState::Gone;
-            self.resolve_inflight_on_gone().await;
-            self.mark_pending_stale().await;
-            let actions = self.turn.interrupt("upstream_gone");
-            self.execute_actions(actions).await;
-
-            let finalizing = std::mem::take(&mut self.finalizing_waiters);
-            for (_, waiters) in finalizing {
-                for w in waiters {
-                    let err_resp = crate::rpc::error(
-                        w.downstream_id.clone(),
-                        -32000,
-                        "Session is gone (upstream 404)".to_string(),
-                        None,
-                    );
-                    self.send_to_owner(&w, err_resp);
-                }
-            }
-
-            let msgs = std::mem::take(&mut self.queued_msgs);
-            for m in msgs {
-                match m {
-                    SessionMsg::Prompt { viewer_id, id, .. }
-                    | SessionMsg::Steer { viewer_id, id, .. }
-                    | SessionMsg::Forward { viewer_id, id, .. } => {
-                        let err_resp = crate::rpc::error(
-                            id,
-                            -32000,
-                            "Session is gone (upstream 404)".to_string(),
-                            None,
-                        );
-                        self.send_to_viewer(viewer_id, err_resp);
-                    }
-                    _ => {}
-                }
-            }
+            Box::pin(self.handle_gone()).await;
         } else {
             self.state = ActorState::Reattaching;
             let self_tx = self.self_tx.clone();
@@ -590,7 +588,107 @@ impl Session {
         }
     }
 
-    async fn resolve_inflight_on_gone(&mut self) {
+    async fn handle_gone(&mut self) {
+        if self.state == ActorState::Gone {
+            return;
+        }
+        tracing::warn!("Session {} handling upstream gone / restart", self.sid);
+        self.active_probe_id = None;
+
+        // Step 1: turn.interrupt("upstream_restart")
+        let actions = self.turn.interrupt("upstream_restart");
+        Box::pin(self.execute_actions(actions)).await;
+
+        // Ensure any inflight ledger entries for this session in state become Done
+        // with the cancelled/upstream_restart response (reconciliation with A14)
+        self.resolve_inflight_on_restart().await;
+
+        // Step 2: pending entries become stale
+        self.mark_pending_stale().await;
+
+        // Step 3: push a synthesized activeRunId:null into the log (stamped, fanned out to honk-aware)
+        let synth_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": self.sid,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": Value::Null
+                        }
+                    }
+                }
+            }
+        });
+        let stamped_opt = match self.log.append(vec![(None, synth_frame)]) {
+            Ok(entries) => entries.last().map(|e| e.frame.clone()),
+            Err(_) => None,
+        };
+        if let Some(frame) = stamped_opt {
+            self.fan_out_stamped(&frame, true);
+        }
+
+        // Step 4: never auto-resend
+
+        // Step 5: move old conn id to orphans and drop it without DELETE (and clean orphan list — it's 404)
+        let old_conn_id = self.up.conn_id().to_string();
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.push(old_conn_id.clone());
+                st.orphan_conns.retain(|id| id != &old_conn_id);
+            });
+        }
+
+        // Step 6: re-activate (A16)
+        // Sessions with attached viewers re-activate 500 ms apart; others lazily on first use.
+        let has_attached_viewers = !self.viewers.is_empty();
+        if !has_attached_viewers {
+            tracing::info!(
+                "Session {} has no attached viewers; retiring session for lazy re-activation",
+                self.sid
+            );
+            let sid = self.sid.clone();
+            let epoch = self.log.head().epoch;
+            {
+                let mut s = self.state_store.lock().await;
+                let _ = s.mutate(|st| {
+                    if let Some(held) = st.sessions.remove(&sid) {
+                        st.retired_epochs.insert(sid.clone(), held.epoch);
+                    } else {
+                        st.retired_epochs.insert(sid.clone(), epoch);
+                    }
+                });
+            }
+            self.hub.sessions.write().await.remove(&self.sid);
+            self.state = ActorState::Gone;
+            return;
+        }
+
+        self.state = ActorState::Rebuilding;
+
+        // Wait for control connection to become available
+        self.hub.wait_for_control_connected().await;
+
+        if self.hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
+            tracing::error!(
+                "upstream goose is no longer patched; cannot re-activate session {}",
+                self.sid
+            );
+            return;
+        }
+
+        // Acquire staggered re-activation slot (500 ms apart)
+        self.hub.acquire_reactivation_slot().await;
+
+        if let Err(e) = self.reactivate_in_place().await {
+            tracing::error!("Session {} re-activation failed: {e:#}", self.sid);
+        }
+    }
+
+    async fn resolve_inflight_on_restart(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -608,17 +706,234 @@ impl Session {
                 {
                     *entry = crate::state::LedgerEntry::Done {
                         session: sid.clone(),
-                        response: crate::rpc::error(
-                            Value::Null,
-                            -32000,
-                            "Session is gone (upstream 404)".to_string(),
-                            Some(json!({ "reason": "upstream_gone" })),
-                        ),
+                        response: json!({
+                            "jsonrpc": "2.0",
+                            "id": Value::Null,
+                            "result": {
+                                "stopReason": "cancelled",
+                                "_meta": {
+                                    "honk": {
+                                        "reason": "upstream_restart"
+                                    }
+                                }
+                            }
+                        }),
                         done_unix: now,
                     };
                 }
             }
         });
+    }
+
+    async fn reactivate_in_place(&mut self) -> anyhow::Result<()> {
+        let stored_cwd = self
+            .hub
+            .get_stored_cwd(&self.sid)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let init_opts = UpstreamOpts {
+            allow_production: self.hub.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
+        let recorder = if let Some(rec_path) = &self.hub.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor).unwrap_or_else(|_| Recorder::disabled())
+        } else {
+            Recorder::disabled()
+        };
+
+        let mut session_upstream = Upstream::initialize_with(
+            &self.hub.upstream_url,
+            self.hub.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await?;
+
+        let conn_id = session_upstream.conn_id().to_string();
+
+        {
+            let mut s = self.state_store.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })?;
+        }
+
+        session_upstream
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(0),
+                },
+            )
+            .await?;
+
+        session_upstream
+            .subscribe_with(
+                Some(&self.sid),
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(0),
+                },
+            )
+            .await?;
+
+        let load_reply = session_upstream
+            .call(
+                "session/load",
+                json!({
+                    "sessionId": &self.sid,
+                    "cwd": stored_cwd,
+                    "mcpServers": []
+                }),
+                Some(&self.sid),
+                Duration::from_secs(30),
+            )
+            .await?;
+
+        let (up_handle, mut event_rx) = session_upstream.split();
+
+        let mut initial_events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let honk_upstream::Event::Frame(key, frame, _) = &ev
+                && key == &honk_upstream::StreamKey::Session(self.sid.clone())
+                && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
+            {
+                continue;
+            }
+            initial_events.push(ev);
+        }
+
+        let export_val = self.hub.export(&self.sid).await?;
+        let frames = honk_wire::export::to_updates(&export_val, &self.sid);
+        let mut keys = std::collections::HashSet::new();
+        for f in &frames {
+            if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key) {
+                keys.insert(k);
+            }
+        }
+
+        let (new_log, next_epoch) = create_new_generation_from_export(
+            &self.sid,
+            &self.state_dir,
+            &self.state_store,
+            frames,
+            keys.clone(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .await?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        {
+            let mut s = self.state_store.lock().await;
+            let sid_clone = self.sid.clone();
+            let conn_id_clone = conn_id.clone();
+            let stored_cwd_clone = stored_cwd.clone();
+            let load_reply_clone = load_reply.clone();
+            s.mutate(|st| {
+                st.orphan_conns.retain(|id| id != &conn_id_clone);
+                st.retired_epochs.remove(&sid_clone);
+                st.sessions.insert(
+                    sid_clone,
+                    crate::state::HeldSession {
+                        conn_id: conn_id_clone,
+                        cwd: stored_cwd_clone,
+                        epoch: next_epoch,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: now,
+                        init_result: Some(load_reply_clone),
+                    },
+                );
+            })?;
+        }
+
+        let handle = crate::hub::SessionHandle {
+            sid: self.sid.clone(),
+            conn_id: conn_id.clone(),
+            tx: self.self_tx.clone(),
+        };
+        self.hub
+            .sessions
+            .write()
+            .await
+            .insert(self.sid.clone(), handle);
+
+        self.up = up_handle;
+        self.events = event_rx;
+        self.log = new_log;
+        self.last_processed_session_id = self.log.last_upstream_id();
+        self.last_processed_conn_id = None;
+        self.init_result = load_reply;
+        self.suppressed_keys = keys;
+
+        let head = self.log.head();
+        let reset_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/reset",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
+            }
+        });
+        let replay_done_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/replay_done",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
+                "seq": head.seq,
+            }
+        });
+
+        let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
+        msgs.push(axum::extract::ws::Message::Text(
+            reset_frame.to_string().into(),
+        ));
+        for entry in self.log.entries() {
+            msgs.push(axum::extract::ws::Message::Text(
+                entry.frame.to_string().into(),
+            ));
+        }
+        msgs.push(axum::extract::ws::Message::Text(
+            replay_done_frame.to_string().into(),
+        ));
+
+        for (tx, is_honk_aware) in self.viewers.values() {
+            if *is_honk_aware {
+                let batch = crate::viewer::ReplayBatch {
+                    session_id: self.sid.clone(),
+                    head: head.clone(),
+                    msgs: msgs.clone(),
+                    done_tx: None,
+                };
+                let _ = tx.send_replay(batch);
+            }
+        }
+
+        for ev in initial_events {
+            self.on_upstream(ev).await;
+        }
+
+        self.state = ActorState::Live;
+        self.drain_queued_msgs().await;
+
+        Ok(())
     }
 
     /// Restored inflight delivery check used only at restart/boot time.
@@ -1286,22 +1601,7 @@ impl Session {
                         let failure = classify_prompt_post_error(&e);
                         match failure {
                             PromptPostFailure::Gone => {
-                                self.state = ActorState::Gone;
-                                self.resolve_inflight_on_gone().await;
-                                let err_val = crate::rpc::error(
-                                    Value::Null,
-                                    -32000,
-                                    "Session is gone (upstream 404)".to_string(),
-                                    Some(json!({ "reason": "upstream_gone" })),
-                                );
-                                let fail_actions = self.turn.on_prompt_send_failed(
-                                    &upstream_id,
-                                    err_val,
-                                    &mut self.ids,
-                                );
-                                for a in fail_actions.into_iter().rev() {
-                                    queue.push_front(a);
-                                }
+                                Box::pin(self.handle_gone()).await;
                             }
                             PromptPostFailure::CertainlyNotStarted => {
                                 // 4xx/5xx rejection from goose, or connect error before sending.
@@ -1541,6 +1841,14 @@ impl Session {
                 id,
                 params,
             } => {
+                tracing::info!("Session {} received SessionMsg::Prompt id={id}", self.sid);
+                if self.hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
+                    tracing::error!("upstream goose is no longer patched");
+                    let err_resp =
+                        crate::rpc::error(id, -32000, "upstream goose is no longer patched", None);
+                    self.send_to_viewer(viewer_id, err_resp);
+                    return;
+                }
                 if !self.viewers.contains_key(&viewer_id) {
                     self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
                 }
@@ -1821,7 +2129,7 @@ impl Session {
             }
             SessionMsg::RetryReattach => {
                 if self.state == ActorState::Reattaching {
-                    self.trigger_reattach().await;
+                    self.do_reattach().await;
                 }
             }
             SessionMsg::Rebuilt {
@@ -1899,33 +2207,18 @@ impl Session {
                     // Ledger: InFlight -> Done{response}
                     if let Some(crid) = &o.client_req_id {
                         let sid = self.sid.clone();
-                        let is_gone = self.state == ActorState::Gone;
                         let mut s = self.state_store.lock().await;
                         let _ = s.mutate(|st| {
-                            if is_gone {
-                                st.ledger.insert(
-                                    crid.clone(),
-                                    crate::state::LedgerEntry::Done {
-                                        session: sid,
-                                        response: crate::rpc::error(
-                                            Value::Null,
-                                            -32000,
-                                            "Session is gone (upstream 404)".to_string(),
-                                            Some(json!({ "reason": "upstream_gone" })),
-                                        ),
-                                        done_unix: now,
-                                    },
-                                );
-                            } else {
-                                st.ledger.insert(
-                                    crid.clone(),
-                                    crate::state::LedgerEntry::Done {
-                                        session: sid,
-                                        response: resp.clone(),
-                                        done_unix: now,
-                                    },
-                                );
-                            }
+                            let mut cached_resp = resp.clone();
+                            cached_resp["id"] = Value::Null;
+                            st.ledger.insert(
+                                crid.clone(),
+                                crate::state::LedgerEntry::Done {
+                                    session: sid,
+                                    response: cached_resp,
+                                    done_unix: now,
+                                },
+                            );
                         });
                         drop(s);
 
