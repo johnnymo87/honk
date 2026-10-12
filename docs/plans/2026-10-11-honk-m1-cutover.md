@@ -89,7 +89,7 @@ goose-serve (systemd system service, 127.0.0.1:4080)
   - Workstation repo: `PIGEON_GOOSE_ACP_URL` is set in systemd `Environment=` in `$HOME/projects/workstation/hosts/cloudbox/configuration.nix`.
   - SQLite CLI: run via `nix shell nixpkgs#sqlite -c sqlite3 -cmd '.timeout 5000'`.
 - **pigeon branch requirement (B1)**:
-  - Pigeon must run the B1 branch (honk-aware runner: transmits `_meta.honk.client_req_id`, reconnects and resends once on honk disconnect, receives authoritative turn text from `_meta.honk.text`).
+  - Pigeon must run the B1 branch (honk-aware runner: transmits `_meta.honk.client_req_id`, on honk disconnect retries the reconnect with backoff (~2 min budget) and resends with the same id, receives authoritative turn text from `_meta.honk.text`).
 - **Operational limits**:
   - `--max-sessions 16`: M1a has no LRU eviction.
   - Socket idle timeout: pigeon closes idle runner sockets after 10 minutes of inactivity (`DEFAULT_IDLE_SOCKET_TIMEOUT_MS = 10 * 60 * 1000`) for honk connections (`isHonk: true`). Therefore, held sessions in honkd are bounded by recent activity (sessions active within the last 10 minutes), not by the lifetime of the pigeon-daemon process.
@@ -326,7 +326,7 @@ Because pigeon receives little natural goose traffic, verification requires deli
    systemctl --user restart honkd
    ```
 3. **Verify**:
-   - Pigeon B1 client detects disconnect, logs `[goose] honk disconnect mid-turn, attempting single reconnect and resend`, reconnects to `127.0.0.1:4280`, and re-attaches with the same `_meta.honk.client_req_id`.
+   - Pigeon B1 client detects disconnect, logs `[goose] honk disconnect mid-turn, retrying reconnect and resend with backoff`, reconnects to `127.0.0.1:4280`, and re-attaches with the same `_meta.honk.client_req_id`.
    - honkd restores the session, rebuilds turn progress, and continues relaying to goose.
    - The turn finishes successfully.
    - Exactly **one** full receipt arrives in Telegram / pigeon client with no duplicate text or dropped responses.
@@ -416,8 +416,10 @@ Command:
 journalctl --namespace=pigeon -u pigeon-daemon -f
 ```
 Watch for:
-- `[goose] honk disconnect mid-turn, attempting single reconnect and resend`: Indicates a connection drop was caught and recovery attempted.
-- `[goose] honk reconnect or resend failed`: Indicates reconnect or prompt resend failed after disconnect.
+- `[goose] honk disconnect mid-turn, retrying reconnect and resend with backoff`: a connection drop was caught and recovery started (expected around honkd restarts).
+- `[goose] honk reconnect attempt failed, backing off` / `honk resend disconnected, backing off and retrying reconnect`: recovery in progress; repeated lines are normal while honkd starts.
+- `[goose] honk resend failed with non-disconnect error`: honkd answered the resend with an error; the human was told.
+- `[goose] honk reconnect budget exhausted, reporting lost contact`: **a receipt was lost** (the turn may have finished in honkd). Investigate honkd's journal.
 - `[goose] goose connection closed underneath us`: Indicates socket dropped during idle or between turns.
 - `[goose] goose runner: could not report finished turn` / `turn continuation threw`: Indicates finish-turn reporting error.
 - `error_kind: goose-turn-disconnected` or `DisconnectedDuringTurn`: Indicates unrecoverable turn failure on connection loss.
