@@ -45,7 +45,17 @@ async fn main() {
     let secret_path = state_dir.join("secret");
     let downstream_secret = if secret_path.exists() {
         match std::fs::read_to_string(&secret_path) {
-            Ok(s) => s.trim().to_string(),
+            Ok(s) => {
+                let trimmed = s.trim().to_string();
+                if trimmed.len() < 32 {
+                    eprintln!(
+                        "honkd: downstream secret file {} is invalid (empty or shorter than 32 characters)",
+                        secret_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                trimmed
+            }
             Err(e) => {
                 eprintln!("honkd: failed to read downstream secret: {e:#}");
                 std::process::exit(1);
@@ -77,6 +87,7 @@ async fn main() {
                 if let Err(e) = out
                     .write_all(hex_str.as_bytes())
                     .and_then(|_| out.write_all(b"\n"))
+                    .and_then(|_| out.sync_all())
                 {
                     eprintln!("honkd: failed to write downstream secret: {e:#}");
                     std::process::exit(1);
@@ -111,7 +122,17 @@ async fn main() {
 
     // 6. Hub::start
     let upstream_secret = match std::fs::read_to_string(&args.upstream_secret_file) {
-        Ok(s) => s.trim().to_string(),
+        Ok(s) => {
+            let trimmed = s.trim().to_string();
+            if trimmed.len() < 32 {
+                eprintln!(
+                    "honkd: upstream secret file {} is invalid (empty or shorter than 32 characters)",
+                    args.upstream_secret_file.display()
+                );
+                std::process::exit(1);
+            }
+            trimmed
+        }
         Err(e) => {
             eprintln!(
                 "honkd: failed to read upstream secret file {}: {e:#}",

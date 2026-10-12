@@ -65,10 +65,18 @@ async fn acp_handler(
     });
 
     let header_ok = auth_header
-        .map(|h| constant_time_eq(&state.secret, h.trim()))
+        .map(|h| {
+            !h.trim().is_empty()
+                && !state.secret.is_empty()
+                && constant_time_eq(&state.secret, h.trim())
+        })
         .unwrap_or(false);
     let token_ok = token_query
-        .map(|t| constant_time_eq(&state.secret, t.trim()))
+        .map(|t| {
+            !t.trim().is_empty()
+                && !state.secret.is_empty()
+                && constant_time_eq(&state.secret, t.trim())
+        })
         .unwrap_or(false);
 
     if !header_ok && !token_ok {

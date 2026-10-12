@@ -179,7 +179,7 @@ struct AuthQuery {
 impl FakeGoose {
     pub async fn start() -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let secret = "fake-secret-key-1234".to_string();
+        let secret = "fake-secret-key-1234-0123456789abcdef".to_string();
         let secret_path = temp_dir.path().join("secret");
         std::fs::write(&secret_path, &secret).expect("write secret file");
 

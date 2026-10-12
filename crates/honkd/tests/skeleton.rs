@@ -19,6 +19,24 @@ async fn auth_and_preflight_codes() {
             .status(),
         401
     );
+    // Empty token must be rejected with 401
+    assert_eq!(
+        c.get(url("?token=".into()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        c.get(url("".into()))
+            .header("x-secret-key", "")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
     assert_eq!(
         c.get(url(format!("?token={}", h.secret())))
             .send()
@@ -55,7 +73,7 @@ async fn refuses_unpatched_upstream_unless_allowed() {
 fn refuses_production_port_and_non_loopback_listen() {
     let dummy_dir = tempfile::tempdir().unwrap();
     let dummy_secret = dummy_dir.path().join("secret");
-    std::fs::write(&dummy_secret, "test-secret").unwrap();
+    std::fs::write(&dummy_secret, "0123456789abcdef0123456789abcdef").unwrap();
 
     let (code1, stderr1) =
         Honkd::spawn_expect_exit("http://127.0.0.1:4080/acp", &dummy_secret, &[]);
@@ -69,6 +87,38 @@ fn refuses_production_port_and_non_loopback_listen() {
     );
     assert_ne!(code2, 0);
     assert!(stderr2.contains("loopback"));
+}
+
+#[test]
+fn refuses_short_secret_files() {
+    let dummy_dir = tempfile::tempdir().unwrap();
+    let short_secret = dummy_dir.path().join("short_secret");
+    std::fs::write(&short_secret, "short").unwrap();
+
+    // Short upstream secret file refused
+    let (code1, stderr1) = Honkd::spawn_expect_exit(
+        "http://127.0.0.1:4181/acp",
+        &short_secret,
+        &[],
+    );
+    assert_ne!(code1, 0);
+    assert!(stderr1.contains("invalid (empty or shorter than 32 characters)"));
+
+    // Short downstream secret file in state dir refused
+    let valid_secret = dummy_dir.path().join("valid_secret");
+    std::fs::write(&valid_secret, "0123456789abcdef0123456789abcdef").unwrap();
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let downstream_secret = state_dir.path().join("secret");
+    std::fs::write(&downstream_secret, "short").unwrap();
+
+    let (code2, stderr2) = Honkd::spawn_expect_exit(
+        "http://127.0.0.1:4181/acp",
+        &valid_secret,
+        &["--state-dir", state_dir.path().to_str().unwrap()],
+    );
+    assert_ne!(code2, 0);
+    assert!(stderr2.contains("invalid (empty or shorter than 32 characters)"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
