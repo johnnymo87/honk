@@ -659,6 +659,83 @@ async fn turn_ended_in_gap_synthesizes_end_turn_after_rebuild_without_hang() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn idle_probe_overtakes_reply_real_reply_wins_no_synthesis() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--stream-dead-secs",
+            "2",
+            "--gap-synthesis-grace-ms",
+            "1000",
+        ],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    fake.set_export_data(
+        &sid,
+        json!({
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "overtake_prompt"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "assistant_real_reply"}]
+            }]
+        }),
+    );
+
+    fake.gap_on_next_resume(&sid);
+    fake.set_probe_overtakes_reply(true);
+
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "overtake_prompt", None),
+        )
+        .await;
+
+    // Wait until run starts so prompt is in flight
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // Kick stream while turn is in flight -> gap on resume -> steer probe issued
+    fake.kick_stream(&sid);
+
+    // The idle probe overtakes the reply. Honkd rebuilds from export and waits in grace window.
+    // The real reply arrives during the grace window and wins.
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp.pointer("/result/_meta/honk/synthesized"),
+        None,
+        "real reply must be used when arriving during grace window (no synthesis)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn tool_turn_mid_run_gap_never_synthesizes_and_uses_real_reply() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(true);

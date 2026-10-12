@@ -278,6 +278,8 @@ impl Hub {
                 inflight_needs_delivery_check: held.inflight.is_some(),
                 finalizing_waiters: HashMap::new(),
                 active_probe_id: None,
+                gap_synthesis_grace: Duration::from_millis(hub.args.gap_synthesis_grace_ms),
+                synthesized_replies: std::collections::HashSet::new(),
             };
 
             tokio::spawn(session.run());
@@ -648,6 +650,8 @@ impl Hub {
             inflight_needs_delivery_check: false,
             finalizing_waiters: HashMap::new(),
             active_probe_id: None,
+            gap_synthesis_grace: Duration::from_millis(self.args.gap_synthesis_grace_ms),
+            synthesized_replies: std::collections::HashSet::new(),
         };
 
         tokio::spawn(session.run());

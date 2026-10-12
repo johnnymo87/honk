@@ -29,6 +29,8 @@ pub struct Args {
     pub max_sessions: usize,
     #[arg(long, default_value_t = 20, hide = true)]
     pub stream_dead_secs: u64,
+    #[arg(long, default_value_t = 2000, hide = true)]
+    pub gap_synthesis_grace_ms: u64,
 }
 
 impl Args {

@@ -156,6 +156,7 @@ struct FakeGooseInner {
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
     drop_prompt_announcement: AtomicBool,
+    probe_overtakes_reply: AtomicBool,
     steer_status: Mutex<Option<StatusCode>>,
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
@@ -202,6 +203,7 @@ impl FakeGoose {
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
             drop_prompt_announcement: AtomicBool::new(false),
+            probe_overtakes_reply: AtomicBool::new(false),
             steer_status: Mutex::new(None),
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
@@ -346,6 +348,12 @@ impl FakeGoose {
         self.state
             .drop_prompt_announcement
             .store(drop, Ordering::SeqCst);
+    }
+
+    pub fn set_probe_overtakes_reply(&self, overtakes: bool) {
+        self.state
+            .probe_overtakes_reply
+            .store(overtakes, Ordering::SeqCst);
     }
 
     pub fn set_steer_status(&self, status: Option<StatusCode>) {
@@ -649,7 +657,17 @@ async fn handle_post(
                 .unwrap_or("");
             let active_run = state.active_runs.lock().unwrap().get(sid).cloned();
 
+            let force_idle = state.probe_overtakes_reply.load(Ordering::SeqCst);
             let resp = match active_run {
+                _ if force_idle => json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params",
+                        "data": "no active run to steer"
+                    }
+                }),
                 None => json!({
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -765,6 +783,9 @@ async fn handle_post(
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     state_clone.active_runs.lock().unwrap().remove(&sid_clone);
+                    if state_clone.probe_overtakes_reply.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                     if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
                         return;
                     }
@@ -879,6 +900,9 @@ async fn handle_post(
                 );
 
                 // 4. Prompt reply
+                if state_clone.probe_overtakes_reply.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
                 if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
                     return;
                 }

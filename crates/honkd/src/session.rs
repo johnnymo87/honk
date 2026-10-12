@@ -96,6 +96,9 @@ pub enum SessionMsg {
         body: Reply,
         text: Option<String>,
     },
+    SynthesizeGapEndTurn {
+        upstream_id: String,
+    },
     MarkPendingStale,
 }
 
@@ -158,6 +161,8 @@ pub struct Session {
     pub inflight_needs_delivery_check: bool,
     pub finalizing_waiters: HashMap<String, Vec<OwnerRef>>,
     pub active_probe_id: Option<String>,
+    pub gap_synthesis_grace: Duration,
+    pub synthesized_replies: HashSet<String>,
 }
 
 impl Session {
@@ -353,15 +358,28 @@ impl Session {
             ReplayOutcome::Gap | ReplayOutcome::Unsupported => {
                 self.gap_evidenced = true;
 
-                // Non-destructive active-run probe:
-                // An active-run probe via _goose/unstable/session/steer with a bogus expectedRunId
-                // (require_active_run in crates/goose/src/acp/server.rs:1954-1980, called ~2392).
-                // Response is pushed to the session stream mailbox (vendor/agent-client-protocol-http/src/connection.rs:368-395)
-                // in FIFO order after all live/replayed frames emitted before it.
-                // Case (a): If a run is active, probe returns actualRunId -> stay Live, set rebuild_at_turn_end,
-                //           real prompt reply arrives live, never synthesize.
-                // Case (b): If idle ("no active run to steer"), the run ended inside the gap -> rebuild immediately,
-                //           synthesize end_turn upon rebuild completion.
+                // Non-destructive active-run probe after gap:
+                // When a gap occurs during an active turn or inflight prompt, we issue a non-destructive
+                // steer probe with a bogus expectedRunId (_goose/unstable/session/steer, require_active_run
+                // in crates/goose/src/acp/server.rs:2391).
+                //
+                // Note on concurrent dispatch in goose:
+                // ACP requests in goose are dispatched concurrently via cx.spawn (server/dispatch.rs:128,479).
+                // The prompt task clears the active run (clear_active_run, server.rs:2360) BEFORE completing
+                // usage updates and returning the prompt reply.
+                //
+                // Soundness of the branches:
+                // Case (a): Probe answers actualRunId -> The run is still active at that instant, so its end
+                //           and prompt reply will be emitted later on the session stream. Stay Live, set
+                //           rebuild_at_turn_end, and await the real reply. Sound.
+                // Case (b): Probe answers idle ("no active run to steer") -> The run has ended (clear_active_run
+                //           has occurred). Rebuild export starts immediately. However, because goose dispatches
+                //           concurrently, an idle probe response can overtake the real prompt reply (which is
+                //           waiting on send_session_usage_updates).
+                //           Rule: After rebuild export completes, do NOT synthesize end_turn immediately.
+                //           Instead, wait for a grace window (gap_synthesis_grace) for the real reply to arrive.
+                //           Any reply arriving in that window wins (no synthesis). Only if the grace window expires
+                //           with no reply does honkd synthesize end_turn (the reply was truly lost in the gap).
                 if self.turn.run.is_some() || self.turn.inflight.is_some() {
                     self.state = ActorState::Live;
                     let gap_marker = json!({
@@ -687,24 +705,18 @@ impl Session {
                     self.on_upstream(ev).await;
                 }
 
-                if self.gap_evidenced && self.turn.inflight.is_some() {
-                    let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                    let synth_reply = json!({
-                        "jsonrpc": "2.0",
-                        "id": upstream_id,
-                        "result": {
-                            "stopReason": "end_turn",
-                            "_meta": {
-                                "honk": {
-                                    "synthesized": true
-                                }
-                            }
-                        }
+                if self.gap_evidenced
+                    && let Some(inf) = self.turn.inflight.as_ref()
+                {
+                    let upstream_id = inf.upstream_id.clone();
+                    let grace = self.gap_synthesis_grace;
+                    let self_tx = self.self_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(grace).await;
+                        let _ = self_tx
+                            .send(SessionMsg::SynthesizeGapEndTurn { upstream_id })
+                            .await;
                     });
-                    let reply_actions =
-                        self.turn
-                            .on_prompt_reply(&upstream_id, &synth_reply, &mut self.ids);
-                    self.execute_actions(reply_actions).await;
                 }
                 self.gap_evidenced = false;
             }
@@ -961,12 +973,34 @@ impl Session {
                                     .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
                             self.execute_actions(actions).await;
                         } else {
-                            // Unmatched upstream response -> warn with upstream id only
-                            let id_disp = frame
+                            let up_id_opt = frame
                                 .get("id")
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "null".into());
-                            tracing::warn!("unmatched upstream response for id: {id_disp}");
+                                .and_then(Value::as_str)
+                                .or_else(|| frame.pointer("/id").and_then(Value::as_str));
+
+                            if let Some(id_str) = up_id_opt
+                                && self.synthesized_replies.contains(id_str)
+                            {
+                                // The real prompt reply arrived AFTER synthesis grace window expired.
+                                // Documented residual: requires >grace delay in goose's usage updates.
+                                // Record real reply in replies sidecar and log a warning; do not double-reply.
+                                tracing::warn!(
+                                    "Session {}: real prompt reply arrived after synthesis for id: {id_str}",
+                                    self.sid
+                                );
+                                let sidecar_path = self
+                                    .state_dir
+                                    .join("sessions")
+                                    .join(format!("{}.replies.jsonl", self.sid));
+                                let _ = append_reply_sidecar(&sidecar_path, id_str, &frame);
+                            } else {
+                                // Unmatched upstream response -> warn with upstream id only
+                                let id_disp = frame
+                                    .get("id")
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "null".into());
+                                tracing::warn!("unmatched upstream response for id: {id_disp}");
+                            }
                         }
                     }
                 }
@@ -1624,6 +1658,32 @@ impl Session {
             }
             SessionMsg::ReplyText { owners, body, text } => {
                 self.handle_reply_text(owners, body, text).await;
+            }
+            SessionMsg::SynthesizeGapEndTurn { upstream_id } => {
+                if self
+                    .turn
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|inf| inf.upstream_id == upstream_id)
+                {
+                    self.synthesized_replies.insert(upstream_id.clone());
+                    let synth_reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": upstream_id,
+                        "result": {
+                            "stopReason": "end_turn",
+                            "_meta": {
+                                "honk": {
+                                    "synthesized": true
+                                }
+                            }
+                        }
+                    });
+                    let reply_actions =
+                        self.turn
+                            .on_prompt_reply(&upstream_id, &synth_reply, &mut self.ids);
+                    self.execute_actions(reply_actions).await;
+                }
             }
         }
     }
