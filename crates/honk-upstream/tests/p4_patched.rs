@@ -13,7 +13,6 @@ async fn p4b_prime_lost_permission_is_replayed() -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    require_patched(&ts.upstream)?;
     let prompt = "Run the shell command \"echo P4OK\", then reply with only the word FINISHED.";
     let prompt_id = ts
         .upstream

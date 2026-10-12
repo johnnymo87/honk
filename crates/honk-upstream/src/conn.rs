@@ -319,6 +319,13 @@ impl UpstreamHandle {
         do_respond(&self.target(), id, result, session).await
     }
 
+    pub async fn subscribe(&self, session: Option<&str>) -> anyhow::Result<Duration> {
+        Ok(self
+            .subscribe_with(session, SubscribeOpts::default())
+            .await?
+            .conflict_window)
+    }
+
     pub async fn subscribe_with(
         &self,
         session: Option<&str>,
@@ -349,6 +356,9 @@ impl UpstreamHandle {
             session,
             opts,
             timeouts,
+            |features| {
+                *self.inner.features.lock().unwrap() = Some(features);
+            },
         )
         .await?;
 
@@ -619,6 +629,7 @@ async fn do_subscribe_with(
     session: Option<&str>,
     opts: SubscribeOpts,
     timeouts: SubscribeTimeouts,
+    mut on_features: impl FnMut(StreamFeatures),
 ) -> anyhow::Result<(SubscribeOutcome, tokio::task::JoinHandle<()>)> {
     let stream_key = session
         .map(|s| StreamKey::Session(s.to_string()))
@@ -658,8 +669,11 @@ async fn do_subscribe_with(
             })?
             .with_context(|| format!("failed to send GET request for {stream_name}"))?;
 
-        let features = StreamFeatures::from_headers(res.headers());
         let status = res.status();
+        if status == StatusCode::OK || status == StatusCode::CONFLICT {
+            on_features(StreamFeatures::from_headers(res.headers()));
+        }
+
         if status == StatusCode::CONFLICT {
             if first_409.is_none() {
                 first_409 = Some(Instant::now());
@@ -693,6 +707,7 @@ async fn do_subscribe_with(
 
         let conflict_window = first_409.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
         let replay = ReplayOutcome::from_headers(opts.resume_after.is_some(), res.headers());
+        let features = StreamFeatures::from_headers(res.headers());
         let took_over = opts.takeover && features.takeover;
 
         target.rec.record_marker(
@@ -729,7 +744,11 @@ async fn do_subscribe_with(
         let handle = tokio::spawn(async move {
             let mut stream = sse_stream;
             let mut stream_err = None;
-            let mut floor = opts.resume_after;
+            let mut floor = if replay == ReplayOutcome::Complete {
+                opts.resume_after
+            } else {
+                None
+            };
             loop {
                 tokio::select! {
                     biased;
@@ -1118,12 +1137,21 @@ impl Upstream {
         };
 
         let (outcome, task_handle) = do_subscribe_with(
-            &self.target(),
+            &HttpTarget {
+                client: &self.client,
+                url: &self.url,
+                secret: &self.secret,
+                conn_id: &self.conn_id,
+                rec: &self.rec,
+            },
             &self.tx,
             &self.last_byte_at,
             session,
             opts,
             timeouts,
+            |features| {
+                self.features = Some(features);
+            },
         )
         .await?;
 
@@ -1707,14 +1735,17 @@ mod tests {
         }
     }
 
-    /// Accepts one GET, returns its lowercased request head, answers with an SSE body.
-    async fn one_shot_sse_server(
-        response_headers: &'static str,
-        body: &'static str,
+    async fn one_shot_http_server(
+        status_line: &str,
+        response_headers: &str,
+        body: &str,
     ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/acp", listener.local_addr().unwrap());
+        let status_line = status_line.to_string();
+        let response_headers = response_headers.to_string();
+        let body = body.to_string();
         let handle = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 8192];
@@ -1727,13 +1758,22 @@ mod tests {
                 head.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{response_headers}\r\n{body}"
+                "HTTP/1.1 {status_line}\r\nconnection: close\r\n{response_headers}\r\n{body}"
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             let _ = sock.shutdown().await;
             head.to_ascii_lowercase()
         });
         (url, handle)
+    }
+
+    /// Accepts one GET, returns its lowercased request head, answers with an SSE body.
+    async fn one_shot_sse_server(
+        response_headers: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let headers = format!("content-type: text/event-stream\r\n{response_headers}");
+        one_shot_http_server("200 OK", &headers, body).await
     }
 
     #[tokio::test]
@@ -2376,5 +2416,194 @@ mod tests {
         );
         assert!(handle.inner.stream_tasks.lock().unwrap().is_empty());
         assert!(handle.inner.last_byte_at.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_gap_does_not_drop_live_frames_below_resume_after() {
+        let (url, server) = one_shot_sse_server(
+            "acp-stream-features: takeover, replay\r\nacp-replay: gap\r\n",
+            "id: 1\ndata: {\"n\":1}\n\nid: 2\ndata: {\"n\":2}\n\n",
+        )
+        .await;
+        let mut up = Upstream::resume(&url, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let out = up
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(42),
+                },
+            )
+            .await
+            .unwrap();
+        let _head = server.await.unwrap();
+        assert_eq!(out.replay, ReplayOutcome::Gap);
+        let first = up.next(Duration::from_secs(1)).await.unwrap().unwrap();
+        assert_eq!(
+            first.frame(),
+            Some(&serde_json::json!({"n": 1})),
+            "id 1 must not be dropped when replay is Gap"
+        );
+        assert_eq!(first.event_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn subscribe_error_does_not_overwrite_features_but_409_does() {
+        // 1. Initial 404 does not set stream_features to Some(unpatched).
+        let (url404, srv404) = one_shot_http_server("404 Not Found", "", "not found").await;
+        let mut up =
+            Upstream::resume(&url404, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let res = up.subscribe(None).await;
+        assert!(res.is_err());
+        let _ = srv404.await.unwrap();
+        assert_eq!(up.stream_features(), None, "404 must not set features");
+
+        // 2. 409 conflict DOES update features from headers.
+        let (url409, srv409) = one_shot_http_server(
+            "409 Conflict",
+            "acp-stream-features: takeover, replay\r\n",
+            "conflict",
+        )
+        .await;
+        let mut up409 =
+            Upstream::resume(&url409, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        up409.set_subscribe_deadline(Duration::ZERO);
+        let res409 = up409.subscribe(None).await;
+        assert!(res409.is_err());
+        let _ = srv409.await.unwrap();
+        assert_eq!(
+            up409.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true,
+            }),
+            "409 must update features"
+        );
+
+        // 3. A subsequent 404 does not overwrite previously established patched features.
+        let (url404_subsequent, srv404_subsequent) =
+            one_shot_http_server("404 Not Found", "", "not found").await;
+        let mut up_patched = Upstream::resume(
+            &url404_subsequent,
+            "s".into(),
+            "c".into(),
+            Recorder::disabled(),
+        )
+        .unwrap();
+        // Manually prime features as if from prior 200/409
+        up_patched.features = Some(StreamFeatures {
+            takeover: true,
+            replay: true,
+        });
+        let res_subsequent = up_patched.subscribe(None).await;
+        assert!(res_subsequent.is_err());
+        let _ = srv404_subsequent.await.unwrap();
+        assert_eq!(
+            up_patched.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true,
+            }),
+            "subsequent 404 must not overwrite existing features"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_error_does_not_overwrite_features_but_409_does_on_handle() {
+        // 1. Initial 404 does not set stream_features on handle.
+        let (url404, srv404) = one_shot_http_server("404 Not Found", "", "not found").await;
+        let up = Upstream::resume(&url404, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let (handle, _rx) = up.split();
+        let res = handle.subscribe(None).await;
+        assert!(res.is_err());
+        let _ = srv404.await.unwrap();
+        assert_eq!(handle.stream_features(), None, "404 must not set features");
+
+        // 2. 409 conflict DOES update features from headers on handle.
+        let (url409, srv409) = one_shot_http_server(
+            "409 Conflict",
+            "acp-stream-features: takeover, replay\r\n",
+            "conflict",
+        )
+        .await;
+        let mut up409 =
+            Upstream::resume(&url409, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        up409.set_subscribe_deadline(Duration::ZERO);
+        let (handle409, _rx409) = up409.split();
+        let res409 = handle409.subscribe(None).await;
+        assert!(res409.is_err());
+        let _ = srv409.await.unwrap();
+        assert_eq!(
+            handle409.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true,
+            }),
+            "409 must update features on handle"
+        );
+
+        // 3. A subsequent 404 does not overwrite previously established patched features on handle.
+        let (url404_subsequent, srv404_subsequent) =
+            one_shot_http_server("404 Not Found", "", "not found").await;
+        let up_patched = Upstream::resume(
+            &url404_subsequent,
+            "s".into(),
+            "c".into(),
+            Recorder::disabled(),
+        )
+        .unwrap();
+        let (handle_patched, _rx_patched) = up_patched.split();
+        *handle_patched.inner.features.lock().unwrap() = Some(StreamFeatures {
+            takeover: true,
+            replay: true,
+        });
+        let res_subsequent = handle_patched.subscribe(None).await;
+        assert!(res_subsequent.is_err());
+        let _ = srv404_subsequent.await.unwrap();
+        assert_eq!(
+            handle_patched.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true,
+            }),
+            "subsequent 404 must not overwrite existing features on handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubscribe_with_gap_does_not_drop_live_frames_below_resume_after() {
+        let (url, server) = one_shot_sse_server(
+            "acp-stream-features: takeover, replay\r\nacp-replay: gap\r\n",
+            "id: 1\ndata: {\"n\":1}\n\nid: 2\ndata: {\"n\":2}\n\n",
+        )
+        .await;
+        let up = Upstream::resume(&url, "s".into(), "c".into(), Recorder::disabled()).unwrap();
+        let (handle, mut rx) = up.split();
+        let out = handle
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(42),
+                },
+            )
+            .await
+            .unwrap();
+        let _head = server.await.unwrap();
+        assert_eq!(out.replay, ReplayOutcome::Gap);
+        assert_eq!(
+            handle.stream_features(),
+            Some(StreamFeatures {
+                takeover: true,
+                replay: true,
+            })
+        );
+        let first = rx.recv().await.unwrap();
+        assert_eq!(
+            first.frame(),
+            Some(&serde_json::json!({"n": 1})),
+            "id 1 must not be dropped when replay is Gap on handle"
+        );
+        assert_eq!(first.event_id(), Some(1));
     }
 }

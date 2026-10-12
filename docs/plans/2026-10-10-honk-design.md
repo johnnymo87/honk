@@ -363,6 +363,7 @@ SSE `GET /acp` response, `200` and `409`. Unpatched goose sends nothing.
   goose restart loses everything in memory.
 - Takeover is for honkd's own dead streams only. honkd owns its connection ids, and two
   honkd instances must never share one: the last subscriber silently wins.
+- Event ids are scoped to (connection id, stream) and a consumer's last-processed id must reset when the connection id changes.
 
 ## 7. Testing
 

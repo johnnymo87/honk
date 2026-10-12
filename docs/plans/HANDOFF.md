@@ -2,8 +2,7 @@
 
 Executing `docs/plans/2026-10-10-honk-m0-plan.md` with subagent-driven development
 (implementer subagent per task; then spec + code-quality review; fixes re-reviewed).
-Branch `m0` (pushed to origin). No PR yet; open one at the end of M0 (load the
-shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
+M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci.yml`.
 
 ## Author decisions (2026-10-10)
 - Author is busy; agent uses best judgement, author reviews afterwards.
@@ -49,9 +48,10 @@ shepherding-pull-requests skill first). CI = `.github/workflows/ci.yml`.
 - Tasks 9-11 DONE: release run 38116818991 green; assets verified; release binary packaged at ~/.local/state/honk-goose-bin/patched-1.54.0.3/pkg (GC root); all probes + pigeon WS qualification PASS on it (logs /tmp/opencode/pigeon-qual-release-*.log); fixtures committed. `honk-goose-sandbox-patched` left running on the release binary for M1.
 - Production deploy of patched-1.54.0.3 is AUTHOR-ONLY (plan "Production deploy" section); gate evidence = Task 10 pigeon-qual-release logs.
 
-## Open PR status / next (2026-10-11)
-- M0 PR (m0 -> main) NOT opened: pre-PR adversarial review found the org name in pushed history (133bf83..b2443a5); opening a PR pins refs/pull/N/head permanently. Waiting on the author: rewrite history (needs force-push OK) or accept. Review fixes landed on m0 (2a3707e). Branches m0 -> goose-patch-track -> m1a are stacked; all carry the same history.
-- M1a executes in worktree ../honk-m1a (branch m1a off goose-patch-track) per docs/plans/2026-10-11-honk-m1-plan.md; patched sandbox `honk-goose-sandbox-patched` on :4181 runs the release binary.
+## Open PR status / next (2026-10-12)
+- M0 PR #1 merged (squash) on 2026-10-12.
+- `goose-patch-track` merged as PR #2 on 2026-10-12.
+- Branch `m1a` now based on `main`, executes in worktree ../honk-m1a per docs/plans/2026-10-11-honk-m1-plan.md; patched sandbox `honk-goose-sandbox-patched` on :4181 runs the release binary.
 
 ## M1a progress (branch m1a, worktree ../honk-m1a)
 - A0 preflight PASS (patched :4181 advertises `takeover, replay`; upstream tests green). Branch is `m1a`, not the plan's `m1`.

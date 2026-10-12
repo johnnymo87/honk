@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 
-/// P5a′: session/cancel must leave no shell descendant alive (patch 1).
+/// P5a′: session/cancel must leave no shell descendant alive (patch 5).
 #[tokio::test]
 #[ignore]
 async fn p5a_prime_cancel_leaves_no_orphans() -> anyhow::Result<()> {
@@ -10,7 +10,6 @@ async fn p5a_prime_cancel_leaves_no_orphans() -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    require_patched(&ts.upstream)?;
     let prompt = "Run the shell command \"sleep 61 & sleep 62; echo P5A_PRIME_DONE\", then reply with only the word FINISHED.";
     let prompt_id = ts
         .upstream

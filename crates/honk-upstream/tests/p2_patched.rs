@@ -24,7 +24,6 @@ async fn freeze_mid_stream(probe: &str) -> anyhow::Result<Option<HalfOpen>> {
     else {
         return Ok(None);
     };
-    require_patched(&ts.upstream)?;
     let prompt_id = ts
         .upstream
         .request(
