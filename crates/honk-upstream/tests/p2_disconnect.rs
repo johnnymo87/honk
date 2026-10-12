@@ -1,119 +1,11 @@
 mod common;
 use common::*;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::proxy::TcpProxy;
 use honk_upstream::{Event, rpc_id_matches};
 use serde_json::json;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, broadcast, watch};
-
-async fn wait_for_freeze(f_rx: &mut watch::Receiver<bool>) {
-    loop {
-        if *f_rx.borrow() {
-            return;
-        }
-        if f_rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-struct TcpProxy {
-    port: u16,
-    freeze_tx: watch::Sender<bool>,
-    close_tx: broadcast::Sender<()>,
-    held_sockets: Arc<Mutex<Vec<TcpStream>>>,
-    server_task: tokio::task::JoinHandle<()>,
-}
-
-impl TcpProxy {
-    pub async fn start(target_port: u16) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        let (freeze_tx, _) = watch::channel(false);
-        let (close_tx, _) = broadcast::channel(16);
-        let held_sockets = Arc::new(Mutex::new(Vec::new()));
-
-        let freeze_rx = freeze_tx.subscribe();
-        let close_tx_clone = close_tx.clone();
-        let held_clone = held_sockets.clone();
-
-        let server_task = tokio::spawn(async move {
-            let mut close_rx = close_tx_clone.subscribe();
-            loop {
-                tokio::select! {
-                    accept_res = listener.accept() => {
-                        let (mut client_sock, _) = match accept_res {
-                            Ok(pair) => pair,
-                            Err(_) => break,
-                        };
-                        let target_addr = format!("127.0.0.1:{target_port}");
-                        let mut target_sock = match TcpStream::connect(&target_addr).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[Proxy] failed to connect to target {target_addr}: {e}");
-                                continue;
-                            }
-                        };
-
-                        let mut f_rx = freeze_rx.clone();
-                        let mut c_rx = close_tx_clone.subscribe();
-                        let held = held_clone.clone();
-
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                _ = tokio::io::copy_bidirectional(&mut client_sock, &mut target_sock) => {}
-                                _ = wait_for_freeze(&mut f_rx) => {
-                                    // Freeze: keep sockets open without reading or writing
-                                    let mut guard = held.lock().await;
-                                    guard.push(client_sock);
-                                    guard.push(target_sock);
-                                    drop(guard);
-                                    let _ = c_rx.recv().await;
-                                }
-                                _ = c_rx.recv() => {}
-                            }
-                        });
-                    }
-                    _ = close_rx.recv() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            port,
-            freeze_tx,
-            close_tx,
-            held_sockets,
-            server_task,
-        })
-    }
-
-    pub fn freeze(&self) {
-        let _ = self.freeze_tx.send(true);
-    }
-
-    pub async fn close(&self) {
-        let _ = self.close_tx.send(());
-        self.server_task.abort();
-        let mut guard = self.held_sockets.lock().await;
-        guard.clear();
-    }
-}
-
-impl Drop for TcpProxy {
-    fn drop(&mut self) {
-        let _ = self.close_tx.send(());
-        self.server_task.abort();
-        if let Ok(mut guard) = self.held_sockets.try_lock() {
-            guard.clear();
-        }
-    }
-}
 
 #[tokio::test]
 #[ignore]
@@ -155,7 +47,7 @@ async fn p2a_quiet_drop() -> anyhow::Result<()> {
             panic!("[P2a] stream ended or timed out waiting for tool_call");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2a] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -206,7 +98,7 @@ async fn p2a_quiet_drop() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2a] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -299,7 +191,7 @@ async fn p2b_drop_streaming() -> anyhow::Result<()> {
             panic!("[P2b] stream ended or timed out waiting for chunks");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2b] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -355,7 +247,7 @@ async fn p2b_drop_streaming() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2b] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -474,7 +366,7 @@ async fn p2c_long_gap() -> anyhow::Result<()> {
             panic!("[P2c] stream ended or timed out waiting for tool_call");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2c] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -530,7 +422,7 @@ async fn p2c_long_gap() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2c] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -601,12 +493,7 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
         .unwrap()
         .as_secs();
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("finding repo root");
-    let fixture_path = repo_root.join(format!("fixtures/goose-1.54.0-patched.2/p2d/{ts}.jsonl"));
+    let fixture_path = fixtures_root().join(format!("{FIXTURES_PATCHED_2}/p2d/{ts}.jsonl"));
     if let Some(parent) = fixture_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -614,12 +501,13 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
     let redactor = Redactor::from_env();
     let rec = Recorder::file(&fixture_path, redactor)?;
 
-    // 1. Start TCP forwarding proxy in front of Goose sandbox port 4180
-    let proxy = TcpProxy::start(4180).await?;
+    // 1. Start TCP forwarding proxy in front of Goose sandbox
+    let proxy = TcpProxy::start(goose_port()).await?;
     let proxy_url = format!("http://127.0.0.1:{}/acp", proxy.port);
     println!(
-        "[P2d] Started TCP forwarding proxy on port {} pointing to 4180",
-        proxy.port
+        "[P2d] Started TCP forwarding proxy on port {} pointing to {}",
+        proxy.port,
+        goose_port()
     );
 
     // 2. Initialize Upstream via proxy
@@ -710,7 +598,7 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
             panic!("[P2d] stream ended or timed out waiting for chunks");
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2d] unexpected session/request_permission in auto mode: {frame}");
             }
@@ -813,7 +701,7 @@ async fn p2d_half_open_drop() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(_, frame) = event {
+        if let Event::Frame(_, frame, _) = event {
             if frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission") {
                 panic!("[P2d] unexpected session/request_permission in auto mode: {frame}");
             }

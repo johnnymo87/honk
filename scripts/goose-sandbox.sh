@@ -7,6 +7,12 @@
 #   systemctl --user reset-failed honk-goose-sandbox 2>/dev/null
 #   XDG_RUNTIME_DIR=/run/user/$(id -u) systemd-run --user --unit=honk-goose-sandbox --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" <abs path>/scripts/goose-sandbox.sh
 #
+# A second, isolated sandbox for a specific goose build (e.g. the fork):
+#   systemd-run --user --unit=honk-goose-sandbox-patched --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+#     --setenv=HONK_SANDBOX="$HOME/.local/state/honk-sandbox-patched" --setenv=HONK_SANDBOX_PORT=4181 \
+#     --setenv=HONK_SANDBOX_UNIT=honk-goose-sandbox-patched \
+#     --setenv=GOOSE_BIN=<abs path to goose> <abs path>/scripts/goose-sandbox.sh
+#
 # Read logs:
 #   journalctl --user -u honk-goose-sandbox
 
@@ -25,6 +31,40 @@ SANDBOX=$(realpath -m "$RAW_SANDBOX")
 if [[ "$SANDBOX" == "$HOME" || "$SANDBOX" == "/" ]]; then
     echo "ERROR: SANDBOX cannot be \$HOME or root (/): $SANDBOX" >&2
     exit 1
+fi
+
+PORT="${HONK_SANDBOX_PORT:-4180}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: PORT must be numeric: $PORT" >&2
+    exit 1
+fi
+if (( 10#$PORT == 4080 )); then
+    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing port 4080." >&2
+    exit 1
+fi
+
+# When GOOSE_BIN is set, require non-default HONK_SANDBOX, port, and unit
+if [[ -n "${GOOSE_BIN:-}" ]]; then
+    DEFAULT_SANDBOX_RESOLVED=$(realpath -m "$HOME/.local/state/honk-sandbox")
+    if [[ -z "${HONK_SANDBOX:-}" || "$SANDBOX" == "$DEFAULT_SANDBOX_RESOLVED" ]]; then
+        echo "ERROR: GOOSE_BIN is set, but HONK_SANDBOX is default ($SANDBOX). Set HONK_SANDBOX to an isolated path." >&2
+        exit 1
+    fi
+    if [[ -z "${HONK_SANDBOX_PORT:-}" || "$PORT" == "4180" ]]; then
+        echo "ERROR: GOOSE_BIN is set, but HONK_SANDBOX_PORT is default ($PORT). Set HONK_SANDBOX_PORT to an isolated port." >&2
+        exit 1
+    fi
+    UNIT="${HONK_SANDBOX_UNIT:-}"
+    if [[ -z "$UNIT" ]]; then
+        cgroup_unit=$(sed -n 's|.*/\([^/]*\)\.\(service\|scope\)$|\1|p' /proc/self/cgroup 2>/dev/null || true)
+        if [[ -n "$cgroup_unit" ]]; then
+            UNIT="$cgroup_unit"
+        fi
+    fi
+    if [[ -z "$UNIT" || "$UNIT" == "honk-goose-sandbox" || "$UNIT" == "honk-goose-sandbox.service" ]]; then
+        echo "ERROR: GOOSE_BIN is set, but unit is default (${UNIT:-empty}). Set HONK_SANDBOX_UNIT or launch with a distinct systemd-run --unit." >&2
+        exit 1
+    fi
 fi
 
 mkdir -p "$SANDBOX"/{config,data,state}
@@ -116,16 +156,6 @@ if [[ ! -f "$SANDBOX/secret" ]]; then
     chmod 0600 "$SANDBOX/secret"
 fi
 
-PORT="${HONK_SANDBOX_PORT:-4180}"
-if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: PORT must be numeric: $PORT" >&2
-    exit 1
-fi
-if (( 10#$PORT == 4080 )); then
-    echo "ERROR: Port 4080 is reserved for production goose-serve. Refusing port 4080." >&2
-    exit 1
-fi
-
 gcp_secret="/run/secrets/google_cloud_project"
 if [[ ! -f "$gcp_secret" ]]; then
     echo "ERROR: GCP project secret file $gcp_secret not found" >&2
@@ -138,6 +168,25 @@ if [[ ! -f "$gcloud_creds" ]]; then
     exit 1
 fi
 
+# Which goose to run. Default: whatever `goose` is on PATH (the production build).
+# Set GOOSE_BIN to an absolute path to run a specific build, e.g. a fork release.
+GOOSE_BIN="${GOOSE_BIN:-goose}"
+if [[ "$GOOSE_BIN" != "goose" ]]; then
+    case "$GOOSE_BIN" in
+        /*) ;;
+        *)
+            echo "ERROR: GOOSE_BIN must be an absolute path: $GOOSE_BIN" >&2
+            exit 1
+            ;;
+    esac
+    if [[ ! -x "$GOOSE_BIN" ]]; then
+        echo "ERROR: GOOSE_BIN is not executable: $GOOSE_BIN" >&2
+        exit 1
+    fi
+fi
+goose_resolved=$(command -v "$GOOSE_BIN") || { echo "ERROR: $GOOSE_BIN not found" >&2; exit 1; }
+echo "goose binary: $(readlink -f "$goose_resolved")" >&2
+
 cd "$SANDBOX"
 exec env \
     GOOSE_PATH_ROOT="$SANDBOX" \
@@ -147,4 +196,4 @@ exec env \
     GCP_LOCATION=global \
     GCP_PROJECT_ID="$(cat "$gcp_secret")" \
     GOOGLE_APPLICATION_CREDENTIALS="$gcloud_creds" \
-    goose serve --host 127.0.0.1 --port "$PORT"
+    "$GOOSE_BIN" serve --host 127.0.0.1 --port "$PORT"

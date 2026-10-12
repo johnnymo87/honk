@@ -28,20 +28,6 @@ fn is_tool_call_completed(frame: &Value) -> bool {
     false
 }
 
-#[allow(dead_code)]
-fn is_run_end(frame: &Value) -> bool {
-    if frame
-        .pointer("/params/update/sessionUpdate")
-        .and_then(|v| v.as_str())
-        == Some("session_info_update")
-    {
-        let active_run = frame.pointer("/params/update/_meta/goose/activeRunId");
-        active_run == Some(&Value::Null) || active_run.is_none()
-    } else {
-        false
-    }
-}
-
 fn get_active_run_id(frame: &Value) -> Option<String> {
     if frame
         .pointer("/params/update/sessionUpdate")
@@ -55,17 +41,6 @@ fn get_active_run_id(frame: &Value) -> Option<String> {
     } else {
         None
     }
-}
-
-fn is_permission_request(frame: &Value) -> bool {
-    frame.get("method").and_then(|m| m.as_str()) == Some("session/request_permission")
-}
-
-fn is_agent_chunk(frame: &Value) -> bool {
-    frame
-        .pointer("/params/update/sessionUpdate")
-        .and_then(|v| v.as_str())
-        == Some("agent_message_chunk")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,86 +107,6 @@ pub fn summarize_export(session_json: &Value) -> ExportSummary {
 pub fn check_child_processes(pid: u32) -> anyhow::Result<Vec<String>> {
     let stats = get_proc_stats(pid)?;
     Ok(stats.children)
-}
-
-pub fn get_sandbox_unit() -> String {
-    std::env::var("HONK_SANDBOX_UNIT").unwrap_or_else(|_| "honk-goose-sandbox".to_string())
-}
-
-pub fn get_sandbox_cgroup() -> anyhow::Result<PathBuf> {
-    let unit = get_sandbox_unit();
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "show", "-p", "ControlGroup", "--value", &unit])
-        .output()?;
-    let cg = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if cg.is_empty() {
-        anyhow::bail!("no ControlGroup found for unit '{unit}'");
-    }
-    let base = Path::new("/sys/fs/cgroup");
-    Ok(base.join(cg.trim_start_matches('/')))
-}
-
-fn read_cgroup_procs_recursive(dir: &Path, pids: &mut Vec<u32>) {
-    let procs_file = dir.join("cgroup.procs");
-    if let Ok(content) = std::fs::read_to_string(&procs_file) {
-        for line in content.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                pids.push(pid);
-            }
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type()
-                && ft.is_dir()
-            {
-                read_cgroup_procs_recursive(&entry.path(), pids);
-            }
-        }
-    }
-}
-
-pub fn get_sandbox_cgroup_pids() -> anyhow::Result<Vec<u32>> {
-    let cg_dir = get_sandbox_cgroup()?;
-    let mut pids = Vec::new();
-    read_cgroup_procs_recursive(&cg_dir, &mut pids);
-    pids.sort_unstable();
-    pids.dedup();
-    Ok(pids)
-}
-
-pub fn sandbox_pids_matching(pattern: &str) -> anyhow::Result<Vec<u32>> {
-    let cgroup_pids = get_sandbox_cgroup_pids()?;
-    let mut matching = Vec::new();
-    for pid in cgroup_pids {
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        if let Ok(raw) = std::fs::read(&cmdline_path) {
-            let args: Vec<&str> = raw
-                .split(|&b| b == 0)
-                .filter(|a| !a.is_empty())
-                .map(|a| std::str::from_utf8(a).unwrap_or(""))
-                .collect();
-            // Match exact sleep N command
-            if let Some(sec_str) = pattern.strip_prefix("sleep ")
-                && let Some(cmd) = args.first()
-                && (*cmd == "sleep" || cmd.ends_with("/sleep"))
-                && args.get(1) == Some(&sec_str)
-            {
-                matching.push(pid);
-                continue;
-            }
-
-            let cmd_str = args.join(" ");
-            if cmd_str.contains(pattern) {
-                matching.push(pid);
-            }
-        }
-    }
-    Ok(matching)
-}
-
-pub fn pgrep_user(pattern: &str) -> anyhow::Result<Vec<u32>> {
-    sandbox_pids_matching(pattern)
 }
 
 pub async fn restart_sandbox_unit() -> anyhow::Result<()> {
@@ -313,7 +208,7 @@ async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed");
@@ -362,7 +257,7 @@ async fn run_p5a_conn_a_case(case_name: &str, sleep_secs: u64) -> anyhow::Result
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_frame = Some(frame.clone());
@@ -523,7 +418,7 @@ async fn run_p5a_conn_b_case(
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed on Conn A");
@@ -599,7 +494,7 @@ async fn run_p5a_conn_b_case(
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_frame = Some(frame.clone());
@@ -723,7 +618,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call frame observed");
@@ -768,7 +663,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
 
     while observe_start.elapsed() < observe_timeout {
         let remaining = observe_timeout - observe_start.elapsed();
-        if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_during_observe = Some(frame.clone());
@@ -812,7 +707,7 @@ async fn run_p5b_case(case_name: &str) -> anyhow::Result<()> {
         let cleanup_start = Instant::now();
         while cleanup_start.elapsed() < cleanup_timeout {
             let remaining = cleanup_timeout - cleanup_start.elapsed();
-            if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+            if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
                 && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
             {
                 final_stop_reason = frame
@@ -907,7 +802,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for permission request");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_permission_request(frame)
         {
             let id = frame.get("id").cloned().expect("permission id");
@@ -939,7 +834,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
 
     while observe_start.elapsed() < observe_timeout {
         let remaining = observe_timeout - observe_start.elapsed();
-        if let Ok(Some(Event::Frame(_, ref frame))) = ts.upstream.next(remaining).await
+        if let Ok(Some(Event::Frame(_, ref frame, _))) = ts.upstream.next(remaining).await
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             prompt_reply_without_answer = Some(frame.clone());
@@ -982,7 +877,7 @@ async fn run_p5c_case(case_name: &str) -> anyhow::Result<()> {
         let Some(event) = ts.upstream.next(remaining).await? else {
             break;
         };
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && rpc_id_matches(&prompt_req_id, frame.get("id").unwrap_or(&Value::Null))
         {
             post_answer_reply = Some(frame.clone());
@@ -1113,7 +1008,7 @@ async fn run_p5d_case(case_name: &str, late_timing: bool) -> anyhow::Result<()> 
             break;
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             if let Some(rid) = get_active_run_id(frame) {
                 active_run_id = Some(rid);
             }
@@ -1308,7 +1203,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
             panic!("[{case_name}] stream closed while waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event
+        if let Event::Frame(_, ref frame, _) = event
             && is_tool_call(frame)
         {
             println!("[{case_name}] Tool call observed, verifying sleep child...");
@@ -1434,7 +1329,7 @@ async fn run_p5e_case(case_name: &str) -> anyhow::Result<()> {
     let drain_start = Instant::now();
     while drain_start.elapsed() < Duration::from_secs(3) {
         let remaining = Duration::from_secs(3) - drain_start.elapsed();
-        if let Ok(Some(Event::Frame(_, frame))) = new_upstream.next(remaining).await {
+        if let Ok(Some(Event::Frame(_, frame, _))) = new_upstream.next(remaining).await {
             resent_frames.push(frame);
         }
     }

@@ -5,6 +5,13 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 
+/// One SSE event: its JSON payload and its `id:` field if this event set a new one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SseFrame {
+    pub id: Option<u64>,
+    pub data: Value,
+}
+
 /// Transforms a stream of bytes into a stream of parsed JSON [`Value`]s.
 ///
 /// Skips events with empty or whitespace-only data (such as keepalives).
@@ -14,22 +21,50 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
+    sse_to_frames(byte_stream)
+        .map(|r| r.map(|f| f.data))
+        .boxed()
+}
+
+/// Like [`sse_to_json_stream`], but keeps each event's id (patched goose stamps one).
+pub fn sse_to_frames<S, E>(byte_stream: S) -> BoxStream<'static, anyhow::Result<SseFrame>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut previous_id = String::new();
     byte_stream
         .eventsource()
-        .filter_map(|event_res| async move {
-            match event_res {
+        .filter_map(move |event_res| {
+            let item = match event_res {
                 Ok(event) => {
+                    // eventsource-stream carries the last `id:` onto later events that
+                    // set none; only an id that differs from the previous one is new.
+                    let id = if event.id != previous_id {
+                        event.id.trim().parse().ok()
+                    } else {
+                        None
+                    };
+                    previous_id.clone_from(&event.id);
                     let data = event.data.trim();
                     if data.is_empty() {
                         None
                     } else {
-                        Some(serde_json::from_str::<Value>(data).with_context(|| {
-                            format!("failed to parse SSE data as JSON (length: {})", data.len())
-                        }))
+                        Some(
+                            serde_json::from_str::<Value>(data)
+                                .with_context(|| {
+                                    format!(
+                                        "failed to parse SSE data as JSON (length: {})",
+                                        data.len()
+                                    )
+                                })
+                                .map(|data| SseFrame { id, data }),
+                        )
                     }
                 }
                 Err(err) => Some(Err(anyhow::anyhow!("SSE stream error: {err}"))),
-            }
+            };
+            futures::future::ready(item)
         })
         .boxed()
 }
@@ -123,5 +158,45 @@ mod tests {
             "error should not leak raw data, got: {err_msg}"
         );
         assert!(json_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_ids_are_parsed_and_absent_ids_are_none() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("data: {\"a\":1}\n\n")),
+            Ok(Bytes::from("id: 7\ndata: {\"b\":2}\n\n")),
+            Ok(Bytes::from("data:\n\n")),
+        ];
+        let frames: Vec<SseFrame> = sse_to_frames(futures::stream::iter(chunks))
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            frames,
+            vec![
+                SseFrame {
+                    id: None,
+                    data: json!({"a": 1})
+                },
+                SseFrame {
+                    id: Some(7),
+                    data: json!({"b": 2})
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inherited_id_is_not_reported_as_new() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("id: 5\ndata: {\"a\":1}\n\n")),
+            Ok(Bytes::from("data: {\"b\":2}\n\n")),
+            Ok(Bytes::from("id: 6\ndata: {\"c\":3}\n\n")),
+        ];
+        let ids: Vec<Option<u64>> = sse_to_frames(futures::stream::iter(chunks))
+            .map(|r| r.unwrap().id)
+            .collect()
+            .await;
+        assert_eq!(ids, vec![Some(5), None, Some(6)]);
     }
 }

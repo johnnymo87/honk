@@ -130,7 +130,7 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
             panic!("[P3a1] stream ended or timed out waiting for chunks");
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             check_no_permission_request(frame, "P3a1 pre-drop");
             if is_agent_chunk(frame) {
                 if let Some(t) = get_chunk_text(frame) {
@@ -247,7 +247,7 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(key, frame) = event {
+        if let Event::Frame(key, frame, _) = event {
             check_no_permission_request(&frame, "P3a1 post-load");
 
             if frame
@@ -299,7 +299,7 @@ async fn p3a1_same_conn_reload_tides() -> anyhow::Result<()> {
 
             if prompt_reply_frame.is_some() && run_end_frame.is_some() {
                 let _ = tokio::time::sleep(Duration::from_millis(500)).await;
-                while let Ok(Some(Event::Frame(_, extra))) =
+                while let Ok(Some(Event::Frame(_, extra, _))) =
                     resumed.next(Duration::from_millis(200)).await
                 {
                     live_frames_after_drop.push(extra);
@@ -544,7 +544,7 @@ async fn p3a2_same_conn_reload_sleep() -> anyhow::Result<()> {
             panic!("[P3a2] stream ended waiting for tool_call");
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             check_no_permission_request(frame, "P3a2 pre-drop");
             let update_type = frame
                 .pointer("/params/update/sessionUpdate")
@@ -617,7 +617,7 @@ async fn p3a2_same_conn_reload_sleep() -> anyhow::Result<()> {
             break;
         };
 
-        if let Event::Frame(key, frame) = event {
+        if let Event::Frame(key, frame, _) = event {
             check_no_permission_request(&frame, "P3a2 post-load");
 
             if frame
@@ -652,7 +652,7 @@ async fn p3a2_same_conn_reload_sleep() -> anyhow::Result<()> {
 
             if prompt_reply_frame.is_some() && run_end_frame.is_some() {
                 let _ = tokio::time::sleep(Duration::from_millis(500)).await;
-                while let Ok(Some(Event::Frame(_, extra))) =
+                while let Ok(Some(Event::Frame(_, extra, _))) =
                     resumed.next(Duration::from_millis(200)).await
                 {
                     live_frames_after_load.push(extra);
@@ -807,7 +807,7 @@ async fn p3c_diff_conn_reload_mid_run() -> anyhow::Result<()> {
             panic!("[P3c] stream ended waiting for chunks on Conn A");
         };
 
-        if let Event::Frame(_, ref frame) = event {
+        if let Event::Frame(_, ref frame, _) = event {
             check_no_permission_request(frame, "P3c Conn A pre");
             if is_agent_chunk(frame) {
                 a_chunks_before += 1;
@@ -883,7 +883,7 @@ async fn p3c_diff_conn_reload_mid_run() -> anyhow::Result<()> {
     while post_start.elapsed() < post_timeout {
         tokio::select! {
             ev_a = ts.upstream.next(Duration::from_millis(100)) => {
-                if let Ok(Some(Event::Frame(_, frame))) = ev_a {
+                if let Ok(Some(Event::Frame(_, frame, _))) = ev_a {
                     check_no_permission_request(&frame, "P3c Conn A post");
                     if is_agent_chunk(&frame) {
                         a_chunks_after += 1;
@@ -897,7 +897,7 @@ async fn p3c_diff_conn_reload_mid_run() -> anyhow::Result<()> {
                 }
             }
             ev_b = upstream_b.next(Duration::from_millis(100)) => {
-                if let Ok(Some(Event::Frame(key, frame))) = ev_b {
+                if let Ok(Some(Event::Frame(key, frame, _))) = ev_b {
                     check_no_permission_request(&frame, "P3c Conn B post");
                     if frame.get("id").is_some_and(|id| rpc_id_matches(&b_load_req_id, id)) {
                         b_load_reply_stream = Some(key);
@@ -920,13 +920,13 @@ async fn p3c_diff_conn_reload_mid_run() -> anyhow::Result<()> {
         if (a_got_prompt_reply || a_got_run_end) && b_load_reply.is_some() {
             let drain_until = Instant::now() + Duration::from_secs(2);
             while Instant::now() < drain_until {
-                if let Ok(Some(Event::Frame(_, frame))) =
+                if let Ok(Some(Event::Frame(_, frame, _))) =
                     ts.upstream.next(Duration::from_millis(200)).await
                     && is_agent_chunk(&frame)
                 {
                     a_chunks_after += 1;
                 }
-                if let Ok(Some(Event::Frame(_, frame))) =
+                if let Ok(Some(Event::Frame(_, frame, _))) =
                     upstream_b.next(Duration::from_millis(200)).await
                     && is_agent_chunk(&frame)
                 {
