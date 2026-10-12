@@ -945,3 +945,76 @@ async fn test_agent_message_chunk_carries_message_id() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_stub_model_gate_queued_before_restart_consumed_after_waits() {
+    use honk_testgoose::{StubModel, Turn};
+
+    let model = StubModel::start().await;
+    // Queue gate "g1" and gate "g2" before restart
+    model.push([
+        Turn::Gate("g1".into(), Box::new(Turn::Text(vec!["one".into()]))),
+        Turn::Gate("g2".into(), Box::new(Turn::Text(vec!["two".into()]))),
+    ]);
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", model.base_url());
+
+    // Request 1 arrives and enters gate "g1" wait
+    let client1 = client.clone();
+    let url1 = url.clone();
+    let req1_fut = tokio::spawn(async move {
+        client1
+            .post(&url1)
+            .json(&json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hi 1"}],
+                "tools": [{"type": "function", "function": {"name": "developer"}}],
+            }))
+            .send()
+            .await
+    });
+
+    // Give req1 a moment to begin waiting on "g1"
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Goose restart occurs: open_all() releases currently-waiting gates
+    model.open_all();
+
+    // req1 must resolve successfully
+    let res1 = req1_fut.await.expect("join req1").expect("req1 response");
+    assert!(res1.status().is_success());
+
+    // Request 2 (for "g2", which was queued BEFORE restart) is sent AFTER restart
+    let client2 = client.clone();
+    let url2 = url.clone();
+    let mut req2_fut = tokio::spawn(async move {
+        client2
+            .post(&url2)
+            .json(&json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hi 2"}],
+                "tools": [{"type": "function", "function": {"name": "developer"}}],
+            }))
+            .send()
+            .await
+    });
+
+    // Verify req2 DOES NOT resolve immediately (it must still wait on "g2")
+    let wait_res = tokio::time::timeout(Duration::from_millis(150), &mut req2_fut).await;
+    assert!(
+        wait_res.is_err(),
+        "req2 must still wait on gate g2 even though it was queued before restart"
+    );
+
+    // Explicitly open gate "g2"
+    model.open("g2");
+
+    // req2 now resolves!
+    let res2 = tokio::time::timeout(Duration::from_secs(2), req2_fut)
+        .await
+        .expect("req2 completes")
+        .expect("join req2")
+        .expect("res2 ok");
+    assert!(res2.status().is_success());
+}

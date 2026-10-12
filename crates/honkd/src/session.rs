@@ -102,6 +102,7 @@ pub enum SessionMsg {
     },
     RetryReattach,
     Rebuilt {
+        token: u64,
         frames: Vec<Value>,
         keys: std::collections::HashSet<honk_wire::BlockKey>,
         resume_from: Option<u64>,
@@ -115,8 +116,12 @@ pub enum SessionMsg {
         upstream_id: String,
     },
     MarkPendingStale,
-    ReactivationComplete(Box<ReactivationData>),
+    ReactivationComplete {
+        token: u64,
+        data: Box<ReactivationData>,
+    },
     ReactivationFailed {
+        token: u64,
         reason: String,
         permanent: bool,
     },
@@ -185,6 +190,9 @@ pub struct Session {
     pub synthesized_replies: HashSet<String>,
     pub initial_events: Vec<honk_upstream::Event>,
     pub gap_synthesis_pending: bool,
+    pub reactivating: bool,
+    pub reactivation_token: u64,
+    pub rebuild_token: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +361,10 @@ impl Session {
     }
 
     async fn trigger_reattach(&mut self) {
-        if self.state == ActorState::Gone || self.state == ActorState::Reattaching {
+        if self.state == ActorState::Gone
+            || self.state == ActorState::Reattaching
+            || self.reactivating
+        {
             return;
         }
         self.state = ActorState::Reattaching;
@@ -605,11 +616,18 @@ impl Session {
     }
 
     async fn handle_gone(&mut self) {
-        if self.state == ActorState::Gone {
+        if self.state == ActorState::Gone || self.reactivating {
+            tracing::warn!(
+                "Session {} ignoring Gone while already reactivating or Gone",
+                self.sid
+            );
             return;
         }
         tracing::warn!("Session {} handling upstream gone / restart", self.sid);
         self.active_probe_id = None;
+
+        // Cancel any in-flight gap rebuild so a late Rebuilt msg will be ignored
+        self.rebuild_token += 1;
 
         // Step 1: turn.interrupt("upstream_restart")
         let actions = self.turn.interrupt("upstream_restart");
@@ -680,6 +698,9 @@ impl Session {
         }
 
         self.state = ActorState::Rebuilding;
+        self.reactivating = true;
+        self.reactivation_token += 1;
+        let token = self.reactivation_token;
 
         // Spawn reactivation task so the actor never awaits recovery inline (plan ~80-84)
         let sid = self.sid.clone();
@@ -689,7 +710,7 @@ impl Session {
         let self_tx = self.self_tx.clone();
 
         tokio::spawn(async move {
-            Self::run_reactivation_task(sid, hub, state_dir, state_store, self_tx).await;
+            Self::run_reactivation_task(token, sid, hub, state_dir, state_store, self_tx).await;
         });
     }
 
@@ -731,6 +752,7 @@ impl Session {
     }
 
     async fn run_reactivation_task(
+        token: u64,
         sid: String,
         hub: Arc<Hub>,
         state_dir: PathBuf,
@@ -744,6 +766,7 @@ impl Session {
         if hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
             let _ = self_tx
                 .send(SessionMsg::ReactivationFailed {
+                    token,
                     reason: "upstream goose is no longer patched".to_string(),
                     permanent: true,
                 })
@@ -769,6 +792,7 @@ impl Session {
                         // Session not found in session/list -> permanent failure
                         let _ = self_tx
                             .send(SessionMsg::ReactivationFailed {
+                                token,
                                 reason: format!("session not found upstream: {e:#}"),
                                 permanent: true,
                             })
@@ -778,6 +802,7 @@ impl Session {
                     if attempts >= max_attempts {
                         let _ = self_tx
                             .send(SessionMsg::ReactivationFailed {
+                                token,
                                 reason: format!(
                                     "failed to get stored cwd after {attempts} attempts: {e:#}"
                                 ),
@@ -940,7 +965,10 @@ impl Session {
             match result {
                 Ok(data) => {
                     let _ = self_tx
-                        .send(SessionMsg::ReactivationComplete(Box::new(data)))
+                        .send(SessionMsg::ReactivationComplete {
+                            token,
+                            data: Box::new(data),
+                        })
                         .await;
                     return;
                 }
@@ -951,6 +979,7 @@ impl Session {
                     if attempts >= max_attempts {
                         let _ = self_tx
                             .send(SessionMsg::ReactivationFailed {
+                                token,
                                 reason: format!(
                                     "reactivation failed after {attempts} attempts: {e:#}"
                                 ),
@@ -991,11 +1020,16 @@ impl Session {
     }
 
     async fn start_rebuild(&mut self) {
-        if self.state == ActorState::Gone || self.state == ActorState::Rebuilding {
+        if self.state == ActorState::Gone
+            || self.state == ActorState::Rebuilding
+            || self.reactivating
+        {
             return;
         }
         self.state = ActorState::Rebuilding;
         self.rebuilding_buffered_frames.clear();
+        self.rebuild_token += 1;
+        let token = self.rebuild_token;
 
         let hub = self.hub.clone();
         let sid = self.sid.clone();
@@ -1015,6 +1049,7 @@ impl Session {
                     }
                     let _ = self_tx
                         .send(SessionMsg::Rebuilt {
+                            token,
                             frames,
                             keys,
                             resume_from,
@@ -1023,6 +1058,13 @@ impl Session {
                 }
                 Err(e) => {
                     tracing::error!("rebuild export failed for {sid}: {e:#}");
+                    let gone = honk_upstream::is_gone(&e);
+                    let _ = self_tx
+                        .send(SessionMsg::ReattachFailed {
+                            gone,
+                            error: e.to_string(),
+                        })
+                        .await;
                 }
             }
         });
@@ -1312,7 +1354,9 @@ impl Session {
                     "Session {} stream ended: key={key:?}, error={error:?}",
                     self.sid
                 );
-                if self.state == ActorState::Live {
+                if self.state == ActorState::Live
+                    || (self.state == ActorState::Rebuilding && !self.reactivating)
+                {
                     self.trigger_reattach().await;
                 }
                 return;
@@ -2170,10 +2214,22 @@ impl Session {
                 }
             }
             SessionMsg::Rebuilt {
+                token,
                 frames,
                 keys,
                 resume_from,
             } => {
+                if token != self.rebuild_token
+                    || self.state != ActorState::Rebuilding
+                    || self.reactivating
+                {
+                    tracing::warn!(
+                        "Session {}: ignoring stale Rebuilt msg (token={token}, current={})",
+                        self.sid,
+                        self.rebuild_token
+                    );
+                    return;
+                }
                 self.on_rebuilt(frames, keys, resume_from).await;
             }
             SessionMsg::ReplyText { owners, body, text } => {
@@ -2206,7 +2262,16 @@ impl Session {
                     self.execute_actions(reply_actions).await;
                 }
             }
-            SessionMsg::ReactivationComplete(data) => {
+            SessionMsg::ReactivationComplete { token, data } => {
+                if token != self.reactivation_token || !self.reactivating {
+                    tracing::warn!(
+                        "Session {}: ignoring stale ReactivationComplete (token={token}, current={})",
+                        self.sid,
+                        self.reactivation_token
+                    );
+                    return;
+                }
+                self.reactivating = false;
                 let ReactivationData {
                     conn_id,
                     up_handle,
@@ -2289,9 +2354,19 @@ impl Session {
                 self.drain_queued_msgs().await;
             }
             SessionMsg::ReactivationFailed {
+                token,
                 reason,
                 permanent: _,
             } => {
+                if token != self.reactivation_token || !self.reactivating {
+                    tracing::warn!(
+                        "Session {}: ignoring stale ReactivationFailed (token={token}, current={})",
+                        self.sid,
+                        self.reactivation_token
+                    );
+                    return;
+                }
+                self.reactivating = false;
                 tracing::error!("Session {} reactivation failed: {reason}", self.sid);
                 self.state = ActorState::Gone;
 

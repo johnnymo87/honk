@@ -161,6 +161,7 @@ struct FakeGooseInner {
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
     prompt_error_reply: Mutex<Option<Value>>,
+    export_delay: Mutex<Option<Duration>>,
 }
 
 pub struct FakeGoose {
@@ -208,6 +209,7 @@ impl FakeGoose {
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
             prompt_error_reply: Mutex::new(None),
+            export_delay: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -313,6 +315,10 @@ impl FakeGoose {
             .lock()
             .unwrap()
             .insert(sid.to_string(), data);
+    }
+
+    pub fn set_export_delay(&self, delay: Option<Duration>) {
+        *self.state.export_delay.lock().unwrap() = delay;
     }
 
     pub fn set_keepalive_interval(&self, interval: Duration) {
@@ -617,6 +623,11 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("_goose/unstable/session/export") => {
+            let delay_opt = *state.export_delay.lock().unwrap();
+            if let Some(d) = delay_opt {
+                tokio::time::sleep(d).await;
+            }
+
             let export_val = target_session
                 .as_ref()
                 .and_then(|sid| state.export_data.lock().unwrap().get(sid).cloned())

@@ -359,6 +359,9 @@ impl Hub {
                 synthesized_replies: std::collections::HashSet::new(),
                 initial_events: Vec::new(),
                 gap_synthesis_pending: false,
+                reactivating: false,
+                reactivation_token: 0,
+                rebuild_token: 0,
             };
 
             tokio::spawn(session.run());
@@ -986,6 +989,9 @@ impl Hub {
             synthesized_replies: std::collections::HashSet::new(),
             initial_events: Vec::new(),
             gap_synthesis_pending: false,
+            reactivating: false,
+            reactivation_token: 0,
+            rebuild_token: 0,
         };
 
         tokio::spawn(session.run());
@@ -1330,6 +1336,9 @@ impl Hub {
                 synthesized_replies: std::collections::HashSet::new(),
                 initial_events,
                 gap_synthesis_pending: false,
+                reactivating: false,
+                reactivation_token: 0,
+                rebuild_token: 0,
             };
 
             tokio::spawn(session.run());

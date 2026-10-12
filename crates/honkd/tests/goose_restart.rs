@@ -37,6 +37,11 @@ async fn goose_restart_mid_turn_cancelled_reloaded_and_retry_single() {
             == Some("session_info_update")
     })
     .await;
+    // Ensure the turn has reached the model and is waiting on the gate
+    let wait_start = Instant::now();
+    while g.model().turn_requests().is_empty() && wait_start.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     g.restart().await;
     let r = v.response_timeout(&id, SECS * 3).await;
     assert_eq!(r["result"]["stopReason"], "cancelled");
@@ -536,5 +541,108 @@ async fn rebuilding_session_queues_requests_fifo_and_serves_attaches() {
         presp.pointer("/result/stopReason").and_then(Value::as_str),
         Some("end_turn"),
         "queued prompt must be drained and succeed: {presp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn double_gone_triggers_exactly_one_reactivation() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    v.blocks.resets = 0;
+
+    // Induce a double gone by restarting FakeGoose and kicking stream
+    fake.restart().await;
+    fake.kick_stream(&sid);
+
+    // Wait for reactivation to complete
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(2))
+    })
+    .await;
+
+    // Exactly one reset delivered to viewer
+    assert_eq!(
+        v.blocks.resets, 1,
+        "exactly one reset should be delivered on double gone"
+    );
+
+    // Inbound session/load calls on FakeGoose should be exactly 1 from the single reactivation
+    let loads: Vec<_> = fake
+        .inbound()
+        .into_iter()
+        .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/load"))
+        .collect();
+    assert_eq!(
+        loads.len(),
+        1,
+        "must have exactly 1 session/load call from single reactivation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gone_during_gap_rebuild_reactivation_wins_late_rebuilt_ignored() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Delay export so gap rebuild is in progress when restart occurs
+    fake.set_export_delay(Some(Duration::from_millis(300)));
+
+    // Induce a gap rebuild: kick stream with gap_on_next_resume while idle
+    fake.gap_on_next_resume(&sid);
+    fake.kick_stream(&sid);
+
+    // Give the actor a moment to observe the gap and enter ActorState::Rebuilding
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // While in gap rebuild, clear delay for reactivation and restart goose -> 404 / Gone occurs!
+    fake.set_export_delay(None);
+    fake.restart().await;
+    fake.kick_stream(&sid);
+
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 2
+    })
+    .await;
+
+    // A prompt on the reactivated session must succeed
+    fake.script_prompt(vec!["prompt after gap rebuild gone ok".into()]);
+    let req_id = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test prompt", Some("crid-rebuild-gone")),
+        )
+        .await;
+
+    let resp = v.response_timeout(&req_id, SECS * 2).await;
+    assert_eq!(
+        resp.pointer("/result/stopReason").and_then(Value::as_str),
+        Some("end_turn"),
+        "prompt after reactivation over interrupted rebuild must succeed: {resp:?}"
     );
 }

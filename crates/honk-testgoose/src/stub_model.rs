@@ -21,8 +21,6 @@ pub enum Turn {
     },
     /// wait until `StubModel::open(name)` before answering the NEXT turn
     Gate(String, Box<Turn>),
-    #[doc(hidden)]
-    GateWithEpoch(String, Box<Turn>, u64),
 }
 
 #[derive(Clone)]
@@ -111,14 +109,9 @@ impl StubModel {
     }
 
     pub fn push(&self, turns: impl IntoIterator<Item = Turn>) {
-        let current_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let mut q = self.turns.lock().unwrap();
         for t in turns {
-            let stamped = match t {
-                Turn::Gate(name, inner) => Turn::GateWithEpoch(name, inner, current_epoch),
-                other => other,
-            };
-            q.push_back(stamped);
+            q.push_back(t);
         }
     }
 
@@ -249,21 +242,15 @@ async fn chat_completions(
     // 4. Resolve gates: race-free wait armed before checking gate set, bounded by 60s timeout
     let mut resolved_turn = turn;
     let gate_deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while matches!(resolved_turn, Turn::Gate(..) | Turn::GateWithEpoch(..)) {
-        let (gate_name, inner, gate_epoch) = match resolved_turn {
-            Turn::Gate(name, inner) => (name, inner, None),
-            Turn::GateWithEpoch(name, inner, ep) => (name, inner, Some(ep)),
-            _ => unreachable!(),
-        };
-
+    while let Turn::Gate(gate_name, inner) = resolved_turn {
+        let wait_start_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
         loop {
             let notified = state.gate_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
             let current_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
-            if gate_epoch.is_some_and(|ep| ep < current_epoch)
-                || state.gates.lock().unwrap().contains(&gate_name)
+            if wait_start_epoch < current_epoch || state.gates.lock().unwrap().contains(&gate_name)
             {
                 break;
             }
@@ -391,9 +378,7 @@ fn build_json_response(turn: Turn) -> (StatusCode, Json<serde_json::Value>) {
                 }
             })),
         ),
-        Turn::Gate(_, _) | Turn::GateWithEpoch(_, _, _) => {
-            unreachable!("gates must be resolved")
-        }
+        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
     }
 }
 
@@ -528,9 +513,7 @@ fn build_sse_response(turn: Turn) -> Response {
 
             frames.push("data: [DONE]\n\n".to_string());
         }
-        Turn::Gate(_, _) | Turn::GateWithEpoch(_, _, _) => {
-            unreachable!("gates must be resolved")
-        }
+        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
