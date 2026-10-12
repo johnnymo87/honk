@@ -54,6 +54,7 @@ pub struct Hub {
     pub activating: Arc<Mutex<HashMap<String, ActivatingReceiver>>>,
     pub evicting: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     pub in_flight_creations: Arc<std::sync::atomic::AtomicUsize>,
+    pub next_actor_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Hub {
@@ -209,6 +210,7 @@ impl Hub {
             activating: Arc::new(Mutex::new(HashMap::new())),
             evicting: Arc::new(Mutex::new(HashMap::new())),
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
@@ -325,6 +327,7 @@ impl Hub {
                 turn.inflight = Some(crate::turn::Inflight::from_persisted(inf.clone()));
             }
 
+            let actor_id = hub.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let session = crate::session::Session {
                 sid: sid.clone(),
                 state_dir: hub.state_dir.clone(),
@@ -337,7 +340,7 @@ impl Hub {
                 log: session_log,
                 turn,
                 state: crate::session::ActorState::Live,
-                ids: UpstreamIds::new(boot),
+                ids: UpstreamIds::with_actor(boot, actor_id),
                 last_processed_session_id: last_processed_session,
                 last_processed_conn_id: last_processed_conn,
                 viewers: HashMap::new(),
@@ -948,11 +951,19 @@ impl Hub {
             })?;
         }
 
+        // Clean any old replies sidecar for this session ID
+        let _ = std::fs::remove_file(
+            self.state_dir
+                .join("sessions")
+                .join(format!("{sid}.replies.jsonl")),
+        );
+
         // 8. Spawn actor
         let (up_handle, event_rx) = session_upstream.split();
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
 
         let boot = { self.state.lock().await.boot };
+        let actor_id = self.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let last_processed_session = session_log.last_upstream_id();
         let last_processed_conn = {
             let s = self.state.lock().await;
@@ -971,7 +982,7 @@ impl Hub {
             log: session_log,
             turn: crate::turn::TurnCore::default(),
             state: crate::session::ActorState::Live,
-            ids: UpstreamIds::new(boot),
+            ids: UpstreamIds::with_actor(boot, actor_id),
             last_processed_session_id: last_processed_session,
             last_processed_conn_id: last_processed_conn,
             viewers: HashMap::new(),
@@ -1305,8 +1316,16 @@ impl Hub {
                 })?;
             }
 
+            // Clean any old replies sidecar for this session ID
+            let _ = std::fs::remove_file(
+                hub.state_dir
+                    .join("sessions")
+                    .join(format!("{sid_str}.replies.jsonl")),
+            );
+
             let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
             let boot = { hub.state.lock().await.boot };
+            let actor_id = hub.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let last_processed_session = new_log.last_upstream_id();
 
             let session = crate::session::Session {
@@ -1324,7 +1343,7 @@ impl Hub {
                     ..Default::default()
                 },
                 state: crate::session::ActorState::Live,
-                ids: UpstreamIds::new(boot),
+                ids: UpstreamIds::with_actor(boot, actor_id),
                 last_processed_session_id: last_processed_session,
                 last_processed_conn_id: None,
                 viewers: HashMap::new(),

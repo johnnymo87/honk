@@ -960,6 +960,10 @@ impl Session {
                     })?;
                 }
 
+                let _ = std::fs::remove_file(
+                    state_dir.join("sessions").join(format!("{sid}.replies.jsonl")),
+                );
+
                 Ok(ReactivationData {
                     conn_id,
                     up_handle,
@@ -1143,6 +1147,11 @@ impl Session {
 
         self.log = new_log;
         let head = self.log.head();
+        let _ = std::fs::remove_file(
+            self.state_dir
+                .join("sessions")
+                .join(format!("{}.replies.jsonl", self.sid)),
+        );
         self.last_processed_session_id = self.log.last_upstream_id();
         self.turn.client_prompts = client_prompts;
         self.sync_inflight().await;

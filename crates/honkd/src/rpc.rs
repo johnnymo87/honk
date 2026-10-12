@@ -168,12 +168,25 @@ pub fn extract_user_text(params: &Value) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamIds {
     pub boot: u64,
+    pub actor: u64,
     pub next_seq: u64,
 }
 
 impl UpstreamIds {
     pub fn new(boot: u64) -> Self {
-        Self { boot, next_seq: 1 }
+        Self {
+            boot,
+            actor: 0,
+            next_seq: 1,
+        }
+    }
+
+    pub fn with_actor(boot: u64, actor: u64) -> Self {
+        Self {
+            boot,
+            actor,
+            next_seq: 1,
+        }
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -183,7 +196,11 @@ impl UpstreamIds {
         }
         let n = self.next_seq;
         self.next_seq += 1;
-        format!("hk{}-{n}", self.boot)
+        if self.actor == 0 {
+            format!("hk{}-{n}", self.boot)
+        } else {
+            format!("hk{}_{}-{n}", self.boot, self.actor)
+        }
     }
 }
 
@@ -360,5 +377,11 @@ mod tests {
         assert_eq!(ids.next(), "hk42-1");
         assert_eq!(ids.next(), "hk42-2");
         assert_eq!(ids.next(), "hk42-3");
+
+        let mut ids1 = UpstreamIds::with_actor(1, 1);
+        let mut ids2 = UpstreamIds::with_actor(1, 2);
+        assert_eq!(ids1.next(), "hk1_1-1");
+        assert_eq!(ids2.next(), "hk1_2-1");
+        assert_ne!(ids1.next(), ids2.next());
     }
 }

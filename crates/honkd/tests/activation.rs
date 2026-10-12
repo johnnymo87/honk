@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Honkd, Viewer, new_session, prompt_params};
 use honk_testgoose::{StubGoose, Turn};
@@ -790,5 +790,90 @@ async fn two_queued_msgs_during_paused_eviction_dispatched_in_order() {
             .pointer("/result/_meta/honk/text")
             .and_then(Value::as_str),
         Some("prompt response"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let stored_cwd = g.cwd().to_str().unwrap().to_string();
+
+    g.model().push([Turn::Text(vec!["reply 1".into()])]);
+
+    let mut h = Honkd::spawn(&g.url(), g.secret_file(), &["--idle-ttl-secs", "1"]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, &stored_cwd).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Turn 1 completes
+    let r1 = v
+        .call("session/prompt", prompt_params(&sid, "prompt 1", Some("r1")))
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+    assert_eq!(r1["result"]["_meta"]["honk"]["text"], "reply 1");
+
+    // Detach and wait for eviction (> 1 sec)
+    v.call("session/close", json!({ "sessionId": &sid })).await;
+    drop(v);
+
+    let wait_evict = Instant::now();
+    loop {
+        let state = read_state(&h);
+        if !state.sessions.contains_key(&sid) {
+            break;
+        }
+        if wait_evict.elapsed() > Duration::from_secs(5) {
+            panic!("session failed to evict");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Queue reply 2 for the model
+    g.model().push([Turn::Text(vec!["reply 2".into()])]);
+
+    // Reconnect and reactivate
+    let mut v2 = Viewer::connect(&h).await;
+    v2.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Send prompt 2
+    v2.request("session/prompt", prompt_params(&sid, "prompt 2", Some("r2")))
+        .await;
+
+    // Wait until model receives prompt 2
+    let wait_start = Instant::now();
+    while g.model().turn_requests().len() < 2 && wait_start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Kill honkd mid-turn while Turn 2 is running
+    h.kill9();
+
+    // Give stub goose enough time to complete Turn 2 in SQLite
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Restart honkd
+    h.restart().await;
+
+    // Connect new viewer and retry prompt 2
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call("session/prompt", prompt_params(&sid, "prompt 2", Some("r2")))
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["text"],
+        "reply 2",
+        "must use real reply 2, not stale sidecar reply 1"
     );
 }
