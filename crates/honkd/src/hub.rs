@@ -520,26 +520,27 @@ impl Hub {
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
-        {
-            let held_count = self.sessions.read().await.len();
-            let activating_count = self.activating.lock().await.len();
-            let creating_count = self
-                .in_flight_creations
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if held_count + activating_count + creating_count >= self.args.max_sessions {
-                anyhow::bail!("honkd: held-session limit reached");
-            }
-        }
-        self.in_flight_creations
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let creating_counter = self.in_flight_creations.clone();
         struct CreatingGuard(Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for CreatingGuard {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        let _creating_guard = CreatingGuard(creating_counter);
+
+        let _creating_guard = {
+            let activating = self.activating.lock().await;
+            let held_count = self.sessions.read().await.len();
+            let activating_count = activating.len();
+            let creating_count = self
+                .in_flight_creations
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if held_count + activating_count + creating_count >= self.args.max_sessions {
+                anyhow::bail!("honkd: held-session limit reached");
+            }
+            self.in_flight_creations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CreatingGuard(self.in_flight_creations.clone())
+        };
 
         // 1. Upstream::initialize_with
         let init_opts = UpstreamOpts {

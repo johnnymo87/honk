@@ -713,3 +713,82 @@ async fn answer_routes_to_pending_request_across_sessions() {
         "pending request must be answered and removed from state by unattached viewer answer"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_queued_msgs_during_paused_eviction_dispatched_in_order() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let stored_cwd = g.cwd().to_str().unwrap().to_string();
+
+    let h = Honkd::spawn_with_env(
+        &g.url(),
+        g.secret_file(),
+        &["--idle-ttl-secs", "1"],
+        &[("HONKD_TEST_PAUSE_EVICT_MS", "2500")],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, &stored_cwd).await;
+
+    // Prompt initial turn so goose commits session to DB
+    g.model().push([Turn::Text(vec!["initial ok".into()])]);
+    let req0 = v
+        .request("session/prompt", prompt_params(&sid, "init", None))
+        .await;
+    let _ = v.response(&req0).await;
+
+    v.call("session/close", json!({ "sessionId": &sid })).await;
+
+    // Wait 1.8s: eviction starts (~1.2s) and is paused inside the 2500ms HONKD_TEST_PAUSE_EVICT_MS barrier
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+
+    g.model().push([Turn::Text(vec!["prompt response".into()])]);
+
+    // Send session/load first, then session/prompt second while eviction is paused
+    let mut v2 = Viewer::connect(&h).await;
+    let load_id = v2
+        .request(
+            "session/load",
+            json!({
+                "sessionId": &sid,
+                "cwd": ".",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    let prompt_id = v2
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "second prompt after load", None),
+        )
+        .await;
+
+    // Load response must arrive for load_id with epoch 2
+    let load_resp = v2.response_timeout(&load_id, Duration::from_secs(15)).await;
+    assert_eq!(
+        load_resp
+            .pointer("/result/_meta/honk/epoch")
+            .and_then(Value::as_u64),
+        Some(2),
+        "load must be answered with epoch 2"
+    );
+
+    // Prompt response must arrive for prompt_id with end_turn
+    let prompt_resp = v2
+        .response_timeout(&prompt_id, Duration::from_secs(15))
+        .await;
+    assert_eq!(
+        prompt_resp
+            .pointer("/result/stopReason")
+            .and_then(Value::as_str),
+        Some("end_turn"),
+        "prompt must complete with end_turn"
+    );
+    assert_eq!(
+        prompt_resp
+            .pointer("/result/_meta/honk/text")
+            .and_then(Value::as_str),
+        Some("prompt response"),
+    );
+}

@@ -872,31 +872,52 @@ impl Session {
     }
 
     fn return_undelivered_to_hub(&mut self) {
+        let mut undelivered = Vec::new();
+        while let Ok(msg) = self.rx.try_recv() {
+            undelivered.push(msg);
+        }
+        if undelivered.is_empty() {
+            return;
+        }
+
         let sid = self.sid.clone();
         let hub = self.hub.clone();
-        while let Ok(msg) = self.rx.try_recv() {
-            tracing::warn!("Session {sid} exiting; re-dispatching undelivered msg");
-            let sid = sid.clone();
-            let hub = hub.clone();
-            tokio::spawn(async move {
-                match hub.get_or_activate_session(&sid).await {
-                    Ok(handle) => {
+        tokio::spawn(async move {
+            tracing::warn!(
+                "Session {sid} exiting; re-dispatching {} undelivered msg(s) in order",
+                undelivered.len()
+            );
+            match hub.get_or_activate_session(&sid).await {
+                Ok(handle) => {
+                    for msg in undelivered {
                         let _ = handle.tx.send(msg).await;
                     }
-                    Err(e) => match msg {
-                        SessionMsg::Prompt { viewer, id, .. }
-                        | SessionMsg::Steer { viewer, id, .. }
-                        | SessionMsg::Forward { viewer, id, .. } => {
-                            let err_frame = crate::rpc::error(id, e.code, e.message, None);
-                            let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                                err_frame.to_string().into(),
-                            ));
-                        }
-                        _ => {}
-                    },
                 }
-            });
-        }
+                Err(e) => {
+                    for msg in undelivered {
+                        match msg {
+                            SessionMsg::Prompt { viewer, id, .. }
+                            | SessionMsg::Steer { viewer, id, .. }
+                            | SessionMsg::Forward { viewer, id, .. } => {
+                                let err_frame =
+                                    crate::rpc::error(id, e.code, e.message.clone(), None);
+                                let _ = viewer.send_frame(axum::extract::ws::Message::Text(
+                                    err_frame.to_string().into(),
+                                ));
+                            }
+                            SessionMsg::Attach { viewer, .. } => {
+                                let err_frame =
+                                    crate::rpc::error(Value::Null, e.code, e.message.clone(), None);
+                                let _ = viewer.send_frame(axum::extract::ws::Message::Text(
+                                    err_frame.to_string().into(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn sync_inflight(&self) {
