@@ -1003,9 +1003,21 @@ impl Session {
             return vec![];
         };
         let user_text = crate::rpc::extract_user_text(&inf.params);
+        let logged_completed_turns = self
+            .log
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.frame
+                    .pointer("/params/update")
+                    .and_then(honk_wire::run_state)
+                    == Some(None)
+            })
+            .count();
+
         match self.hub.export(&self.sid).await {
             Ok(export_val) => {
-                if !export_has_user_text(&export_val, &user_text) {
+                if !export_has_inflight_delivery(&export_val, &user_text, logged_completed_turns) {
                     return self.turn.interrupt("not_delivered");
                 }
             }
@@ -2933,14 +2945,60 @@ pub(crate) fn load_reply_sidecar(path: &Path) -> HashMap<String, Value> {
     map
 }
 
-fn export_has_user_text(export: &Value, expected_text: &str) -> bool {
+fn export_has_inflight_delivery(
+    export: &Value,
+    expected_text: &str,
+    logged_completed_turns: usize,
+) -> bool {
     let Some(conversation) = export.get("conversation").and_then(Value::as_array) else {
         return false;
     };
-    // Only consider trailing user messages after the last completed assistant turn
-    let last_assistant_idx = conversation
+
+    let export_completed_turns = conversation
         .iter()
-        .rposition(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"));
+        .filter(|msg| {
+            honk_wire::export::is_message_user_visible(msg)
+                && msg.get("role").and_then(Value::as_str) == Some("assistant")
+        })
+        .count();
+
+    if export_completed_turns > logged_completed_turns {
+        // Goose completed a turn while honkd was stopped or restarting.
+        // Check if the user message for the latest completed turn matches expected_text.
+        let last_assistant_idx = conversation.iter().rposition(|msg| {
+            honk_wire::export::is_message_user_visible(msg)
+                && msg.get("role").and_then(Value::as_str) == Some("assistant")
+        });
+
+        if let Some(a_idx) = last_assistant_idx {
+            // Find the user-visible user message preceding this assistant message
+            for msg in conversation[..a_idx].iter().rev() {
+                if honk_wire::export::is_message_user_visible(msg)
+                    && msg.get("role").and_then(Value::as_str) == Some("user")
+                {
+                    let mut text = String::new();
+                    if let Some(content) = msg.get("content").and_then(Value::as_array) {
+                        for block in content {
+                            if block.get("type").and_then(Value::as_str) == Some("text")
+                                && let Some(t) = block.get("text").and_then(Value::as_str)
+                            {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    return text == expected_text;
+                }
+            }
+        }
+    }
+
+    // Otherwise, every completed turn on goose was already processed by honkd.
+    // So the in-flight prompt, if delivered, must be currently in-flight (trailing
+    // after the last completed assistant turn).
+    let last_assistant_idx = conversation.iter().rposition(|msg| {
+        honk_wire::export::is_message_user_visible(msg)
+            && msg.get("role").and_then(Value::as_str) == Some("assistant")
+    });
 
     let start_idx = match last_assistant_idx {
         Some(idx) => idx + 1,
@@ -2948,7 +3006,9 @@ fn export_has_user_text(export: &Value, expected_text: &str) -> bool {
     };
 
     for msg in &conversation[start_idx..] {
-        if msg.get("role").and_then(Value::as_str) == Some("user") {
+        if honk_wire::export::is_message_user_visible(msg)
+            && msg.get("role").and_then(Value::as_str) == Some("user")
+        {
             let mut text = String::new();
             if let Some(content) = msg.get("content").and_then(Value::as_array) {
                 for block in content {

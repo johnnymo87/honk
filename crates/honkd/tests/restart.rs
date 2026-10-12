@@ -3,7 +3,7 @@ mod common;
 use common::{Honkd, Viewer, new_session, prompt_params};
 use honk_testgoose::{FakeGoose, StubGoose, TcpProxy, Turn};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
@@ -340,6 +340,62 @@ async fn prompt_with_repeated_text_after_completed_turn_reported_not_delivered_o
     assert_eq!(r2["result"]["stopReason"], "cancelled");
     assert_eq!(r2["result"]["_meta"]["honk"]["reason"], "not_delivered");
     assert_eq!(g.model().turn_requests().len(), 1, "model only saw turn 1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_completed_on_upstream_during_honkd_restart_recognized_delivered_and_deduped() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model()
+        .push([Turn::Text(vec!["response while honkd was dead".into()])]);
+
+    let mut h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Send prompt with client_req_id "r_mid"
+    v.request(
+        "session/prompt",
+        prompt_params(&sid, "test prompt", Some("r_mid")),
+    )
+    .await;
+
+    // Wait until model receives the request
+    let wait_start = Instant::now();
+    while g.model().turn_requests().is_empty() && wait_start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Kill honkd while turn is processing
+    h.kill9();
+
+    // Give stub goose enough time to complete the turn in SQLite
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart honkd
+    h.restart().await;
+
+    // Connect new viewer and send prompt with the same client_req_id "r_mid"
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "test prompt", Some("r_mid")),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["text"],
+        "response while honkd was dead"
+    );
+    assert_eq!(g.model().turn_requests().len(), 1, "model only saw 1 turn");
 }
 
 #[tokio::test(flavor = "multi_thread")]

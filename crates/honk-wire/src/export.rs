@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-fn is_message_user_visible(msg: &Value) -> bool {
+pub fn is_message_user_visible(msg: &Value) -> bool {
     let meta = match msg.get("metadata") {
         Some(m) => m,
         None => return true,
