@@ -41,8 +41,11 @@ async fn goose_restart_mid_turn_cancelled_reloaded_and_retry_single() {
     let r = v.response_timeout(&id, SECS * 3).await;
     assert_eq!(r["result"]["stopReason"], "cancelled");
     assert_eq!(r["result"]["_meta"]["honk"]["reason"], "upstream_restart");
-    v.wait_for(|f| is_method(f, honk_wire::method::REPLAY_DONE))
-        .await;
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(2))
+    })
+    .await;
     assert_eq!(
         v.blocks.user_texts(),
         vec!["first".to_string()],
@@ -97,17 +100,29 @@ async fn degraded_after_restart_refusal_test() {
     fake.advertise_patched(false);
     fake.restart().await;
 
-    // Wait briefly for control connection to reconnect and detect unpatched upstream
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Poll until control connection reconnects and detects unpatched upstream
+    let start = Instant::now();
+    let resp = loop {
+        let pid = v
+            .request(
+                "session/prompt",
+                prompt_params(&sid, "test unpatched prompt", Some("crid-unpatched")),
+            )
+            .await;
 
-    let pid = v
-        .request(
-            "session/prompt",
-            prompt_params(&sid, "test unpatched prompt", Some("crid-unpatched")),
-        )
-        .await;
+        let r = v.response_timeout(&pid, SECS).await;
+        if r.pointer("/error/code").and_then(Value::as_i64) == Some(-32000)
+            && r.pointer("/error/message").and_then(Value::as_str)
+                == Some("upstream goose is no longer patched")
+        {
+            break r;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("timed out waiting for unpatched refusal: {r:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
-    let resp = v.response_timeout(&pid, SECS).await;
     assert_eq!(
         resp.pointer("/error/code").and_then(Value::as_i64),
         Some(-32000),
@@ -264,5 +279,262 @@ async fn unviewed_session_lazily_reactivated_on_first_prompt() {
     assert!(
         state2["sessions"].get(&sid2).is_some(),
         "session 2 is held in state after lazy activation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn synthesized_active_run_id_null_reaches_legacy_viewer() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Send a prompt on legacy viewer to establish a run
+    fake.script_frames(vec![json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": {
+                    "goose": {
+                        "activeRunId": "run_legacy_test"
+                    }
+                }
+            }
+        }
+    })]);
+
+    let req_id = v
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": &sid,
+                "prompt": [{ "type": "text", "text": "hello legacy" }]
+            }),
+        )
+        .await;
+
+    // Wait for activeRunId to be announced
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                == Some("run_legacy_test")
+    })
+    .await;
+
+    // Goose restarts!
+    fake.restart().await;
+
+    // Legacy viewer must receive session_info_update with activeRunId: null
+    let null_frame = v
+        .wait_for(|f| {
+            f.pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("session_info_update")
+                && f.pointer("/params/update/_meta/goose/activeRunId") == Some(&Value::Null)
+        })
+        .await;
+
+    // Confirm that honk metadata was stripped for legacy viewer
+    assert!(
+        null_frame.pointer("/params/_meta/honk").is_none(),
+        "legacy viewer frame must not contain honk metadata: {null_frame:?}"
+    );
+
+    // Prompt response is cancelled
+    let resp = v.response_timeout(&req_id, SECS * 2).await;
+    assert_eq!(resp["result"]["stopReason"], "cancelled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reactivation_permanent_failure_missing_session_terminates_actor() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Remove session from FakeGoose so session/list will not contain it after restart
+    fake.remove_session(&sid);
+    fake.restart().await;
+
+    // Honk-aware viewer receives _honk/evicted
+    let evicted = v
+        .wait_for(|f| is_method(f, honk_wire::method::EVICTED))
+        .await;
+    assert_eq!(evicted["params"]["sessionId"], sid);
+
+    // Verify actor is removed from state.sessions and retired_epochs is recorded
+    let state_bytes = std::fs::read(h.state_dir.path().join("state.json")).expect("read state");
+    let state: Value = serde_json::from_slice(&state_bytes).expect("parse state");
+    assert!(
+        state["sessions"].get(&sid).is_none(),
+        "session must be removed from state.sessions on permanent reactivation failure"
+    );
+    assert!(
+        state["retired_epochs"].get(&sid).is_some(),
+        "session retired_epoch must be recorded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_reconnect_drains_pending_control_oneshots() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    // Induce control connection failure
+    fake.restart().await;
+
+    // Immediately send session/list request on viewer: should return error quickly (< 2s), NOT wait 30s
+    let start = Instant::now();
+    let resp = v.call("session/list", json!({})).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "control_request must not wait for 30s timeout; took {elapsed:?}"
+    );
+    assert!(
+        resp["error"].is_object(),
+        "must return an error response: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_connection_half_open_byte_watchdog() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    // Disable keepalives so stream goes silent
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    // Spawn honkd with stream-dead-secs 2
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
+
+    // Wait > 2.5s for the watchdog to detect dead control connection and trigger reconnect
+    tokio::time::sleep(Duration::from_millis(2700)).await;
+
+    let stderr = h.stderr_text();
+    assert!(
+        stderr.contains("Control connection watchdog detected dead/half-open stream"),
+        "control watchdog must trigger reconnect; stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn steer_post_404_triggers_handle_gone() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Set steer status to 404
+    fake.set_steer_status(Some(reqwest::StatusCode::NOT_FOUND));
+
+    let steer_resp = v
+        .call(
+            "_goose/unstable/session/steer",
+            json!({
+                "sessionId": &sid,
+                "prompt": [{ "type": "text", "text": "test steer" }]
+            }),
+        )
+        .await;
+
+    assert!(
+        steer_resp["error"].is_object(),
+        "steer 404 returns error to caller: {steer_resp:?}"
+    );
+
+    // Session handles gone and re-activates with epoch 2
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(2))
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuilding_session_queues_requests_fifo_and_serves_attaches() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v1 = Viewer::connect(&h).await;
+    let sid = new_session(&mut v1, ".").await;
+
+    v1.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Goose restarts!
+    fake.restart().await;
+
+    // While session is rebuilding, a new viewer attaches: attach must be served immediately from log!
+    let mut v2 = Viewer::connect(&h).await;
+    let load_res = v2
+        .call(
+            "session/load",
+            json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+        )
+        .await;
+    assert!(
+        load_res["result"].is_object(),
+        "attach during rebuilding must succeed: {load_res:?}"
+    );
+
+    // Queue a prompt during rebuilding on v1
+    fake.script_prompt(vec!["prompt drained ok".into()]);
+    let pid = v1
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "queued during rebuild", Some("crid-queued")),
+        )
+        .await;
+
+    // Both viewers must receive replay_done for epoch 2 once reactivation completes
+    v1.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(2))
+    })
+    .await;
+
+    // The queued prompt must be drained and succeed!
+    let presp = v1.response_timeout(&pid, SECS * 3).await;
+    assert_eq!(
+        presp.pointer("/result/stopReason").and_then(Value::as_str),
+        Some("end_turn"),
+        "queued prompt must be drained and succeed: {presp:?}"
     );
 }

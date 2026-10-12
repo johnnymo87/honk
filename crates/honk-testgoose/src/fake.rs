@@ -261,6 +261,10 @@ impl FakeGoose {
             .store(patched, Ordering::SeqCst);
     }
 
+    pub fn remove_session(&self, sid: &str) {
+        self.state.all_sessions.lock().unwrap().remove(sid);
+    }
+
     pub fn gap_on_next_resume(&self, sid: &str) {
         self.state
             .gap_on_next_resume

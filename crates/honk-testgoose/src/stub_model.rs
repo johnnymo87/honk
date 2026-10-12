@@ -21,6 +21,8 @@ pub enum Turn {
     },
     /// wait until `StubModel::open(name)` before answering the NEXT turn
     Gate(String, Box<Turn>),
+    #[doc(hidden)]
+    GateWithEpoch(String, Box<Turn>, u64),
 }
 
 #[derive(Clone)]
@@ -28,7 +30,7 @@ struct AppState {
     turns: Arc<Mutex<VecDeque<Turn>>>,
     gates: Arc<Mutex<HashSet<String>>>,
     gate_notify: Arc<Notify>,
-    open_all: Arc<std::sync::atomic::AtomicBool>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
     turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -40,7 +42,7 @@ pub struct StubModel {
     pub(crate) turns: Arc<Mutex<VecDeque<Turn>>>,
     pub(crate) gates: Arc<Mutex<HashSet<String>>>,
     pub(crate) gate_notify: Arc<Notify>,
-    pub(crate) open_all: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) requests: Arc<Mutex<Vec<serde_json::Value>>>,
     pub(crate) turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     pub(crate) classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -58,7 +60,7 @@ impl StubModel {
         let turns = Arc::new(Mutex::new(VecDeque::new()));
         let gates = Arc::new(Mutex::new(HashSet::new()));
         let gate_notify = Arc::new(Notify::new());
-        let open_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let turn_requests = Arc::new(Mutex::new(Vec::new()));
         let classification_log = Arc::new(Mutex::new(Vec::new()));
@@ -68,7 +70,7 @@ impl StubModel {
             turns: turns.clone(),
             gates: gates.clone(),
             gate_notify: gate_notify.clone(),
-            open_all: open_all.clone(),
+            epoch: epoch.clone(),
             requests: requests.clone(),
             turn_requests: turn_requests.clone(),
             classification_log: classification_log.clone(),
@@ -95,7 +97,7 @@ impl StubModel {
             turns,
             gates,
             gate_notify,
-            open_all,
+            epoch,
             requests,
             turn_requests,
             classification_log,
@@ -109,9 +111,14 @@ impl StubModel {
     }
 
     pub fn push(&self, turns: impl IntoIterator<Item = Turn>) {
+        let current_epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
         let mut q = self.turns.lock().unwrap();
         for t in turns {
-            q.push_back(t);
+            let stamped = match t {
+                Turn::Gate(name, inner) => Turn::GateWithEpoch(name, inner, current_epoch),
+                other => other,
+            };
+            q.push_back(stamped);
         }
     }
 
@@ -121,15 +128,8 @@ impl StubModel {
     }
 
     pub fn open_all(&self) {
-        self.open_all
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.gate_notify.notify_waiters();
-    }
-
-    pub fn reset_gates(&self) {
-        self.open_all
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.gates.lock().unwrap().clear();
     }
 
     pub fn requests(&self) -> Vec<serde_json::Value> {
@@ -249,13 +249,20 @@ async fn chat_completions(
     // 4. Resolve gates: race-free wait armed before checking gate set, bounded by 60s timeout
     let mut resolved_turn = turn;
     let gate_deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while let Turn::Gate(gate_name, inner) = resolved_turn {
+    while matches!(resolved_turn, Turn::Gate(..) | Turn::GateWithEpoch(..)) {
+        let (gate_name, inner, gate_epoch) = match resolved_turn {
+            Turn::Gate(name, inner) => (name, inner, None),
+            Turn::GateWithEpoch(name, inner, ep) => (name, inner, Some(ep)),
+            _ => unreachable!(),
+        };
+
         loop {
             let notified = state.gate_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if state.open_all.load(std::sync::atomic::Ordering::SeqCst)
+            let current_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
+            if gate_epoch.is_some_and(|ep| ep < current_epoch)
                 || state.gates.lock().unwrap().contains(&gate_name)
             {
                 break;
@@ -384,7 +391,9 @@ fn build_json_response(turn: Turn) -> (StatusCode, Json<serde_json::Value>) {
                 }
             })),
         ),
-        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
+        Turn::Gate(_, _) | Turn::GateWithEpoch(_, _, _) => {
+            unreachable!("gates must be resolved")
+        }
     }
 }
 
@@ -519,7 +528,9 @@ fn build_sse_response(turn: Turn) -> Response {
 
             frames.push("data: [DONE]\n\n".to_string());
         }
-        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
+        Turn::Gate(_, _) | Turn::GateWithEpoch(_, _, _) => {
+            unreachable!("gates must be resolved")
+        }
     }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);

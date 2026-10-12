@@ -242,6 +242,32 @@ impl Hub {
             hub_for_rx.trigger_control_reconnect();
         });
 
+        let hub_watchdog = hub.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if !hub_watchdog
+                    .is_control_connected
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    continue;
+                }
+                let dead_secs = Duration::from_secs(hub_watchdog.args.stream_dead_secs);
+                let handle = hub_watchdog.control.read().await.clone();
+                let is_dead = handle
+                    .last_byte_at(&honk_upstream::StreamKey::Conn)
+                    .map(|t| t.elapsed() > dead_secs)
+                    .unwrap_or(false);
+                if is_dead {
+                    tracing::warn!(
+                        "Control connection watchdog detected dead/half-open stream; reconnecting"
+                    );
+                    hub_watchdog.trigger_control_reconnect();
+                }
+            }
+        });
+
         let held_sessions: Vec<(String, crate::state::HeldSession)> = {
             let s = hub.state.lock().await;
             s.sessions
@@ -407,6 +433,14 @@ impl Hub {
         }
         self.is_control_connected
             .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Drain any pending control oneshots so callers don't wait for 30s timeout
+        let pending = self.pending_control.clone();
+        tokio::spawn(async move {
+            let mut p = pending.lock().await;
+            p.clear();
+        });
+
         let hub = self.arc();
         tokio::spawn(async move {
             hub.run_control_reconnect().await;

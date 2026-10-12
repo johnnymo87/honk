@@ -40,6 +40,17 @@ pub struct AttachSnapshot {
     pub pending: Vec<crate::state::PendingRequest>,
 }
 
+pub struct ReactivationData {
+    pub conn_id: String,
+    pub up_handle: UpstreamHandle,
+    pub event_rx: EventRx,
+    pub new_log: SessionLog,
+    pub next_epoch: u64,
+    pub load_reply: Value,
+    pub keys: HashSet<honk_wire::BlockKey>,
+    pub initial_events: Vec<Event>,
+}
+
 pub enum SessionMsg {
     // from viewers / hub
     Attach {
@@ -104,6 +115,11 @@ pub enum SessionMsg {
         upstream_id: String,
     },
     MarkPendingStale,
+    ReactivationComplete(Box<ReactivationData>),
+    ReactivationFailed {
+        reason: String,
+        permanent: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -627,20 +643,16 @@ impl Session {
             Err(_) => None,
         };
         if let Some(frame) = stamped_opt {
-            self.fan_out_stamped(&frame, true);
+            // Synthesized activeRunId:null reaches both honk-aware and legacy viewers (pigeon tracks runs by it)
+            self.fan_out_stamped(&frame, false);
         }
 
         // Step 4: never auto-resend
 
-        // Step 5: move old conn id to orphans and drop it without DELETE (and clean orphan list — it's 404)
-        let old_conn_id = self.up.conn_id().to_string();
-        {
-            let mut s = self.state_store.lock().await;
-            let _ = s.mutate(|st| {
-                st.orphan_conns.push(old_conn_id.clone());
-                st.orphan_conns.retain(|id| id != &old_conn_id);
-            });
-        }
+        // Step 5: The dead connection returned 404 (Not Found), meaning upstream goose has
+        // already dropped it from memory (e.g. process restart). We do not send DELETE upstream,
+        // and we do not record it in state.orphan_conns (orphans are cleaned up by sending DELETE
+        // at boot, which would only fail with 404 again). We simply drop the dead handle in-memory.
 
         // Step 6: re-activate (A16)
         // Sessions with attached viewers re-activate 500 ms apart; others lazily on first use.
@@ -669,23 +681,16 @@ impl Session {
 
         self.state = ActorState::Rebuilding;
 
-        // Wait for control connection to become available
-        self.hub.wait_for_control_connected().await;
+        // Spawn reactivation task so the actor never awaits recovery inline (plan ~80-84)
+        let sid = self.sid.clone();
+        let hub = self.hub.clone();
+        let state_dir = self.state_dir.clone();
+        let state_store = self.state_store.clone();
+        let self_tx = self.self_tx.clone();
 
-        if self.hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
-            tracing::error!(
-                "upstream goose is no longer patched; cannot re-activate session {}",
-                self.sid
-            );
-            return;
-        }
-
-        // Acquire staggered re-activation slot (500 ms apart)
-        self.hub.acquire_reactivation_slot().await;
-
-        if let Err(e) = self.reactivate_in_place().await {
-            tracing::error!("Session {} re-activation failed: {e:#}", self.sid);
-        }
+        tokio::spawn(async move {
+            Self::run_reactivation_task(sid, hub, state_dir, state_store, self_tx).await;
+        });
     }
 
     async fn resolve_inflight_on_restart(&mut self) {
@@ -725,215 +730,240 @@ impl Session {
         });
     }
 
-    async fn reactivate_in_place(&mut self) -> anyhow::Result<()> {
-        let stored_cwd = self
-            .hub
-            .get_stored_cwd(&self.sid)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    async fn run_reactivation_task(
+        sid: String,
+        hub: Arc<Hub>,
+        state_dir: PathBuf,
+        state_store: Arc<Mutex<crate::state::StateStore>>,
+        self_tx: mpsc::Sender<SessionMsg>,
+    ) {
+        // 1. Wait for control connection to become available
+        hub.wait_for_control_connected().await;
 
-        let init_opts = UpstreamOpts {
-            allow_production: self.hub.args.allow_production_upstream,
-            client_capabilities: serde_json::json!({
-                "fs": {
-                    "readTextFile": false,
-                    "writeTextFile": false
-                },
-                "terminal": false
-            }),
-        };
-        let recorder = if let Some(rec_path) = &self.hub.args.record {
-            let redactor = Redactor::from_env();
-            Recorder::file(rec_path, redactor).unwrap_or_else(|_| Recorder::disabled())
-        } else {
-            Recorder::disabled()
-        };
-
-        let mut session_upstream = Upstream::initialize_with(
-            &self.hub.upstream_url,
-            self.hub.upstream_secret.clone(),
-            recorder,
-            &init_opts,
-        )
-        .await?;
-
-        let conn_id = session_upstream.conn_id().to_string();
-
-        {
-            let mut s = self.state_store.lock().await;
-            s.mutate(|st| {
-                st.orphan_conns.push(conn_id.clone());
-            })?;
+        // 2. Check if upstream unpatched is refused (permanent failure)
+        if hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
+            let _ = self_tx
+                .send(SessionMsg::ReactivationFailed {
+                    reason: "upstream goose is no longer patched".to_string(),
+                    permanent: true,
+                })
+                .await;
+            return;
         }
 
-        session_upstream
-            .subscribe_with(
-                None,
-                SubscribeOpts {
-                    takeover: true,
-                    resume_after: Some(0),
-                },
-            )
-            .await?;
+        // 3. Acquire staggered reactivation slot (500 ms apart)
+        hub.acquire_reactivation_slot().await;
 
-        session_upstream
-            .subscribe_with(
-                Some(&self.sid),
-                SubscribeOpts {
-                    takeover: true,
-                    resume_after: Some(0),
-                },
-            )
-            .await?;
+        // 4. Bounded retries on transient errors (up to 5 attempts with backoff)
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut backoff = Duration::from_millis(200);
 
-        let load_reply = session_upstream
-            .call(
-                "session/load",
-                json!({
-                    "sessionId": &self.sid,
-                    "cwd": stored_cwd,
-                    "mcpServers": []
-                }),
-                Some(&self.sid),
-                Duration::from_secs(30),
-            )
-            .await?;
+        loop {
+            attempts += 1;
 
-        let (up_handle, mut event_rx) = session_upstream.split();
+            let stored_cwd = match hub.get_stored_cwd(&sid).await {
+                Ok(cwd) => cwd,
+                Err(e) => {
+                    if e.code == -32602 {
+                        // Session not found in session/list -> permanent failure
+                        let _ = self_tx
+                            .send(SessionMsg::ReactivationFailed {
+                                reason: format!("session not found upstream: {e:#}"),
+                                permanent: true,
+                            })
+                            .await;
+                        return;
+                    }
+                    if attempts >= max_attempts {
+                        let _ = self_tx
+                            .send(SessionMsg::ReactivationFailed {
+                                reason: format!(
+                                    "failed to get stored cwd after {attempts} attempts: {e:#}"
+                                ),
+                                permanent: true,
+                            })
+                            .await;
+                        return;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+            };
 
-        let mut initial_events = Vec::new();
-        while let Ok(ev) = event_rx.try_recv() {
-            if let honk_upstream::Event::Frame(key, frame, _) = &ev
-                && key == &honk_upstream::StreamKey::Session(self.sid.clone())
-                && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
-            {
-                continue;
-            }
-            initial_events.push(ev);
-        }
-
-        let export_val = self.hub.export(&self.sid).await?;
-        let frames = honk_wire::export::to_updates(&export_val, &self.sid);
-        let mut keys = std::collections::HashSet::new();
-        for f in &frames {
-            if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key) {
-                keys.insert(k);
-            }
-        }
-
-        let (new_log, next_epoch) = create_new_generation_from_export(
-            &self.sid,
-            &self.state_dir,
-            &self.state_store,
-            frames,
-            keys.clone(),
-            Vec::new(),
-            None,
-            None,
-        )
-        .await?;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        {
-            let mut s = self.state_store.lock().await;
-            let sid_clone = self.sid.clone();
-            let conn_id_clone = conn_id.clone();
-            let stored_cwd_clone = stored_cwd.clone();
-            let load_reply_clone = load_reply.clone();
-            s.mutate(|st| {
-                st.orphan_conns.retain(|id| id != &conn_id_clone);
-                st.retired_epochs.remove(&sid_clone);
-                st.sessions.insert(
-                    sid_clone,
-                    crate::state::HeldSession {
-                        conn_id: conn_id_clone,
-                        cwd: stored_cwd_clone,
-                        epoch: next_epoch,
-                        last_conn_event_id: None,
-                        pending: Vec::new(),
-                        inflight: None,
-                        last_active_unix: now,
-                        init_result: Some(load_reply_clone),
-                    },
-                );
-            })?;
-        }
-
-        let handle = crate::hub::SessionHandle {
-            sid: self.sid.clone(),
-            conn_id: conn_id.clone(),
-            tx: self.self_tx.clone(),
-        };
-        self.hub
-            .sessions
-            .write()
-            .await
-            .insert(self.sid.clone(), handle);
-
-        self.up = up_handle;
-        self.events = event_rx;
-        self.log = new_log;
-        self.last_processed_session_id = self.log.last_upstream_id();
-        self.last_processed_conn_id = None;
-        self.init_result = load_reply;
-        self.suppressed_keys = keys;
-
-        let head = self.log.head();
-        let reset_frame = json!({
-            "jsonrpc": "2.0",
-            "method": "_honk/reset",
-            "params": {
-                "sessionId": self.sid,
-                "epoch": head.epoch,
-            }
-        });
-        let replay_done_frame = json!({
-            "jsonrpc": "2.0",
-            "method": "_honk/replay_done",
-            "params": {
-                "sessionId": self.sid,
-                "epoch": head.epoch,
-                "seq": head.seq,
-            }
-        });
-
-        let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
-        msgs.push(axum::extract::ws::Message::Text(
-            reset_frame.to_string().into(),
-        ));
-        for entry in self.log.entries() {
-            msgs.push(axum::extract::ws::Message::Text(
-                entry.frame.to_string().into(),
-            ));
-        }
-        msgs.push(axum::extract::ws::Message::Text(
-            replay_done_frame.to_string().into(),
-        ));
-
-        for (tx, is_honk_aware) in self.viewers.values() {
-            if *is_honk_aware {
-                let batch = crate::viewer::ReplayBatch {
-                    session_id: self.sid.clone(),
-                    head: head.clone(),
-                    msgs: msgs.clone(),
-                    done_tx: None,
+            let result: Result<ReactivationData, anyhow::Error> = async {
+                let init_opts = UpstreamOpts {
+                    allow_production: hub.args.allow_production_upstream,
+                    client_capabilities: json!({
+                        "fs": {
+                            "readTextFile": false,
+                            "writeTextFile": false
+                        },
+                        "terminal": false
+                    }),
                 };
-                let _ = tx.send_replay(batch);
+                let recorder = if let Some(rec_path) = &hub.args.record {
+                    let redactor = Redactor::from_env();
+                    Recorder::file(rec_path, redactor).unwrap_or_else(|_| Recorder::disabled())
+                } else {
+                    Recorder::disabled()
+                };
+
+                let mut session_upstream = Upstream::initialize_with(
+                    &hub.upstream_url,
+                    hub.upstream_secret.clone(),
+                    recorder,
+                    &init_opts,
+                )
+                .await?;
+
+                let conn_id = session_upstream.conn_id().to_string();
+
+                {
+                    let mut s = state_store.lock().await;
+                    s.mutate(|st| {
+                        st.orphan_conns.push(conn_id.clone());
+                    })?;
+                }
+
+                session_upstream
+                    .subscribe_with(
+                        None,
+                        SubscribeOpts {
+                            takeover: true,
+                            resume_after: Some(0),
+                        },
+                    )
+                    .await?;
+
+                session_upstream
+                    .subscribe_with(
+                        Some(&sid),
+                        SubscribeOpts {
+                            takeover: true,
+                            resume_after: Some(0),
+                        },
+                    )
+                    .await?;
+
+                let load_reply = session_upstream
+                    .call(
+                        "session/load",
+                        json!({
+                            "sessionId": &sid,
+                            "cwd": stored_cwd,
+                            "mcpServers": []
+                        }),
+                        Some(&sid),
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+
+                let (up_handle, mut event_rx) = session_upstream.split();
+
+                let mut initial_events = Vec::new();
+                while let Ok(ev) = event_rx.try_recv() {
+                    if let honk_upstream::Event::Frame(key, frame, _) = &ev
+                        && key == &honk_upstream::StreamKey::Session(sid.clone())
+                        && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
+                    {
+                        continue;
+                    }
+                    initial_events.push(ev);
+                }
+
+                let export_val = hub.export(&sid).await?;
+                let frames = honk_wire::export::to_updates(&export_val, &sid);
+                let mut keys = HashSet::new();
+                for f in &frames {
+                    if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key) {
+                        keys.insert(k);
+                    }
+                }
+
+                let (new_log, next_epoch) = create_new_generation_from_export(
+                    &sid,
+                    &state_dir,
+                    &state_store,
+                    frames,
+                    keys.clone(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await?;
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                {
+                    let mut s = state_store.lock().await;
+                    let sid_clone = sid.clone();
+                    let conn_id_clone = conn_id.clone();
+                    let stored_cwd_clone = stored_cwd.clone();
+                    let load_reply_clone = load_reply.clone();
+                    s.mutate(|st| {
+                        st.orphan_conns.retain(|id| id != &conn_id_clone);
+                        st.retired_epochs.remove(&sid_clone);
+                        st.sessions.insert(
+                            sid_clone,
+                            crate::state::HeldSession {
+                                conn_id: conn_id_clone,
+                                cwd: stored_cwd_clone,
+                                epoch: next_epoch,
+                                last_conn_event_id: None,
+                                pending: Vec::new(),
+                                inflight: None,
+                                last_active_unix: now,
+                                init_result: Some(load_reply_clone),
+                            },
+                        );
+                    })?;
+                }
+
+                Ok(ReactivationData {
+                    conn_id,
+                    up_handle,
+                    event_rx,
+                    new_log,
+                    next_epoch,
+                    load_reply,
+                    keys,
+                    initial_events,
+                })
+            }
+            .await;
+
+            match result {
+                Ok(data) => {
+                    let _ = self_tx
+                        .send(SessionMsg::ReactivationComplete(Box::new(data)))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "run_reactivation_task for {sid} attempt {attempts} error: {e:#}"
+                    );
+                    if attempts >= max_attempts {
+                        let _ = self_tx
+                            .send(SessionMsg::ReactivationFailed {
+                                reason: format!(
+                                    "reactivation failed after {attempts} attempts: {e:#}"
+                                ),
+                                permanent: true,
+                            })
+                            .await;
+                        return;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
             }
         }
-
-        for ev in initial_events {
-            self.on_upstream(ev).await;
-        }
-
-        self.state = ActorState::Live;
-        self.drain_queued_msgs().await;
-
-        Ok(())
     }
 
     /// Restored inflight delivery check used only at restart/boot time.
@@ -1841,7 +1871,6 @@ impl Session {
                 id,
                 params,
             } => {
-                tracing::info!("Session {} received SessionMsg::Prompt id={id}", self.sid);
                 if self.hub.upstream_unpatched_refused.load(Ordering::SeqCst) {
                     tracing::error!("upstream goose is no longer patched");
                     let err_resp =
@@ -1988,9 +2017,13 @@ impl Session {
                     .await
                 {
                     self.pending_requests.remove(&up_id);
+                    let is_gone = honk_upstream::is_gone(&e);
                     let err_resp =
                         crate::rpc::error(id, -32603, format!("Steer POST failed: {e:#}"), None);
                     self.send_to_viewer(viewer_id, err_resp);
+                    if is_gone {
+                        Box::pin(self.handle_gone()).await;
+                    }
                 }
             }
             SessionMsg::Cancel => {
@@ -2116,9 +2149,13 @@ impl Session {
                     .await
                 {
                     self.pending_requests.remove(&up_id);
+                    let is_gone = honk_upstream::is_gone(&e);
                     let err_resp =
                         crate::rpc::error(id, -32603, format!("Forward POST failed: {e:#}"), None);
                     self.send_to_viewer(viewer_id, err_resp);
+                    if is_gone {
+                        Box::pin(self.handle_gone()).await;
+                    }
                 }
             }
             SessionMsg::Reattached { outcome } => {
@@ -2167,6 +2204,161 @@ impl Session {
                         self.turn
                             .on_prompt_reply(&upstream_id, &synth_reply, &mut self.ids);
                     self.execute_actions(reply_actions).await;
+                }
+            }
+            SessionMsg::ReactivationComplete(data) => {
+                let ReactivationData {
+                    conn_id,
+                    up_handle,
+                    event_rx,
+                    new_log,
+                    next_epoch: _,
+                    load_reply,
+                    keys,
+                    initial_events,
+                } = *data;
+
+                let handle = crate::hub::SessionHandle {
+                    sid: self.sid.clone(),
+                    conn_id,
+                    tx: self.self_tx.clone(),
+                };
+                self.hub
+                    .sessions
+                    .write()
+                    .await
+                    .insert(self.sid.clone(), handle);
+
+                self.up = up_handle;
+                self.events = event_rx;
+                self.log = new_log;
+                self.last_processed_session_id = self.log.last_upstream_id();
+                self.last_processed_conn_id = None;
+                self.init_result = load_reply;
+                self.suppressed_keys = keys;
+
+                let head = self.log.head();
+                let reset_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/reset",
+                    "params": {
+                        "sessionId": self.sid,
+                        "epoch": head.epoch,
+                    }
+                });
+                let replay_done_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": {
+                        "sessionId": self.sid,
+                        "epoch": head.epoch,
+                        "seq": head.seq,
+                    }
+                });
+
+                let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
+                msgs.push(axum::extract::ws::Message::Text(
+                    reset_frame.to_string().into(),
+                ));
+                for entry in self.log.entries() {
+                    msgs.push(axum::extract::ws::Message::Text(
+                        entry.frame.to_string().into(),
+                    ));
+                }
+                msgs.push(axum::extract::ws::Message::Text(
+                    replay_done_frame.to_string().into(),
+                ));
+
+                for (tx, is_honk_aware) in self.viewers.values() {
+                    if *is_honk_aware {
+                        let batch = crate::viewer::ReplayBatch {
+                            session_id: self.sid.clone(),
+                            head: head.clone(),
+                            msgs: msgs.clone(),
+                            done_tx: None,
+                        };
+                        let _ = tx.send_replay(batch);
+                    }
+                }
+
+                for ev in initial_events {
+                    self.on_upstream(ev).await;
+                }
+
+                self.state = ActorState::Live;
+                self.drain_queued_msgs().await;
+            }
+            SessionMsg::ReactivationFailed {
+                reason,
+                permanent: _,
+            } => {
+                tracing::error!("Session {} reactivation failed: {reason}", self.sid);
+                self.state = ActorState::Gone;
+
+                // Remove from hub.sessions
+                self.hub.sessions.write().await.remove(&self.sid);
+
+                // Remove from state.sessions and record retired_epochs
+                let sid = self.sid.clone();
+                let epoch = self.log.head().epoch;
+                {
+                    let mut s = self.state_store.lock().await;
+                    let _ = s.mutate(|st| {
+                        if let Some(held) = st.sessions.remove(&sid) {
+                            st.retired_epochs.insert(sid.clone(), held.epoch);
+                        } else {
+                            st.retired_epochs.insert(sid.clone(), epoch);
+                        }
+                    });
+                }
+
+                // Fail all finalizing waiters with -32000
+                let finalizing = std::mem::take(&mut self.finalizing_waiters);
+                for (_, waiters) in finalizing {
+                    for w in waiters {
+                        let err_resp = crate::rpc::error(
+                            w.downstream_id.clone(),
+                            -32000,
+                            format!("Session is gone: {reason}"),
+                            None,
+                        );
+                        self.send_to_owner(&w, err_resp);
+                    }
+                }
+
+                // Fail all queued msgs with -32000
+                let msgs = std::mem::take(&mut self.queued_msgs);
+                for m in msgs {
+                    match m {
+                        SessionMsg::Prompt { viewer_id, id, .. }
+                        | SessionMsg::Steer { viewer_id, id, .. }
+                        | SessionMsg::Forward { viewer_id, id, .. } => {
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32000,
+                                format!("Session is gone: {reason}"),
+                                None,
+                            );
+                            self.send_to_viewer(viewer_id, err_resp);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Notify honk-aware viewers with _honk/evicted
+                let evicted_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": honk_wire::method::EVICTED,
+                    "params": {
+                        "sessionId": self.sid,
+                    }
+                });
+                for (tx, is_honk_aware) in self.viewers.values() {
+                    if *is_honk_aware {
+                        let _ = tx.send_frame(axum::extract::ws::Message::Text(
+                            evicted_frame.to_string().into(),
+                        ));
+                    }
                 }
             }
         }
