@@ -1596,15 +1596,20 @@ impl Session {
                         let sid = self.sid.clone();
                         let mut s = self.state_store.lock().await;
                         let _ = s.mutate(|st| {
-                            // Done entries are written on every Reply
-                            st.ledger.insert(
-                                crid.clone(),
-                                crate::state::LedgerEntry::Done {
-                                    session: sid,
-                                    response: resp.clone(),
-                                    done_unix: now,
-                                },
-                            );
+                            // Only update to Done if previously InFlight (e.g. busy prompt rejections are not persisted)
+                            if matches!(
+                                st.ledger.get(crid),
+                                Some(crate::state::LedgerEntry::InFlight { .. })
+                            ) {
+                                st.ledger.insert(
+                                    crid.clone(),
+                                    crate::state::LedgerEntry::Done {
+                                        session: sid,
+                                        response: resp.clone(),
+                                        done_unix: now,
+                                    },
+                                );
+                            }
                         });
                         drop(s);
 
