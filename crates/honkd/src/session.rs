@@ -965,21 +965,29 @@ impl Session {
                     let sid = self.sid.clone();
                     if let Some(inf) = self.turn.inflight.as_ref() {
                         let persisted = inf.to_persisted();
-                        let mut s = self.state_store.lock().await;
-                        let _ = s.mutate(|st| {
-                            if let Some(h) = st.sessions.get_mut(&sid) {
-                                h.inflight = Some(persisted.clone());
-                            }
-                            for crid in &persisted.client_req_ids {
-                                st.ledger.insert(
-                                    crid.clone(),
-                                    crate::state::LedgerEntry::InFlight {
-                                        session: sid.clone(),
-                                        upstream_id: upstream_id.clone(),
-                                    },
-                                );
-                            }
-                        });
+                        let mutate_res = {
+                            let mut s = self.state_store.lock().await;
+                            s.mutate(|st| {
+                                if let Some(h) = st.sessions.get_mut(&sid) {
+                                    h.inflight = Some(persisted.clone());
+                                }
+                                for crid in &persisted.client_req_ids {
+                                    st.ledger.insert(
+                                        crid.clone(),
+                                        crate::state::LedgerEntry::InFlight {
+                                            session: sid.clone(),
+                                            upstream_id: upstream_id.clone(),
+                                        },
+                                    );
+                                }
+                            })
+                        };
+                        if let Err(e) = mutate_res {
+                            tracing::error!(
+                                "Session {}: failed to persist inflight before POST: {e:#}",
+                                sid
+                            );
+                        }
                     }
 
                     #[cfg(any(test, debug_assertions))]
@@ -1007,9 +1015,9 @@ impl Session {
 
                         // Prompt POST failed -> remove failed prompt's ledger entries AND clear inflight in one mutate
                         let failed_inf = self.turn.inflight.as_ref().map(|i| i.to_persisted());
-                        {
+                        let mutate_res = {
                             let mut s = self.state_store.lock().await;
-                            let _ = s.mutate(|st| {
+                            s.mutate(|st| {
                                 if let Some(h) = st.sessions.get_mut(&sid) {
                                     h.inflight = None;
                                 }
@@ -1018,7 +1026,13 @@ impl Session {
                                         st.ledger.remove(crid);
                                     }
                                 }
-                            });
+                            })
+                        };
+                        if let Err(e) = mutate_res {
+                            tracing::error!(
+                                "Session {}: failed to clear inflight after prompt POST error: {e:#}",
+                                sid
+                            );
                         }
 
                         let err_val = json!({
@@ -1377,13 +1391,19 @@ impl Session {
                 if !self.pending_server_requests.is_empty() {
                     let pending_list = std::mem::take(&mut self.pending_server_requests);
                     let sid = self.sid.clone();
-                    {
+                    let mutate_res = {
                         let mut s = self.state_store.lock().await;
-                        let _ = s.mutate(|st| {
+                        s.mutate(|st| {
                             if let Some(h) = st.sessions.get_mut(&sid) {
                                 h.pending.clear();
                             }
-                        });
+                        })
+                    };
+                    if let Err(e) = mutate_res {
+                        tracing::error!(
+                            "Session {}: failed to clear pending requests on cancel: {e:#}",
+                            sid
+                        );
                     }
                     let honk_vids: Vec<ViewerId> = self
                         .viewers
@@ -1411,7 +1431,7 @@ impl Session {
                             "params": {
                                 "sessionId": sid,
                                 "requestId": p.id,
-                                "reason": "answered",
+                                "reason": "cancelled",
                             }
                         });
                         for vid in &honk_vids {
@@ -1666,16 +1686,26 @@ impl Session {
             received_unix: now,
         };
 
-        // Persist via state.mutate BEFORE offering
+        // Persist via state.mutate BEFORE offering per ground rules.
+        // If disk persistence fails, log and return early without adding to memory or
+        // offering to viewers. This allows a subsequent replayed frame to retry persistence.
         let sid = self.sid.clone();
         let pending_clone = pending_req.clone();
-        {
+        let mutate_res = {
             let mut s = self.state_store.lock().await;
-            let _ = s.mutate(|st| {
+            s.mutate(|st| {
                 if let Some(h) = st.sessions.get_mut(&sid) {
                     h.pending.push(pending_clone);
                 }
-            });
+            })
+        };
+        if let Err(e) = mutate_res {
+            tracing::error!(
+                "Session {}: failed to persist pending request {} before offer: {e:#}",
+                self.sid,
+                req_id
+            );
+            return;
         }
         self.pending_server_requests.push(pending_req);
 
@@ -1686,6 +1716,25 @@ impl Session {
         }
     }
 
+    // Crash window safety note:
+    // We execute up.respond BEFORE removing the pending request from persistent state (state.mutate).
+    // If honkd crashes after up.respond succeeds but before state removal completes, the pending request
+    // remains on disk and will be restored on restart and re-offered to viewers. A subsequent answer will
+    // be sent upstream again with up.respond.
+    //
+    // As verified in goose source:
+    // - vendor/agent-client-protocol-http/src/http_server.rs:183-186:
+    //   POST /acp accepts any valid JSON-RPC response frame and returns HTTP 202 Accepted via
+    //   connection.send_frame_to_agent.
+    // - crates/goose/src/acp/server.rs:1606-1632:
+    //   cx.send_request(permission_request).on_receiving_result(...) completes when the first result arrives.
+    // - vendor/agent-client-protocol-http/src/connection.rs:373-383:
+    //   The response route is removed once completed; subsequent response frames for an already-resolved
+    //   request id are discarded without error.
+    //
+    // Therefore, a duplicate upstream answer is completely harmless. Conversely, if we removed from state
+    // before up.respond succeeded and crashed, the pending request would be permanently lost from honkd while
+    // goose remained parked forever waiting for a response. Thus, respond-then-remove is strictly safer.
     async fn handle_server_request_answer(&mut self, viewer_id: ViewerId, frame: Value) {
         let resp_id = match frame.get("id") {
             Some(id) if !id.is_null() => id.clone(),
@@ -1706,37 +1755,77 @@ impl Session {
             return;
         };
 
-        let pending = self.pending_server_requests.remove(idx);
+        // Note: Do not pop from pending_server_requests yet! If up.respond fails with 404/Gone,
+        // on_reattach_failed -> mark_pending_stale needs this request in the list to broadcast "stale".
+        // If up.respond fails with a non-gone error, we keep it pending and re-offer it.
+        let pending = self.pending_server_requests[idx].clone();
         let sid = self.sid.clone();
         let up_id = pending.id.clone();
-
-        // 1. First viewer answer goes upstream with up.respond(id, result, Some(sid)) on this connection
         let result = frame.get("result").cloned().unwrap_or(Value::Null);
-        if let Err(e) = self.up.respond(up_id.clone(), result, Some(&sid)).await {
+
+        // 1. First viewer answer goes upstream with up.respond(id, result, Some(sid)) on this connection.
+        // Include one bounded retry for transient errors.
+        let mut respond_res = self
+            .up
+            .respond(up_id.clone(), result.clone(), Some(&sid))
+            .await;
+        if let Err(ref e) = respond_res
+            && !honk_upstream::is_gone(e)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            respond_res = self.up.respond(up_id.clone(), result, Some(&sid)).await;
+        }
+
+        if let Err(e) = respond_res {
             tracing::error!(
                 "Session {}: failed to send upstream respond for id {}: {e:#}",
                 self.sid,
                 up_id
             );
             if honk_upstream::is_gone(&e) {
+                // Request is still in pending_server_requests, so mark_pending_stale will find it
+                // and broadcast "stale" to viewers.
                 self.on_reattach_failed(true, e.to_string()).await;
                 return;
             }
+
+            // On non-gone failure: keep it pending in memory and state, do not broadcast request_resolved.
+            // Re-offer the request verbatim to the answering viewer. A JSON-RPC response cannot receive
+            // an error reply, so re-offering the request frame informs the viewer that the request is still pending.
+            let pending_frame = json!({
+                "jsonrpc": "2.0",
+                "id": pending.id,
+                "method": pending.method,
+                "params": pending.params,
+            });
+            self.send_to_viewer(viewer_id, pending_frame);
+            return;
         }
 
-        // 2. Remove from persistent state
-        {
+        // 2. Success: remove from in-memory pending_server_requests
+        self.pending_server_requests
+            .retain(|p| !honk_upstream::rpc_id_matches(&p.id, &up_id));
+
+        // 3. Remove from persistent state
+        let mutate_res = {
             let mut s = self.state_store.lock().await;
-            let _ = s.mutate(|st| {
+            s.mutate(|st| {
                 if let Some(h) = st.sessions.get_mut(&sid) {
                     h.pending
                         .retain(|p| !honk_upstream::rpc_id_matches(&p.id, &up_id));
                 }
-            });
+            })
+        };
+        if let Err(e) = mutate_res {
+            tracing::error!(
+                "Session {}: failed to remove answered pending request {} from state: {e:#}",
+                self.sid,
+                up_id
+            );
         }
         self.recently_resolved.insert(up_id.to_string());
 
-        // 3. Send other honk-aware viewers _honk/request_resolved{reason:"answered"}
+        // 4. Send other honk-aware viewers _honk/request_resolved{reason:"answered"}
         let resolved_frame = json!({
             "jsonrpc": "2.0",
             "method": honk_wire::method::REQUEST_RESOLVED,
@@ -1772,13 +1861,19 @@ impl Session {
         let pending_list = std::mem::take(&mut self.pending_server_requests);
         let sid = self.sid.clone();
 
-        {
+        let mutate_res = {
             let mut s = self.state_store.lock().await;
-            let _ = s.mutate(|st| {
+            s.mutate(|st| {
                 if let Some(h) = st.sessions.get_mut(&sid) {
                     h.pending.clear();
                 }
-            });
+            })
+        };
+        if let Err(e) = mutate_res {
+            tracing::error!(
+                "Session {}: failed to clear pending requests in state on stale: {e:#}",
+                sid
+            );
         }
 
         let honk_vids: Vec<ViewerId> = self

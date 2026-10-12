@@ -492,3 +492,265 @@ async fn steer_probe_post_failure_404_transitions_to_gone() {
         Some("upstream_gone")
     );
 }
+
+#[tokio::test]
+async fn failed_up_respond_keeps_request_pending_and_reoffers() {
+    use honk_testgoose::FakeGoose;
+    use reqwest::StatusCode;
+
+    let fake = FakeGoose::start().await;
+    let honkd = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&honkd).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    let mut v2 = Viewer::connect(&honkd).await;
+    v2.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Fake goose emits a permission request
+    fake.emit_frame(
+        &sid,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "req_fail_500",
+            "method": "request_permission",
+            "params": {
+                "sessionId": &sid,
+                "toolCall": {
+                    "toolCallId": "call_500",
+                    "title": "shell"
+                }
+            }
+        }),
+    );
+
+    let req = v
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("request_permission")
+                && f.get("id").and_then(Value::as_str) == Some("req_fail_500")
+        })
+        .await;
+    let _req2 = v2
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("request_permission")
+                && f.get("id").and_then(Value::as_str) == Some("req_fail_500")
+        })
+        .await;
+    assert_eq!(req["id"], "req_fail_500");
+
+    // Make respond POST return 500
+    fake.set_respond_status(Some(StatusCode::INTERNAL_SERVER_ERROR));
+
+    // Viewer answers
+    v.respond(
+        json!("req_fail_500"),
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow_once"
+            }
+        }),
+    )
+    .await;
+
+    // Because respond POST failed with non-gone 500, honkd must keep it pending,
+    // not broadcast request_resolved, and re-offer the request to the viewer!
+    let reoffered = v
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("request_permission")
+                && f.get("id").and_then(Value::as_str) == Some("req_fail_500")
+        })
+        .await;
+    assert_eq!(
+        reoffered["id"], "req_fail_500",
+        "request was re-offered to answering viewer"
+    );
+
+    // Now clear the 500 failure
+    fake.set_respond_status(None);
+
+    // Answering again succeeds
+    v.respond(
+        json!("req_fail_500"),
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow_once"
+            }
+        }),
+    )
+    .await;
+
+    // v2 receives _honk/request_resolved
+    let res = v2
+        .wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/request_resolved"))
+        .await;
+    assert_eq!(res["params"]["reason"], "answered");
+
+    // Check that state no longer has the pending request
+    let state_file = honkd.state_dir.path().join("state.json");
+    let state_content = std::fs::read_to_string(&state_file).unwrap();
+    assert!(
+        !state_content.contains("req_fail_500"),
+        "pending request removed after successful respond"
+    );
+}
+
+#[tokio::test]
+async fn cancel_broadcasts_reason_cancelled_for_pending_request() {
+    use honk_testgoose::FakeGoose;
+
+    let fake = FakeGoose::start().await;
+    let honkd = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let mut v1 = Viewer::connect(&honkd).await;
+    let sid = new_session(&mut v1, ".").await;
+
+    v1.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    let mut v2 = Viewer::connect(&honkd).await;
+    v2.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Emit a pending permission request
+    fake.emit_frame(
+        &sid,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "req_cancel_test",
+            "method": "request_permission",
+            "params": {
+                "sessionId": &sid,
+                "toolCall": {
+                    "toolCallId": "call_c",
+                    "title": "shell"
+                }
+            }
+        }),
+    );
+
+    let _req1 = v1
+        .wait_for(|f| f.get("id").and_then(Value::as_str) == Some("req_cancel_test"))
+        .await;
+    let _req2 = v2
+        .wait_for(|f| f.get("id").and_then(Value::as_str) == Some("req_cancel_test"))
+        .await;
+
+    // Cancel session
+    v1.call("session/cancel", json!({"sessionId": &sid})).await;
+
+    // Viewers should receive _honk/request_resolved with reason "cancelled"
+    let res1 = v1
+        .wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/request_resolved"))
+        .await;
+    assert_eq!(
+        res1["params"]["reason"], "cancelled",
+        "cancel must broadcast reason 'cancelled', not 'answered'"
+    );
+
+    let res2 = v2
+        .wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/request_resolved"))
+        .await;
+    assert_eq!(
+        res2["params"]["reason"], "cancelled",
+        "cancel must broadcast reason 'cancelled', not 'answered'"
+    );
+}
+
+#[tokio::test]
+async fn failed_up_respond_404_broadcasts_stale() {
+    use honk_testgoose::FakeGoose;
+    use reqwest::StatusCode;
+
+    let fake = FakeGoose::start().await;
+    let honkd = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&honkd).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Fake goose emits a permission request
+    fake.emit_frame(
+        &sid,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "req_gone_404",
+            "method": "request_permission",
+            "params": {
+                "sessionId": &sid,
+                "toolCall": {
+                    "toolCallId": "call_404",
+                    "title": "shell"
+                }
+            }
+        }),
+    );
+
+    let _req = v
+        .wait_for(|f| f.get("id").and_then(Value::as_str) == Some("req_gone_404"))
+        .await;
+
+    // Set respond status to 404
+    fake.set_respond_status(Some(StatusCode::NOT_FOUND));
+
+    // Viewer answers
+    v.respond(
+        json!("req_gone_404"),
+        json!({
+            "outcome": {
+                "outcome": "selected",
+                "optionId": "allow_once"
+            }
+        }),
+    )
+    .await;
+
+    // Because respond POST failed with 404 (upstream gone), the request must be marked stale
+    // and broadcast to honk-aware viewers with reason "stale"
+    let resolved = v
+        .wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/request_resolved"))
+        .await;
+    assert_eq!(resolved["params"]["sessionId"], sid);
+    assert_eq!(resolved["params"]["requestId"], "req_gone_404");
+    assert_eq!(
+        resolved["params"]["reason"], "stale",
+        "404 on respond must broadcast reason 'stale'"
+    );
+}

@@ -156,6 +156,7 @@ struct FakeGooseInner {
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
     steer_status: Mutex<Option<StatusCode>>,
+    respond_status: Mutex<Option<StatusCode>>,
 }
 
 pub struct FakeGoose {
@@ -198,6 +199,7 @@ impl FakeGoose {
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
             steer_status: Mutex::new(None),
+            respond_status: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -336,6 +338,23 @@ impl FakeGoose {
 
     pub fn set_steer_status(&self, status: Option<StatusCode>) {
         *self.state.steer_status.lock().unwrap() = status;
+    }
+
+    pub fn set_respond_status(&self, status: Option<StatusCode>) {
+        *self.state.respond_status.lock().unwrap() = status;
+    }
+
+    pub fn emit_frame(&self, sid: &str, frame: Value) {
+        let conn_id = {
+            let conns = self.state.connections.lock().unwrap();
+            conns
+                .iter()
+                .find(|(_, conn)| conn.sessions.contains_key(sid))
+                .map(|(cid, _)| cid.clone())
+        };
+        if let Some(cid) = conn_id {
+            emit_session_frame(&self.state, &cid, sid, frame);
+        }
     }
 
     pub async fn restart(&mut self) {
@@ -847,6 +866,12 @@ async fn handle_post(
                 && let Some(cancel) = state.active_prompt_cancels.lock().unwrap().get(&sid)
             {
                 cancel.store(true, Ordering::SeqCst);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        None => {
+            if let Some(status) = *state.respond_status.lock().unwrap() {
+                return status.into_response();
             }
             StatusCode::ACCEPTED.into_response()
         }
