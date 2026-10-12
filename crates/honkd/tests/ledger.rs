@@ -660,9 +660,9 @@ async fn boot_prunes_orphan_inflight_entries() {
         !ledger.contains_key("crid_unheld"),
         "crid_unheld must be pruned at boot because its session is not held"
     );
-    assert!(
-        !ledger.contains_key("crid_no_inflight"),
-        "crid_no_inflight must be pruned at boot because held.inflight doesn't reference it"
+    assert_eq!(
+        ledger["crid_no_inflight"]["state"], "done",
+        "crid_no_inflight must be resolved to Done at boot because held.inflight doesn't reference it"
     );
     assert!(
         ledger.contains_key("crid_held"),

@@ -22,20 +22,44 @@ pub struct State {
 impl State {
     pub fn prune_ledger(&mut self, now_unix: u64, ttl_secs: u64, max_entries: usize) {
         let sessions = &self.sessions;
+        let mut to_resolve_lost = Vec::new();
+
         self.ledger.retain(|crid, entry| match entry {
             LedgerEntry::Done { done_unix, .. } => now_unix.saturating_sub(*done_unix) <= ttl_secs,
             LedgerEntry::InFlight { session, .. } => {
                 if let Some(held) = sessions.get(session) {
                     if let Some(inf) = &held.inflight {
-                        inf.client_req_ids.contains(crid)
+                        if inf.client_req_ids.contains(crid) {
+                            true
+                        } else {
+                            to_resolve_lost.push((crid.clone(), session.clone()));
+                            true
+                        }
                     } else {
-                        false
+                        to_resolve_lost.push((crid.clone(), session.clone()));
+                        true
                     }
                 } else {
-                    false
+                    false // session not held -> prune
                 }
             }
         });
+
+        for (crid, session) in to_resolve_lost {
+            self.ledger.insert(
+                crid,
+                LedgerEntry::Done {
+                    session,
+                    response: crate::rpc::error(
+                        Value::Null,
+                        -32000,
+                        "honkd lost track of this client_req_id; not resending",
+                        None,
+                    ),
+                    done_unix: now_unix,
+                },
+            );
+        }
 
         if self.ledger.len() > max_entries {
             let mut done_keys: Vec<(String, u64)> = self
@@ -424,8 +448,8 @@ mod tests {
             "InFlight for unheld session must be pruned"
         );
         assert!(
-            !st.ledger.contains_key("orphan_mismatched_crid"),
-            "InFlight not in held.inflight.client_req_ids must be pruned"
+            matches!(st.ledger.get("orphan_mismatched_crid"), Some(LedgerEntry::Done { .. })),
+            "InFlight not in held.inflight.client_req_ids must be resolved to Done"
         );
 
         // When exceeding max_entries, old Done entries are dropped, but never InFlight
