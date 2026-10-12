@@ -81,6 +81,20 @@ impl Hub {
             })?;
         }
 
+        // Prune ledger at boot per documented policy
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let mut s = state.lock().await;
+            s.prune_ledger(
+                now_unix,
+                crate::state::LEDGER_PRUNE_TTL_SECS,
+                crate::state::LEDGER_PRUNE_MAX_ENTRIES,
+            )?;
+        }
+
         // 3. Initialize a new control connection, persisting its id first
         let recorder = if let Some(rec_path) = &args.record {
             let redactor = Redactor::from_env();

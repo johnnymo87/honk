@@ -75,6 +75,13 @@ pub struct InflightPrompt {
     pub announced: bool,
 }
 
+/// Boot-time ledger prune policy:
+/// - Done entries older than 24 hours (86,400s) are dropped.
+/// - If still more than 1,000 entries remain, the oldest excess Done entries are dropped.
+/// - InFlight entries are never dropped by age or count.
+pub const LEDGER_PRUNE_TTL_SECS: u64 = 24 * 3600;
+pub const LEDGER_PRUNE_MAX_ENTRIES: usize = 1000;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LedgerEntry {
@@ -87,6 +94,15 @@ pub enum LedgerEntry {
         response: Value,
         done_unix: u64,
     },
+}
+
+impl LedgerEntry {
+    pub fn session(&self) -> &str {
+        match self {
+            LedgerEntry::InFlight { session, .. } => session,
+            LedgerEntry::Done { session, .. } => session,
+        }
+    }
 }
 
 fn save_atomic(dir: &Path, state: &State) -> Result<()> {

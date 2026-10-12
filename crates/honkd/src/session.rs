@@ -1105,14 +1105,8 @@ impl Session {
                     user_text,
                 } => match body {
                     Reply::Error(err) => {
-                        for o in owners {
-                            let resp = json!({
-                                "jsonrpc": "2.0",
-                                "id": o.downstream_id,
-                                "error": err.clone(),
-                            });
-                            self.send_to_owner(&o, resp);
-                        }
+                        self.handle_reply_text(owners, Reply::Error(err), None)
+                            .await;
                     }
                     Reply::Result(result_val) => {
                         if user_text.is_none() {
@@ -1154,18 +1148,28 @@ impl Session {
                     }
                 },
                 Action::NotifySteerUnconsumed { viewer, message_id } => {
-                    if let Some((_, is_honk_aware)) = self.viewers.get(&viewer)
-                        && *is_honk_aware
-                    {
-                        let notify_frame = json!({
-                            "jsonrpc": "2.0",
-                            "method": "_honk/steer_unconsumed",
-                            "params": {
-                                "sessionId": self.sid,
-                                "messageId": message_id,
-                            }
-                        });
-                        self.send_to_viewer(viewer, notify_frame);
+                    if let Some((_, is_honk_aware)) = self.viewers.get(&viewer) {
+                        if *is_honk_aware {
+                            let notify_frame = json!({
+                                "jsonrpc": "2.0",
+                                "method": "_honk/steer_unconsumed",
+                                "params": {
+                                    "sessionId": self.sid,
+                                    "messageId": message_id,
+                                }
+                            });
+                            self.send_to_viewer(viewer, notify_frame);
+                        } else {
+                            tracing::warn!(
+                                "Session {}: unconsumed steer {message_id} for legacy viewer {viewer}",
+                                self.sid
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Session {}: unconsumed steer {message_id} for disconnected viewer {viewer}",
+                            self.sid
+                        );
                     }
                 }
             }
@@ -1250,27 +1254,20 @@ impl Session {
                     let cached = {
                         let s = self.state_store.lock().await;
                         match s.ledger.get(crid) {
+                            Some(entry) if entry.session() != self.sid => {
+                                Some(Err(crate::rpc::error(
+                                    id.clone(),
+                                    -32602,
+                                    "client_req_id belongs to another session",
+                                    None,
+                                )))
+                            }
                             Some(crate::state::LedgerEntry::Done { response, .. }) => {
                                 let mut resp = response.clone();
                                 resp["id"] = id.clone();
                                 Some(Ok(resp))
                             }
-                            Some(crate::state::LedgerEntry::InFlight {
-                                session: led_sid, ..
-                            }) => {
-                                if led_sid != &self.sid {
-                                    Some(Err(crate::rpc::error(
-                                        id.clone(),
-                                        -32602,
-                                        format!(
-                                            "client_req_id {crid} already in flight in another session"
-                                        ),
-                                        None,
-                                    )))
-                                } else {
-                                    None
-                                }
-                            }
+                            Some(crate::state::LedgerEntry::InFlight { .. }) => None,
                             None => None,
                         }
                     };
@@ -1584,19 +1581,39 @@ impl Session {
                 }
             }
             Reply::Error(err) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
                 for o in &owners {
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": o.downstream_id,
                         "error": err,
                     });
-                    if let Some(crid) = &o.client_req_id
-                        && let Some(waiters) = self.finalizing_waiters.remove(crid)
-                    {
-                        for w in waiters {
-                            let mut w_resp = resp.clone();
-                            w_resp["id"] = w.downstream_id.clone();
-                            self.send_to_owner(&w, w_resp);
+                    if let Some(crid) = &o.client_req_id {
+                        let sid = self.sid.clone();
+                        let mut s = self.state_store.lock().await;
+                        let _ = s.mutate(|st| {
+                            // Done entries are written on every Reply
+                            st.ledger.insert(
+                                crid.clone(),
+                                crate::state::LedgerEntry::Done {
+                                    session: sid,
+                                    response: resp.clone(),
+                                    done_unix: now,
+                                },
+                            );
+                        });
+                        drop(s);
+
+                        if let Some(waiters) = self.finalizing_waiters.remove(crid) {
+                            for w in waiters {
+                                let mut w_resp = resp.clone();
+                                w_resp["id"] = w.downstream_id.clone();
+                                self.send_to_owner(&w, w_resp);
+                            }
                         }
                     }
                     self.send_to_owner(o, resp);
