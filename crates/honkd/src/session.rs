@@ -112,6 +112,9 @@ pub enum SessionMsg {
     CheckAmbiguousInflight {
         upstream_id: String,
     },
+    ProbeTimeout {
+        probe_id: String,
+    },
     MarkPendingStale,
     ReactivationComplete {
         token: u64,
@@ -535,6 +538,7 @@ impl Session {
         let up = self.up.clone();
         let sid = self.sid.clone();
         let self_tx = self.self_tx.clone();
+        let send_probe_id = probe_id.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(50);
             let max_backoff = Duration::from_secs(1);
@@ -545,7 +549,7 @@ impl Session {
                 }
                 match up
                     .request_with_id(
-                        json!(probe_id),
+                        json!(send_probe_id),
                         "_goose/unstable/session/steer",
                         probe_params.clone(),
                         Some(&sid),
@@ -581,6 +585,18 @@ impl Session {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
+        });
+
+        let timeout_secs = Duration::from_secs(self.hub.args.probe_timeout_secs);
+        let timeout_probe_id = probe_id;
+        let timeout_tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout_secs).await;
+            let _ = timeout_tx
+                .send(SessionMsg::ProbeTimeout {
+                    probe_id: timeout_probe_id,
+                })
+                .await;
         });
     }
 
@@ -2450,6 +2466,18 @@ impl Session {
                                 );
                             }
                         }
+                    }
+                }
+            }
+            SessionMsg::ProbeTimeout { probe_id } => {
+                if self.active_probe_id.as_deref() == Some(&probe_id) {
+                    tracing::warn!(
+                        "Session {}: steer probe {probe_id} timed out without response; resetting active probe",
+                        self.sid
+                    );
+                    self.active_probe_id = None;
+                    if self.turn.run.is_some() || self.turn.inflight.is_some() {
+                        self.issue_steer_probe().await;
                     }
                 }
             }

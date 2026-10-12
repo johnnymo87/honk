@@ -31,6 +31,8 @@ pub struct Args {
     pub stream_dead_secs: u64,
     #[arg(long, default_value_t = 2000, hide = true)]
     pub gap_synthesis_grace_ms: u64,
+    #[arg(long, default_value_t = 5, hide = true)]
+    pub probe_timeout_secs: u64,
 }
 
 impl Args {

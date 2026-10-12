@@ -726,3 +726,46 @@ async fn on_rebuilt_sets_live_before_draining_events_so_notifications_are_not_lo
     let resp = v.response_timeout(&pid, Duration::from_secs(5)).await;
     assert_eq!(resp["result"]["stopReason"], "end_turn");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_steer_probe_response_clears_active_probe_on_timeout_and_retries() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    // Spawn honkd with probe_timeout_secs = 1
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--probe-timeout-secs", "1", "--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Drop the first steer probe response in fake goose so it is lost
+    fake.lose_next(&sid, |f| {
+        f.get("error")
+            .and_then(|e| e.get("data"))
+            .and_then(Value::as_str)
+            == Some("no active run to steer")
+    });
+
+    // Trigger gap reattach so steer probe is issued
+    fake.gap_on_next_resume(&sid);
+    fake.kick_stream(&sid);
+
+    // Because first probe was dropped, probe timeout clears active_probe_id and retries.
+    // The retried probe succeeds, rebuild completes, and replay_done arrives!
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+}
