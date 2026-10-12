@@ -218,10 +218,58 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                     crate::rpc::Kind::Response => {
                         // Downstream response to a server request issued by a session (A13).
-                        // Drop with debug log for now; never forward upstream as method "".
-                        tracing::debug!(
-                            "dropping downstream response frame until server request routing in A13: {frame}"
-                        );
+                        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                        if !id.is_null() {
+                            let session_tx = if viewer.attached_sessions.len() == 1 {
+                                let sid = viewer.attached_sessions.iter().next().unwrap();
+                                let sessions = hub.sessions.read().await;
+                                sessions.get(sid).map(|h| h.tx.clone())
+                            } else if viewer.attached_sessions.len() > 1 {
+                                let sid_opt = {
+                                    let s = hub.state.lock().await;
+                                    let mut found = None;
+                                    for sid in &viewer.attached_sessions {
+                                        if let Some(h) = s.sessions.get(sid)
+                                            && h.pending
+                                                .iter()
+                                                .any(|p| honk_upstream::rpc_id_matches(&p.id, &id))
+                                        {
+                                            found = Some(sid.clone());
+                                            break;
+                                        }
+                                    }
+                                    found
+                                };
+                                if let Some(sid) = sid_opt {
+                                    let sessions = hub.sessions.read().await;
+                                    sessions.get(&sid).map(|h| h.tx.clone())
+                                } else {
+                                    let sessions = hub.sessions.read().await;
+                                    for sid in &viewer.attached_sessions {
+                                        if let Some(h) = sessions.get(sid) {
+                                            let _ =
+                                                h.tx.send(crate::session::SessionMsg::Answer {
+                                                    viewer_id: viewer.id,
+                                                    frame: frame.clone(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(tx) = session_tx {
+                                let _ = tx
+                                    .send(crate::session::SessionMsg::Answer {
+                                        viewer_id: viewer.id,
+                                        frame,
+                                    })
+                                    .await;
+                            }
+                        }
                         continue;
                     }
                     crate::rpc::Kind::Request | crate::rpc::Kind::Notification => {}

@@ -509,6 +509,18 @@ impl Viewer {
         panic!("timed out in wait_for");
     }
 
+    pub async fn respond(&mut self, id: Value, result: Value) {
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        self.ws
+            .send(Message::Text(resp.to_string().into()))
+            .await
+            .expect("send ws message");
+    }
+
     pub fn accumulated_text(&self) -> &str {
         &self.accumulated_agent_text
     }

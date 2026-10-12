@@ -248,6 +248,8 @@ impl Hub {
                 last_processed_conn_id: last_processed_conn,
                 viewers: HashMap::new(),
                 pending_requests: HashMap::new(),
+                pending_server_requests: held.pending.clone(),
+                recently_resolved: std::collections::HashSet::new(),
                 init_result: held
                     .init_result
                     .clone()
@@ -619,6 +621,8 @@ impl Hub {
             last_processed_conn_id: last_processed_conn,
             viewers: HashMap::new(),
             pending_requests: HashMap::new(),
+            pending_server_requests: Vec::new(),
+            recently_resolved: std::collections::HashSet::new(),
             init_result: new_res.clone(),
             queued_msgs: std::collections::VecDeque::new(),
             rebuilding_buffered_frames: Vec::new(),

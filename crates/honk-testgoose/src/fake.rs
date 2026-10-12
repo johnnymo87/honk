@@ -155,6 +155,7 @@ struct FakeGooseInner {
     all_sessions: Mutex<HashMap<String, String>>,
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
+    steer_status: Mutex<Option<StatusCode>>,
 }
 
 pub struct FakeGoose {
@@ -196,6 +197,7 @@ impl FakeGoose {
             all_sessions: Mutex::new(HashMap::new()),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
+            steer_status: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -330,6 +332,10 @@ impl FakeGoose {
 
     pub fn set_drop_prompt_reply(&self, drop: bool) {
         self.state.drop_prompt_reply.store(drop, Ordering::SeqCst);
+    }
+
+    pub fn set_steer_status(&self, status: Option<StatusCode>) {
+        *self.state.steer_status.lock().unwrap() = status;
     }
 
     pub async fn restart(&mut self) {
@@ -589,6 +595,9 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("_goose/unstable/session/steer") => {
+            if let Some(status) = *state.steer_status.lock().unwrap() {
+                return status.into_response();
+            }
             let Some(sid) = target_session
                 .as_deref()
                 .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))

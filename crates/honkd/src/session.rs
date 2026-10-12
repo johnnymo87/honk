@@ -96,6 +96,7 @@ pub enum SessionMsg {
         body: Reply,
         text: Option<String>,
     },
+    MarkPendingStale,
 }
 
 pub struct Session {
@@ -115,6 +116,8 @@ pub struct Session {
     pub last_processed_conn_id: Option<u64>,
     pub viewers: HashMap<ViewerId, (ViewerTx, bool)>,
     pub pending_requests: HashMap<String, PendingSessionRequest>,
+    pub pending_server_requests: Vec<crate::state::PendingRequest>,
+    pub recently_resolved: HashSet<String>,
     pub init_result: Value,
     pub queued_msgs: VecDeque<SessionMsg>,
     pub rebuilding_buffered_frames: Vec<(Option<u64>, Value)>,
@@ -350,15 +353,53 @@ impl Session {
                     });
                     let up = self.up.clone();
                     let sid = self.sid.clone();
+                    let self_tx = self.self_tx.clone();
                     tokio::spawn(async move {
-                        let _ = up
-                            .request_with_id(
-                                json!(probe_id),
-                                "_goose/unstable/session/steer",
-                                probe_params,
-                                Some(&sid),
-                            )
-                            .await;
+                        let mut backoff = Duration::from_millis(50);
+                        let max_backoff = Duration::from_secs(1);
+                        let max_retries = 5;
+                        for attempt in 0..=max_retries {
+                            if self_tx.is_closed() {
+                                return;
+                            }
+                            match up
+                                .request_with_id(
+                                    json!(probe_id),
+                                    "_goose/unstable/session/steer",
+                                    probe_params.clone(),
+                                    Some(&sid),
+                                )
+                                .await
+                            {
+                                Ok(()) => return,
+                                Err(e) => {
+                                    let gone = honk_upstream::is_gone(&e);
+                                    if gone {
+                                        let _ = self_tx
+                                            .send(SessionMsg::ReattachFailed {
+                                                gone: true,
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                    if attempt == max_retries {
+                                        tracing::error!(
+                                            "steer probe failed after {max_retries} retries: {e:#}"
+                                        );
+                                        let _ = self_tx
+                                            .send(SessionMsg::ReattachFailed {
+                                                gone: false,
+                                                error: e.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(max_backoff);
+                                }
+                            }
+                        }
                     });
                     self.drain_queued_msgs().await;
                 } else {
@@ -377,8 +418,10 @@ impl Session {
             "Session {} reattach failed: gone={gone}, err={error}",
             self.sid
         );
+        self.active_probe_id = None;
         if gone {
             self.state = ActorState::Gone;
+            self.mark_pending_stale().await;
             let actions = self.turn.interrupt("upstream_gone");
             self.execute_actions(actions).await;
 
@@ -864,7 +907,7 @@ impl Session {
                 }
             } else if kind == crate::rpc::Kind::Request {
                 // Server request (e.g. request_permission) -> forward to viewers
-                self.forward_raw(&frame);
+                self.on_server_request(frame.clone(), id_opt).await;
             }
         }
 
@@ -1143,7 +1186,7 @@ impl Session {
                 self.viewers.insert(viewer_id, (viewer, true));
 
                 let init_result = self.init_result.clone();
-                let pending = Vec::new(); // Stub until A13
+                let pending = self.pending_server_requests.clone();
 
                 let _ = reply.send(AttachSnapshot {
                     reset,
@@ -1330,7 +1373,52 @@ impl Session {
                 }
                 let actions = self.turn.on_cancel();
                 self.execute_actions(actions).await;
-                // TODO(A13/A15): answer any pending server requests with "cancelled"
+
+                if !self.pending_server_requests.is_empty() {
+                    let pending_list = std::mem::take(&mut self.pending_server_requests);
+                    let sid = self.sid.clone();
+                    {
+                        let mut s = self.state_store.lock().await;
+                        let _ = s.mutate(|st| {
+                            if let Some(h) = st.sessions.get_mut(&sid) {
+                                h.pending.clear();
+                            }
+                        });
+                    }
+                    let honk_vids: Vec<ViewerId> = self
+                        .viewers
+                        .iter()
+                        .filter_map(|(vid, (_, is_honk))| if *is_honk { Some(*vid) } else { None })
+                        .collect();
+
+                    for p in pending_list {
+                        let _ = self
+                            .up
+                            .respond(
+                                p.id.clone(),
+                                json!({
+                                    "outcome": {
+                                        "outcome": "cancelled"
+                                    }
+                                }),
+                                Some(&sid),
+                            )
+                            .await;
+                        self.recently_resolved.insert(p.id.to_string());
+                        let resolved_frame = json!({
+                            "jsonrpc": "2.0",
+                            "method": honk_wire::method::REQUEST_RESOLVED,
+                            "params": {
+                                "sessionId": sid,
+                                "requestId": p.id,
+                                "reason": "answered",
+                            }
+                        });
+                        for vid in &honk_vids {
+                            self.send_to_viewer(*vid, resolved_frame.clone());
+                        }
+                    }
+                }
             }
             SessionMsg::Answer { viewer_id, frame } => {
                 if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding)
@@ -1338,8 +1426,12 @@ impl Session {
                 {
                     self.queued_msgs
                         .push_back(SessionMsg::Answer { viewer_id, frame });
+                    return;
                 }
-                // Server request answer (A10/A13)
+                self.handle_server_request_answer(viewer_id, frame).await;
+            }
+            SessionMsg::MarkPendingStale => {
+                self.mark_pending_stale().await;
             }
             SessionMsg::Forward {
                 viewer_id,
@@ -1501,25 +1593,214 @@ impl Session {
             .insert(viewer_id, (viewer.clone(), is_honk_aware))
             .is_some();
 
-        if !was_present && !is_honk_aware {
-            let synth_info = json!({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": self.sid,
-                    "update": {
-                        "sessionUpdate": "session_info_update",
-                        "_meta": {
-                            "goose": {
-                                "activeRunId": self.turn.run
+        if !was_present {
+            if !is_honk_aware {
+                let synth_info = json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": self.sid,
+                        "update": {
+                            "sessionUpdate": "session_info_update",
+                            "_meta": {
+                                "goose": {
+                                    "activeRunId": self.turn.run
+                                }
                             }
                         }
                     }
+                });
+                viewer.send_frame(axum::extract::ws::Message::Text(
+                    synth_info.to_string().into(),
+                ));
+            }
+
+            for p in &self.pending_server_requests {
+                let pending_frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": p.id,
+                    "method": p.method,
+                    "params": p.params,
+                });
+                viewer.send_frame(axum::extract::ws::Message::Text(
+                    pending_frame.to_string().into(),
+                ));
+            }
+        }
+    }
+
+    async fn on_server_request(&mut self, frame: Value, _id_opt: Option<u64>) {
+        let req_id = match frame.get("id") {
+            Some(id) if !id.is_null() => id.clone(),
+            _ => return,
+        };
+        let method = match frame.get("method").and_then(Value::as_str) {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => return,
+        };
+
+        // If the id is already pending (a replayed frame), skip it
+        if self
+            .pending_server_requests
+            .iter()
+            .any(|p| honk_upstream::rpc_id_matches(&p.id, &req_id))
+        {
+            return;
+        }
+
+        // If this id was already resolved in this session, skip it
+        if self.recently_resolved.contains(&req_id.to_string()) {
+            return;
+        }
+
+        let params = frame.get("params").cloned().unwrap_or(json!({}));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let pending_req = crate::state::PendingRequest {
+            id: req_id.clone(),
+            method: method.clone(),
+            params: params.clone(),
+            received_unix: now,
+        };
+
+        // Persist via state.mutate BEFORE offering
+        let sid = self.sid.clone();
+        let pending_clone = pending_req.clone();
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                if let Some(h) = st.sessions.get_mut(&sid) {
+                    h.pending.push(pending_clone);
                 }
             });
-            viewer.send_frame(axum::extract::ws::Message::Text(
-                synth_info.to_string().into(),
-            ));
+        }
+        self.pending_server_requests.push(pending_req);
+
+        // Offer verbatim (goose's id) to every attached viewer, honk-aware and legacy alike
+        let viewer_ids: Vec<ViewerId> = self.viewers.keys().copied().collect();
+        for vid in viewer_ids {
+            self.send_to_viewer(vid, frame.clone());
+        }
+    }
+
+    async fn handle_server_request_answer(&mut self, viewer_id: ViewerId, frame: Value) {
+        let resp_id = match frame.get("id") {
+            Some(id) if !id.is_null() => id.clone(),
+            _ => return,
+        };
+
+        let pending_idx = self
+            .pending_server_requests
+            .iter()
+            .position(|p| honk_upstream::rpc_id_matches(&p.id, &resp_id));
+
+        let Some(idx) = pending_idx else {
+            tracing::debug!(
+                "Session {}: ignoring late or unknown server request answer for id {}",
+                self.sid,
+                resp_id
+            );
+            return;
+        };
+
+        let pending = self.pending_server_requests.remove(idx);
+        let sid = self.sid.clone();
+        let up_id = pending.id.clone();
+
+        // 1. First viewer answer goes upstream with up.respond(id, result, Some(sid)) on this connection
+        let result = frame.get("result").cloned().unwrap_or(Value::Null);
+        if let Err(e) = self.up.respond(up_id.clone(), result, Some(&sid)).await {
+            tracing::error!(
+                "Session {}: failed to send upstream respond for id {}: {e:#}",
+                self.sid,
+                up_id
+            );
+            if honk_upstream::is_gone(&e) {
+                self.on_reattach_failed(true, e.to_string()).await;
+                return;
+            }
+        }
+
+        // 2. Remove from persistent state
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                if let Some(h) = st.sessions.get_mut(&sid) {
+                    h.pending
+                        .retain(|p| !honk_upstream::rpc_id_matches(&p.id, &up_id));
+                }
+            });
+        }
+        self.recently_resolved.insert(up_id.to_string());
+
+        // 3. Send other honk-aware viewers _honk/request_resolved{reason:"answered"}
+        let resolved_frame = json!({
+            "jsonrpc": "2.0",
+            "method": honk_wire::method::REQUEST_RESOLVED,
+            "params": {
+                "sessionId": sid,
+                "requestId": up_id,
+                "reason": "answered",
+            }
+        });
+
+        let honk_vids: Vec<ViewerId> = self
+            .viewers
+            .iter()
+            .filter_map(|(vid, (_, is_honk))| {
+                if *is_honk && *vid != viewer_id {
+                    Some(*vid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for vid in honk_vids {
+            self.send_to_viewer(vid, resolved_frame.clone());
+        }
+    }
+
+    pub async fn mark_pending_stale(&mut self) {
+        if self.pending_server_requests.is_empty() {
+            return;
+        }
+
+        let pending_list = std::mem::take(&mut self.pending_server_requests);
+        let sid = self.sid.clone();
+
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                if let Some(h) = st.sessions.get_mut(&sid) {
+                    h.pending.clear();
+                }
+            });
+        }
+
+        let honk_vids: Vec<ViewerId> = self
+            .viewers
+            .iter()
+            .filter_map(|(vid, (_, is_honk))| if *is_honk { Some(*vid) } else { None })
+            .collect();
+
+        for p in pending_list {
+            self.recently_resolved.insert(p.id.to_string());
+            let resolved_frame = json!({
+                "jsonrpc": "2.0",
+                "method": honk_wire::method::REQUEST_RESOLVED,
+                "params": {
+                    "sessionId": sid,
+                    "requestId": p.id,
+                    "reason": "stale",
+                }
+            });
+            for vid in &honk_vids {
+                self.send_to_viewer(*vid, resolved_frame.clone());
+            }
         }
     }
 
@@ -1548,13 +1829,6 @@ impl Session {
 
         for (vid, frame) in to_send {
             self.send_to_viewer(vid, frame);
-        }
-    }
-
-    fn forward_raw(&mut self, frame: &Value) {
-        let viewer_ids: Vec<ViewerId> = self.viewers.keys().copied().collect();
-        for vid in viewer_ids {
-            self.send_to_viewer(vid, frame.clone());
         }
     }
 }
