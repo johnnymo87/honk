@@ -148,8 +148,10 @@ struct FakeGooseInner {
     next_conn_num: AtomicU64,
     next_session_num: AtomicU64,
     prompt_chunks: Mutex<Vec<String>>,
+    scripted_frames: Mutex<Vec<Value>>,
     export_data: Mutex<HashMap<String, Value>>,
     active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    active_runs: Mutex<HashMap<String, String>>,
     all_sessions: Mutex<HashMap<String, String>>,
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
@@ -187,8 +189,10 @@ impl FakeGoose {
             next_conn_num: AtomicU64::new(1),
             next_session_num: AtomicU64::new(1),
             prompt_chunks: Mutex::new(vec!["fake chunk".to_string()]),
+            scripted_frames: Mutex::new(Vec::new()),
             export_data: Mutex::new(HashMap::new()),
             active_prompt_cancels: Mutex::new(HashMap::new()),
+            active_runs: Mutex::new(HashMap::new()),
             all_sessions: Mutex::new(HashMap::new()),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
@@ -281,6 +285,10 @@ impl FakeGoose {
 
     pub fn script_prompt(&self, chunks: Vec<String>) {
         *self.state.prompt_chunks.lock().unwrap() = chunks;
+    }
+
+    pub fn script_frames(&self, frames: Vec<Value>) {
+        *self.state.scripted_frames.lock().unwrap() = frames;
     }
 
     pub fn set_export_data(&self, sid: &str, data: Value) {
@@ -580,6 +588,70 @@ async fn handle_post(
             }
             StatusCode::ACCEPTED.into_response()
         }
+        Some("_goose/unstable/session/steer") => {
+            let Some(sid) = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+            else {
+                return (StatusCode::BAD_REQUEST, "sessionId required").into_response();
+            };
+            let expected_run_id = frame
+                .pointer("/params/expectedRunId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let active_run = state.active_runs.lock().unwrap().get(sid).cloned();
+
+            let resp = match active_run {
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params",
+                        "data": "no active run to steer"
+                    }
+                }),
+                Some(actual_run_id) if actual_run_id != expected_run_id => json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params",
+                        "data": {
+                            "message": format!(
+                                "expected active run id `{expected_run_id}` but found `{actual_run_id}`"
+                            ),
+                            "expectedRunId": expected_run_id,
+                            "actualRunId": actual_run_id
+                        }
+                    }
+                }),
+                Some(actual_run_id) => {
+                    let msg_id = format!(
+                        "steer_{}",
+                        state.next_session_num.fetch_add(1, Ordering::SeqCst)
+                    );
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "runId": actual_run_id,
+                            "messageId": msg_id
+                        }
+                    })
+                }
+            };
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id) {
+                let stream = conn
+                    .sessions
+                    .entry(sid.to_string())
+                    .or_insert_with(StreamState::new);
+                stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
         Some("session/prompt") => {
             let Some(sid) = target_session else {
                 return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
@@ -598,11 +670,57 @@ async fn handle_post(
             let req_id_clone = req_id.clone();
 
             tokio::spawn(async move {
-                let chunks = state_clone.prompt_chunks.lock().unwrap().clone();
+                let custom_frames = state_clone.scripted_frames.lock().unwrap().clone();
                 let run_id = "run_fake_001".to_string();
+
+                if !custom_frames.is_empty() {
+                    state_clone
+                        .active_runs
+                        .lock()
+                        .unwrap()
+                        .insert(sid_clone.clone(), run_id.clone());
+                    for f in custom_frames {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, f);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    state_clone.active_runs.lock().unwrap().remove(&sid_clone);
+                    if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(id) = req_id_clone {
+                        let stop_reason = if cancel_flag.load(Ordering::SeqCst) {
+                            "cancelled"
+                        } else {
+                            "end_turn"
+                        };
+                        emit_session_frame(
+                            &state_clone,
+                            &conn_id_clone,
+                            &sid_clone,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "stopReason": stop_reason
+                                }
+                            }),
+                        );
+                    }
+                    return;
+                }
+
+                let chunks = state_clone.prompt_chunks.lock().unwrap().clone();
                 let message_id = format!("msg_fake_{run_id}");
 
                 // 1. Run start
+                state_clone
+                    .active_runs
+                    .lock()
+                    .unwrap()
+                    .insert(sid_clone.clone(), run_id.clone());
                 emit_session_frame(
                     &state_clone,
                     &conn_id_clone,
@@ -660,6 +778,7 @@ async fn handle_post(
                 }
 
                 // 3. Run end
+                state_clone.active_runs.lock().unwrap().remove(&sid_clone);
                 emit_session_frame(
                     &state_clone,
                     &conn_id_clone,

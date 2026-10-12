@@ -90,6 +90,11 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
                 "role": "user",
                 "created": 1,
                 "content": [{"type": "text", "text": "go"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "turn output text"}]
             }]
         }),
     );
@@ -120,25 +125,6 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
     v.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/gap"))
         .await;
     assert_eq!(v.blocks.resets, 1, "no reset while run is active");
-
-    // The turn completes on fake: assistant response is committed
-    fake.set_export_data(
-        &sid,
-        json!({
-            "sessionId": sid,
-            "conversation": [{
-                "id": "msg_1",
-                "role": "user",
-                "created": 1,
-                "content": [{"type": "text", "text": "go"}]
-            }, {
-                "id": "msg_2",
-                "role": "assistant",
-                "created": 2,
-                "content": [{"type": "text", "text": "turn output text"}]
-            }]
-        }),
-    );
 
     // Turn finishes, activeRunId: null processed -> triggers rebuild at turn end
     // Viewer receives _honk/replay_done for epoch 2
@@ -670,4 +656,156 @@ async fn turn_ended_in_gap_synthesizes_end_turn_after_rebuild_without_hang() {
         resp.pointer("/result/_meta/honk/synthesized"),
         Some(&json!(true))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_turn_mid_run_gap_never_synthesizes_and_uses_real_reply() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    assert_eq!(v.blocks.resets, 1, "initial load has 1 reset");
+
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [{
+                "id": "msg_1",
+                "role": "user",
+                "created": 1,
+                "content": [{"type": "text", "text": "run_tool"}]
+            }, {
+                "id": "msg_2",
+                "role": "assistant",
+                "created": 2,
+                "content": [{"type": "text", "text": "final_turn_response"}]
+            }]
+        }),
+    );
+
+    fake.script_frames(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": "run_fake_tool"
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool_1",
+                    "title": "shell"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tool_1",
+                    "status": "completed"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "final_turn_response"
+                    }
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": Value::Null
+                        }
+                    }
+                }
+            }
+        }),
+    ]);
+
+    // Gap on resume
+    fake.gap_on_next_resume(&sid);
+
+    let pid = v
+        .request("session/prompt", prompt_params(&sid, "run_tool", None))
+        .await;
+
+    // Wait until tool_call appears
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("tool_call")
+    })
+    .await;
+
+    // Kick stream while tool turn is in flight
+    fake.kick_stream(&sid);
+
+    // Watchdog reattaches via takeover, probe sees actualRunId -> stays Live, NO mid-run reset!
+    v.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/gap"))
+        .await;
+    assert_eq!(v.blocks.resets, 1, "NO reset while tool turn is running");
+
+    // Turn completes live: real prompt response arrives, rebuild runs at turn end
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp.pointer("/result/_meta/honk/synthesized"),
+        None,
+        "real reply used, must NOT be synthesized"
+    );
+
+    // Rebuild at turn end delivered epoch 2
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some("_honk/replay_done")
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+    assert_eq!(v.blocks.resets, 2, "exactly one reset at turn end");
+    assert!(v.blocks.agent_text().contains("final_turn_response"));
 }

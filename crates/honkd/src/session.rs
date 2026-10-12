@@ -125,6 +125,7 @@ pub struct Session {
     pub needs_rebuild: bool,
     pub inflight_needs_delivery_check: bool,
     pub finalizing_waiters: HashMap<String, Vec<OwnerRef>>,
+    pub active_probe_id: Option<String>,
 }
 
 impl Session {
@@ -319,29 +320,16 @@ impl Session {
             ReplayOutcome::Gap | ReplayOutcome::Unsupported => {
                 self.gap_evidenced = true;
 
-                // Check whether goose is still running the turn live, or if the turn already ended in the gap.
-                // In goose (crates/goose/src/acp/server.rs:2360-2374), activeRunId:null and the prompt response
-                // are sent in-order to the session stream mailbox (vendor/agent-client-protocol-http/src/connection.rs:385-395).
-                // Case (a): If the turn is still running live on goose, export has no turn text for the inflight prompt yet.
-                //           We stay Live, send _honk/gap, and wait for activeRunId:null and real prompt reply to arrive live.
-                // Case (b): If the turn finished inside the gap, export already has the committed assistant message.
-                //           Goose is idle and will never send activeRunId:null live. We trigger rebuild immediately
-                //           and synthesize end_turn upon rebuild completion.
-                let is_turn_running = if let Some(inf) = self.turn.inflight.as_ref() {
-                    let user_text = crate::rpc::extract_user_text(&inf.params);
-                    match self.hub.export(&self.sid).await {
-                        Ok(export_val) => {
-                            let has_completed_turn =
-                                !honk_wire::export::turn_text(&export_val, &user_text).is_empty();
-                            !has_completed_turn
-                        }
-                        Err(_) => self.turn.run.is_some(),
-                    }
-                } else {
-                    self.turn.run.is_some()
-                };
-
-                if is_turn_running {
+                // Non-destructive active-run probe:
+                // An active-run probe via _goose/unstable/session/steer with a bogus expectedRunId
+                // (require_active_run in crates/goose/src/acp/server.rs:1954-1980, called ~2392).
+                // Response is pushed to the session stream mailbox (vendor/agent-client-protocol-http/src/connection.rs:368-395)
+                // in FIFO order after all live/replayed frames emitted before it.
+                // Case (a): If a run is active, probe returns actualRunId -> stay Live, set rebuild_at_turn_end,
+                //           real prompt reply arrives live, never synthesize.
+                // Case (b): If idle ("no active run to steer"), the run ended inside the gap -> rebuild immediately,
+                //           synthesize end_turn upon rebuild completion.
+                if self.turn.run.is_some() || self.turn.inflight.is_some() {
                     self.state = ActorState::Live;
                     let gap_marker = json!({
                         "jsonrpc": "2.0",
@@ -351,10 +339,29 @@ impl Session {
                         }
                     });
                     self.fan_out_stamped(&gap_marker, true);
-                    self.rebuild_at_turn_end = true;
+
+                    // Issue non-destructive steer probe
+                    let probe_id = self.ids.next();
+                    self.active_probe_id = Some(probe_id.clone());
+                    let probe_params = json!({
+                        "sessionId": self.sid,
+                        "expectedRunId": format!("honk-probe-{}", self.ids.next()),
+                        "prompt": [{"type": "text", "text": "probe"}]
+                    });
+                    let up = self.up.clone();
+                    let sid = self.sid.clone();
+                    tokio::spawn(async move {
+                        let _ = up
+                            .request_with_id(
+                                json!(probe_id),
+                                "_goose/unstable/session/steer",
+                                probe_params,
+                                Some(&sid),
+                            )
+                            .await;
+                    });
                     self.drain_queued_msgs().await;
                 } else {
-                    self.turn.run = None;
                     self.start_rebuild().await;
                 }
             }
@@ -765,60 +772,94 @@ impl Session {
                     }
                 }
             } else if kind == crate::rpc::Kind::Response {
-                // Check if this is a response to pending steer or forward
-                let found_pending = self
-                    .pending_requests
-                    .keys()
-                    .find(|k| {
-                        honk_upstream::rpc_id_matches(
-                            &json!(k),
-                            frame.get("id").unwrap_or(&Value::Null),
-                        )
-                    })
-                    .cloned();
+                let is_probe_response = self.active_probe_id.as_ref().is_some_and(|pid| {
+                    honk_upstream::rpc_id_matches(
+                        &json!(pid),
+                        frame.get("id").unwrap_or(&Value::Null),
+                    )
+                });
 
-                if let Some(up_id) = found_pending {
-                    let pending = self.pending_requests.remove(&up_id).unwrap();
-                    let mut resp = frame.clone();
-                    resp["id"] = pending.downstream_id;
+                if is_probe_response {
+                    self.active_probe_id = None;
 
-                    if pending.is_steer
-                        && let Some(msg_id) =
-                            frame.pointer("/result/messageId").and_then(Value::as_str)
-                    {
-                        let actions = self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
-                        self.execute_actions(actions).await;
+                    let is_idle = frame.pointer("/error/data").and_then(Value::as_str)
+                        == Some("no active run to steer")
+                        || frame
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .is_some_and(|m| m.contains("no active run to steer"));
+
+                    let actual_run_id = frame
+                        .pointer("/error/data/actualRunId")
+                        .and_then(Value::as_str);
+
+                    if is_idle {
+                        // Case (b): Turn ended inside the gap, or session is idle!
+                        self.turn.run = None;
+                        self.start_rebuild().await;
+                    } else if let Some(run_id) = actual_run_id {
+                        // Case (a): Turn is still running live on goose!
+                        self.turn.run = Some(run_id.to_string());
+                        self.rebuild_at_turn_end = true;
                     }
-
-                    self.send_to_viewer(pending.viewer_id, resp);
                 } else {
-                    // Check if response to inflight prompt
-                    let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
-                        honk_upstream::rpc_id_matches(
-                            &json!(inf.upstream_id),
-                            frame.get("id").unwrap_or(&Value::Null),
-                        )
-                    });
+                    // Check if this is a response to pending steer or forward
+                    let found_pending = self
+                        .pending_requests
+                        .keys()
+                        .find(|k| {
+                            honk_upstream::rpc_id_matches(
+                                &json!(k),
+                                frame.get("id").unwrap_or(&Value::Null),
+                            )
+                        })
+                        .cloned();
 
-                    if is_inflight_reply {
-                        let upstream_id = self.turn.inflight.as_ref().unwrap().upstream_id.clone();
-                        let sidecar_path = self
-                            .state_dir
-                            .join("sessions")
-                            .join(format!("{}.replies.jsonl", self.sid));
-                        let _ = append_reply_sidecar(&sidecar_path, &upstream_id, &frame);
+                    if let Some(up_id) = found_pending {
+                        let pending = self.pending_requests.remove(&up_id).unwrap();
+                        let mut resp = frame.clone();
+                        resp["id"] = pending.downstream_id;
 
-                        let actions =
-                            self.turn
-                                .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
-                        self.execute_actions(actions).await;
+                        if pending.is_steer
+                            && let Some(msg_id) =
+                                frame.pointer("/result/messageId").and_then(Value::as_str)
+                        {
+                            let actions =
+                                self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
+                            self.execute_actions(actions).await;
+                        }
+
+                        self.send_to_viewer(pending.viewer_id, resp);
                     } else {
-                        // Unmatched upstream response -> warn with upstream id only
-                        let id_disp = frame
-                            .get("id")
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "null".into());
-                        tracing::warn!("unmatched upstream response for id: {id_disp}");
+                        // Check if response to inflight prompt
+                        let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
+                            honk_upstream::rpc_id_matches(
+                                &json!(inf.upstream_id),
+                                frame.get("id").unwrap_or(&Value::Null),
+                            )
+                        });
+
+                        if is_inflight_reply {
+                            let upstream_id =
+                                self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                            let sidecar_path = self
+                                .state_dir
+                                .join("sessions")
+                                .join(format!("{}.replies.jsonl", self.sid));
+                            let _ = append_reply_sidecar(&sidecar_path, &upstream_id, &frame);
+
+                            let actions =
+                                self.turn
+                                    .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
+                            self.execute_actions(actions).await;
+                        } else {
+                            // Unmatched upstream response -> warn with upstream id only
+                            let id_disp = frame
+                                .get("id")
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "null".into());
+                            tracing::warn!("unmatched upstream response for id: {id_disp}");
+                        }
                     }
                 }
             } else if kind == crate::rpc::Kind::Request {
