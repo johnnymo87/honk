@@ -646,3 +646,83 @@ async fn gone_during_gap_rebuild_reactivation_wins_late_rebuilt_ignored() {
         "prompt after reactivation over interrupted rebuild must succeed: {resp:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_requests_fail_with_32000_on_connection_replacement() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Send a forward request that FakeGoose doesn't answer
+    let forward_id = v
+        .request(
+            "session/set_config_option",
+            json!({
+                "sessionId": &sid,
+                "configId": "model",
+                "value": "custom-model"
+            }),
+        )
+        .await;
+
+    // Goose restarts!
+    fake.restart().await;
+
+    // The in-flight forward request must fail with -32000, not hang!
+    let resp = v.response_timeout(&forward_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        resp.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32000),
+        "pending request must fail with -32000: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_rebuilt_sets_live_before_draining_events_so_notifications_are_not_lost() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--stream-dead-secs", "2"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Trigger gap rebuild
+    fake.gap_on_next_resume(&sid);
+    fake.kick_stream(&sid);
+
+    // Wait for replay_done for epoch 2
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(2))
+    })
+    .await;
+
+    // Send a prompt to verify session actor is in Live state and can process events
+    fake.script_prompt(vec!["live after rebuild".into()]);
+    let pid = v
+        .request("session/prompt", prompt_params(&sid, "test", None))
+        .await;
+    let resp = v.response_timeout(&pid, Duration::from_secs(5)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+}

@@ -616,6 +616,19 @@ impl Session {
         }
     }
 
+    fn fail_pending_requests(&mut self, reason: &str) {
+        let pending = std::mem::take(&mut self.pending_requests);
+        for (_, req) in pending {
+            let err_resp = crate::rpc::error(
+                req.downstream_id,
+                -32000,
+                format!("Upstream connection was replaced; request cancelled ({reason})"),
+                None,
+            );
+            self.send_to_viewer(req.viewer_id, err_resp);
+        }
+    }
+
     async fn handle_gone(&mut self) {
         if self.state == ActorState::Gone || self.reactivating {
             tracing::warn!(
@@ -629,6 +642,9 @@ impl Session {
 
         // Cancel any in-flight gap rebuild so a late Rebuilt msg will be ignored
         self.rebuild_token += 1;
+
+        // Fail any in-flight pending steer / forward requests
+        self.fail_pending_requests("upstream_gone");
 
         // Step 1: turn.interrupt("upstream_restart")
         let actions = self.turn.interrupt("upstream_restart");
@@ -1192,6 +1208,7 @@ impl Session {
         }
 
         self.suppressed_keys = keys;
+        self.state = ActorState::Live;
 
         // Drain already-buffered events from the session stream before checking synthesis
         while let Ok(ev) = self.events.try_recv() {
@@ -1213,7 +1230,6 @@ impl Session {
             });
         }
         self.gap_evidenced = false;
-        self.state = ActorState::Live;
         self.drain_queued_msgs().await;
     }
 
@@ -2186,8 +2202,9 @@ impl Session {
                 {
                     self.pending_requests.remove(&up_id);
                     let is_gone = honk_upstream::is_gone(&e);
+                    let err_code = if is_gone { -32000 } else { -32603 };
                     let err_resp =
-                        crate::rpc::error(id, -32603, format!("Steer POST failed: {e:#}"), None);
+                        crate::rpc::error(id, err_code, format!("Steer POST failed: {e:#}"), None);
                     self.send_to_viewer(viewer_id, err_resp);
                     if is_gone {
                         Box::pin(self.handle_gone()).await;
@@ -2318,8 +2335,9 @@ impl Session {
                 {
                     self.pending_requests.remove(&up_id);
                     let is_gone = honk_upstream::is_gone(&e);
+                    let err_code = if is_gone { -32000 } else { -32603 };
                     let err_resp =
-                        crate::rpc::error(id, -32603, format!("Forward POST failed: {e:#}"), None);
+                        crate::rpc::error(id, err_code, format!("Forward POST failed: {e:#}"), None);
                     self.send_to_viewer(viewer_id, err_resp);
                     if is_gone {
                         Box::pin(self.handle_gone()).await;
@@ -2430,6 +2448,7 @@ impl Session {
                 self.suppressed_keys = keys;
                 self.turn.client_prompts = client_prompts;
                 self.sync_inflight().await;
+                self.fail_pending_requests("connection_replaced");
 
                 let head = self.log.head();
                 let reset_frame = json!({
@@ -2498,6 +2517,7 @@ impl Session {
                 self.reactivating = false;
                 tracing::error!("Session {} reactivation failed: {reason}", self.sid);
                 self.state = ActorState::Gone;
+                self.fail_pending_requests("reactivation_failed");
 
                 // Remove from hub.sessions
                 self.hub.sessions.write().await.remove(&self.sid);
