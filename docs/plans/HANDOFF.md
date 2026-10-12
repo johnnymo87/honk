@@ -31,7 +31,7 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
 - Production goose (:4080, system unit `goose-serve`) is off-limits; never run goose without absolute `GOOSE_PATH_ROOT`.
 - Public repo: fixtures must be grep-checked for secret, `/home/dev`, project id (compare to /run/secrets/google_cloud_project without printing), org names.
 - Bash tool 120s default timeout; long probe waits via longer timeouts or systemd-run.
-- Pigeon likely bug (unverified at runtime): its goose runner assumes turns survive disconnect; on WS they are cancelled. Report to author; not fixed.
+- Pigeon WS disconnect bug: confirmed at runtime and fixed by honest reporting in pigeon PR #168 (merged + deployed 2026-10-12): turns still die on WS close; pigeon now says so (`error_kind: goose-turn-disconnected`). The HTTP+SSE transport switch (pigeon bead `pigeon-82sa`) is DEFERRED in favour of routing pigeon through honkd.
 
 ## Post-M0 (2026-10-11)
 - M0 probes done; findings + amendments A1-A16 in docs/spike/m0-findings.md; design revised (86ff5a3).
@@ -39,7 +39,7 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
 - Order: execute the goose patch plan first (Tasks 0-11; stop at published release patched-1.54.0.3 + author-only deploy runbook), then M1a (A0 depends on the patch release).
 - Org-name leak: commits 133bf83..ee1781b (pushed, public) contained the org name in redact.rs; fixed forward in b2443a5 (needles now in ~/.config/honk/redact.txt). History NOT rewritten — author decides.
 - goose bug found (P5a): cancel orphans shell descendants — affects production goose; patch 1 of the patch plan fixes it.
-- Open questions for author: GOOSE_STATE_MACHINE in production? widened extension set on re-activation acceptable? in-file Apache notice on shell.rs?
+- Open questions — all resolved 2026-10-12: GOOSE_STATE_MACHINE is OFF in production (env-only switch, `state_machine/mod.rs` `enabled()`, unset in goose-serve); extension set does not widen on re-activation (A10); Apache §4(b) modification notices are being added in the fork by a separate session (see "Current state").
 
 ## Goose patch track (2026-10-11) — branch `goose-patch-track` (worktree ../honk-patch-track)
 - Fork worktree: ~/projects/goose-patched-track3 (local branch patched/v1.54.0). Pushed fork/patched/v1.54.0 = e41c1ec30; tag patched-1.54.0.3 pushed; release run 38116818991.
@@ -95,3 +95,14 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
   6. Ambiguous prompt POST failures bounded: conservative bounded rule polls steer probe and export at 2s, 5s, 10s, 20s, 30s (scaled via --ambiguous-inflight-timeout-secs, default 30s); run announced, prompt reply, probe actualRunId, or export containing prompt N confirms delivered; whole window expiring with every probe idle and prompt absent marks not_delivered and dispatches parked.
   7. Secret file validated >= 32 chars and fsync'd on creation; downstream auth rejects empty tokens (3217f9f).
   8. Steer probe timeout and retry added for degraded mode (1e57c3d).
+
+## Current state (2026-10-12, after M1a merged) — READ THIS FIRST
+- main = 1d6843c: PRs #1 (M0), #2 (goose patch track), #3 (M1a) squash-merged. Old branches m0, goose-patch-track, m1a and worktrees ../honk-patch-track, ../honk-m1a are historical (m1a's pre-rebase history is in local branch `m1a-pre-rebase-backup`). M1b work happens in worktree ../honk-m1b (branch `m1b`, off main).
+- Task tracking moved to beads: `bd` in this repo (stealth, `.beads/` git-excluded, the private DoltHub remote). M1b epic `honk-znj` (runbook in its design field), M1c epic `honk-oi2`; `bd ready --parent=<epic>` is the only "what next". This file keeps history and decisions.
+- Production goose (:4080, `goose-serve`) runs patched-1.54.0.3 since 2026-10-12 10:46 EDT (workstation PR #665; sessions.db backup in ~/.local/state/goose-db-backups/pre-patched.3-20261012-104623). Verified by real stall-watch traffic. Plan Task B2 is DONE.
+- goose fork hygiene (Apache §4(b) notices + Nix dev shell fix) merged as johnnymo87/goose PR #1 into patched/v1.54.0; no new release needed (binary unchanged).
+- pigeon PR #168 (honest WS-disconnect reporting) merged and deployed. B1 must build on it: on a honk connection, reconnect once and resend with the same client_req_id; on bare goose keep #168's behaviour.
+- stall-watch coordinators (the stall-watch coordinator) do NOT use ACP: each tick runs the `goose run` CLI (`--session-id … --resume` or `--name stallwatch-…`) as a subprocess, sharing ~/.local/share/goose/sessions/sessions.db with goose-serve. The author wants to use honk to talk to those coordinators; that is a separate design question (CLI writer and serve writer on one session), tracked as a bead, not part of the cutover.
+- Process the author asked for on M1b: compact first; optional oracle-opus consult; subagent-driven development where there are code tasks; adversarial-reviewer-opus on designs and diffs; PRs via shepherding-pull-requests; keep beads current. Author-gated steps (anything that changes live pigeon/honkd/goose service config) wait for an explicit go.
+- Known limits carried into M1b: --max-sessions 16 with no LRU (M1c) — check how many goose sessions pigeon holds open before cutover; logs not compacted (M1c); state.json is rewritten+fsynced several times per turn under one lock; boot-time restored-inflight check awaits export inline.
+- B3 complete: added packages.honkd to flake.nix (packages.default = honkd; builds honkd + honk via pinned toolchain and lib.fileset src filtering) and wrote cutover operator runbook docs/plans/2026-10-11-honk-m1-cutover.md.

@@ -10,7 +10,32 @@
       let
         pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+        honkd = rustPlatform.buildRustPackage {
+          pname = "honkd";
+          version = "0.0.0";
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./crates
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "honkd" "-p" "honk" ];
+          # Real test suite needs a live goose / stub instance and is run by CI.
+          doCheck = false;
+          meta = {
+            mainProgram = "honkd";
+            description = "Durable ACP proxy and relay for goose";
+          };
+        };
       in {
+        packages = {
+          inherit honkd;
+          default = honkd;
+        };
         devShells.default = pkgs.mkShell {
           packages = [ rust pkgs.pkg-config pkgs.openssl pkgs.jq pkgs.websocat pkgs.shellcheck ];
         };
