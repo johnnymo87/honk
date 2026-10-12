@@ -672,7 +672,7 @@ async fn boot_prunes_orphan_inflight_entries() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gone_session_resolves_inflight_to_done_upstream_gone() {
-    let mut fake = FakeGoose::start().await;
+    let fake = FakeGoose::start().await;
     fake.advertise_patched(true);
     let h = Honkd::spawn(
         &fake.url(),
@@ -683,8 +683,48 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
     let mut v = Viewer::connect(&h).await;
     let sid = new_session(&mut v, ".").await;
 
-    // Send prompt with client_req_id
-    fake.set_drop_prompt_reply(true);
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Script an active run with a tool call in FakeGoose
+    fake.script_frames(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": "run_probe_test_gone"
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_1",
+                    "title": "shell",
+                    "status": "in_progress"
+                }
+            }
+        }),
+    ]);
+
+    // Induce gap on resume, and 404 on steer probe POST
+    fake.gap_on_next_resume(&sid);
+    fake.set_steer_status(Some(StatusCode::NOT_FOUND));
+
     let pid = v
         .request(
             "session/prompt",
@@ -692,26 +732,51 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
         )
         .await;
 
-    // Wait until prompt is inflight
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait until tool_call frame appears
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("tool_call")
+    })
+    .await;
 
-    // Upstream 404s on reattach -> Gone
-    fake.restart().await;
-    fake.conflict_forever("any");
-    // Trigger watchdog / reattach by kicking stream or sending a request that 404s
-    let _ = v.request("session/close", json!({"sessionId": &sid})).await;
+    // Kick stream while turn is in flight
+    fake.kick_stream(&sid);
 
-    // Session transitions to Gone, resolving inflight to Done with upstream_gone
+    // Watchdog or stream ended causes reattach -> gap -> steer probe POST returns 404 -> ReattachFailed { gone: true } -> Gone!
+    // The in-flight prompt should get cancelled with reason upstream_gone
     let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
     assert_eq!(resp["result"]["stopReason"], "cancelled");
 
-    // Check state.json: crid-gone is resolved to Done
+    // Check state.json: crid-gone is resolved to Done with upstream_gone
     let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
     let state: Value = serde_json::from_str(&state_content).unwrap();
     let entry = &state["ledger"]["crid-gone"];
     assert_eq!(
         entry["state"], "done",
         "InFlight must be resolved to Done on Gone"
+    );
+    assert_eq!(
+        entry["response"]["error"]["data"]["reason"], "upstream_gone",
+        "cached response must indicate upstream_gone"
+    );
+
+    // When client retries with the same client_req_id, it gets a clear error answer instead of lost track
+    let mut v2 = Viewer::connect(&h).await;
+    let r2 = v2
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "test gone prompt retry", Some("crid-gone")),
+        )
+        .await;
+
+    assert_eq!(
+        r2["error"]["code"], -32000,
+        "retry gets -32000 error: {r2:?}"
+    );
+    assert_eq!(
+        r2["error"]["data"]["reason"], "upstream_gone",
+        "retry error data has reason upstream_gone"
     );
 }
 
@@ -802,6 +867,9 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_
             }]
         }),
     );
+
+    // Drop automatic prompt reply so we can observe the in-flight state
+    fake.set_drop_prompt_reply(true);
 
     // Enable connection drop on prompt in proxy
     proxy.set_drop_on_prompt(true);

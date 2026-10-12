@@ -1653,16 +1653,33 @@ impl Session {
                     // Ledger: InFlight -> Done{response}
                     if let Some(crid) = &o.client_req_id {
                         let sid = self.sid.clone();
+                        let is_gone = self.state == ActorState::Gone;
                         let mut s = self.state_store.lock().await;
                         let _ = s.mutate(|st| {
-                            st.ledger.insert(
-                                crid.clone(),
-                                crate::state::LedgerEntry::Done {
-                                    session: sid,
-                                    response: resp.clone(),
-                                    done_unix: now,
-                                },
-                            );
+                            if is_gone {
+                                st.ledger.insert(
+                                    crid.clone(),
+                                    crate::state::LedgerEntry::Done {
+                                        session: sid,
+                                        response: crate::rpc::error(
+                                            Value::Null,
+                                            -32000,
+                                            "Session is gone (upstream 404)".to_string(),
+                                            Some(json!({ "reason": "upstream_gone" })),
+                                        ),
+                                        done_unix: now,
+                                    },
+                                );
+                            } else {
+                                st.ledger.insert(
+                                    crid.clone(),
+                                    crate::state::LedgerEntry::Done {
+                                        session: sid,
+                                        response: resp.clone(),
+                                        done_unix: now,
+                                    },
+                                );
+                            }
                         });
                         drop(s);
 

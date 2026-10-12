@@ -448,7 +448,10 @@ mod tests {
             "InFlight for unheld session must be pruned"
         );
         assert!(
-            matches!(st.ledger.get("orphan_mismatched_crid"), Some(LedgerEntry::Done { .. })),
+            matches!(
+                st.ledger.get("orphan_mismatched_crid"),
+                Some(LedgerEntry::Done { .. })
+            ),
             "InFlight not in held.inflight.client_req_ids must be resolved to Done"
         );
 
