@@ -20,23 +20,29 @@ pub struct State {
 }
 
 impl State {
-    pub fn prune_ledger(&mut self, now_unix: u64, ttl_secs: u64, max_entries: usize) {
+    pub fn prune_ledger(
+        &mut self,
+        now_unix: u64,
+        ttl_secs: u64,
+        max_entries: usize,
+        state_dir: Option<&std::path::Path>,
+    ) {
         let sessions = &self.sessions;
         let mut to_resolve_lost = Vec::new();
 
         self.ledger.retain(|crid, entry| match entry {
             LedgerEntry::Done { done_unix, .. } => now_unix.saturating_sub(*done_unix) <= ttl_secs,
-            LedgerEntry::InFlight { session, .. } => {
+            LedgerEntry::InFlight { session, upstream_id } => {
                 if let Some(held) = sessions.get(session) {
                     if let Some(inf) = &held.inflight {
                         if inf.client_req_ids.contains(crid) {
                             true
                         } else {
-                            to_resolve_lost.push((crid.clone(), session.clone()));
+                            to_resolve_lost.push((crid.clone(), session.clone(), upstream_id.clone()));
                             true
                         }
                     } else {
-                        to_resolve_lost.push((crid.clone(), session.clone()));
+                        to_resolve_lost.push((crid.clone(), session.clone(), upstream_id.clone()));
                         true
                     }
                 } else {
@@ -45,20 +51,49 @@ impl State {
             }
         });
 
-        for (crid, session) in to_resolve_lost {
-            self.ledger.insert(
-                crid,
-                LedgerEntry::Done {
-                    session,
-                    response: crate::rpc::error(
-                        Value::Null,
-                        -32000,
-                        "honkd lost track of this client_req_id; not resending",
-                        None,
-                    ),
-                    done_unix: now_unix,
-                },
-            );
+        for (crid, session, upstream_id) in to_resolve_lost {
+            // Check if replies sidecar has cached reply for this upstream_id
+            let cached_reply = state_dir.and_then(|dir| {
+                let sidecar_path = dir.join("sessions").join(format!("{session}.replies.jsonl"));
+                let Ok(content) = std::fs::read_to_string(sidecar_path) else {
+                    return None;
+                };
+                for line in content.lines() {
+                    if let Ok(v) = serde_json::from_str::<Value>(line)
+                        && let Some(uid) = v.get("upstream_id").and_then(Value::as_str)
+                        && uid == upstream_id
+                        && let Some(reply) = v.get("reply")
+                    {
+                        return Some(reply.clone());
+                    }
+                }
+                None
+            });
+
+            if let Some(reply) = cached_reply {
+                self.ledger.insert(
+                    crid,
+                    LedgerEntry::Done {
+                        session,
+                        response: reply,
+                        done_unix: now_unix,
+                    },
+                );
+            } else {
+                self.ledger.insert(
+                    crid,
+                    LedgerEntry::Done {
+                        session,
+                        response: crate::rpc::error(
+                            Value::Null,
+                            -32000,
+                            "honkd lost track of this client_req_id; not resending",
+                            None,
+                        ),
+                        done_unix: now_unix,
+                    },
+                );
+            }
         }
 
         if self.ledger.len() > max_entries {
@@ -78,6 +113,24 @@ impl State {
                 self.ledger.remove(&k);
             }
         }
+    }
+
+    pub fn insert_done_entry(
+        &mut self,
+        crid: String,
+        session: String,
+        response: Value,
+        done_unix: u64,
+    ) {
+        self.ledger.insert(
+            crid,
+            LedgerEntry::Done {
+                session,
+                response,
+                done_unix,
+            },
+        );
+        self.prune_ledger(done_unix, LEDGER_PRUNE_TTL_SECS, LEDGER_PRUNE_MAX_ENTRIES, None);
     }
 }
 
@@ -300,7 +353,8 @@ impl StateStore {
     }
 
     pub fn prune_ledger(&mut self, now_unix: u64, ttl_secs: u64, max_entries: usize) -> Result<()> {
-        self.mutate(|st| st.prune_ledger(now_unix, ttl_secs, max_entries))
+        let dir = self.dir.clone();
+        self.mutate(|st| st.prune_ledger(now_unix, ttl_secs, max_entries, Some(&dir)))
     }
 }
 
@@ -450,7 +504,7 @@ mod tests {
             },
         );
 
-        st.prune_ledger(100_000, 24 * 3600, 1000);
+        st.prune_ledger(100_000, 24 * 3600, 1000, None);
         assert!(!st.ledger.contains_key("old"));
         assert!(st.ledger.contains_key("live"));
         assert!(
@@ -491,16 +545,87 @@ mod tests {
         );
         // Total entries = 4: 2 InFlight, 2 Done.
         // If max_entries = 2, both Done entries should be dropped, leaving both InFlight
-        st.prune_ledger(100_000, 24 * 3600, 2);
+        st.prune_ledger(100_000, 24 * 3600, 2, None);
         assert!(st.ledger.contains_key("live"));
         assert!(st.ledger.contains_key("live2"));
         assert_eq!(st.ledger.len(), 2);
 
         // If max_entries = 1, excess is 1, but all are InFlight so none can be dropped!
-        st.prune_ledger(100_000, 24 * 3600, 1);
+        st.prune_ledger(100_000, 24 * 3600, 1, None);
         assert!(st.ledger.contains_key("live"));
         assert!(st.ledger.contains_key("live2"));
         assert_eq!(st.ledger.len(), 2);
+    }
+
+    #[test]
+    fn insert_done_entry_prunes_old_entries() {
+        let mut st = State::default();
+        let held = HeldSession::default();
+        st.sessions.insert("s".into(), held);
+
+        let now = 100_000;
+        // Insert an entry older than 24h
+        st.insert_done_entry("old".into(), "s".into(), json!({}), now - (25 * 3600));
+        assert!(st.ledger.contains_key("old"));
+
+        // Inserting a new entry prunes the old one
+        st.insert_done_entry("new".into(), "s".into(), json!({}), now);
+        assert!(!st.ledger.contains_key("old"));
+        assert!(st.ledger.contains_key("new"));
+    }
+
+    #[test]
+    fn prune_ledger_consults_sidecar_for_inflight_without_held_inflight() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sessions_dir = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Write a reply in the sidecar for upstream_id "u_completed"
+        let sidecar_file = sessions_dir.join("s.replies.jsonl");
+        let line = json!({
+            "upstream_id": "u_completed",
+            "reply": { "result": { "stopReason": "end_turn", "text": "cached" } }
+        });
+        std::fs::write(&sidecar_file, format!("{line}\n")).unwrap();
+
+        let mut st = State::default();
+        // Session is held, but held.inflight is None (e.g. crash between reply and ReplyText export)
+        let held = HeldSession::default();
+        st.sessions.insert("s".into(), held);
+
+        st.ledger.insert(
+            "crid1".into(),
+            LedgerEntry::InFlight {
+                session: "s".into(),
+                upstream_id: "u_completed".into(),
+            },
+        );
+        st.ledger.insert(
+            "crid2".into(),
+            LedgerEntry::InFlight {
+                session: "s".into(),
+                upstream_id: "u_other".into(),
+            },
+        );
+
+        st.prune_ledger(100_000, 24 * 3600, 1000, Some(temp_dir.path()));
+
+        // crid1 matched sidecar reply -> resolved to Done with cached reply!
+        match st.ledger.get("crid1") {
+            Some(LedgerEntry::Done { response, .. }) => {
+                assert_eq!(response["result"]["stopReason"], "end_turn");
+                assert_eq!(response["result"]["text"], "cached");
+            }
+            other => panic!("expected Done with cached reply, got {other:?}"),
+        }
+
+        // crid2 did not match sidecar -> resolved to lost track error
+        match st.ledger.get("crid2") {
+            Some(LedgerEntry::Done { response, .. }) => {
+                assert!(response.to_string().contains("lost track"));
+            }
+            other => panic!("expected Done with lost track error, got {other:?}"),
+        }
     }
 
     #[test]

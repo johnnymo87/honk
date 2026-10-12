@@ -909,13 +909,18 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_without_false_negative_not
         )
         .await;
 
+    let up_id = state["ledger"]["crid-ambig"]["upstream_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     // Disable drop and emit prompt reply from fake goose
     proxy.set_drop_on_prompt(false);
     fake.emit_frame(
         &sid,
         json!({
             "jsonrpc": "2.0",
-            "id": "hk1-1",
+            "id": up_id,
             "result": {
                 "stopReason": "end_turn"
             }
@@ -986,5 +991,112 @@ async fn cancel_on_unannounced_inflight_ends_with_reply_and_done_ledger() {
     assert!(
         state["sessions"][&sid]["inflight"].is_null(),
         "held.inflight must be cleared"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_prunes_old_done_ledger_entries_live() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+
+    // Mutate state to inject an expired Done entry (> 24h old)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    {
+        let state_path = h.state_dir.path().join("state.json");
+        let content = std::fs::read_to_string(&state_path).unwrap();
+        let mut state: Value = serde_json::from_str(&content).unwrap();
+        state["ledger"]["expired_crid"] = json!({
+            "state": "done",
+            "session": "dummy",
+            "response": {},
+            "done_unix": now - (25 * 3600)
+        });
+        std::fs::write(&state_path, state.to_string()).unwrap();
+    }
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Run a prompt to trigger insert_done_entry
+    fake.script_prompt(vec!["done".into()]);
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test", Some("fresh_crid")),
+        )
+        .await;
+    let resp = v.response_timeout(&pid, Duration::from_secs(5)).await;
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+
+    // The state file should have fresh_crid, and expired_crid should be pruned!
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert!(state["ledger"]["fresh_crid"].is_object());
+    assert!(state["ledger"]["expired_crid"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_prune_consults_sidecar_for_inflight_missing_from_held() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Write a reply to the sidecar file simulating crash right after sidecar append before ReplyText
+    let sidecar_path = h
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.replies.jsonl"));
+    let line = json!({
+        "upstream_id": "hk1_1-1",
+        "reply": {
+            "jsonrpc": "2.0",
+            "id": "hk1_1-1",
+            "result": {
+                "stopReason": "end_turn",
+                "_meta": { "honk": { "text": "cached from sidecar" } }
+            }
+        }
+    });
+    std::fs::write(&sidecar_path, format!("{line}\n")).unwrap();
+
+    // Mutate state.json so ledger has crid_cached as InFlight, but held.inflight is None
+    {
+        let state_path = h.state_dir.path().join("state.json");
+        let content = std::fs::read_to_string(&state_path).unwrap();
+        let mut state: Value = serde_json::from_str(&content).unwrap();
+        state["ledger"]["crid_cached"] = json!({
+            "state": "in_flight",
+            "session": sid,
+            "upstream_id": "hk1_1-1"
+        });
+        state["sessions"][&sid]["inflight"] = Value::Null;
+        std::fs::write(&state_path, state.to_string()).unwrap();
+    }
+
+    // Restart honkd
+    h.restart().await;
+
+    // Retry with crid_cached: must return the cached reply from the sidecar, not "lost track"!
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "test", Some("crid_cached")),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["text"],
+        "cached from sidecar"
     );
 }

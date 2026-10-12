@@ -765,6 +765,12 @@ impl Session {
                     };
                 }
             }
+            st.prune_ledger(
+                now,
+                crate::state::LEDGER_PRUNE_TTL_SECS,
+                crate::state::LEDGER_PRUNE_MAX_ENTRIES,
+                None,
+            );
         });
     }
 
@@ -2627,14 +2633,7 @@ impl Session {
                         let _ = s.mutate(|st| {
                             let mut cached_resp = resp.clone();
                             cached_resp["id"] = Value::Null;
-                            st.ledger.insert(
-                                crid.clone(),
-                                crate::state::LedgerEntry::Done {
-                                    session: sid,
-                                    response: cached_resp,
-                                    done_unix: now,
-                                },
-                            );
+                            st.insert_done_entry(crid.clone(), sid, cached_resp, now);
                         });
                         drop(s);
 
@@ -2689,14 +2688,7 @@ impl Session {
                                     st.ledger.get(crid),
                                     Some(crate::state::LedgerEntry::InFlight { .. })
                                 ) {
-                                    st.ledger.insert(
-                                        crid.clone(),
-                                        crate::state::LedgerEntry::Done {
-                                            session: sid,
-                                            response: resp.clone(),
-                                            done_unix: now,
-                                        },
-                                    );
+                                    st.insert_done_entry(crid.clone(), sid, resp.clone(), now);
                                 }
                             });
                             drop(s);
