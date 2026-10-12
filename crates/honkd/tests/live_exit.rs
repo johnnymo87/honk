@@ -739,7 +739,7 @@ async fn run_delete_frees_parked_run() {
     let id_a = req_a["id"].clone();
     eprintln!("[delete_probe] Conn A permission request id: {id_a:?}");
 
-    // DELETE connection A (frees the parked run)
+    // DELETE connection A: the claim under test is that this alone frees the parked run
     let del_status = up1.delete().await.expect("delete Conn A");
     eprintln!("[delete_probe] Conn A DELETE status: {del_status:?}");
 
@@ -775,9 +775,10 @@ async fn run_delete_frees_parked_run() {
             break;
         }
     }
-    eprintln!(
-        "[delete_probe] Was permission re-offered on Conn B? {:?}",
-        reoffered_perm.is_some()
+    // Observed on patched-1.54.0.3: DELETE drops the active run, so nothing is re-offered.
+    assert!(
+        reoffered_perm.is_none(),
+        "DELETE freed the parked run: no permission re-offered on session/load"
     );
 
     // Send new prompt on Conn B: instructs model not to use tools
@@ -810,12 +811,6 @@ async fn run_delete_frees_parked_run() {
     );
 
     let _ = up2.delete().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn delete_leaves_parked_run_reoffered_on_load() {
-    run_delete_frees_parked_run().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
