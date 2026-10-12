@@ -218,14 +218,31 @@ Two tests evaluate session activation behavior:
   - If `export_completed_turns <= logged_completed_turns`, goose has not completed any new turn, and the function verifies trailing user messages after `last_assistant_idx`.
   - Added unit test in `crates/honkd/tests/restart.rs`: `turn_completed_on_upstream_during_honkd_restart_recognized_delivered_and_deduped`.
 
-#### 2. Test Artefact: `e3_goose_restart_mid_turn` Prompt Phrasing
-- **Symptom:** Probabilistic models (Claude Haiku) occasionally emitted preliminary text (e.g. *"I'll execute that command right now."*) before invoking the `shell` tool.
-- **Observation:** If the model emits preliminary text before the tool call, that text is streamed live over SSE to `pigeon`, but when goose is killed via `systemctl restart` mid-tool-call, goose aborts before committing the turn to SQLite. Thus, `pigeon.receipt_text()` contained the uncommitted preamble while `export` turn text was empty.
-- **Resolution:** Tuned prompt to instruct the model to execute the tool immediately without preliminary conversational text: `"Run the bash command 'sleep 40' immediately using your shell tool. Output no text before calling the tool."` This ensures deterministic parity between live streaming and export.
+#### 2. Finding: Uncommitted Preamble Stream vs Export on Upstream Restart (`e3_goose_restart_mid_turn`)
+- **Product Behavior:** When the model generates conversational preamble text before invoking a tool (e.g. *"I'll run the bash command 'sleep 40' for you right now."*), this text is streamed live over SSE to legacy/pigeon viewers and accumulated in `pigeon.receipt_text()`.
+- **Crash Impact:** When goose restarts mid-tool-call (before turn completion), the turn aborts uncommitted. Goose's SQLite database contains only the user prompt; no assistant message is committed (`export mid_text == ""`).
+- **Honk Contract Parity:**
+  - A honk-aware tail connecting after the reactivation reset (`session/load` with `_meta: { honk: {} }`) resumes from `_honk/reset` and receives only the committed transcript, exactly matching `export turn text` (`""`).
+  - A live tail running across the restart retains whatever was printed live to the terminal. In `text_only: true` mode, rebuild markers (`[honk: transcript rebuilt]`) are suppressed by design.
+  - The cancelled prompt response from `honkd` carries `_meta.honk.reason: "upstream_restart"`, but `_meta.honk.text` is `None` because the turn was cancelled, not completed.
+- **M1b Downstream Implication for Pigeon:**
+  - In M1b cutover, pigeon's `receipt_text` prefers `result._meta.honk.text` when present, but on a cancelled turn where `_meta.honk.text` is absent, pigeon falls back to its live `accumulated_agent_text`. Consequently, on goose restarts mid-turn, pigeon's local receipt may show text chunks that goose never committed to its SQLite conversation history. This is real product behavior reflecting transport boundaries rather than an artefact.
 
-#### 3. Wire Finding: `delete_frees_parked_run` Mechanism
-- **Observation:** When connection A is terminated via `DELETE /acp` while waiting on a tool confirmation in approve mode, goose's SQLite database retains the unconfirmed tool call. When connection B initializes and issues `session/load`, goose re-offers `session/request_permission`.
-- **Resolution:** Answering `outcome: { outcome: "cancelled" }` to the re-offered request releases the parked tool call without executing it (`check_export_tool_output` confirms the tool never ran), freeing the session to accept and complete the subsequent prompt (`Reply with exactly: UNPARKED_OK`).
+#### 3. Finding: `delete_frees_parked_run` Mechanism & Plan Hypothesis
+- **Plan Hypothesis Tested:** The M1 plan (§C5 and A19) hypothesized that `DELETE /acp` of a connection alone frees a parked run, serving as the primitive for hard cancel (`_honk/hard_cancel`).
+- **Empirical Findings on Patched Sandbox (`:4181`):**
+  - When Conn A is in approve mode waiting on a tool permission request, deleting Conn A via `DELETE /acp` (HTTP 202 Accepted) causes goose's `ActiveRunDropGuard` to drop the in-memory active run.
+  - When Conn B initializes, subscribes, and calls `session/load`:
+    - In bare goose (standard mode, state machine disabled), goose does NOT re-offer the permission request (`reoffered_perm.is_none()`).
+    - The parked run on Conn A was indeed dropped and freed by `DELETE`.
+    - When Conn B sends a new prompt that does not invoke tools (`"Do not call any tool. Reply with only: UNPARKED_OK"`), it is NOT rejected busy; it runs cleanly and completes with `stopReason: "end_turn"`.
+    - Export confirms `check_export_tool_output` is false (the parked tool `echo PARKED_TOOL_OUTPUT` never executed), and export contains `UNPARKED_OK`.
+  - However, if the new prompt on Conn B does not forbid tools, the model in turn 2 inspects the unfulfilled prompt in SQLite conversation history and may issue a *new* tool call requiring approval in turn 2.
+- **Implications for Honkd & A13 Connection Replacement:**
+  - In `honkd` (tested in `e4`), `honkd` maintains pending server requests across restarts/reconnection in `state.json`.
+  - When `honkd` replaces a connection (via activation/reattach), A13's rule applies: `mark_pending_stale()` clears old pending requests and broadcasts `_honk/request_resolved { reason: "stale" }`.
+  - If goose sends server requests during `session/load`, `hub.rs` retains them in `initial_events` and re-processes them via `on_upstream`, assigning fresh state and broadcasting to viewers.
+  - For `_honk/hard_cancel` (M1c), sending `DELETE /acp` upstream effectively terminates the active run on goose, but honkd must also resolve pending viewer requests as cancelled and reset the session actor.
 
 ### M1a Exit Status
 
