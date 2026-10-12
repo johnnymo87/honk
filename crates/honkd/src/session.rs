@@ -165,10 +165,71 @@ pub struct Session {
     pub synthesized_replies: HashSet<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn create_new_generation_from_export(
+    sid: &str,
+    state_dir: &Path,
+    state_store: &Arc<Mutex<crate::state::StateStore>>,
+    frames: Vec<Value>,
+    keys: HashSet<honk_wire::BlockKey>,
+    buffered_frames: Vec<(Option<u64>, Value)>,
+    resume_from: Option<u64>,
+    last_processed_session_id: Option<u64>,
+) -> anyhow::Result<(SessionLog, u64)> {
+    let log_path = state_dir.join("sessions").join(format!("{sid}.jsonl"));
+    let log_header_epoch = if log_path.exists() {
+        crate::log::read_header_epoch(&log_path).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut next_epoch = 1;
+    {
+        let mut s = state_store.lock().await;
+        s.mutate(|st| {
+            if let Some(h) = st.sessions.get_mut(sid) {
+                next_epoch = h.epoch.max(log_header_epoch) + 1;
+                h.epoch = next_epoch;
+            } else if let Some(ret) = st.retired_epochs.get_mut(sid) {
+                next_epoch = (*ret).max(log_header_epoch) + 1;
+                *ret = next_epoch;
+            } else {
+                next_epoch = log_header_epoch + 1;
+                st.retired_epochs.insert(sid.to_string(), next_epoch);
+            }
+        })?;
+    }
+
+    let mut combined: Vec<(Option<u64>, Value)> =
+        Vec::with_capacity(frames.len() + buffered_frames.len());
+    for f in frames {
+        combined.push((None, f));
+    }
+    for (id_opt, f) in buffered_frames {
+        let key = f.pointer("/params/update").and_then(honk_wire::block_key);
+        if let Some(k) = key
+            && keys.contains(&k)
+        {
+            continue;
+        }
+        combined.push((id_opt, f));
+    }
+
+    let max_resume = match (resume_from, last_processed_session_id) {
+        (Some(r), Some(l)) => Some(r.max(l)),
+        (None, l) => l,
+        (r, None) => r,
+    };
+
+    let new_log = crate::log::SessionLog::create(&log_path, next_epoch, max_resume, combined)?;
+    Ok((new_log, next_epoch))
+}
+
 impl Session {
     pub async fn run(mut self) {
         let mut watchdog = tokio::time::interval(Duration::from_secs(5));
-        let mut idle = tokio::time::interval(Duration::from_secs(60));
+        let mut idle = tokio::time::interval(Duration::from_millis(200));
+        let mut idle_since: Option<std::time::Instant> = None;
 
         if self.start_reattach {
             self.start_reattach = false;
@@ -208,7 +269,16 @@ impl Session {
                     self.check_streams().await;
                 }
                 _ = idle.tick() => {
-                    self.on_idle();
+                    if self.is_idle() {
+                        let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= Duration::from_secs(self.hub.args.idle_ttl_secs)
+                            && self.evict().await
+                        {
+                            break;
+                        }
+                    } else {
+                        idle_since = None;
+                    }
                 }
             }
         }
@@ -613,118 +683,94 @@ impl Session {
         keys: HashSet<honk_wire::BlockKey>,
         resume_from: Option<u64>,
     ) {
-        let sid = self.sid.clone();
-        let current_epoch = self.log.epoch();
-        let mut next_epoch = current_epoch + 1;
+        let buffered = std::mem::take(&mut self.rebuilding_buffered_frames);
+        let (new_log, _next_epoch) = match create_new_generation_from_export(
+            &self.sid,
+            &self.state_dir,
+            &self.state_store,
+            frames,
+            keys.clone(),
+            buffered,
+            resume_from,
+            self.last_processed_session_id,
+        )
+        .await
         {
-            let mut s = self.state_store.lock().await;
-            let _ = s.mutate(|st| {
-                if let Some(h) = st.sessions.get_mut(&sid) {
-                    next_epoch = h.epoch.max(current_epoch) + 1;
-                    h.epoch = next_epoch;
-                } else if let Some(ret) = st.retired_epochs.get(&sid) {
-                    next_epoch = ret.max(&current_epoch) + 1;
-                }
-            });
-        }
-
-        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
-        let mut combined: Vec<(Option<u64>, Value)> = Vec::new();
-        for f in frames {
-            combined.push((None, f));
-        }
-        for (id_opt, f) in std::mem::take(&mut self.rebuilding_buffered_frames) {
-            let key = f.pointer("/params/update").and_then(honk_wire::block_key);
-            if let Some(k) = key
-                && keys.contains(&k)
-            {
-                continue;
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("rebuild new generation failed for {}: {e:#}", self.sid);
+                return;
             }
-            combined.push((id_opt, f));
-        }
-
-        let max_resume = match (resume_from, self.last_processed_session_id) {
-            (Some(r), Some(l)) => Some(r.max(l)),
-            (None, l) => l,
-            (r, None) => r,
         };
 
-        match crate::log::SessionLog::create(&log_path, next_epoch, max_resume, combined) {
-            Ok(new_log) => {
-                self.log = new_log;
-                let head = self.log.head();
-                self.last_processed_session_id = self.log.last_upstream_id();
+        self.log = new_log;
+        let head = self.log.head();
+        self.last_processed_session_id = self.log.last_upstream_id();
 
-                let reset_frame = json!({
-                    "jsonrpc": "2.0",
-                    "method": "_honk/reset",
-                    "params": {
-                        "sessionId": self.sid,
-                        "epoch": head.epoch,
-                    }
-                });
-                let replay_done_frame = json!({
-                    "jsonrpc": "2.0",
-                    "method": "_honk/replay_done",
-                    "params": {
-                        "sessionId": self.sid,
-                        "epoch": head.epoch,
-                        "seq": head.seq,
-                    }
-                });
-
-                let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
-                msgs.push(axum::extract::ws::Message::Text(
-                    reset_frame.to_string().into(),
-                ));
-                for entry in self.log.entries() {
-                    msgs.push(axum::extract::ws::Message::Text(
-                        entry.frame.to_string().into(),
-                    ));
-                }
-                msgs.push(axum::extract::ws::Message::Text(
-                    replay_done_frame.to_string().into(),
-                ));
-
-                for (tx, is_honk_aware) in self.viewers.values() {
-                    if *is_honk_aware {
-                        let batch = crate::viewer::ReplayBatch {
-                            session_id: self.sid.clone(),
-                            head: head.clone(),
-                            msgs: msgs.clone(),
-                            done_tx: None,
-                        };
-                        let _ = tx.send_replay(batch);
-                    }
-                }
-
-                self.suppressed_keys = keys;
-
-                // Drain already-buffered events from the session stream before checking synthesis
-                while let Ok(ev) = self.events.try_recv() {
-                    self.on_upstream(ev).await;
-                }
-
-                if self.gap_evidenced
-                    && let Some(inf) = self.turn.inflight.as_ref()
-                {
-                    let upstream_id = inf.upstream_id.clone();
-                    let grace = self.gap_synthesis_grace;
-                    let self_tx = self.self_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(grace).await;
-                        let _ = self_tx
-                            .send(SessionMsg::SynthesizeGapEndTurn { upstream_id })
-                            .await;
-                    });
-                }
-                self.gap_evidenced = false;
+        let reset_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/reset",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
             }
-            Err(e) => {
-                tracing::error!("failed to create session log during rebuild of {sid}: {e:#}");
+        });
+        let replay_done_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/replay_done",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
+                "seq": head.seq,
+            }
+        });
+
+        let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
+        msgs.push(axum::extract::ws::Message::Text(
+            reset_frame.to_string().into(),
+        ));
+        for entry in self.log.entries() {
+            msgs.push(axum::extract::ws::Message::Text(
+                entry.frame.to_string().into(),
+            ));
+        }
+        msgs.push(axum::extract::ws::Message::Text(
+            replay_done_frame.to_string().into(),
+        ));
+
+        for (tx, is_honk_aware) in self.viewers.values() {
+            if *is_honk_aware {
+                let batch = crate::viewer::ReplayBatch {
+                    session_id: self.sid.clone(),
+                    head: head.clone(),
+                    msgs: msgs.clone(),
+                    done_tx: None,
+                };
+                let _ = tx.send_replay(batch);
             }
         }
 
+        self.suppressed_keys = keys;
+
+        // Drain already-buffered events from the session stream before checking synthesis
+        while let Ok(ev) = self.events.try_recv() {
+            self.on_upstream(ev).await;
+        }
+
+        if self.gap_evidenced
+            && let Some(inf) = self.turn.inflight.as_ref()
+        {
+            let upstream_id = inf.upstream_id.clone();
+            let grace = self.gap_synthesis_grace;
+            let self_tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                let _ = self_tx
+                    .send(SessionMsg::SynthesizeGapEndTurn { upstream_id })
+                    .await;
+            });
+        }
+        self.gap_evidenced = false;
         self.state = ActorState::Live;
         self.drain_queued_msgs().await;
     }
@@ -736,8 +782,77 @@ impl Session {
         }
     }
 
-    fn on_idle(&mut self) {
-        // Stub for idle eviction in A16
+    pub fn is_idle(&self) -> bool {
+        self.viewers.is_empty()
+            && self.turn.run.is_none()
+            && self.turn.inflight.is_none()
+            && self.turn.parked.is_empty()
+            && self.pending_server_requests.is_empty()
+            && self.pending_requests.is_empty()
+            && self.queued_msgs.is_empty()
+            && self.state == ActorState::Live
+            && !self.rebuild_at_turn_end
+            && !self.needs_rebuild
+            && self.finalizing_waiters.is_empty()
+    }
+
+    async fn evict(&mut self) -> bool {
+        if !self.is_idle() {
+            return false;
+        }
+
+        // Notify hub that eviction has begun for sid so concurrent activations wait
+        let notify = self.hub.begin_eviction(&self.sid).await;
+
+        // Remove from hub.sessions so no new triggers can acquire our tx
+        self.hub.sessions.write().await.remove(&self.sid);
+
+        // Check if a message arrived right before removal
+        if let Ok(msg) = self.rx.try_recv() {
+            self.hub.sessions.write().await.insert(
+                self.sid.clone(),
+                crate::hub::SessionHandle {
+                    sid: self.sid.clone(),
+                    conn_id: self.up.conn_id().to_string(),
+                    tx: self.self_tx.clone(),
+                },
+            );
+            self.hub.finish_eviction(&self.sid, notify).await;
+            self.on_msg(msg).await;
+            return false;
+        }
+
+        let conn_id = self.up.conn_id().to_string();
+        let sid = self.sid.clone();
+        let epoch = self.log.epoch();
+
+        // 1. Move connection to orphans
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            });
+        }
+
+        // 2. DELETE
+        let _ = self.up.delete().await;
+
+        // 3. Remove orphan entry and session, record state.retired_epochs[sid]
+        {
+            let mut s = self.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.retain(|id| id != &conn_id);
+                if let Some(held) = st.sessions.remove(&sid) {
+                    st.retired_epochs.insert(sid.clone(), held.epoch);
+                } else {
+                    st.retired_epochs.insert(sid.clone(), epoch);
+                }
+            });
+        }
+
+        self.hub.finish_eviction(&self.sid, notify).await;
+        self.state = ActorState::Gone;
+        true
     }
 
     async fn return_undelivered_to_hub(&mut self) {

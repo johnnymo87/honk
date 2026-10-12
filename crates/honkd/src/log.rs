@@ -23,6 +23,15 @@ struct LogHeader {
     resume_from: Option<u64>,
 }
 
+pub fn read_header_epoch(path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first_line)?;
+    let header: LogHeader = serde_json::from_str(&first_line)?;
+    Ok(header.epoch)
+}
+
 #[derive(Serialize)]
 struct BorrowedLogLine<'a> {
     seq: Option<u64>,
@@ -401,6 +410,7 @@ mod tests {
         drop(log);
         let log = SessionLog::open(&p).unwrap();
         assert_eq!(log.epoch(), 3);
+        assert_eq!(read_header_epoch(&p).unwrap(), 3);
         assert_eq!(log.head(), cur);
         assert_eq!(log.last_upstream_id(), Some(11));
         assert!(matches!(

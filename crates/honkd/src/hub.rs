@@ -1,6 +1,6 @@
 use anyhow::Context;
 use honk_upstream::{Recorder, Redactor, SubscribeOpts, Upstream, UpstreamHandle, UpstreamOpts};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,12 +11,28 @@ use crate::config::Args;
 use crate::rpc::UpstreamIds;
 use crate::state::StateStore;
 
+#[derive(Debug, Clone)]
+pub struct ActivationError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl std::fmt::Display for ActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ActivationError {}
+
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
     pub sid: String,
     pub conn_id: String,
     pub tx: tokio::sync::mpsc::Sender<crate::session::SessionMsg>,
 }
+
+type ActivatingSender = tokio::sync::watch::Sender<Option<Result<SessionHandle, ActivationError>>>;
 
 pub struct Hub {
     pub args: Arc<Args>,
@@ -30,6 +46,8 @@ pub struct Hub {
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
     pub self_weak: std::sync::RwLock<Option<std::sync::Weak<Hub>>>,
+    pub activating: Arc<Mutex<HashMap<String, ActivatingSender>>>,
+    pub evicting: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 impl Hub {
@@ -187,6 +205,8 @@ impl Hub {
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             self_weak: std::sync::RwLock::new(None),
+            activating: Arc::new(Mutex::new(HashMap::new())),
+            evicting: Arc::new(Mutex::new(HashMap::new())),
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
@@ -496,6 +516,11 @@ impl Hub {
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
+        let held_count = self.sessions.read().await.len();
+        if held_count >= self.args.max_sessions {
+            anyhow::bail!("honkd: held-session limit reached");
+        }
+
         // 1. Upstream::initialize_with
         let init_opts = UpstreamOpts {
             allow_production: self.args.allow_production_upstream,
@@ -666,5 +691,337 @@ impl Hub {
         );
 
         Ok(new_res)
+    }
+
+    pub async fn begin_eviction(&self, sid: &str) -> Arc<tokio::sync::Notify> {
+        let mut evicting = self.evicting.lock().await;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        evicting.insert(sid.to_string(), notify.clone());
+        notify
+    }
+
+    pub async fn finish_eviction(&self, sid: &str, notify: Arc<tokio::sync::Notify>) {
+        {
+            let mut evicting = self.evicting.lock().await;
+            evicting.remove(sid);
+        }
+        notify.notify_waiters();
+    }
+
+    pub async fn get_or_activate_session(
+        &self,
+        sid: &str,
+    ) -> Result<SessionHandle, ActivationError> {
+        loop {
+            // 1. If held, return handle
+            if let Some(h) = self.sessions.read().await.get(sid).cloned() {
+                return Ok(h);
+            }
+
+            // 2. If evicting, wait for eviction to complete
+            let evict_notify = {
+                let evicting = self.evicting.lock().await;
+                evicting.get(sid).cloned()
+            };
+            if let Some(notify) = evict_notify {
+                notify.notified().await;
+                continue;
+            }
+
+            break;
+        }
+
+        // 3. Coalesce concurrent activations
+        let mut rx = {
+            let mut activating = self.activating.lock().await;
+            if let Some(h) = self.sessions.read().await.get(sid).cloned() {
+                return Ok(h);
+            }
+
+            if let Some(tx) = activating.get(sid) {
+                tx.subscribe()
+            } else {
+                let held_count = self.sessions.read().await.len();
+                if held_count >= self.args.max_sessions {
+                    return Err(ActivationError {
+                        code: -32000,
+                        message: "honkd: held-session limit reached".to_string(),
+                    });
+                }
+
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                activating.insert(sid.to_string(), tx.clone());
+
+                let hub = self.arc();
+                let sid_clone = sid.to_string();
+                tokio::spawn(async move {
+                    let res = hub.activate_session_inner(&sid_clone).await;
+                    let _ = tx.send(Some(res));
+                    let mut activating = hub.activating.lock().await;
+                    activating.remove(&sid_clone);
+                });
+
+                rx
+            }
+        };
+
+        loop {
+            if let Some(res) = rx.borrow().as_ref() {
+                return res.clone();
+            }
+            if rx.changed().await.is_err() {
+                return Err(ActivationError {
+                    code: -32603,
+                    message: "Activation task dropped before sending result".into(),
+                });
+            }
+        }
+    }
+
+    async fn activate_session_inner(&self, sid: &str) -> Result<SessionHandle, ActivationError> {
+        // Step 1: Find cwd in session/list on control connection
+        let list_res = self
+            .control_request("session/list", json!({}), json!(1))
+            .await
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("control session/list failed: {e:#}"),
+            })?;
+
+        let sessions = list_res
+            .pointer("/result/sessions")
+            .and_then(Value::as_array);
+        let stored_cwd = sessions
+            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
+            .and_then(|s| s["cwd"].as_str())
+            .map(|s| s.to_string());
+
+        let stored_cwd = match stored_cwd {
+            Some(cwd) => cwd,
+            None => {
+                return Err(ActivationError {
+                    code: -32602,
+                    message: format!("Session not found: {sid}"),
+                });
+            }
+        };
+
+        // Step 2: Create a new connection, persisting its id first
+        let init_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
+        let recorder = if let Some(rec_path) = &self.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor).map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("recorder init failed: {e:#}"),
+            })?
+        } else {
+            Recorder::disabled()
+        };
+
+        let mut session_upstream = Upstream::initialize_with(
+            &self.upstream_url,
+            self.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await
+        .map_err(|e| ActivationError {
+            code: -32603,
+            message: format!("failed to initialize upstream connection: {e:#}"),
+        })?;
+
+        let conn_id = session_upstream.conn_id().to_string();
+
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("failed to persist orphan conn: {e:#}"),
+            })?;
+        }
+
+        // Step 3: Subscribe both streams (takeover, resume_after: Some(0))
+        session_upstream
+            .subscribe_with(
+                None,
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(0),
+                },
+            )
+            .await
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("failed to subscribe conn stream: {e:#}"),
+            })?;
+
+        session_upstream
+            .subscribe_with(
+                Some(sid),
+                SubscribeOpts {
+                    takeover: true,
+                    resume_after: Some(0),
+                },
+            )
+            .await
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("failed to subscribe session stream: {e:#}"),
+            })?;
+
+        // Step 4: session/load {sessionId, cwd: stored, mcpServers: []}; discard its replay frames (C1)
+        let load_reply = session_upstream
+            .call(
+                "session/load",
+                json!({
+                    "sessionId": sid,
+                    "cwd": stored_cwd,
+                    "mcpServers": []
+                }),
+                Some(sid),
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("failed to call session/load: {e:#}"),
+            })?;
+
+        let (up_handle, mut event_rx) = session_upstream.split();
+
+        // Step 5: Export on a side connection -> new generation
+        let export_val = self.export(sid).await.map_err(|e| ActivationError {
+            code: -32603,
+            message: format!("export failed during activation: {e:#}"),
+        })?;
+
+        let frames = honk_wire::export::to_updates(&export_val, sid);
+        let mut keys = std::collections::HashSet::new();
+        for f in &frames {
+            if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key) {
+                keys.insert(k);
+            }
+        }
+
+        let mut buffered_frames = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let honk_upstream::Event::Frame(key, frame, id) = ev
+                && key == honk_upstream::StreamKey::Session(sid.to_string())
+                && crate::rpc::kind(&frame) == crate::rpc::Kind::Notification
+            {
+                buffered_frames.push((id, frame));
+            }
+        }
+
+        let (new_log, next_epoch) = crate::session::create_new_generation_from_export(
+            sid,
+            &self.state_dir,
+            &self.state,
+            frames,
+            keys.clone(),
+            buffered_frames,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| ActivationError {
+            code: -32603,
+            message: format!("failed to create session log: {e:#}"),
+        })?;
+
+        // Step 6: The session is now held
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.retain(|id| id != &conn_id);
+                st.retired_epochs.remove(sid);
+                st.sessions.insert(
+                    sid.to_string(),
+                    crate::state::HeldSession {
+                        conn_id: conn_id.clone(),
+                        cwd: stored_cwd.clone(),
+                        epoch: next_epoch,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: now,
+                        init_result: Some(load_reply.clone()),
+                    },
+                );
+            })
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("state mutate failed during activation: {e:#}"),
+            })?;
+        }
+
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
+        let boot = { self.state.lock().await.boot };
+        let last_processed_session = new_log.last_upstream_id();
+
+        let session = crate::session::Session {
+            sid: sid.to_string(),
+            state_dir: self.state_dir.clone(),
+            state_store: self.state.clone(),
+            hub: self.arc(),
+            up: up_handle,
+            events: event_rx,
+            rx: session_rx,
+            self_tx: session_tx.clone(),
+            log: new_log,
+            turn: crate::turn::TurnCore::default(),
+            state: crate::session::ActorState::Live,
+            ids: UpstreamIds::new(boot),
+            last_processed_session_id: last_processed_session,
+            last_processed_conn_id: None,
+            viewers: HashMap::new(),
+            pending_requests: HashMap::new(),
+            pending_server_requests: Vec::new(),
+            recently_resolved: std::collections::HashSet::new(),
+            init_result: load_reply.clone(),
+            queued_msgs: std::collections::VecDeque::new(),
+            rebuilding_buffered_frames: Vec::new(),
+            rebuild_at_turn_end: false,
+            suppressed_keys: keys,
+            gap_evidenced: false,
+            start_reattach: false,
+            needs_rebuild: false,
+            inflight_needs_delivery_check: false,
+            finalizing_waiters: HashMap::new(),
+            active_probe_id: None,
+            gap_synthesis_grace: Duration::from_millis(self.args.gap_synthesis_grace_ms),
+            synthesized_replies: std::collections::HashSet::new(),
+        };
+
+        tokio::spawn(session.run());
+
+        let handle = SessionHandle {
+            sid: sid.to_string(),
+            conn_id: conn_id.clone(),
+            tx: session_tx,
+        };
+
+        self.sessions
+            .write()
+            .await
+            .insert(sid.to_string(), handle.clone());
+        Ok(handle)
     }
 }

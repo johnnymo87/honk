@@ -380,20 +380,21 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         sessions.get(sid).map(|h| h.tx.clone())
                     };
 
-                    let Some(tx) = session_tx else {
-                        let err_resp = crate::rpc::error(
-                            id,
-                            -32602,
-                            format!("Session not found or not held: {sid}"),
-                            None,
-                        );
-                        if !viewer
-                            .tx
-                            .send_frame(Message::Text(err_resp.to_string().into()))
-                        {
-                            break;
-                        }
-                        continue;
+                    let tx = match session_tx {
+                        Some(tx) => tx,
+                        None => match hub.get_or_activate_session(sid).await {
+                            Ok(h) => h.tx,
+                            Err(e) => {
+                                let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                if !viewer
+                                    .tx
+                                    .send_frame(Message::Text(err_resp.to_string().into()))
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        },
                     };
 
                     let after = honk_wire::honk_meta(&params).after;
@@ -509,6 +510,29 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     let sessions = hub.sessions.read().await;
                                     sessions.get(sid).map(|h| h.tx.clone())
                                 };
+                                let session_tx = if let Some(tx) = session_tx {
+                                    Some(tx)
+                                } else {
+                                    let sid_opt = {
+                                        let s = hub.state.lock().await;
+                                        s.sessions.iter().find_map(|(sid, h)| {
+                                            if h.pending
+                                                .iter()
+                                                .any(|p| honk_upstream::rpc_id_matches(&p.id, &id))
+                                            {
+                                                Some(sid.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    };
+                                    if let Some(sid) = sid_opt {
+                                        hub.get_or_activate_session(&sid).await.ok().map(|h| h.tx)
+                                    } else {
+                                        None
+                                    }
+                                };
+
                                 if let Some(tx) = session_tx {
                                     let _ = tx
                                         .send(crate::session::SessionMsg::AttachLive {
@@ -528,12 +552,13 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             }
                         }
                         Err(e) => {
-                            let err_resp = crate::rpc::error(
-                                id,
-                                -32603,
-                                format!("Failed to create session: {e:#}"),
-                                None,
-                            );
+                            let (code, msg) =
+                                if e.to_string().contains("honkd: held-session limit reached") {
+                                    (-32000, "honkd: held-session limit reached".to_string())
+                                } else {
+                                    (-32603, format!("Failed to create session: {e:#}"))
+                                };
+                            let err_resp = crate::rpc::error(id, code, msg, None);
                             if !viewer
                                 .tx
                                 .send_frame(Message::Text(err_resp.to_string().into()))
@@ -550,7 +575,24 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             sessions.get(sid).map(|h| h.tx.clone())
                         };
 
-                        if let Some(tx) = session_tx {
+                        let tx = match session_tx {
+                            Some(tx) => Some(tx),
+                            None => match hub.get_or_activate_session(sid).await {
+                                Ok(h) => Some(h.tx),
+                                Err(e) => {
+                                    let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                    if !viewer
+                                        .tx
+                                        .send_frame(Message::Text(err_resp.to_string().into()))
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            },
+                        };
+
+                        if let Some(tx) = tx {
                             // Auto-attach if not already attached
                             if !viewer.attached_sessions.contains(sid) {
                                 let _ = tx
@@ -572,19 +614,6 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     params,
                                 })
                                 .await;
-                        } else {
-                            let err_resp = crate::rpc::error(
-                                id,
-                                -32602,
-                                format!("Session not found: {sid}"),
-                                None,
-                            );
-                            if !viewer
-                                .tx
-                                .send_frame(Message::Text(err_resp.to_string().into()))
-                            {
-                                break;
-                            }
                         }
                     } else {
                         let err_resp = crate::rpc::error(
@@ -606,7 +635,24 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         sessions.get(sid).map(|h| h.tx.clone())
                     };
 
-                    if let Some(tx) = session_tx {
+                    let tx = match session_tx {
+                        Some(tx) => Some(tx),
+                        None => match hub.get_or_activate_session(sid).await {
+                            Ok(h) => Some(h.tx),
+                            Err(e) => {
+                                let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                if !viewer
+                                    .tx
+                                    .send_frame(Message::Text(err_resp.to_string().into()))
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        },
+                    };
+
+                    if let Some(tx) = tx {
                         // Auto-attach if not already attached
                         if !viewer.attached_sessions.contains(sid) {
                             let _ = tx
@@ -638,19 +684,6 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     params,
                                 })
                                 .await;
-                        }
-                    } else {
-                        let err_resp = crate::rpc::error(
-                            id,
-                            -32602,
-                            format!("Session not found: {sid}"),
-                            None,
-                        );
-                        if !viewer
-                            .tx
-                            .send_frame(Message::Text(err_resp.to_string().into()))
-                        {
-                            break;
                         }
                     }
                 } else if method == Some("session/list")
