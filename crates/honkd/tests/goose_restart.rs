@@ -678,7 +678,9 @@ async fn pending_requests_fail_with_32000_on_connection_replacement() {
     fake.restart().await;
 
     // The in-flight forward request must fail with -32000, not hang!
-    let resp = v.response_timeout(&forward_id, Duration::from_secs(5)).await;
+    let resp = v
+        .response_timeout(&forward_id, Duration::from_secs(5))
+        .await;
     assert_eq!(
         resp.pointer("/error/code").and_then(Value::as_i64),
         Some(-32000),

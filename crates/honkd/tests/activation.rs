@@ -813,7 +813,10 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
 
     // Turn 1 completes
     let r1 = v
-        .call("session/prompt", prompt_params(&sid, "prompt 1", Some("r1")))
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 1", Some("r1")),
+        )
         .await;
     assert_eq!(r1["result"]["stopReason"], "end_turn");
     assert_eq!(r1["result"]["_meta"]["honk"]["text"], "reply 1");
@@ -846,8 +849,11 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
     .await;
 
     // Send prompt 2
-    v2.request("session/prompt", prompt_params(&sid, "prompt 2", Some("r2")))
-        .await;
+    v2.request(
+        "session/prompt",
+        prompt_params(&sid, "prompt 2", Some("r2")),
+    )
+    .await;
 
     // Wait until model receives prompt 2
     let wait_start = Instant::now();
@@ -867,13 +873,15 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
     // Connect new viewer and retry prompt 2
     let mut w = Viewer::connect(&h).await;
     let resp = w
-        .call("session/prompt", prompt_params(&sid, "prompt 2", Some("r2")))
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 2", Some("r2")),
+        )
         .await;
 
     assert_eq!(resp["result"]["stopReason"], "end_turn");
     assert_eq!(
-        resp["result"]["_meta"]["honk"]["text"],
-        "reply 2",
+        resp["result"]["_meta"]["honk"]["text"], "reply 2",
         "must use real reply 2, not stale sidecar reply 1"
     );
 }

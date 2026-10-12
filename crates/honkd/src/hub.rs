@@ -327,7 +327,9 @@ impl Hub {
                 turn.inflight = Some(crate::turn::Inflight::from_persisted(inf.clone()));
             }
 
-            let actor_id = hub.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let actor_id = hub
+                .next_actor_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let session = crate::session::Session {
                 sid: sid.clone(),
                 state_dir: hub.state_dir.clone(),
@@ -963,7 +965,9 @@ impl Hub {
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
 
         let boot = { self.state.lock().await.boot };
-        let actor_id = self.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let actor_id = self
+            .next_actor_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let last_processed_session = session_log.last_upstream_id();
         let last_processed_conn = {
             let s = self.state.lock().await;
@@ -1325,7 +1329,9 @@ impl Hub {
 
             let (session_tx, session_rx) = tokio::sync::mpsc::channel(1024);
             let boot = { hub.state.lock().await.boot };
-            let actor_id = hub.next_actor_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let actor_id = hub
+                .next_actor_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let last_processed_session = new_log.last_upstream_id();
 
             let session = crate::session::Session {

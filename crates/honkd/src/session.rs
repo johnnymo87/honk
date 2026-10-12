@@ -994,7 +994,9 @@ impl Session {
                 }
 
                 let _ = std::fs::remove_file(
-                    state_dir.join("sessions").join(format!("{sid}.replies.jsonl")),
+                    state_dir
+                        .join("sessions")
+                        .join(format!("{sid}.replies.jsonl")),
                 );
 
                 Ok(ReactivationData {
@@ -2364,8 +2366,12 @@ impl Session {
                     self.pending_requests.remove(&up_id);
                     let is_gone = honk_upstream::is_gone(&e);
                     let err_code = if is_gone { -32000 } else { -32603 };
-                    let err_resp =
-                        crate::rpc::error(id, err_code, format!("Forward POST failed: {e:#}"), None);
+                    let err_resp = crate::rpc::error(
+                        id,
+                        err_code,
+                        format!("Forward POST failed: {e:#}"),
+                        None,
+                    );
                     self.send_to_viewer(viewer_id, err_resp);
                     if is_gone {
                         Box::pin(self.handle_gone()).await;
@@ -2435,36 +2441,39 @@ impl Session {
                 }
             }
             SessionMsg::CheckAmbiguousInflight { upstream_id } => {
-                if let Some(inf) = self.turn.inflight.as_ref() {
-                    if inf.upstream_id == upstream_id && !inf.announced {
-                        let export_res = self.hub.export(&self.sid).await;
-                        match export_res {
-                            Ok(export_val) => {
-                                let prompts = honk_wire::export::client_prompts(&export_val);
-                                let n = inf.prompt_index;
-                                let expected_text = crate::rpc::extract_user_text(&inf.params);
-                                if prompts.len() > n && prompts[n] == expected_text {
-                                    if self.turn.client_prompts <= n {
-                                        self.turn.client_prompts = n + 1;
-                                        self.sync_inflight().await;
-                                    }
-                                    self.gap_evidenced = true;
-                                    self.issue_steer_probe().await;
-                                } else {
-                                    tracing::warn!(
-                                        "Session {}: ambiguous prompt was not delivered to goose; interrupting as not_delivered",
-                                        self.sid
-                                    );
-                                    let actions = self.turn.on_prompt_not_delivered(&upstream_id, &mut self.ids);
-                                    self.execute_actions(actions).await;
+                if let Some(inf) = self.turn.inflight.as_ref()
+                    && inf.upstream_id == upstream_id
+                    && !inf.announced
+                {
+                    let export_res = self.hub.export(&self.sid).await;
+                    match export_res {
+                        Ok(export_val) => {
+                            let prompts = honk_wire::export::client_prompts(&export_val);
+                            let n = inf.prompt_index;
+                            let expected_text = crate::rpc::extract_user_text(&inf.params);
+                            if prompts.len() > n && prompts[n] == expected_text {
+                                if self.turn.client_prompts <= n {
+                                    self.turn.client_prompts = n + 1;
+                                    self.sync_inflight().await;
                                 }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Session {}: export check for ambiguous prompt failed: {e:#}",
+                                self.gap_evidenced = true;
+                                self.issue_steer_probe().await;
+                            } else {
+                                tracing::warn!(
+                                    "Session {}: ambiguous prompt was not delivered to goose; interrupting as not_delivered",
                                     self.sid
                                 );
+                                let actions = self
+                                    .turn
+                                    .on_prompt_not_delivered(&upstream_id, &mut self.ids);
+                                self.execute_actions(actions).await;
                             }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Session {}: export check for ambiguous prompt failed: {e:#}",
+                                self.sid
+                            );
                         }
                     }
                 }

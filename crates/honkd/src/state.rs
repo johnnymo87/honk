@@ -32,13 +32,20 @@ impl State {
 
         self.ledger.retain(|crid, entry| match entry {
             LedgerEntry::Done { done_unix, .. } => now_unix.saturating_sub(*done_unix) <= ttl_secs,
-            LedgerEntry::InFlight { session, upstream_id } => {
+            LedgerEntry::InFlight {
+                session,
+                upstream_id,
+            } => {
                 if let Some(held) = sessions.get(session) {
                     if let Some(inf) = &held.inflight {
                         if inf.client_req_ids.contains(crid) {
                             true
                         } else {
-                            to_resolve_lost.push((crid.clone(), session.clone(), upstream_id.clone()));
+                            to_resolve_lost.push((
+                                crid.clone(),
+                                session.clone(),
+                                upstream_id.clone(),
+                            ));
                             true
                         }
                     } else {
@@ -54,7 +61,9 @@ impl State {
         for (crid, session, upstream_id) in to_resolve_lost {
             // Check if replies sidecar has cached reply for this upstream_id
             let cached_reply = state_dir.and_then(|dir| {
-                let sidecar_path = dir.join("sessions").join(format!("{session}.replies.jsonl"));
+                let sidecar_path = dir
+                    .join("sessions")
+                    .join(format!("{session}.replies.jsonl"));
                 let Ok(content) = std::fs::read_to_string(sidecar_path) else {
                     return None;
                 };
@@ -130,7 +139,12 @@ impl State {
                 done_unix,
             },
         );
-        self.prune_ledger(done_unix, LEDGER_PRUNE_TTL_SECS, LEDGER_PRUNE_MAX_ENTRIES, None);
+        self.prune_ledger(
+            done_unix,
+            LEDGER_PRUNE_TTL_SECS,
+            LEDGER_PRUNE_MAX_ENTRIES,
+            None,
+        );
     }
 }
 

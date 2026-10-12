@@ -21,11 +21,7 @@ async fn auth_and_preflight_codes() {
     );
     // Empty token must be rejected with 401
     assert_eq!(
-        c.get(url("?token=".into()))
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        c.get(url("?token=".into())).send().await.unwrap().status(),
         401
     );
     assert_eq!(
@@ -96,11 +92,8 @@ fn refuses_short_secret_files() {
     std::fs::write(&short_secret, "short").unwrap();
 
     // Short upstream secret file refused
-    let (code1, stderr1) = Honkd::spawn_expect_exit(
-        "http://127.0.0.1:4181/acp",
-        &short_secret,
-        &[],
-    );
+    let (code1, stderr1) =
+        Honkd::spawn_expect_exit("http://127.0.0.1:4181/acp", &short_secret, &[]);
     assert_ne!(code1, 0);
     assert!(stderr1.contains("invalid (empty or shorter than 32 characters)"));
 

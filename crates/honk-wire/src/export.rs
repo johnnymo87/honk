@@ -243,18 +243,18 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
                 .pointer("/metadata/steer")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let has_tool_response = msg
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| {
-                    content.iter().any(|block| {
-                        let b_type = block.get("type").and_then(Value::as_str);
-                        b_type == Some("toolResponse")
-                            || b_type == Some("toolResult")
-                            || block.get("toolResult").is_some()
-                            || block.get("toolResponse").is_some()
-                    })
-                });
+            let has_tool_response =
+                msg.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|block| {
+                            let b_type = block.get("type").and_then(Value::as_str);
+                            b_type == Some("toolResponse")
+                                || b_type == Some("toolResult")
+                                || block.get("toolResult").is_some()
+                                || block.get("toolResponse").is_some()
+                        })
+                    });
             if !is_steer && !has_tool_response {
                 break;
             }
