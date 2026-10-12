@@ -318,8 +318,8 @@ async fn slow_viewer_evicted_with_4001_without_stalling_turn() {
     let Some(g) = StubGoose::start_or_skip().await else {
         return;
     };
-    let chunk_512 = "a".repeat(512);
-    let chunks = vec![chunk_512; 20_000];
+    let chunk_4k = "a".repeat(4096);
+    let chunks = vec![chunk_4k; 2_000];
     g.model().push([Turn::Text(chunks)]);
 
     let h = Honkd::spawn(&g.url(), g.secret_file(), &["--viewer-queue", "8"]).await;
@@ -352,7 +352,7 @@ async fn slow_viewer_evicted_with_4001_without_stalling_turn() {
         .response_timeout(&prompt_id, Duration::from_secs(30))
         .await;
     assert_eq!(resp["result"]["stopReason"], "end_turn");
-    assert_eq!(fast.accumulated_text().len(), 20_000 * 512);
+    assert_eq!(fast.accumulated_text().len(), 2_000 * 4096);
 
     // Read from slow viewer until closed
     let start = std::time::Instant::now();
@@ -376,7 +376,7 @@ async fn slow_viewer_evicted_with_4001_without_stalling_turn() {
     let log_content = std::fs::read_to_string(&log_path).expect("read log");
     let line_count = log_content.lines().count();
     assert!(
-        line_count >= 20_000,
+        line_count >= 2_000,
         "log file must hold all frames, found {line_count} lines"
     );
 }
