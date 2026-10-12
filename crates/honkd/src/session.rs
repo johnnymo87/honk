@@ -109,6 +109,9 @@ pub enum SessionMsg {
     SynthesizeGapEndTurn {
         upstream_id: String,
     },
+    CheckAmbiguousInflight {
+        upstream_id: String,
+    },
     MarkPendingStale,
     ReactivationComplete {
         token: u64,
@@ -1791,17 +1794,20 @@ impl Session {
                                 }
                             }
                             PromptPostFailure::Ambiguous => {
-                                // In goose, requests are dispatched concurrently in spawned tasks
-                                // (crates/goose/src/acp/server/dispatch.rs:128,479), so an immediate export
-                                // or steer probe is not a barrier for whether the prompt was accepted.
-                                // Right after transport drop, an export query can predate goose committing
-                                // the user message to SQLite. Therefore, never declare not_delivered on
-                                // Ambiguous while the connection is live. Keep InFlight in state and ledger
-                                // and wait for the announcement or stream reply. A retry attaches as waiter.
                                 tracing::warn!(
-                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); keeping inflight and awaiting stream reply",
+                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); scheduling export/steer check",
                                     sid
                                 );
+                                let self_tx = self.self_tx.clone();
+                                let up_id = upstream_id.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                                    let _ = self_tx
+                                        .send(SessionMsg::CheckAmbiguousInflight {
+                                            upstream_id: up_id,
+                                        })
+                                        .await;
+                                });
                             }
                         }
                     }
@@ -2410,6 +2416,41 @@ impl Session {
                         self.turn
                             .on_prompt_reply(&upstream_id, &synth_reply, &mut self.ids);
                     self.execute_actions(reply_actions).await;
+                }
+            }
+            SessionMsg::CheckAmbiguousInflight { upstream_id } => {
+                if let Some(inf) = self.turn.inflight.as_ref() {
+                    if inf.upstream_id == upstream_id && !inf.announced {
+                        let export_res = self.hub.export(&self.sid).await;
+                        match export_res {
+                            Ok(export_val) => {
+                                let prompts = honk_wire::export::client_prompts(&export_val);
+                                let n = inf.prompt_index;
+                                let expected_text = crate::rpc::extract_user_text(&inf.params);
+                                if prompts.len() > n && prompts[n] == expected_text {
+                                    if self.turn.client_prompts <= n {
+                                        self.turn.client_prompts = n + 1;
+                                        self.sync_inflight().await;
+                                    }
+                                    self.gap_evidenced = true;
+                                    self.issue_steer_probe().await;
+                                } else {
+                                    tracing::warn!(
+                                        "Session {}: ambiguous prompt was not delivered to goose; interrupting as not_delivered",
+                                        self.sid
+                                    );
+                                    let actions = self.turn.on_prompt_not_delivered(&upstream_id, &mut self.ids);
+                                    self.execute_actions(actions).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Session {}: export check for ambiguous prompt failed: {e:#}",
+                                    self.sid
+                                );
+                            }
+                        }
+                    }
                 }
             }
             SessionMsg::ReactivationComplete { token, data } => {

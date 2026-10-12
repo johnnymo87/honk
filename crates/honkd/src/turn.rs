@@ -245,6 +245,33 @@ impl TurnCore {
         out
     }
 
+    pub fn on_prompt_not_delivered(
+        &mut self,
+        upstream_id: &str,
+        ids: &mut crate::rpc::UpstreamIds,
+    ) -> Vec<Action> {
+        let Some(inf) = self.inflight.take_if(|i| i.upstream_id == upstream_id) else {
+            return vec![];
+        };
+        self.cancel_pending = false;
+        let mut out = vec![Action::Reply {
+            owners: inf.owners,
+            body: Reply::Result(serde_json::json!({
+                "stopReason": "cancelled",
+                "_meta": {
+                    "honk": {
+                        "reason": "not_delivered"
+                    }
+                }
+            })),
+            user_text: None,
+        }];
+        if self.run.is_none() {
+            out.extend(self.dispatch_parked(ids));
+        }
+        out
+    }
+
     fn dispatch_parked(&mut self, ids: &mut crate::rpc::UpstreamIds) -> Vec<Action> {
         if self.parked.is_empty() {
             return vec![];

@@ -935,6 +935,60 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_without_false_negative_not
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let proxy = TcpProxy::start(fake.addr()).await.unwrap();
+    let proxy_url = format!("http://{}/acp", proxy.addr());
+
+    let h = Honkd::spawn(
+        &proxy_url,
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Export remains empty (goose never got prompt 1)
+    fake.set_export_data(&sid, json!({ "conversation": [] }));
+    fake.set_drop_prompt_reply(true);
+    proxy.set_drop_on_prompt(true);
+
+    // Send prompt 1 (which will suffer ambiguous drop)
+    let pid1 = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "ambiguous prompt", Some("crid-ambig-fail")),
+        )
+        .await;
+
+    // Send prompt 2 (which will park behind prompt 1)
+    let pid2 = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "parked prompt", Some("crid-parked")),
+        )
+        .await;
+
+    // Turn off proxy drop so parked prompt can succeed
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy.set_drop_on_prompt(false);
+    fake.set_drop_prompt_reply(false);
+    fake.script_prompt(vec!["parked prompt done".into()]);
+
+    // Prompt 1 must be finished as not_delivered
+    let r1 = v.response_timeout(&pid1, Duration::from_secs(5)).await;
+    assert_eq!(r1["result"]["stopReason"], "cancelled");
+    assert_eq!(r1["result"]["_meta"]["honk"]["reason"], "not_delivered");
+
+    // Prompt 2 must be unparked and completed!
+    let r2 = v.response_timeout(&pid2, Duration::from_secs(5)).await;
+    assert_eq!(r2["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cancel_on_unannounced_inflight_ends_with_reply_and_done_ledger() {
     let fake = FakeGoose::start().await;
     let h = Honkd::spawn(
