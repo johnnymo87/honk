@@ -26,4 +26,6 @@ jobs:
           tar -xzf goose-x86_64-unknown-linux-gnu.tar.gz
           chmod +x goose
           echo "HONK_GOOSE_BIN=$GITHUB_WORKSPACE/goose" >> "$GITHUB_ENV"
+      - run: cargo build -p honkd
+      - run: echo "HONKD_BIN=$GITHUB_WORKSPACE/target/debug/honkd" >> "$GITHUB_ENV"
       - run: cargo test --workspace

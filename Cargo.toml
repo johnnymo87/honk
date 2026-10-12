@@ -5,6 +5,7 @@ members = [
     "crates/honk-testgoose",
     "crates/honk-wire",
     "crates/honkd",
+    "crates/honk",
 ]
 
 [workspace.package]
