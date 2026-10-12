@@ -177,3 +177,63 @@ Two tests evaluate session activation behavior:
 - **Stop rule triggered:** **NO**.
 - **Conclusion:** Re-activation (both via `session/load` and via direct `session/prompt` on a fresh connection) strictly preserves the session's original narrowed extension set. Goose stores enabled extensions in SQLite and does not reload unrequested extensions from `config.yaml` during re-activation.
 - **Containment guarantee:** Pigeon's `assertExactExtensions` check (which runs only at `session/new`) remains safe across reconnections and `honkd` re-activations without risk of silent capability widening.
+
+---
+
+## Part 3: Live M1a Exit Tests on Patched Sandbox (Task A19)
+
+### Setup & Environment
+
+- **Target Upstream:** `honk-goose-sandbox-patched` user unit (`http://127.0.0.1:4181/acp`, token from `$HOME/.local/state/honk-sandbox-patched/secret`).
+- **Relay Under Test:** `honkd` dynamically spawned on `127.0.0.1:0` with fresh temporary state directory (`Honkd::spawn`).
+- **Model:** `claude-haiku-4-5@20251001` via Claude failover proxy, discovered from `session/new` `configOptions` and configured via `session/set_config_option`.
+- **Harness:** `crates/honkd/tests/live_exit.rs`. Executed with `HONK_SANDBOX_PATCHED=$HOME/.local/state/honk-sandbox-patched nix develop -c cargo test -p honkd --test live_exit -- --ignored --test-threads=1 <name>`.
+
+### Test Results Summary
+
+| Test | Objective | Status | Duration | Key Observations |
+|---|---|---|---|---|
+| `e1_pigeon_turn_visible_in_tail` | PigeonLike turn streamed through honkd is visible in `honk::tail::run` | **PASS** | 1.77s | `tail_text == exp_turn_text`, `pigeon.receipt_text() == exp_turn_text`, terminal contains `HONK_E1_OK`. |
+| `e2_kill9_honkd_mid_turn_delta_resume` | `kill -9 honkd` mid-turn while streaming tides prompt; tail resumes with delta; PigeonLike retries with same `client_req_id` | **PASS** | 3.84s | `tail_outcome.reconnect_resets == 0` (clean delta resume without `_honk/reset`); `tail_text == exp_turn_text == pigeon.receipt_text()`; export contains exactly 1 user prompt (no duplication). |
+| `e3_goose_restart_mid_turn` | Patched sandbox restart during `sleep 40` tool call; turn cancellation and retry deduplication | **PASS** | 44.32s | `stopReason: "cancelled"`, `_meta.honk.reason: "upstream_restart"`; `pigeon.receipt_text() == mid_text` (empty); duplicate retry requests deduped into single upstream turn; export shows original + exactly 1 retry; sandbox verified active and answering. |
+| `e4_permission_across_honkd_restart` | Permission request pending across `kill -9 honkd` and restart; re-offered to new viewer and answerable | **PASS** | 1.89s | Goose request ID preserved and re-offered to reconnected viewer on `session/load`; `allow_once` response executes tool; export contains `HONK_E4_OK`. |
+| `delete_frees_parked_run` | Direct raw `honk-upstream` connection deleted while parked on permission; session load on new connection releases parked run and allows new prompt | **PASS** | 2.38s | Connection A deleted; on connection B, cancelling re-offered permission completes parked run without executing tool (`check_export_tool_output` false); subsequent prompt completes with `end_turn`. |
+| `takeover_and_resume_live` | Stream frozen via `TcpProxy` for 30s; byte watchdog fires at 20s and reattaches with takeover | **PASS** | 31.18s | Reattached with takeover over fresh proxied connection without 409; turn completes cleanly (`end_turn`); `tail_outcome.reconnect_resets <= 1`; `tail_text == exp_turn_text` with no duplicate tokens. |
+
+### Observations, Artefacts & Bug Fixes
+
+#### 1. Bug Fix: Restored In-Flight Delivery Check (`crates/honkd/src/session.rs`)
+- **Symptom:** During `e2_kill9_honkd_mid_turn_delta_resume`, after restarting `honkd`, the prompt retry with the same `client_req_id` resulted in 2 user messages in goose's export instead of 1.
+- **Root Cause Analysis:**
+  - In `crates/honkd/src/session.rs`, `check_restored_inflight_delivery` invoked `export_has_user_text`.
+  - The previous implementation inspected messages *strictly after* `last_assistant_idx = conversation.rposition(|m| m.role == "assistant")`.
+  - In live environments, when `honkd` was killed, upstream goose continued generating tokens and committed the assistant message to SQLite while `honkd` was dead.
+  - Upon restart, goose's export already had an assistant message for the in-flight turn. Skipping past that assistant message caused `export_has_user_text` to find no trailing user message, falsely concluding that the in-flight prompt was never delivered to goose.
+  - This triggered `self.turn.interrupt("not_delivered")`, clearing `inflight` state. Consequently, when the reconnected PigeonLike client resent the prompt with the same `client_req_id`, `honkd` treated it as a fresh turn and dispatched a second prompt to goose.
+  - Additionally, goose inserts synthetic turn-context messages (`role: "user"`, `metadata: { "userVisible": false, "turnContext": true }`) which had to be filtered.
+- **Resolution:**
+  - Made `honk_wire::export::is_message_user_visible` public.
+  - Replaced `export_has_user_text` with `export_has_inflight_delivery(&export_val, &user_text, logged_completed_turns)`.
+  - If `export_completed_turns > logged_completed_turns`, goose completed a turn while `honkd` was down; the function verifies whether the user message preceding that last assistant turn matches `expected_text`.
+  - If `export_completed_turns <= logged_completed_turns`, goose has not completed any new turn, and the function verifies trailing user messages after `last_assistant_idx`.
+  - Added unit test in `crates/honkd/tests/restart.rs`: `turn_completed_on_upstream_during_honkd_restart_recognized_delivered_and_deduped`.
+
+#### 2. Test Artefact: `e3_goose_restart_mid_turn` Prompt Phrasing
+- **Symptom:** Probabilistic models (Claude Haiku) occasionally emitted preliminary text (e.g. *"I'll execute that command right now."*) before invoking the `shell` tool.
+- **Observation:** If the model emits preliminary text before the tool call, that text is streamed live over SSE to `pigeon`, but when goose is killed via `systemctl restart` mid-tool-call, goose aborts before committing the turn to SQLite. Thus, `pigeon.receipt_text()` contained the uncommitted preamble while `export` turn text was empty.
+- **Resolution:** Tuned prompt to instruct the model to execute the tool immediately without preliminary conversational text: `"Run the bash command 'sleep 40' immediately using your shell tool. Output no text before calling the tool."` This ensures deterministic parity between live streaming and export.
+
+#### 3. Wire Finding: `delete_frees_parked_run` Mechanism
+- **Observation:** When connection A is terminated via `DELETE /acp` while waiting on a tool confirmation in approve mode, goose's SQLite database retains the unconfirmed tool call. When connection B initializes and issues `session/load`, goose re-offers `session/request_permission`.
+- **Resolution:** Answering `outcome: { outcome: "cancelled" }` to the re-offered request releases the parked tool call without executing it (`check_export_tool_output` confirms the tool never ran), freeing the session to accept and complete the subsequent prompt (`Reply with exactly: UNPARKED_OK`).
+
+### M1a Exit Status
+
+All criteria from design §8 are verified on the live patched sandbox (`:4181`):
+1. **Pigeon turn visible in `honk tail`:** Verified by `e1_pigeon_turn_visible_in_tail`.
+2. **`kill -9 honkd` mid-turn completes turn and tail resumes with delta:** Verified by `e2_kill9_honkd_mid_turn_delta_resume`.
+3. **Pending permission across `honkd` restart remains answerable:** Verified by `e4_permission_across_honkd_restart`.
+4. **Goose restart mid-turn returns cancelled, retry not duplicated:** Verified by `e3_goose_restart_mid_turn`.
+5. **Auxiliary wire checks:** `delete_frees_parked_run` and `takeover_and_resume_live` pass.
+
+Sandbox service `honk-goose-sandbox-patched` remains active and answering on `:4181`.
