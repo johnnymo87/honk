@@ -202,21 +202,27 @@ Two tests evaluate session activation behavior:
 
 ### Observations, Artefacts & Bug Fixes
 
-#### 1. Bug Fix: Restored In-Flight Delivery Check (`crates/honkd/src/session.rs`)
-- **Symptom:** During `e2_kill9_honkd_mid_turn_delta_resume`, after restarting `honkd`, the prompt retry with the same `client_req_id` resulted in 2 user messages in goose's export instead of 1.
+#### 1. Bug Fix: Prompt-Sequence Indexing for In-Flight Delivery Check (`crates/honkd/src/session.rs`)
+- **Symptom:** During `e2_kill9_honkd_mid_turn_delta_resume`, after restarting `honkd`, a prompt retry with the same `client_req_id` resulted in 2 duplicate user messages in goose's export instead of 1.
 - **Root Cause Analysis:**
-  - In `crates/honkd/src/session.rs`, `check_restored_inflight_delivery` invoked `export_has_user_text`.
-  - The previous implementation inspected messages *strictly after* `last_assistant_idx = conversation.rposition(|m| m.role == "assistant")`.
-  - In live environments, when `honkd` was killed, upstream goose continued generating tokens and committed the assistant message to SQLite while `honkd` was dead.
-  - Upon restart, goose's export already had an assistant message for the in-flight turn. Skipping past that assistant message caused `export_has_user_text` to find no trailing user message, falsely concluding that the in-flight prompt was never delivered to goose.
-  - This triggered `self.turn.interrupt("not_delivered")`, clearing `inflight` state. Consequently, when the reconnected PigeonLike client resent the prompt with the same `client_req_id`, `honkd` treated it as a fresh turn and dispatched a second prompt to goose.
-  - Additionally, goose inserts synthetic turn-context messages (`role: "user"`, `metadata: { "userVisible": false, "turnContext": true }`) which had to be filtered.
-- **Resolution:**
-  - Made `honk_wire::export::is_message_user_visible` public.
-  - Replaced `export_has_user_text` with `export_has_inflight_delivery(&export_val, &user_text, logged_completed_turns)`.
-  - If `export_completed_turns > logged_completed_turns`, goose completed a turn while `honkd` was down; the function verifies whether the user message preceding that last assistant turn matches `expected_text`.
-  - If `export_completed_turns <= logged_completed_turns`, goose has not completed any new turn, and the function verifies trailing user messages after `last_assistant_idx`.
-  - Added unit test in `crates/honkd/tests/restart.rs`: `turn_completed_on_upstream_during_honkd_restart_recognized_delivered_and_deduped`.
+  - When `honkd` is killed mid-turn, upstream goose continues processing tokens and may commit the completed turn to its SQLite database while `honkd` is down or restarting.
+  - Previous heuristics that scanned for trailing user messages after the last assistant turn failed because:
+    1. In live runs where goose completes turn generation before `honkd` restarts, the assistant message is already committed in SQLite. Skipping past that assistant message caused the check to find no trailing user message, falsely concluding that the in-flight prompt was never delivered to goose.
+    2. Synthetic `<turn-context>` messages (`role: "user"`, `userVisible: false`) and tool responses (`role: "user"`, `toolResponse`) polluted conversation message parsing.
+    3. Rebuilt and new-generation logs do not retain `session_info_update` frames, making frame-counting comparisons across generations unsound.
+- **Resolution (Prompt-Sequence Indexing):**
+  - **`honk_wire::export::client_prompts(&export)`:** Extracts client user prompts from the conversation: filters for `role == "user"`, `is_message_user_visible` (excluding `<turn-context>` messages which are `userVisible: false`), and verifies the message contains no `toolResponse` or `toolResult` blocks (excluding tool confirmations).
+  - **Prompt Base Tracking ($N$):** `HeldSession.client_prompts` records the number of client prompts goose already has for the session. It is initialized from `client_prompts(&export).len()` at activation and rebuild (and initialized to `0` at `session/new`). When `honkd` dispatches `session/prompt`, it durably persists the expected index $N$ in `InflightPrompt.prompt_index` before the POST. `client_prompts` is incremented only when the prompt is known delivered (run announced or reply received); it is never incremented on busy, not_delivered, or POST errors.
+  - **Restored In-Flight Delivery Check:**
+    - `prompts.len() == N`: The prompt was never received by goose before the crash; interrupted with `not_delivered`.
+    - `prompts.len() > N && prompts[N] == expected_text`: The prompt was delivered at expected index $N$; marks delivered, updates `client_prompts = N + 1`, and bounds the wait.
+    - `prompts.len() > N && prompts[N] != expected_text`: Prompts were sent directly to goose bypassing `honkd` (out of contract). The safe side errs toward never re-POSTing automatically, finishing the in-flight prompt with cancelled reason `delivery_unknown` (error code `-32000`).
+  - **Bounded Delivered Wait:** After the restored check confirms delivery, `honkd` issues a non-destructive steer probe. If goose is idle ("no active run to steer"), it triggers a gap rebuild and grace window (`gap_synthesis_grace`). If no stream reply arrives within the grace window, `SynthesizeGapEndTurn` completes the turn with `synthesized: true` and text from export turn text, preventing hangs.
+  - **Automated Tests:**
+    - `tool_turn_completed_while_honkd_was_down_delivered_and_deduped`: tool turn completed in SQLite while honkd was down is recognized delivered and deduped (model request count stays 1 for that prompt).
+    - `crash_before_post_with_same_text_after_rebuild_reported_not_delivered`: crash before POST with repeated prompt text after a rebuild is reported `not_delivered`.
+    - `delivered_but_reply_lost_synthesizes_end_turn_after_grace_no_hang`: delivered prompt whose reply was dropped by upstream triggers synthesis after grace without hanging.
+    - `turn_completed_on_upstream_during_honkd_restart_recognized_delivered_and_deduped`: text turn completed in SQLite while honkd was down is recognized delivered and deduped.
 
 #### 2. Finding: Uncommitted Preamble Stream vs Export on Upstream Restart (`e3_goose_restart_mid_turn`)
 - **Product Behavior:** When the model generates conversational preamble text before invoking a tool (e.g. *"I'll run the bash command 'sleep 40' for you right now."*), this text is streamed live over SSE to legacy/pigeon viewers and accumulated in `pigeon.receipt_text()`.
