@@ -86,3 +86,12 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
 - Live-found bug fixed: restored-inflight delivery check now uses prompt-sequence indexing (persisted client-prompt count N; export's Nth client prompt decides delivered/not_delivered/delivery_unknown; delivered wait bounded by steer probe + grace) (6e611b6, c2c7760; replaces 369e983).
 - Finding for M1b: after a goose restart mid-turn, pigeon's receipt can contain streamed text goose never committed (cancelled reply has no _meta.honk.text, pigeon falls back to live chunks).
 - M1a COMPLETE. Workspace 288 passed / 0 failed / 46 ignored (live) with HONK_GOOSE_BIN. Next is M1b (author-gated).
+- Pre-PR review fixes:
+  1. Sidecar collision prevention: Upstream IDs formatted as `hk{boot}_{actor}-{seq}` using hub-wide atomic actor ID counter; sidecar rotated/truncated on new generation / activation boundaries (90ba91c).
+  2. Client prompts and turn text skip steer messages (`metadata.steer = true`); turn text stops at the next non-steer client user prompt (6e611b6, 955c79b).
+  3. ReplayBatch sent to `replay_tx` before registering viewer for live fan-out, preventing live frames from preceding replay on attach (4a8321f).
+  4. In-flight pending requests (steer/forward) failed with -32000 on connection replacement / handle_gone; on_rebuilt sets actor Live before draining session events (8d09f3b).
+  5. Ledger prune (24h TTL, 1000 max entries) enforced on Done insert, not only at boot; sidecar consulted before declaring InFlight entries lost at boot (09741f0).
+  6. Ambiguous prompt POST failures bounded: scheduled export/steer check resolves unannounced inflight (as not_delivered if goose never got it), unparking later prompts (bec5b28).
+  7. Secret file validated >= 32 chars and fsync'd on creation; downstream auth rejects empty tokens (3217f9f).
+  8. Steer probe timeout and retry added for degraded mode (1e57c3d).
