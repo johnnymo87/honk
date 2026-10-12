@@ -249,3 +249,57 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
 
     out
 }
+
+/// Extracts client user prompts from an export transcript.
+///
+/// Filters for:
+/// - `role == "user"`
+/// - `is_message_user_visible(msg)` is true (drops synthetic turnContext messages)
+/// - content contains no `toolResponse` or `toolResult` blocks (drops tool confirmations)
+///
+/// Returns the concatenated user-visible text for each client prompt message in order.
+pub fn client_prompts(export: &Value) -> Vec<String> {
+    let conversation = match export.get("conversation").and_then(Value::as_array) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    let mut prompts = Vec::new();
+
+    for msg in conversation {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if !is_message_user_visible(msg) {
+            continue;
+        }
+        let Some(content) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let has_tool_response = content.iter().any(|block| {
+            let b_type = block.get("type").and_then(Value::as_str);
+            b_type == Some("toolResponse")
+                || b_type == Some("toolResult")
+                || block.get("toolResult").is_some()
+                || block.get("toolResponse").is_some()
+        });
+        if has_tool_response {
+            continue;
+        }
+
+        let mut text = String::new();
+        for block in content {
+            if !is_content_user_visible(block) {
+                continue;
+            }
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(t) = block.get("text").and_then(Value::as_str)
+            {
+                text.push_str(t);
+            }
+        }
+        prompts.push(text);
+    }
+
+    prompts
+}

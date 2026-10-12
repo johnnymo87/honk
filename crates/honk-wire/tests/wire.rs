@@ -1,4 +1,4 @@
-use honk_wire::export::{to_updates, turn_text};
+use honk_wire::export::{client_prompts, to_updates, turn_text};
 use honk_wire::{BlockKey, Blocks, block_key, run_state};
 use serde_json::Value;
 use std::fs::read_to_string;
@@ -197,4 +197,68 @@ fn test_turn_text_equals_live_agent_chunks() {
     let computed_turn_text = turn_text(&export, canonical_prompt);
     assert_eq!(computed_turn_text, live_agent_text);
     assert!(!computed_turn_text.is_empty());
+}
+
+#[test]
+fn test_client_prompts_canonical_fixture() {
+    let export = load_json(EXPORT_PATH);
+    let prompts = client_prompts(&export);
+
+    // Canonical export.json has 1 client prompt:
+    // conversation[0] = User message with text
+    // conversation[1] = User message with turnContext (userVisible: false)
+    // conversation[2] = Assistant message with toolRequest
+    // conversation[3] = User message with toolResponse
+    // conversation[4] = Assistant message with toolRequest
+    // conversation[5] = User message with toolResponse
+    // conversation[6] = Assistant message with toolRequest
+    // conversation[7] = User message with toolResponse
+    // conversation[8] = Assistant message with final text
+    // Only conversation[0] is a client user prompt!
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].starts_with("Think first about what to do."));
+}
+
+#[test]
+fn test_client_prompts_multiturn_fixture() {
+    // Test with a multi-prompt fixture or custom json containing:
+    // - normal user prompt
+    // - turn-context message
+    // - toolResponse message
+    // - second user prompt
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "first prompt" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": false, "turnContext": true },
+                "content": [{ "type": "text", "text": "<turn-context>..." }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "toolRequest", "toolCall": { "name": "shell" } }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "toolResponse", "toolResult": { "output": "ok" } }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done 1" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "second prompt" }]
+            }
+        ]
+    });
+
+    let prompts = client_prompts(&session);
+    assert_eq!(prompts, vec!["first prompt".to_string(), "second prompt".to_string()]);
 }
