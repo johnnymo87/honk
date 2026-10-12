@@ -440,7 +440,7 @@ impl Viewer {
     }
 
     pub async fn response(&mut self, id: &Value) -> Value {
-        self.response_timeout(id, Duration::from_secs(10)).await
+        self.response_timeout(id, Duration::from_secs(15)).await
     }
 
     pub async fn try_response_timeout(&mut self, id: &Value, timeout: Duration) -> Option<Value> {

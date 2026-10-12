@@ -21,9 +21,20 @@ pub struct State {
 
 impl State {
     pub fn prune_ledger(&mut self, now_unix: u64, ttl_secs: u64, max_entries: usize) {
-        self.ledger.retain(|_, entry| match entry {
+        let sessions = &self.sessions;
+        self.ledger.retain(|crid, entry| match entry {
             LedgerEntry::Done { done_unix, .. } => now_unix.saturating_sub(*done_unix) <= ttl_secs,
-            LedgerEntry::InFlight { .. } => true,
+            LedgerEntry::InFlight { session, .. } => {
+                if let Some(held) = sessions.get(session) {
+                    if let Some(inf) = &held.inflight {
+                        inf.client_req_ids.contains(crid)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
         });
 
         if self.ledger.len() > max_entries {
@@ -364,6 +375,17 @@ mod tests {
     #[test]
     fn prune_keeps_inflight() {
         let mut st = State::default();
+        let held = HeldSession {
+            inflight: Some(InflightPrompt {
+                upstream_id: "u1".into(),
+                client_req_ids: vec!["live".into(), "live2".into()],
+                params: json!({}),
+                announced: true,
+            }),
+            ..Default::default()
+        };
+        st.sessions.insert("s".into(), held);
+
         st.ledger.insert(
             "old".into(),
             LedgerEntry::Done {
@@ -379,9 +401,32 @@ mod tests {
                 upstream_id: "u1".into(),
             },
         );
+        st.ledger.insert(
+            "orphan_unheld".into(),
+            LedgerEntry::InFlight {
+                session: "unheld_ses".into(),
+                upstream_id: "u_orphan".into(),
+            },
+        );
+        st.ledger.insert(
+            "orphan_mismatched_crid".into(),
+            LedgerEntry::InFlight {
+                session: "s".into(),
+                upstream_id: "u_mismatched".into(),
+            },
+        );
+
         st.prune_ledger(100_000, 24 * 3600, 1000);
         assert!(!st.ledger.contains_key("old"));
         assert!(st.ledger.contains_key("live"));
+        assert!(
+            !st.ledger.contains_key("orphan_unheld"),
+            "InFlight for unheld session must be pruned"
+        );
+        assert!(
+            !st.ledger.contains_key("orphan_mismatched_crid"),
+            "InFlight not in held.inflight.client_req_ids must be pruned"
+        );
 
         // When exceeding max_entries, old Done entries are dropped, but never InFlight
         st.ledger.insert(

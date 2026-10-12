@@ -62,6 +62,12 @@ pub fn is_gone(err: &anyhow::Error) -> bool {
     status_of(err) == Some(reqwest::StatusCode::NOT_FOUND)
 }
 
+pub fn is_connect(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<reqwest::Error>())
+        .is_some_and(|re| re.is_connect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

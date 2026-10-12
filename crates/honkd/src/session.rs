@@ -99,6 +99,35 @@ pub enum SessionMsg {
     MarkPendingStale,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PromptPostFailure {
+    Gone,
+    CertainlyNotStarted,
+    Ambiguous,
+}
+
+fn classify_prompt_post_error(err: &anyhow::Error) -> PromptPostFailure {
+    if honk_upstream::is_gone(err) {
+        return PromptPostFailure::Gone;
+    }
+
+    // Goose answers prompt POST with 202 Accepted and the reply arrives on the session stream.
+    // Therefore, any 4xx/5xx HTTP status means goose rejected the POST (prompt certainly not started).
+    if honk_upstream::status_of(err).is_some() {
+        return PromptPostFailure::CertainlyNotStarted;
+    }
+
+    // Connection errors before sending (connection refused, connect timeout, DNS failure).
+    // The request was never sent over TCP.
+    if honk_upstream::is_connect(err) {
+        return PromptPostFailure::CertainlyNotStarted;
+    }
+
+    // Any transport error after sending (timeout waiting for 202, TCP reset/drop after body read).
+    // The prompt may have reached goose and started executing.
+    PromptPostFailure::Ambiguous
+}
+
 pub struct Session {
     pub sid: String,
     pub state_dir: PathBuf,
@@ -306,7 +335,8 @@ impl Session {
 
     async fn on_reattached(&mut self, outcome: honk_upstream::SubscribeOutcome) {
         if std::mem::take(&mut self.inflight_needs_delivery_check) {
-            self.check_restored_inflight_delivery().await;
+            let actions = self.check_restored_inflight_delivery().await;
+            self.execute_actions(actions).await;
         }
 
         if self.needs_rebuild {
@@ -421,6 +451,7 @@ impl Session {
         self.active_probe_id = None;
         if gone {
             self.state = ActorState::Gone;
+            self.resolve_inflight_on_gone().await;
             self.mark_pending_stale().await;
             let actions = self.turn.interrupt("upstream_gone");
             self.execute_actions(actions).await;
@@ -465,16 +496,46 @@ impl Session {
         }
     }
 
-    async fn check_restored_inflight_delivery(&mut self) {
+    async fn resolve_inflight_on_gone(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sid = self.sid.clone();
+        let mut s = self.state_store.lock().await;
+        let _ = s.mutate(|st| {
+            if let Some(h) = st.sessions.get_mut(&sid) {
+                h.inflight = None;
+            }
+            for entry in st.ledger.values_mut() {
+                if entry.session() == sid
+                    && matches!(entry, crate::state::LedgerEntry::InFlight { .. })
+                {
+                    *entry = crate::state::LedgerEntry::Done {
+                        session: sid.clone(),
+                        response: crate::rpc::error(
+                            Value::Null,
+                            -32000,
+                            "Session is gone (upstream 404)".to_string(),
+                            Some(json!({ "reason": "upstream_gone" })),
+                        ),
+                        done_unix: now,
+                    };
+                }
+            }
+        });
+    }
+
+    async fn check_restored_inflight_delivery(&mut self) -> Vec<Action> {
         let Some(inf) = self.turn.inflight.as_ref() else {
-            return;
+            return vec![];
         };
         let user_text = crate::rpc::extract_user_text(&inf.params);
         match self.hub.export(&self.sid).await {
             Ok(export_val) => {
                 if !export_has_user_text(&export_val, &user_text) {
-                    let actions = self.turn.interrupt("not_delivered");
-                    self.execute_actions(actions).await;
+                    return self.turn.interrupt("not_delivered");
                 }
             }
             Err(e) => {
@@ -484,6 +545,7 @@ impl Session {
                 );
             }
         }
+        vec![]
     }
 
     async fn start_rebuild(&mut self) {
@@ -1009,41 +1071,77 @@ impl Session {
                         )
                         .await
                     {
-                        if honk_upstream::is_gone(&e) {
-                            self.state = ActorState::Gone;
-                        }
-
-                        // Prompt POST failed -> remove failed prompt's ledger entries AND clear inflight in one mutate
-                        let failed_inf = self.turn.inflight.as_ref().map(|i| i.to_persisted());
-                        let mutate_res = {
-                            let mut s = self.state_store.lock().await;
-                            s.mutate(|st| {
-                                if let Some(h) = st.sessions.get_mut(&sid) {
-                                    h.inflight = None;
+                        let failure = classify_prompt_post_error(&e);
+                        match failure {
+                            PromptPostFailure::Gone => {
+                                self.state = ActorState::Gone;
+                                self.resolve_inflight_on_gone().await;
+                                let err_val = crate::rpc::error(
+                                    Value::Null,
+                                    -32000,
+                                    "Session is gone (upstream 404)".to_string(),
+                                    Some(json!({ "reason": "upstream_gone" })),
+                                );
+                                let fail_actions = self.turn.on_prompt_send_failed(
+                                    &upstream_id,
+                                    err_val,
+                                    &mut self.ids,
+                                );
+                                for a in fail_actions.into_iter().rev() {
+                                    queue.push_front(a);
                                 }
-                                if let Some(inf) = &failed_inf {
-                                    for crid in &inf.client_req_ids {
-                                        st.ledger.remove(crid);
-                                    }
+                            }
+                            PromptPostFailure::CertainlyNotStarted => {
+                                // 4xx/5xx rejection from goose, or connect error before sending.
+                                // Prompt was certainly not started -> remove ledger entry and clear inflight.
+                                let failed_inf =
+                                    self.turn.inflight.as_ref().map(|i| i.to_persisted());
+                                let mutate_res = {
+                                    let mut s = self.state_store.lock().await;
+                                    s.mutate(|st| {
+                                        if let Some(h) = st.sessions.get_mut(&sid) {
+                                            h.inflight = None;
+                                        }
+                                        if let Some(inf) = &failed_inf {
+                                            for crid in &inf.client_req_ids {
+                                                st.ledger.remove(crid);
+                                            }
+                                        }
+                                    })
+                                };
+                                if let Err(e) = mutate_res {
+                                    tracing::error!(
+                                        "Session {}: failed to clear inflight after prompt POST error: {e:#}",
+                                        sid
+                                    );
                                 }
-                            })
-                        };
-                        if let Err(e) = mutate_res {
-                            tracing::error!(
-                                "Session {}: failed to clear inflight after prompt POST error: {e:#}",
-                                sid
-                            );
-                        }
 
-                        let err_val = json!({
-                            "code": -32603,
-                            "message": format!("Prompt POST failed: {e:#}"),
-                        });
-                        let fail_actions =
-                            self.turn
-                                .on_prompt_send_failed(&upstream_id, err_val, &mut self.ids);
-                        for a in fail_actions.into_iter().rev() {
-                            queue.push_front(a);
+                                let err_val = json!({
+                                    "code": -32603,
+                                    "message": format!("Prompt POST failed: {e:#}"),
+                                });
+                                let fail_actions = self.turn.on_prompt_send_failed(
+                                    &upstream_id,
+                                    err_val,
+                                    &mut self.ids,
+                                );
+                                for a in fail_actions.into_iter().rev() {
+                                    queue.push_front(a);
+                                }
+                            }
+                            PromptPostFailure::Ambiguous => {
+                                // Transport error after send (timeout waiting for 202, connection drop/reset after body).
+                                // Prompt may have reached goose and started executing.
+                                // Keep InFlight in state and ledger. Resolve through delivery check.
+                                tracing::warn!(
+                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); keeping inflight and checking delivery",
+                                    sid
+                                );
+                                let actions = self.check_restored_inflight_delivery().await;
+                                for a in actions.into_iter().rev() {
+                                    queue.push_front(a);
+                                }
+                            }
                         }
                     }
                 }
@@ -1586,6 +1684,24 @@ impl Session {
                     .unwrap_or_default()
                     .as_secs();
 
+                let is_busy = crate::rpc::busy_run_id(&err).is_some();
+                if is_busy {
+                    let sid = self.sid.clone();
+                    let crids: Vec<String> = owners
+                        .iter()
+                        .filter_map(|o| o.client_req_id.clone())
+                        .collect();
+                    let mut s = self.state_store.lock().await;
+                    let _ = s.mutate(|st| {
+                        if let Some(h) = st.sessions.get_mut(&sid) {
+                            h.inflight = None;
+                        }
+                        for crid in crids {
+                            st.ledger.remove(&crid);
+                        }
+                    });
+                }
+
                 for o in &owners {
                     let resp = json!({
                         "jsonrpc": "2.0",
@@ -1593,25 +1709,26 @@ impl Session {
                         "error": err,
                     });
                     if let Some(crid) = &o.client_req_id {
-                        let sid = self.sid.clone();
-                        let mut s = self.state_store.lock().await;
-                        let _ = s.mutate(|st| {
-                            // Only update to Done if previously InFlight (e.g. busy prompt rejections are not persisted)
-                            if matches!(
-                                st.ledger.get(crid),
-                                Some(crate::state::LedgerEntry::InFlight { .. })
-                            ) {
-                                st.ledger.insert(
-                                    crid.clone(),
-                                    crate::state::LedgerEntry::Done {
-                                        session: sid,
-                                        response: resp.clone(),
-                                        done_unix: now,
-                                    },
-                                );
-                            }
-                        });
-                        drop(s);
+                        if !is_busy {
+                            let sid = self.sid.clone();
+                            let mut s = self.state_store.lock().await;
+                            let _ = s.mutate(|st| {
+                                if matches!(
+                                    st.ledger.get(crid),
+                                    Some(crate::state::LedgerEntry::InFlight { .. })
+                                ) {
+                                    st.ledger.insert(
+                                        crid.clone(),
+                                        crate::state::LedgerEntry::Done {
+                                            session: sid,
+                                            response: resp.clone(),
+                                            done_unix: now,
+                                        },
+                                    );
+                                }
+                            });
+                            drop(s);
+                        }
 
                         if let Some(waiters) = self.finalizing_waiters.remove(crid) {
                             for w in waiters {

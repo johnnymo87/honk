@@ -1,5 +1,7 @@
-use honk_testgoose::{StubGoose, Turn};
+use honk_testgoose::{FakeGoose, StubGoose, TcpProxy, Turn};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 mod common;
 use common::{Honkd, Viewer, new_session, prompt_params};
@@ -458,6 +460,21 @@ async fn boot_prunes_old_done_ledger_entries() {
     // - old_done: 48h ago (should be pruned)
     // - fresh_done: 10s ago (should be kept)
     // - live_inflight: should be kept
+    state["sessions"]["s1"] = json!({
+        "conn_id": "conn_1",
+        "cwd": "/tmp",
+        "epoch": 1,
+        "last_conn_event_id": null,
+        "pending": [],
+        "inflight": {
+            "upstream_id": "up_1",
+            "client_req_ids": ["live_inflight"],
+            "params": {},
+            "announced": true
+        },
+        "last_active_unix": 1000
+    });
+
     state["ledger"] = json!({
         "old_done": {
             "state": "done",
@@ -496,4 +513,349 @@ async fn boot_prunes_old_done_ledger_entries() {
         ledger.contains_key("live_inflight"),
         "live_inflight must be kept"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_busy_rejection_clears_ledger_and_retry_after_idle_runs() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Configure fake goose to answer next session/prompt with an upstream busy rejection
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32602,
+        "message": "Invalid params",
+        "data": "session already has active run `run_fake_busy`; use _goose/unstable/session/steer"
+    })));
+
+    let r1 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 1", Some("crid-busy-retry")),
+        )
+        .await;
+
+    assert_eq!(r1["error"]["code"], -32602);
+    assert!(
+        r1["error"]["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("session already has active run")
+    );
+
+    // Verify ledger did NOT retain crid-busy-retry as Done (it was removed!)
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert!(
+        !state["ledger"]
+            .as_object()
+            .unwrap()
+            .contains_key("crid-busy-retry"),
+        "busy rejection must remove ledger entry so it can be retried"
+    );
+    assert!(
+        state["sessions"][&sid]["inflight"].is_null(),
+        "busy rejection must clear held.inflight"
+    );
+
+    // Clear busy error on fake goose -> session goes idle: activeRunId: null
+    fake.set_prompt_error_reply(None);
+    fake.emit_frame(
+        &sid,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": &sid,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": Value::Null
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Retry with the exact same client_req_id
+    let r2 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 1 retry", Some("crid-busy-retry")),
+        )
+        .await;
+
+    assert_eq!(
+        r2["result"]["stopReason"], "end_turn",
+        "retry after busy rejection must run and succeed: {r2:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_prunes_orphan_inflight_entries() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let mut h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    h.kill9();
+
+    let state_path = h.state_dir.path().join("state.json");
+    let state_content = std::fs::read_to_string(&state_path).unwrap();
+    let mut state: Value = serde_json::from_str(&state_content).unwrap();
+
+    // Populate sessions with:
+    // - s_held: has held.inflight referencing only ["crid_held"]
+    // s_unheld is NOT in sessions
+    state["sessions"]["s_held"] = json!({
+        "conn_id": "conn_1",
+        "cwd": "/tmp",
+        "epoch": 1,
+        "last_conn_event_id": null,
+        "pending": [],
+        "inflight": {
+            "upstream_id": "u1",
+            "client_req_ids": ["crid_held"],
+            "params": {},
+            "announced": true
+        },
+        "last_active_unix": 1000
+    });
+
+    state["ledger"] = json!({
+        "crid_unheld": {
+            "state": "in_flight",
+            "session": "s_unheld",
+            "upstream_id": "u_unheld"
+        },
+        "crid_no_inflight": {
+            "state": "in_flight",
+            "session": "s_held",
+            "upstream_id": "u_other"
+        },
+        "crid_held": {
+            "state": "in_flight",
+            "session": "s_held",
+            "upstream_id": "u1"
+        }
+    });
+
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    h.restart().await;
+
+    let updated_content = std::fs::read_to_string(&state_path).unwrap();
+    let updated_state: Value = serde_json::from_str(&updated_content).unwrap();
+    let ledger = updated_state["ledger"].as_object().unwrap();
+
+    assert!(
+        !ledger.contains_key("crid_unheld"),
+        "crid_unheld must be pruned at boot because its session is not held"
+    );
+    assert!(
+        !ledger.contains_key("crid_no_inflight"),
+        "crid_no_inflight must be pruned at boot because held.inflight doesn't reference it"
+    );
+    assert!(
+        ledger.contains_key("crid_held"),
+        "crid_held must be kept because held.inflight references it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gone_session_resolves_inflight_to_done_upstream_gone() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Send prompt with client_req_id
+    fake.set_drop_prompt_reply(true);
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test gone prompt", Some("crid-gone")),
+        )
+        .await;
+
+    // Wait until prompt is inflight
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Upstream 404s on reattach -> Gone
+    fake.restart().await;
+    fake.conflict_forever("any");
+    // Trigger watchdog / reattach by kicking stream or sending a request that 404s
+    let _ = v.request("session/close", json!({"sessionId": &sid})).await;
+
+    // Session transitions to Gone, resolving inflight to Done with upstream_gone
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "cancelled");
+
+    // Check state.json: crid-gone is resolved to Done
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    let entry = &state["ledger"]["crid-gone"];
+    assert_eq!(
+        entry["state"], "done",
+        "InFlight must be resolved to Done on Gone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_post_500_failure_clears_ledger_and_allows_retry() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Set 500 status on prompt POST (certainly not started)
+    fake.set_prompt_status(Some(StatusCode::INTERNAL_SERVER_ERROR));
+
+    let r1 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 500", Some("crid-500-test")),
+        )
+        .await;
+
+    assert_eq!(
+        r1["error"]["code"], -32603,
+        "POST 500 fails prompt send: {r1:?}"
+    );
+
+    // Verify ledger entry was removed and held.inflight cleared
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert!(
+        !state["ledger"]
+            .as_object()
+            .unwrap()
+            .contains_key("crid-500-test"),
+        "500 POST rejection must remove ledger entry"
+    );
+    assert!(
+        state["sessions"][&sid]["inflight"].is_null(),
+        "500 POST rejection must clear held.inflight"
+    );
+
+    // Clear 500 status
+    fake.set_prompt_status(None);
+
+    // Retry with SAME client_req_id
+    let r2 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt 500 retry", Some("crid-500-test")),
+        )
+        .await;
+
+    assert_eq!(
+        r2["result"]["stopReason"], "end_turn",
+        "retry after 500 failure must run and succeed: {r2:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_check() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    let proxy = TcpProxy::start(fake.addr()).await.unwrap();
+
+    let proxy_url = format!("http://{}/acp", proxy.addr());
+    let h = Honkd::spawn(
+        &proxy_url,
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Fake goose has export showing prompt was delivered
+    fake.set_export_data(
+        &sid,
+        json!({
+            "conversation": [{
+                "id": "msg_user_1",
+                "role": "user",
+                "created": 1,
+                "content": [{ "type": "text", "text": "ambiguous delivery text" }]
+            }]
+        }),
+    );
+
+    // Enable connection drop on prompt in proxy
+    proxy.set_drop_on_prompt(true);
+
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "ambiguous delivery text", Some("crid-ambig")),
+        )
+        .await;
+
+    // Wait for delivery check to run
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Check state.json: crid-ambig MUST STILL BE InFlight (not removed!)
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert!(
+        state["ledger"]
+            .as_object()
+            .unwrap()
+            .contains_key("crid-ambig"),
+        "ambiguous failure must keep ledger InFlight entry"
+    );
+    assert_eq!(
+        state["ledger"]["crid-ambig"]["state"], "in_flight",
+        "ledger entry must remain in_flight"
+    );
+
+    // A concurrent retry with the same client_req_id attaches to the in-flight prompt
+    let mut v2 = Viewer::connect(&h).await;
+    let pid2 = v2
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "ambiguous delivery text retry", Some("crid-ambig")),
+        )
+        .await;
+
+    // Disable drop and emit prompt reply from fake goose
+    proxy.set_drop_on_prompt(false);
+    fake.emit_frame(
+        &sid,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {
+                "stopReason": "end_turn"
+            }
+        }),
+    );
+
+    let r1 = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    let r2 = v2.response_timeout(&pid2, Duration::from_secs(10)).await;
+
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+    assert_eq!(r2["result"]["stopReason"], "end_turn");
 }

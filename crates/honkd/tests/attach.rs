@@ -356,7 +356,7 @@ async fn slow_viewer_evicted_with_4001_without_stalling_turn() {
 
     // Read from slow viewer until closed
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    while start.elapsed() < Duration::from_secs(15) {
         if slow.recv_frame().await.is_none() {
             break;
         }

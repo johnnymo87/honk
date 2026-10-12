@@ -157,6 +157,8 @@ struct FakeGooseInner {
     drop_prompt_reply: AtomicBool,
     steer_status: Mutex<Option<StatusCode>>,
     respond_status: Mutex<Option<StatusCode>>,
+    prompt_status: Mutex<Option<StatusCode>>,
+    prompt_error_reply: Mutex<Option<Value>>,
 }
 
 pub struct FakeGoose {
@@ -200,6 +202,8 @@ impl FakeGoose {
             drop_prompt_reply: AtomicBool::new(false),
             steer_status: Mutex::new(None),
             respond_status: Mutex::new(None),
+            prompt_status: Mutex::new(None),
+            prompt_error_reply: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -342,6 +346,14 @@ impl FakeGoose {
 
     pub fn set_respond_status(&self, status: Option<StatusCode>) {
         *self.state.respond_status.lock().unwrap() = status;
+    }
+
+    pub fn set_prompt_status(&self, status: Option<StatusCode>) {
+        *self.state.prompt_status.lock().unwrap() = status;
+    }
+
+    pub fn set_prompt_error_reply(&self, err: Option<Value>) {
+        *self.state.prompt_error_reply.lock().unwrap() = err;
     }
 
     pub fn emit_frame(&self, sid: &str, frame: Value) {
@@ -681,9 +693,35 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/prompt") => {
+            if let Some(status) = *state.prompt_status.lock().unwrap() {
+                return status.into_response();
+            }
+
             let Some(sid) = target_session else {
                 return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
             };
+
+            if let Some(err_val) = state.prompt_error_reply.lock().unwrap().clone() {
+                let state_clone = state.clone();
+                let conn_id_clone = conn_id.clone();
+                let sid_clone = sid.clone();
+                let req_id_clone = req_id.clone();
+                tokio::spawn(async move {
+                    if let Some(id) = req_id_clone {
+                        emit_session_frame(
+                            &state_clone,
+                            &conn_id_clone,
+                            &sid_clone,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": err_val
+                            }),
+                        );
+                    }
+                });
+                return StatusCode::ACCEPTED.into_response();
+            }
 
             let cancel_flag = Arc::new(AtomicBool::new(false));
             state
