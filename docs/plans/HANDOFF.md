@@ -98,7 +98,7 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
 
 ## Current state (2026-10-12, after M1a merged) — READ THIS FIRST
 - main = 1d6843c: PRs #1 (M0), #2 (goose patch track), #3 (M1a) squash-merged. Old branches m0, goose-patch-track, m1a and worktrees ../honk-patch-track, ../honk-m1a are historical (m1a's pre-rebase history is in local branch `m1a-pre-rebase-backup`). M1b work happens in worktree ../honk-m1b (branch `m1b`, off main).
-- Task tracking moved to beads: `bd` in this repo (stealth, `.beads/` git-excluded, DoltHub `jmohrbacher/honk`). Epic + children for M1b; `bd ready --parent=<epic>` is the only "what next". This file keeps history and decisions.
+- Task tracking moved to beads: `bd` in this repo (stealth, `.beads/` git-excluded, DoltHub `jmohrbacher/honk`). M1b epic `honk-znj` (runbook in its design field), M1c epic `honk-oi2`; `bd ready --parent=<epic>` is the only "what next". This file keeps history and decisions.
 - Production goose (:4080, `goose-serve`) runs patched-1.54.0.3 since 2026-10-12 10:46 EDT (workstation PR #665; sessions.db backup in ~/.local/state/goose-db-backups/pre-patched.3-20261012-104623). Verified by real stall-watch traffic. Plan Task B2 is DONE.
 - goose fork hygiene (Apache §4(b) notices + Nix dev shell fix) merged as johnnymo87/goose PR #1 into patched/v1.54.0; no new release needed (binary unchanged).
 - pigeon PR #168 (honest WS-disconnect reporting) merged and deployed. B1 must build on it: on a honk connection, reconnect once and resend with the same client_req_id; on bare goose keep #168's behaviour.
