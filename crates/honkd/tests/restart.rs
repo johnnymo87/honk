@@ -617,6 +617,155 @@ async fn delivered_but_reply_lost_synthesizes_end_turn_after_grace_no_hang() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn steer_during_turn_kill9_restart_correct_delivery_verdict() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Turn 1 completes through honkd
+    fake.script_prompt(vec!["first reply".into()]);
+    let r1 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "first prompt", Some("r1")),
+        )
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    // Conversation in export now also has steer instruction injected during Turn 1
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "id": "msg_1",
+                    "role": "user",
+                    "created": 1,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "first prompt"}]
+                },
+                {
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "created": 2,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "first reply"}]
+                },
+                {
+                    "id": "msg_3",
+                    "role": "user",
+                    "created": 3,
+                    "metadata": { "userVisible": true, "steer": true },
+                    "content": [{"type": "text", "text": "steer instruction"}]
+                },
+                {
+                    "id": "msg_4",
+                    "role": "assistant",
+                    "created": 4,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "steered completion"}]
+                }
+            ]
+        }),
+    );
+
+    // Prompt "second prompt"
+    fake.script_prompt((0..10).map(|i| format!("c{i}")).collect());
+    v.request(
+        "session/prompt",
+        prompt_params(&sid, "second prompt", Some("r_second")),
+    )
+    .await;
+
+    // Wait until run is active
+    v.wait_for(|f| {
+        f.pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .is_some()
+    })
+    .await;
+
+    // Kill honkd while Turn 2 is running
+    h.kill9();
+
+    // Now update export to show Turn 2 also completed while honkd was dead
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "id": "msg_1",
+                    "role": "user",
+                    "created": 1,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "first prompt"}]
+                },
+                {
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "created": 2,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "first reply"}]
+                },
+                {
+                    "id": "msg_3",
+                    "role": "user",
+                    "created": 3,
+                    "metadata": { "userVisible": true, "steer": true },
+                    "content": [{"type": "text", "text": "steer instruction"}]
+                },
+                {
+                    "id": "msg_4",
+                    "role": "assistant",
+                    "created": 4,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "steered completion"}]
+                },
+                {
+                    "id": "msg_5",
+                    "role": "user",
+                    "created": 5,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "second prompt"}]
+                },
+                {
+                    "id": "msg_6",
+                    "role": "assistant",
+                    "created": 6,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "second reply"}]
+                }
+            ]
+        }),
+    );
+
+    // Restart honkd
+    h.restart().await;
+
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "second prompt", Some("r_second")),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(resp["result"]["_meta"]["honk"]["text"], "second reply");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn degraded_mode_reattach_rebuilds_from_export() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(false);
