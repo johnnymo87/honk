@@ -589,6 +589,7 @@ dependencies = [
  "clap",
  "fs4",
  "futures",
+ "honk",
  "honk-testgoose",
  "honk-upstream",
  "honk-wire",

@@ -22,6 +22,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 
 [dev-dependencies]
+honk = { path = "../honk" }
 honk-testgoose = { path = "../honk-testgoose" }
 reqwest.workspace = true
 tempfile.workspace = true
