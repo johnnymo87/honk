@@ -19,6 +19,7 @@ pub struct Renderer {
     pub thoughts: bool,
     printed: HashMap<BlockKey, String>,
     is_resetting: bool,
+    resets: u32,
     shadow: HashMap<BlockKey, String>,
     shadow_order: Vec<BlockKey>,
     tool_titles: HashMap<String, String>,
@@ -27,6 +28,8 @@ pub struct Renderer {
     shadow_tool_statuses: HashMap<String, String>,
     live_user_raw: HashMap<String, String>,
     shadow_user_raw: HashMap<String, String>,
+    user_line_open: bool,
+    open_user_id: Option<String>,
     rebuild_marker_printed: bool,
 }
 
@@ -53,6 +56,7 @@ impl Renderer {
             thoughts,
             printed: HashMap::new(),
             is_resetting: false,
+            resets: 0,
             shadow: HashMap::new(),
             shadow_order: Vec::new(),
             tool_titles: HashMap::new(),
@@ -61,8 +65,33 @@ impl Renderer {
             shadow_tool_statuses: HashMap::new(),
             live_user_raw: HashMap::new(),
             shadow_user_raw: HashMap::new(),
+            user_line_open: false,
+            open_user_id: None,
             rebuild_marker_printed: false,
         }
+    }
+
+    fn close_user_line<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        if self.user_line_open {
+            out.write_all(b"\n")?;
+            out.flush()?;
+            if let Some(id) = self.open_user_id.take() {
+                self.printed
+                    .entry(BlockKey::User(id))
+                    .or_default()
+                    .push('\n');
+            }
+            self.user_line_open = false;
+        }
+        Ok(())
+    }
+
+    pub fn flush_open_line<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        self.close_user_line(out)
+    }
+
+    pub fn reset_count(&self) -> u32 {
+        self.resets
     }
 
     pub fn handle_frame<W: Write>(&mut self, frame: &Value, out: &mut W) -> io::Result<()> {
@@ -70,11 +99,15 @@ impl Renderer {
         match method {
             Some(honk_wire::method::RESET) => {
                 self.is_resetting = true;
+                self.resets += 1;
                 self.shadow.clear();
                 self.shadow_order.clear();
                 self.shadow_tool_titles.clear();
                 self.shadow_tool_statuses.clear();
                 self.shadow_user_raw.clear();
+                self.live_user_raw.clear();
+                self.user_line_open = false;
+                self.open_user_id = None;
                 self.rebuild_marker_printed = false;
                 Ok(())
             }
@@ -90,10 +123,21 @@ impl Renderer {
                             self.printed.insert(key.clone(), shadow_str.to_string());
                         }
                         Some(printed_str) => {
-                            if shadow_str.starts_with(printed_str) {
-                                let suffix = &shadow_str[printed_str.len()..];
+                            let (shadow_cmp, printed_cmp, is_user) = match key {
+                                BlockKey::User(_) => (
+                                    shadow_str.trim_end_matches('\n'),
+                                    printed_str.trim_end_matches('\n'),
+                                    true,
+                                ),
+                                _ => (shadow_str, printed_str.as_str(), false),
+                            };
+
+                            if let Some(suffix) = shadow_cmp.strip_prefix(printed_cmp) {
                                 if !suffix.is_empty() {
                                     out.write_all(suffix.as_bytes())?;
+                                    if is_user {
+                                        out.write_all(b"\n")?;
+                                    }
                                 }
                                 self.printed.insert(key.clone(), shadow_str.to_string());
                             } else {
@@ -123,6 +167,17 @@ impl Renderer {
                 let Some(key) = honk_wire::block_key(u) else {
                     return Ok(());
                 };
+
+                // Close open user line if block is not the same user block
+                if !self.is_resetting {
+                    let is_same_user_block = match &key {
+                        BlockKey::User(id) => self.open_user_id.as_deref() == Some(id),
+                        _ => false,
+                    };
+                    if self.user_line_open && !is_same_user_block {
+                        self.close_user_line(out)?;
+                    }
+                }
 
                 // Filter blocks based on flags
                 match &key {
@@ -201,21 +256,20 @@ impl Renderer {
             BlockKey::User(id) => {
                 if let Some(t) = honk_wire::text_of(u) {
                     let raw = self.live_user_raw.entry(id.clone()).or_default();
-                    raw.push_str(t);
-                    let target_str = format_user_line(raw);
-                    let printed_so_far = self.printed.entry(key.clone()).or_default();
-                    if target_str.starts_with(printed_so_far.as_str()) {
-                        let suffix = &target_str[printed_so_far.len()..];
-                        if !suffix.is_empty() {
-                            out.write_all(suffix.as_bytes())?;
-                            out.flush()?;
-                            printed_so_far.push_str(suffix);
-                        }
-                    } else {
-                        out.write_all(target_str.as_bytes())?;
-                        out.flush()?;
-                        *printed_so_far = target_str;
+                    if raw.is_empty() {
+                        out.write_all(b"> ")?;
+                        self.printed.entry(key.clone()).or_default().push_str("> ");
                     }
+                    out.write_all(t.as_bytes())?;
+                    out.flush()?;
+                    raw.push_str(t);
+                    self.printed.entry(key.clone()).or_default().push_str(t);
+                    self.user_line_open = !t.ends_with('\n');
+                    self.open_user_id = if self.user_line_open {
+                        Some(id.clone())
+                    } else {
+                        None
+                    };
                 }
             }
             BlockKey::Tool(id) => {
@@ -441,9 +495,9 @@ mod tests {
         // User line
         r.handle_frame(&make_user_frame("u1", "list files"), &mut out)
             .unwrap();
-        assert_eq!(String::from_utf8(out.clone()).unwrap(), "> list files\n");
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "> list files");
 
-        // Tool call 1: completes
+        // Tool call 1: completes (closes user line with newline)
         r.handle_frame(&make_tool_call_frame("t1", "shell: ls"), &mut out)
             .unwrap();
         assert_eq!(
@@ -526,5 +580,36 @@ mod tests {
         let mut out2 = Vec::new();
         r2.handle_frame(&thought_frame, &mut out2).unwrap();
         assert_eq!(String::from_utf8(out2).unwrap(), "thinking deep");
+    }
+
+    #[test]
+    fn test_chunked_user_message_does_not_duplicate() {
+        let mut r = Renderer::new(false, false);
+        let mut out = Vec::new();
+
+        r.handle_frame(&make_user_frame("u1", "hello "), &mut out)
+            .unwrap();
+        r.handle_frame(&make_user_frame("u1", "world"), &mut out)
+            .unwrap();
+        // Agent message closes the user line block
+        r.handle_frame(&make_text_frame("m1", "reply"), &mut out)
+            .unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "> hello world\nreply");
+    }
+
+    #[test]
+    fn test_user_line_cleared_on_reset() {
+        let mut r = Renderer::new(false, false);
+        let mut out = Vec::new();
+
+        r.handle_frame(&make_user_frame("u1", "hello"), &mut out)
+            .unwrap();
+        r.handle_frame(&make_reset_frame(), &mut out).unwrap();
+        r.handle_frame(&make_user_frame("u1", "hello world"), &mut out)
+            .unwrap();
+        r.handle_frame(&make_replay_done_frame(), &mut out).unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "> hello world\n");
     }
 }

@@ -298,14 +298,11 @@ async fn test_tail_reconnect_mid_turn_no_duplicates() {
         return;
     };
 
-    g.model().push([Turn::Gate(
-        "gate_mid_turn".into(),
-        Box::new(Turn::Text(vec![
-            "part one ".into(),
-            "part two ".into(),
-            "part three".into(),
-        ])),
-    )]);
+    g.model().push([Turn::TextThenGate {
+        before: vec!["part one ".into(), "part two ".into()],
+        gate: "gate_mid_turn".into(),
+        after: vec!["part three".into()],
+    }]);
 
     let mut h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
 
@@ -340,7 +337,7 @@ async fn test_tail_reconnect_mid_turn_no_duplicates() {
         url: h.ws_url(),
         secret: h.secret(),
         session: sid.clone(),
-        text_only: true,
+        text_only: false,
         thoughts: false,
         exit_on_turn_end: true,
     };
@@ -362,21 +359,27 @@ async fn test_tail_reconnect_mid_turn_no_duplicates() {
         .await
         .expect("prompt request");
 
-    // Wait until active run is announced
+    // Wait until tail receives the initial chunks emitted before the gate
+    let start_wait = std::time::Instant::now();
     loop {
-        if let Some(frame) = prompt_client.next_frame().await.expect("frame")
-            && frame
-                .pointer("/params/update/sessionUpdate")
-                .and_then(|v| v.as_str())
-                == Some("session_info_update")
-            && frame
-                .pointer("/params/update/_meta/goose/activeRunId")
-                .and_then(|v| v.as_str())
-                .is_some()
-        {
+        let cur = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        if cur.contains("part one part two ") {
             break;
         }
+        if start_wait.elapsed() > Duration::from_secs(10) {
+            panic!(
+                "timed out waiting for tail to receive initial chunks before kill9; current output: {cur}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    // Verify tail printed them before kill9
+    let pre_kill_output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        pre_kill_output.contains("part one part two "),
+        "tail must have printed chunks before kill9"
+    );
 
     // Kill honkd mid-turn while goose is paused at gate
     h.kill9();
@@ -391,16 +394,111 @@ async fn test_tail_reconnect_mid_turn_no_duplicates() {
     h.restart().await;
 
     // Tail should reconnect, resume with delta, and exit when turn ends
-    tail_handle
+    let outcome = tail_handle
         .await
         .expect("join tail")
         .expect("tail run successfully");
 
+    assert_eq!(
+        outcome.reconnect_resets, 0,
+        "no _honk/reset should be observed on reconnect"
+    );
+
     let export_text = g.turn_text(&sid).await;
     let tail_text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
 
-    assert_eq!(tail_text, export_text);
-    assert_eq!(tail_text, "part one part two part three");
+    assert!(
+        !tail_text.contains("[honk: transcript rebuilt]"),
+        "no transcript rebuilt marker should be emitted on delta resume"
+    );
+    assert_eq!(export_text, "part one part two part three");
+    assert!(tail_text.ends_with("part one part two part three"));
+    assert_eq!(
+        tail_text.matches("part one ").count(),
+        1,
+        "no duplicate part one"
+    );
+    assert_eq!(
+        tail_text.matches("part two ").count(),
+        1,
+        "no duplicate part two"
+    );
+    assert_eq!(
+        tail_text.matches("part three").count(),
+        1,
+        "no duplicate part three"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tail_fatal_error_on_bad_secret() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        eprintln!("skipping test_tail_fatal_error_on_bad_secret: StubGoose unset");
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!(
+            "skipping test_tail_fatal_error_on_bad_secret: honkd binary not found (set HONKD_BIN)"
+        );
+        return;
+    };
+
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let opts = TailOpts {
+        url: h.ws_url(),
+        secret: "bad_secret_token".to_string(),
+        session: "s1".to_string(),
+        text_only: true,
+        thoughts: false,
+        exit_on_turn_end: true,
+    };
+
+    let res = honk::run(opts, SharedBuf(output)).await;
+    assert!(res.is_err(), "tail should exit with error on 401");
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("authentication failed") || err.contains("401"),
+        "error should indicate auth failure: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tail_fatal_error_on_missing_session() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        eprintln!("skipping test_tail_fatal_error_on_missing_session: StubGoose unset");
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!(
+            "skipping test_tail_fatal_error_on_missing_session: honkd binary not found (set HONKD_BIN)"
+        );
+        return;
+    };
+
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let opts = TailOpts {
+        url: h.ws_url(),
+        secret: h.secret(),
+        session: "non_existent_session_12345".to_string(),
+        text_only: true,
+        thoughts: false,
+        exit_on_turn_end: true,
+    };
+
+    let res = honk::run(opts, SharedBuf(output)).await;
+    assert!(
+        res.is_err(),
+        "tail should exit with error on session not found"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("session/load failed"),
+        "error should indicate session/load failure: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

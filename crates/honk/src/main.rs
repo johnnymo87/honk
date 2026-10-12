@@ -27,13 +27,16 @@ struct TailArgs {
     /// Secret auth token (defaults to $HONK_SECRET or state file)
     #[arg(long)]
     secret: Option<String>,
-    /// Agent text only (suppresses tool lines, markers, user lines)
+    /// Agent text only (suppresses tool lines, markers, user lines).
+    /// Note: on first attach to an existing session, prints the entire session's
+    /// agent text (not just the last turn).
     #[arg(long)]
     text_only: bool,
     /// Include thought blocks in output
     #[arg(long)]
     thoughts: bool,
-    /// Exit once an active turn finishes
+    /// Exit once an active turn finishes.
+    /// If the session is idle at attach, waits for the next turn to start and finish before exiting.
     #[arg(long)]
     exit_on_turn_end: bool,
 }

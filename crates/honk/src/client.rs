@@ -41,24 +41,38 @@ pub fn format_session_line(
     format!("{session_id}  {held_str}{running_str}  {title}  {cwd}")
 }
 
-/// Normalizes a URL to a WebSocket URL ending in `/acp`.
+use url::Url;
+
+/// Normalizes a URL to a WebSocket URL ending in `/acp`, preserving queries and handling trailing slashes.
 pub fn normalize_ws_url(url: &str) -> String {
-    let mut u = url.trim().to_string();
-    if u.starts_with("http://") {
-        u = format!("ws://{}", &u["http://".len()..]);
-    } else if u.starts_with("https://") {
-        u = format!("wss://{}", &u["https://".len()..]);
-    } else if !u.starts_with("ws://") && !u.starts_with("wss://") {
-        u = format!("ws://{u}");
+    let trimmed = url.trim();
+    let has_scheme = trimmed.contains("://");
+    let url_str = if has_scheme {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    let Ok(mut parsed) = Url::parse(&url_str) else {
+        return trimmed.to_string();
+    };
+
+    let new_scheme = match parsed.scheme() {
+        "https" | "wss" => "wss",
+        _ => "ws",
+    };
+    let _ = parsed.set_scheme(new_scheme);
+
+    let path = parsed.path().trim_end_matches('/').to_string();
+    if path.is_empty() || path == "/" {
+        parsed.set_path("/acp");
+    } else if path.ends_with("/acp") {
+        parsed.set_path(&path);
+    } else {
+        parsed.set_path(&format!("{path}/acp"));
     }
-    if !u.ends_with("/acp") {
-        if u.ends_with('/') {
-            u.push_str("acp");
-        } else {
-            u.push_str("/acp");
-        }
-    }
-    u
+
+    parsed.to_string()
 }
 
 /// Resolves the honkd secret from:
@@ -115,7 +129,15 @@ impl Client {
                 .map_err(|e| anyhow::anyhow!("invalid secret header: {e}"))?,
         );
 
-        let (ws, _) = tokio_tungstenite::connect_async(req).await?;
+        let (ws, _) = match tokio_tungstenite::connect_async(req).await {
+            Ok(pair) => pair,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp))
+                if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 =>
+            {
+                anyhow::bail!("fatal: authentication failed (HTTP {})", resp.status());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut client = Self { ws, next_req_id: 1 };
 
         // Send honk-aware initialize
@@ -131,7 +153,7 @@ impl Client {
             .await?;
 
         if let Some(err) = init_res.get("error") {
-            anyhow::bail!("honkd initialize failed: {err}");
+            anyhow::bail!("fatal: honkd initialize failed: {err}");
         }
 
         Ok(client)
@@ -153,6 +175,11 @@ impl Client {
         Ok(id)
     }
 
+    /// Sends a JSON-RPC request and awaits the matching response by id.
+    ///
+    /// NOTE: Preflight-only. Any session notifications or unsolicited frames
+    /// received while awaiting the response are dropped. For full session streaming
+    /// and frame processing, use `request` followed by `next_frame`.
     pub async fn call(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.request(method, params).await?;
         loop {
@@ -292,6 +319,30 @@ mod tests {
         assert_eq!(
             normalize_ws_url("https://example.com/acp"),
             "wss://example.com/acp"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280/"),
+            "ws://127.0.0.1:4280/acp"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280/acp/"),
+            "ws://127.0.0.1:4280/acp"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280?token=abc"),
+            "ws://127.0.0.1:4280/acp?token=abc"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280/?token=abc"),
+            "ws://127.0.0.1:4280/acp?token=abc"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280/acp?token=abc"),
+            "ws://127.0.0.1:4280/acp?token=abc"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:4280/acp/?token=abc"),
+            "ws://127.0.0.1:4280/acp?token=abc"
         );
     }
 }

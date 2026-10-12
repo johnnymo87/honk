@@ -21,6 +21,12 @@ pub enum Turn {
     },
     /// wait until `StubModel::open(name)` before answering the NEXT turn
     Gate(String, Box<Turn>),
+    /// streams before chunks, waits until `StubModel::open(name)`, then streams after chunks
+    TextThenGate {
+        before: Vec<String>,
+        gate: String,
+        after: Vec<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -309,13 +315,15 @@ async fn chat_completions(
     let stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     if stream {
-        build_sse_response(resolved_turn).into_response()
+        build_sse_response(resolved_turn, state).into_response()
     } else {
-        build_json_response(resolved_turn).into_response()
+        build_json_response(resolved_turn, state)
+            .await
+            .into_response()
     }
 }
 
-fn build_json_response(turn: Turn) -> (StatusCode, Json<serde_json::Value>) {
+async fn build_json_response(turn: Turn, state: AppState) -> (StatusCode, Json<serde_json::Value>) {
     match turn {
         Turn::Text(chunks) => {
             let full_text = chunks.concat();
@@ -378,36 +386,63 @@ fn build_json_response(turn: Turn) -> (StatusCode, Json<serde_json::Value>) {
                 }
             })),
         ),
-        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
-    }
-}
-
-fn build_sse_response(turn: Turn) -> Response {
-    let mut frames: Vec<String> = Vec::new();
-
-    match turn {
-        Turn::Text(chunks) => {
-            frames.push(format!(
-                "data: {}\n\n",
-                serde_json::json!({
+        Turn::TextThenGate {
+            before,
+            gate,
+            after,
+        } => {
+            let wait_start_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let notified = state.gate_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let cur_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
+                if wait_start_epoch < cur_epoch || state.gates.lock().unwrap().contains(&gate) {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let _ = tokio::time::timeout(deadline - now, notified).await;
+            }
+            let full_text = before.concat() + &after.concat();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
                     "id": "chatcmpl-stub",
-                    "object": "chat.completion.chunk",
+                    "object": "chat.completion",
                     "created": 1770000000,
                     "model": "stub-model",
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {
+                            "message": {
                                 "role": "assistant",
-                                "content": ""
+                                "content": full_text
                             },
-                            "finish_reason": serde_json::Value::Null
+                            "finish_reason": "stop"
                         }
-                    ]
-                })
-            ));
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 10,
+                        "total_tokens": 20
+                    }
+                })),
+            )
+        }
+        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
+    }
+}
 
-            for chunk in chunks {
+fn build_sse_response(turn: Turn, state: AppState) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
+    tokio::spawn(async move {
+        match turn {
+            Turn::Text(chunks) => {
+                let mut frames: Vec<String> = Vec::new();
                 frames.push(format!(
                     "data: {}\n\n",
                     serde_json::json!({
@@ -419,113 +454,279 @@ fn build_sse_response(turn: Turn) -> Response {
                             {
                                 "index": 0,
                                 "delta": {
-                                    "content": chunk
+                                    "role": "assistant",
+                                    "content": ""
                                 },
                                 "finish_reason": serde_json::Value::Null
                             }
                         ]
                     })
                 ));
-            }
 
-            frames.push(format!(
-                "data: {}\n\n",
-                serde_json::json!({
-                    "id": "chatcmpl-stub",
-                    "object": "chat.completion.chunk",
-                    "created": 1770000000,
-                    "model": "stub-model",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
+                for chunk in chunks {
+                    frames.push(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id": "chatcmpl-stub",
+                            "object": "chat.completion.chunk",
+                            "created": 1770000000,
+                            "model": "stub-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": chunk
+                                    },
+                                    "finish_reason": serde_json::Value::Null
+                                }
+                            ]
+                        })
+                    ));
+                }
+
+                frames.push(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-stub",
+                        "object": "chat.completion.chunk",
+                        "created": 1770000000,
+                        "model": "stub-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop"
+                            }
+                        ]
+                    })
+                ));
+
+                frames.push(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-stub",
+                        "object": "chat.completion.chunk",
+                        "created": 1770000000,
+                        "model": "stub-model",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 10,
+                            "total_tokens": 20
                         }
-                    ]
-                })
-            ));
+                    })
+                ));
 
-            frames.push(format!(
-                "data: {}\n\n",
-                serde_json::json!({
-                    "id": "chatcmpl-stub",
-                    "object": "chat.completion.chunk",
-                    "created": 1770000000,
-                    "model": "stub-model",
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 10,
-                        "completion_tokens": 10,
-                        "total_tokens": 20
+                frames.push("data: [DONE]\n\n".to_string());
+
+                let frames_len = frames.len();
+                for frame in frames {
+                    let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                    if frames_len <= 100 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    } else {
+                        tokio::task::yield_now().await;
                     }
-                })
-            ));
+                }
+            }
+            Turn::ToolCall { tool, arguments } => {
+                let mut frames: Vec<String> = Vec::new();
+                frames.push(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-stub",
+                        "object": "chat.completion.chunk",
+                        "created": 1770000000,
+                        "model": "stub-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": serde_json::Value::Null,
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_stub_001",
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool,
+                                                "arguments": arguments.to_string()
+                                            }
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls"
+                            }
+                        ]
+                    })
+                ));
 
-            frames.push("data: [DONE]\n\n".to_string());
-        }
-        Turn::ToolCall { tool, arguments } => {
-            frames.push(format!(
-                "data: {}\n\n",
-                serde_json::json!({
-                    "id": "chatcmpl-stub",
-                    "object": "chat.completion.chunk",
-                    "created": 1770000000,
-                    "model": "stub-model",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": serde_json::Value::Null,
-                                "tool_calls": [
+                frames.push(format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "id": "chatcmpl-stub",
+                        "object": "chat.completion.chunk",
+                        "created": 1770000000,
+                        "model": "stub-model",
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 10,
+                            "total_tokens": 20
+                        }
+                    })
+                ));
+
+                frames.push("data: [DONE]\n\n".to_string());
+
+                let frames_len = frames.len();
+                for frame in frames {
+                    let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+                    if frames_len <= 100 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+            Turn::TextThenGate {
+                before,
+                gate,
+                after,
+            } => {
+                // Initial role frame
+                let _ = tx
+                    .send(Ok(bytes::Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id": "chatcmpl-stub",
+                            "object": "chat.completion.chunk",
+                            "created": 1770000000,
+                            "model": "stub-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": ""
+                                    },
+                                    "finish_reason": serde_json::Value::Null
+                                }
+                            ]
+                        })
+                    ))))
+                    .await;
+
+                // Send before chunks
+                for chunk in before {
+                    let _ = tx
+                        .send(Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            serde_json::json!({
+                                "id": "chatcmpl-stub",
+                                "object": "chat.completion.chunk",
+                                "created": 1770000000,
+                                "model": "stub-model",
+                                "choices": [
                                     {
                                         "index": 0,
-                                        "id": "call_stub_001",
-                                        "type": "function",
-                                        "function": {
-                                            "name": tool,
-                                            "arguments": arguments.to_string()
-                                        }
+                                        "delta": {
+                                            "content": chunk
+                                        },
+                                        "finish_reason": serde_json::Value::Null
                                     }
                                 ]
-                            },
-                            "finish_reason": "tool_calls"
-                        }
-                    ]
-                })
-            ));
+                            })
+                        ))))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
 
-            frames.push(format!(
-                "data: {}\n\n",
-                serde_json::json!({
-                    "id": "chatcmpl-stub",
-                    "object": "chat.completion.chunk",
-                    "created": 1770000000,
-                    "model": "stub-model",
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 10,
-                        "completion_tokens": 10,
-                        "total_tokens": 20
+                // Pause until gate opens
+                let wait_start_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    let notified = state.gate_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let cur_epoch = state.epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    if wait_start_epoch < cur_epoch || state.gates.lock().unwrap().contains(&gate) {
+                        break;
                     }
-                })
-            ));
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let _ = tokio::time::timeout(deadline - now, notified).await;
+                }
 
-            frames.push("data: [DONE]\n\n".to_string());
-        }
-        Turn::Gate(_, _) => unreachable!("gates must be resolved"),
-    }
+                // Send after chunks
+                for chunk in after {
+                    let _ = tx
+                        .send(Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            serde_json::json!({
+                                "id": "chatcmpl-stub",
+                                "object": "chat.completion.chunk",
+                                "created": 1770000000,
+                                "model": "stub-model",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": chunk
+                                        },
+                                        "finish_reason": serde_json::Value::Null
+                                    }
+                                ]
+                            })
+                        ))))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::convert::Infallible>>(16);
-    let frames_len = frames.len();
-    tokio::spawn(async move {
-        for frame in frames {
-            let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
-            if frames_len <= 100 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            } else {
-                tokio::task::yield_now().await;
+                // Final finish_reason frame & DONE
+                let _ = tx
+                    .send(Ok(bytes::Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id": "chatcmpl-stub",
+                            "object": "chat.completion.chunk",
+                            "created": 1770000000,
+                            "model": "stub-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }
+                            ]
+                        })
+                    ))))
+                    .await;
+
+                let _ = tx
+                    .send(Ok(bytes::Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id": "chatcmpl-stub",
+                            "object": "chat.completion.chunk",
+                            "created": 1770000000,
+                            "model": "stub-model",
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 10,
+                                "total_tokens": 20
+                            }
+                        })
+                    ))))
+                    .await;
+
+                let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
             }
+            Turn::Gate(_, _) => unreachable!("gates must be resolved"),
         }
     });
 
