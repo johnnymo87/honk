@@ -4,7 +4,7 @@ use std::time::Duration;
 use common::{Honkd, Viewer, new_session, prompt_params};
 use honk_testgoose::{StubGoose, Turn};
 use honk_upstream::{Recorder, Upstream, UpstreamOpts};
-use serde_json::json;
+use serde_json::{Value, json};
 
 mod common;
 
@@ -373,21 +373,13 @@ async fn eviction_deletes_exactly_the_idle_sessions_connection() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn coalesced_concurrent_activation() {
-    let Some(g) = StubGoose::start_or_skip().await else {
-        return;
-    };
-    let stored_cwd = g.cwd().to_str().unwrap().to_string();
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+    let h =
+        Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &["--idle-ttl-secs", "1"]).await);
 
-    let h = Arc::new(Honkd::spawn(&g.url(), g.secret_file(), &["--idle-ttl-secs", "1"]).await);
     let mut v = Viewer::connect(&h).await;
-    let sid = new_session(&mut v, &stored_cwd).await;
-
-    // Prompt initial turn so goose commits session to DB
-    g.model().push([Turn::Text(vec!["initial ok".into()])]);
-    let req0 = v
-        .request("session/prompt", prompt_params(&sid, "init", None))
-        .await;
-    let _ = v.response(&req0).await;
+    let sid = new_session(&mut v, "/tmp").await;
 
     // Detach and wait for eviction
     v.call("session/close", json!({ "sessionId": &sid })).await;
@@ -396,6 +388,12 @@ async fn coalesced_concurrent_activation() {
     let state = read_state(&h);
     assert!(!state.sessions.contains_key(&sid));
     assert_eq!(state.retired_epochs.get(&sid), Some(&1));
+
+    let initial_loads = fake
+        .inbound()
+        .iter()
+        .filter(|f| f.get("method").and_then(serde_json::Value::as_str) == Some("session/load"))
+        .count();
 
     // Spawn 4 concurrent tasks, all calling session/load on sid simultaneously
     let mut tasks = Vec::new();
@@ -429,6 +427,18 @@ async fn coalesced_concurrent_activation() {
         );
     }
 
+    // Assert that upstream received EXACTLY ONE session/load call across all concurrent activations
+    let final_loads = fake
+        .inbound()
+        .iter()
+        .filter(|f| f.get("method").and_then(serde_json::Value::as_str) == Some("session/load"))
+        .count();
+    assert_eq!(
+        final_loads - initial_loads,
+        1,
+        "coalescing must result in exactly one upstream session/load call"
+    );
+
     // Exactly one activation should have occurred: epoch must be 2, not 5
     let state_final = read_state(&h);
     assert_eq!(
@@ -444,7 +454,14 @@ async fn eviction_vs_prompt_race() {
     };
     let stored_cwd = g.cwd().to_str().unwrap().to_string();
 
-    let h = Honkd::spawn(&g.url(), g.secret_file(), &["--idle-ttl-secs", "1"]).await;
+    // Spawn honkd with HONKD_TEST_PAUSE_EVICT_MS=1500 to pause eviction between handle removal and DELETE
+    let h = Honkd::spawn_with_env(
+        &g.url(),
+        g.secret_file(),
+        &["--idle-ttl-secs", "1"],
+        &[("HONKD_TEST_PAUSE_EVICT_MS", "1500")],
+    )
+    .await;
     let mut v = Viewer::connect(&h).await;
     let sid = new_session(&mut v, &stored_cwd).await;
 
@@ -457,17 +474,18 @@ async fn eviction_vs_prompt_race() {
 
     v.call("session/close", json!({ "sessionId": &sid })).await;
 
-    // Sleep right around the 1 second eviction boundary (1000ms)
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Wait 1.1s: idle TTL (1.0s) has expired and eviction has started,
+    // paused inside the 1500ms HONKD_TEST_PAUSE_EVICT_MS barrier between handle removal and DELETE.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 
-    // Prompt right as eviction fires/races
+    // Prompt while eviction is paused mid-flight!
     g.model()
         .push([Turn::Text(vec!["race turn answered".into()])]);
     let req_id = v
         .request("session/prompt", prompt_params(&sid, "racing prompt", None))
         .await;
 
-    let resp = v.response(&req_id).await;
+    let resp = v.response_timeout(&req_id, Duration::from_secs(15)).await;
     assert_eq!(
         resp.pointer("/result/stopReason").and_then(|v| v.as_str()),
         Some("end_turn"),
@@ -542,4 +560,156 @@ async fn max_sessions_refuses_activation_with_32000() {
     // Verify s1 is still held and unaffected
     let state = read_state(&h);
     assert!(state.sessions.contains_key(&s1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_sessions_concurrent_activations_limited() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+    let h = Arc::new(
+        Honkd::spawn(
+            &fake.url(),
+            fake.secret_file(),
+            &["--max-sessions", "2", "--idle-ttl-secs", "600"],
+        )
+        .await,
+    );
+
+    // Create 3 sessions upstream directly
+    let mut direct_up =
+        Upstream::initialize(&fake.url(), fake.secret().to_string(), Recorder::disabled())
+            .await
+            .expect("init direct");
+    direct_up.subscribe(None).await.expect("sub direct");
+
+    let mut sids = Vec::new();
+    for _ in 1..=3 {
+        let res = direct_up
+            .call(
+                "session/new",
+                json!({"cwd": "/tmp", "mcpServers": []}),
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("session/new");
+        sids.push(res["sessionId"].as_str().expect("sessionId").to_string());
+    }
+    let _ = direct_up.delete().await;
+
+    // Attempt to activate all 3 concurrently with max_sessions = 2
+    let mut tasks = Vec::new();
+    for sid in sids {
+        let h_clone = h.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut viewer = Viewer::connect(&h_clone).await;
+            let id = viewer
+                .request(
+                    "session/load",
+                    json!({
+                        "sessionId": sid,
+                        "cwd": ".",
+                        "mcpServers": []
+                    }),
+                )
+                .await;
+            viewer.response(&id).await
+        }));
+    }
+
+    let mut successes = 0;
+    let mut limit_errors = 0;
+    for task in tasks {
+        let resp = task.await.expect("join task");
+        if resp.get("result").is_some() {
+            successes += 1;
+        } else if resp.pointer("/error/code") == Some(&json!(-32000)) {
+            limit_errors += 1;
+        }
+    }
+
+    assert_eq!(
+        successes, 2,
+        "exactly 2 activations must succeed under max-sessions=2"
+    );
+    assert_eq!(
+        limit_errors, 1,
+        "the 3rd activation must be refused with -32000"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn answer_routes_to_pending_request_across_sessions() {
+    let Some(goose) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    goose.model().push([
+        Turn::ToolCall {
+            tool: "shell".to_string(),
+            arguments: json!({"command": "echo answer_test"}),
+        },
+        Turn::Text(vec!["done".to_string()]),
+    ]);
+
+    let h = Honkd::spawn(
+        &goose.url(),
+        goose.secret_file(),
+        &["--idle-ttl-secs", "600"],
+    )
+    .await;
+
+    let mut v1 = Viewer::connect(&h).await;
+    let sid = new_session(&mut v1, goose.cwd().to_str().unwrap()).await;
+
+    let mode_res = v1
+        .call(
+            "session/set_mode",
+            json!({"sessionId": &sid, "modeId": "approve"}),
+        )
+        .await;
+    assert!(mode_res.get("error").is_none());
+
+    let _pid = v1
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "run echo in approve mode", None),
+        )
+        .await;
+
+    let req = v1
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("request_permission")
+                || f.get("method").and_then(Value::as_str) == Some("session/request_permission")
+        })
+        .await;
+    let req_id = req["id"].clone();
+
+    // Detach v1 (close session)
+    v1.call("session/close", json!({ "sessionId": &sid })).await;
+
+    // A fresh viewer v2 (with no attached_sessions) answers the request!
+    let mut v2 = Viewer::connect(&h).await;
+    v2.respond(
+        req_id.clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+    )
+    .await;
+
+    // Verify pending request is answered and removed from state
+    let start = std::time::Instant::now();
+    let mut resolved = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        let state = read_state(&h);
+        if let Some(held) = state.sessions.get(&sid)
+            && held.pending.is_empty()
+        {
+            resolved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        resolved,
+        "pending request must be answered and removed from state by unattached viewer answer"
+    );
 }

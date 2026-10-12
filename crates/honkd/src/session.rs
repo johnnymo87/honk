@@ -163,6 +163,8 @@ pub struct Session {
     pub active_probe_id: Option<String>,
     pub gap_synthesis_grace: Duration,
     pub synthesized_replies: HashSet<String>,
+    pub initial_events: Vec<honk_upstream::Event>,
+    pub gap_synthesis_pending: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -251,6 +253,10 @@ impl Session {
             self.trigger_reattach().await;
         }
 
+        for ev in std::mem::take(&mut self.initial_events) {
+            self.on_upstream(ev).await;
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -282,7 +288,7 @@ impl Session {
                 }
             }
         }
-        self.return_undelivered_to_hub().await;
+        self.return_undelivered_to_hub();
     }
 
     async fn check_streams(&mut self) {
@@ -763,6 +769,7 @@ impl Session {
             let upstream_id = inf.upstream_id.clone();
             let grace = self.gap_synthesis_grace;
             let self_tx = self.self_tx.clone();
+            self.gap_synthesis_pending = true;
             tokio::spawn(async move {
                 tokio::time::sleep(grace).await;
                 let _ = self_tx
@@ -790,6 +797,8 @@ impl Session {
             && self.pending_server_requests.is_empty()
             && self.pending_requests.is_empty()
             && self.queued_msgs.is_empty()
+            && self.active_probe_id.is_none()
+            && !self.gap_synthesis_pending
             && self.state == ActorState::Live
             && !self.rebuild_at_turn_end
             && !self.needs_rebuild
@@ -820,6 +829,13 @@ impl Session {
             self.hub.finish_eviction(&self.sid, notify).await;
             self.on_msg(msg).await;
             return false;
+        }
+
+        #[cfg(debug_assertions)]
+        if let Ok(pause_str) = std::env::var("HONKD_TEST_PAUSE_EVICT_MS")
+            && let Ok(ms) = pause_str.parse::<u64>()
+        {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
         }
 
         let conn_id = self.up.conn_id().to_string();
@@ -855,9 +871,31 @@ impl Session {
         true
     }
 
-    async fn return_undelivered_to_hub(&mut self) {
-        while let Ok(_msg) = self.rx.try_recv() {
-            tracing::warn!("Session {} exiting; drained undelivered msg", self.sid);
+    fn return_undelivered_to_hub(&mut self) {
+        let sid = self.sid.clone();
+        let hub = self.hub.clone();
+        while let Ok(msg) = self.rx.try_recv() {
+            tracing::warn!("Session {sid} exiting; re-dispatching undelivered msg");
+            let sid = sid.clone();
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                match hub.get_or_activate_session(&sid).await {
+                    Ok(handle) => {
+                        let _ = handle.tx.send(msg).await;
+                    }
+                    Err(e) => match msg {
+                        SessionMsg::Prompt { viewer, id, .. }
+                        | SessionMsg::Steer { viewer, id, .. }
+                        | SessionMsg::Forward { viewer, id, .. } => {
+                            let err_frame = crate::rpc::error(id, e.code, e.message, None);
+                            let _ = viewer.send_frame(axum::extract::ws::Message::Text(
+                                err_frame.to_string().into(),
+                            ));
+                        }
+                        _ => {}
+                    },
+                }
+            });
         }
     }
 
@@ -1086,6 +1124,7 @@ impl Session {
                             let actions =
                                 self.turn
                                     .on_prompt_reply(&upstream_id, &frame, &mut self.ids);
+                            self.gap_synthesis_pending = false;
                             self.execute_actions(actions).await;
                         } else {
                             let up_id_opt = frame
@@ -1775,6 +1814,7 @@ impl Session {
                 self.handle_reply_text(owners, body, text).await;
             }
             SessionMsg::SynthesizeGapEndTurn { upstream_id } => {
+                self.gap_synthesis_pending = false;
                 if self
                     .turn
                     .inflight

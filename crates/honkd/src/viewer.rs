@@ -261,6 +261,37 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 None
                             };
 
+                            let session_tx = if let Some(tx) = session_tx {
+                                Some(tx)
+                            } else {
+                                let sid_opt = {
+                                    let s = hub.state.lock().await;
+                                    s.sessions.iter().find_map(|(sid, h)| {
+                                        if h.pending
+                                            .iter()
+                                            .any(|p| honk_upstream::rpc_id_matches(&p.id, &id))
+                                        {
+                                            Some(sid.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                };
+                                if let Some(sid) = sid_opt {
+                                    match hub.sessions.read().await.get(&sid).map(|h| h.tx.clone())
+                                    {
+                                        Some(tx) => Some(tx),
+                                        None => hub
+                                            .get_or_activate_session(&sid)
+                                            .await
+                                            .ok()
+                                            .map(|h| h.tx),
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+
                             if let Some(tx) = session_tx {
                                 let _ = tx
                                     .send(crate::session::SessionMsg::Answer {
@@ -398,15 +429,44 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     };
 
                     let after = honk_wire::honk_meta(&params).after;
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    let _ = tx
+                    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                    let mut tx = tx;
+                    if tx
                         .send(crate::session::SessionMsg::Attach {
                             viewer_id: viewer.id,
                             viewer: viewer.tx.clone(),
-                            after,
+                            after: after.clone(),
                             reply: reply_tx,
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        match hub.get_or_activate_session(sid).await {
+                            Ok(new_h) => {
+                                tx = new_h.tx;
+                                let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+                                let _ = tx
+                                    .send(crate::session::SessionMsg::Attach {
+                                        viewer_id: viewer.id,
+                                        viewer: viewer.tx.clone(),
+                                        after,
+                                        reply: reply_tx2,
+                                    })
+                                    .await;
+                                reply_rx = reply_rx2;
+                            }
+                            Err(e) => {
+                                let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                if !viewer
+                                    .tx
+                                    .send_frame(Message::Text(err_resp.to_string().into()))
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
 
                     let snapshot = match reply_rx.await {
                         Ok(s) => s,
@@ -510,28 +570,6 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     let sessions = hub.sessions.read().await;
                                     sessions.get(sid).map(|h| h.tx.clone())
                                 };
-                                let session_tx = if let Some(tx) = session_tx {
-                                    Some(tx)
-                                } else {
-                                    let sid_opt = {
-                                        let s = hub.state.lock().await;
-                                        s.sessions.iter().find_map(|(sid, h)| {
-                                            if h.pending
-                                                .iter()
-                                                .any(|p| honk_upstream::rpc_id_matches(&p.id, &id))
-                                            {
-                                                Some(sid.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    };
-                                    if let Some(sid) = sid_opt {
-                                        hub.get_or_activate_session(&sid).await.ok().map(|h| h.tx)
-                                    } else {
-                                        None
-                                    }
-                                };
 
                                 if let Some(tx) = session_tx {
                                     let _ = tx
@@ -605,15 +643,42 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 viewer.attached_sessions.insert(sid.to_string());
                             }
 
-                            let _ = tx
+                            if tx
                                 .send(crate::session::SessionMsg::Prompt {
                                     viewer_id: viewer.id,
                                     viewer: viewer.tx.clone(),
                                     is_honk_aware: viewer.is_honk_aware,
-                                    id,
-                                    params,
+                                    id: id.clone(),
+                                    params: params.clone(),
                                 })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                match hub.get_or_activate_session(sid).await {
+                                    Ok(new_h) => {
+                                        let _ = new_h
+                                            .tx
+                                            .send(crate::session::SessionMsg::Prompt {
+                                                viewer_id: viewer.id,
+                                                viewer: viewer.tx.clone(),
+                                                is_honk_aware: viewer.is_honk_aware,
+                                                id,
+                                                params,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let err_resp =
+                                            crate::rpc::error(id, e.code, e.message, None);
+                                        if !viewer
+                                            .tx
+                                            .send_frame(Message::Text(err_resp.to_string().into()))
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else {
                         let err_resp = crate::rpc::error(
@@ -666,24 +731,74 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         }
 
                         if method == Some("_goose/unstable/session/steer") {
-                            let _ = tx
+                            if tx
                                 .send(crate::session::SessionMsg::Steer {
                                     viewer_id: viewer.id,
                                     viewer: viewer.tx.clone(),
-                                    id,
-                                    params,
+                                    id: id.clone(),
+                                    params: params.clone(),
                                 })
-                                .await;
-                        } else {
-                            let _ = tx
-                                .send(crate::session::SessionMsg::Forward {
-                                    viewer_id: viewer.id,
-                                    viewer: viewer.tx.clone(),
-                                    id,
-                                    method: method.unwrap_or("").to_string(),
-                                    params,
-                                })
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                match hub.get_or_activate_session(sid).await {
+                                    Ok(new_h) => {
+                                        let _ = new_h
+                                            .tx
+                                            .send(crate::session::SessionMsg::Steer {
+                                                viewer_id: viewer.id,
+                                                viewer: viewer.tx.clone(),
+                                                id,
+                                                params,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let err_resp =
+                                            crate::rpc::error(id, e.code, e.message, None);
+                                        if !viewer
+                                            .tx
+                                            .send_frame(Message::Text(err_resp.to_string().into()))
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if tx
+                            .send(crate::session::SessionMsg::Forward {
+                                viewer_id: viewer.id,
+                                viewer: viewer.tx.clone(),
+                                id: id.clone(),
+                                method: method.unwrap_or("").to_string(),
+                                params: params.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            match hub.get_or_activate_session(sid).await {
+                                Ok(new_h) => {
+                                    let _ = new_h
+                                        .tx
+                                        .send(crate::session::SessionMsg::Forward {
+                                            viewer_id: viewer.id,
+                                            viewer: viewer.tx.clone(),
+                                            id,
+                                            method: method.unwrap_or("").to_string(),
+                                            params,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                    if !viewer
+                                        .tx
+                                        .send_frame(Message::Text(err_resp.to_string().into()))
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 } else if method == Some("session/list")
