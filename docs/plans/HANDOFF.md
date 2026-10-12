@@ -92,6 +92,6 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
   3. ReplayBatch sent to `replay_tx` before registering viewer for live fan-out, preventing live frames from preceding replay on attach (4a8321f).
   4. In-flight pending requests (steer/forward) failed with -32000 on connection replacement / handle_gone; on_rebuilt sets actor Live before draining session events (8d09f3b).
   5. Ledger prune (24h TTL, 1000 max entries) enforced on Done insert, not only at boot; sidecar consulted before declaring InFlight entries lost at boot (09741f0).
-  6. Ambiguous prompt POST failures bounded: scheduled export/steer check resolves unannounced inflight (as not_delivered if goose never got it), unparking later prompts (bec5b28).
+  6. Ambiguous prompt POST failures bounded: conservative bounded rule polls steer probe and export at 2s, 5s, 10s, 20s, 30s (scaled via --ambiguous-inflight-timeout-secs, default 30s); run announced, prompt reply, probe actualRunId, or export containing prompt N confirms delivered; whole window expiring with every probe idle and prompt absent marks not_delivered and dispatches parked.
   7. Secret file validated >= 32 chars and fsync'd on creation; downstream auth rejects empty tokens (3217f9f).
   8. Steer probe timeout and retry added for degraded mode (1e57c3d).

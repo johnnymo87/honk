@@ -109,8 +109,16 @@ pub enum SessionMsg {
     SynthesizeGapEndTurn {
         upstream_id: String,
     },
-    CheckAmbiguousInflight {
+    AmbiguousCheckPoll {
+        token: u64,
         upstream_id: String,
+        is_last: bool,
+    },
+    AmbiguousExportResult {
+        token: u64,
+        upstream_id: String,
+        is_last: bool,
+        result: anyhow::Result<Value>,
     },
     ProbeTimeout {
         probe_id: String,
@@ -193,6 +201,9 @@ pub struct Session {
     pub reactivating: bool,
     pub reactivation_token: u64,
     pub rebuild_token: u64,
+    pub ambiguous_check_token: u64,
+    pub ambiguous_window_expired: bool,
+    pub ambiguous_export_in_flight: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1536,6 +1547,9 @@ impl Session {
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
+                    if run_opt.is_some() {
+                        self.ambiguous_check_token += 1;
+                    }
                     let actions = self.turn.on_run_state(run_opt.clone(), &mut self.ids);
                     self.execute_actions(actions).await;
 
@@ -1570,14 +1584,50 @@ impl Session {
                         .pointer("/error/data/actualRunId")
                         .and_then(Value::as_str);
 
-                    if is_idle {
-                        // Case (b): Turn ended inside the gap, or session is idle!
-                        self.turn.run = None;
-                        self.start_rebuild().await;
-                    } else if let Some(run_id) = actual_run_id {
+                    if let Some(run_id) = actual_run_id {
                         // Case (a): Turn is still running live on goose!
+                        // If we were checking an ambiguous inflight prompt: DELIVERED!
+                        let delivered_info = if let Some(inf) = self.turn.inflight.as_mut()
+                            && !inf.announced
+                        {
+                            tracing::info!(
+                                "Session {}: ambiguous prompt {} confirmed delivered via probe actualRunId `{run_id}`",
+                                self.sid,
+                                inf.upstream_id
+                            );
+                            inf.announced = true;
+                            Some((
+                                inf.prompt_index,
+                                inf.params.clone(),
+                                inf.owners.first().cloned(),
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some((n, params, owner_opt)) = delivered_info {
+                            self.ambiguous_check_token += 1;
+                            if self.turn.client_prompts <= n {
+                                self.turn.client_prompts = n + 1;
+                                self.sync_inflight().await;
+                            }
+                            if let Some(owner) = owner_opt {
+                                let synth_action = Action::SynthUser { params, owner };
+                                self.execute_actions(vec![synth_action]).await;
+                            }
+                        }
                         self.turn.run = Some(run_id.to_string());
                         self.rebuild_at_turn_end = true;
+                    } else if is_idle {
+                        if self.gap_evidenced {
+                            // Case (b): Turn ended inside the gap, or session is idle after evidenced delivery!
+                            self.turn.run = None;
+                            self.start_rebuild().await;
+                        } else if let Some(inf) = self.turn.inflight.as_ref()
+                            && !inf.announced
+                        {
+                            let up_id = inf.upstream_id.clone();
+                            self.maybe_finish_ambiguous_not_delivered(&up_id).await;
+                        }
                     }
                 } else {
                     // Check if this is a response to pending steer or forward
@@ -1617,6 +1667,7 @@ impl Session {
                         });
 
                         if is_inflight_reply {
+                            self.ambiguous_check_token += 1;
                             let upstream_id =
                                 self.turn.inflight.as_ref().unwrap().upstream_id.clone();
                             let sidecar_path = self
@@ -1813,18 +1864,44 @@ impl Session {
                             }
                             PromptPostFailure::Ambiguous => {
                                 tracing::warn!(
-                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); scheduling export/steer check",
+                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); scheduling conservative bounded polling",
                                     sid
                                 );
+                                self.ambiguous_check_token += 1;
+                                let token = self.ambiguous_check_token;
+                                self.ambiguous_window_expired = false;
+                                self.ambiguous_export_in_flight = false;
+
+                                let total_secs =
+                                    self.hub.args.ambiguous_inflight_timeout_secs.max(1);
+                                let total_duration = Duration::from_secs(total_secs);
+                                let ratios =
+                                    [2.0 / 30.0, 5.0 / 30.0, 10.0 / 30.0, 20.0 / 30.0, 1.0];
+                                let targets: Vec<Duration> =
+                                    ratios.iter().map(|&r| total_duration.mul_f64(r)).collect();
+
                                 let self_tx = self.self_tx.clone();
                                 let up_id = upstream_id.clone();
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(400)).await;
-                                    let _ = self_tx
-                                        .send(SessionMsg::CheckAmbiguousInflight {
-                                            upstream_id: up_id,
-                                        })
-                                        .await;
+                                    let mut prev = Duration::ZERO;
+                                    let n = targets.len();
+                                    for (i, &target) in targets.iter().enumerate() {
+                                        let delay = target.saturating_sub(prev);
+                                        prev = target;
+                                        tokio::time::sleep(delay).await;
+                                        let is_last = i + 1 == n;
+                                        if self_tx
+                                            .send(SessionMsg::AmbiguousCheckPoll {
+                                                token,
+                                                upstream_id: up_id.clone(),
+                                                is_last,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 });
                             }
                         }
@@ -2253,6 +2330,7 @@ impl Session {
                 // If inflight prompt was unannounced (e.g. prompt POST was ambiguous and never arrived at goose),
                 // cancel resolves it immediately so owners get a cancelled reply and the ledger is updated to Done.
                 if self.turn.inflight.as_ref().is_some_and(|i| !i.announced) {
+                    self.ambiguous_check_token += 1;
                     actions.extend(self.turn.interrupt("cancelled"));
                 }
 
@@ -2440,43 +2518,117 @@ impl Session {
                     self.execute_actions(reply_actions).await;
                 }
             }
-            SessionMsg::CheckAmbiguousInflight { upstream_id } => {
-                if let Some(inf) = self.turn.inflight.as_ref()
-                    && inf.upstream_id == upstream_id
-                    && !inf.announced
-                {
-                    let export_res = self.hub.export(&self.sid).await;
-                    match export_res {
-                        Ok(export_val) => {
-                            let prompts = honk_wire::export::client_prompts(&export_val);
-                            let n = inf.prompt_index;
-                            let expected_text = crate::rpc::extract_user_text(&inf.params);
-                            if prompts.len() > n && prompts[n] == expected_text {
-                                if self.turn.client_prompts <= n {
-                                    self.turn.client_prompts = n + 1;
-                                    self.sync_inflight().await;
-                                }
-                                self.gap_evidenced = true;
-                                self.issue_steer_probe().await;
-                            } else {
-                                tracing::warn!(
-                                    "Session {}: ambiguous prompt was not delivered to goose; interrupting as not_delivered",
-                                    self.sid
-                                );
-                                let actions = self
-                                    .turn
-                                    .on_prompt_not_delivered(&upstream_id, &mut self.ids);
-                                self.execute_actions(actions).await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Session {}: export check for ambiguous prompt failed: {e:#}",
+            // Conservative Bounded Rule for Ambiguous Prompt POST Failures:
+            //
+            // When a prompt POST fails ambiguously (e.g. transport reset or timeout after bytes were sent),
+            // honkd cannot immediately determine whether goose received the request.
+            // Goose handles requests concurrently (dispatch.rs cx.spawn) and resolves the session agent
+            // (which may involve loading extensions, taking seconds) BEFORE starting an active run
+            // (start_active_run) and BEFORE committing the user message to the session export.
+            // Therefore, a probe returning "no active run to steer" or an export missing the prompt in the
+            // first few hundred milliseconds is NOT evidence of non-delivery. Declaring false-negative
+            // not_delivered causes client retries to duplicate the prompt, and unparking next prompts while
+            // goose is still running the first causes concurrent prompt runs.
+            //
+            // Rule:
+            // 1. If a run is announced on the session stream or a prompt reply arrives, the prompt is
+            //    delivered (existing paths). Pending ambiguous check timers become no-ops.
+            // 2. Otherwise, poll at roughly 2s, 5s, 10s, 20s, 30s after the failure (proportionally scaled
+            //    by --ambiguous-inflight-timeout-secs, default 30s). At each point, issue a non-destructive
+            //    steer probe and export check.
+            // 3. If ANY probe shows an active run (actualRunId) or the export contains the prompt at index N,
+            //    the prompt is delivered: stop polling and transition to existing bounded-wait machinery
+            //    (probe + grace synthesis).
+            // 4. Only if the entire window expires with every probe idle AND the export never containing
+            //    prompt N do we call turn.on_prompt_not_delivered, returning cancelled/not_delivered to
+            //    the owner and dispatching any parked prompts.
+            //
+            // Residual Risk:
+            // If a prompt POST actually reached goose, but goose's request handler stalls longer than
+            // the entire window (--ambiguous-inflight-timeout-secs) before registering its run or committing
+            // the prompt (e.g. due to severe system overload or stalled extension loading), honkd will
+            // declare not_delivered after the window expires. If the client subsequently retries, goose
+            // may eventually process both the stalled request and the retry, resulting in a duplicate prompt.
+            SessionMsg::AmbiguousCheckPoll {
+                token,
+                upstream_id,
+                is_last,
+            } => {
+                if token != self.ambiguous_check_token {
+                    return;
+                }
+                let Some(inf) = self.turn.inflight.as_ref() else {
+                    return;
+                };
+                if inf.upstream_id != upstream_id || inf.announced {
+                    return;
+                }
+
+                if is_last {
+                    self.ambiguous_window_expired = true;
+                }
+
+                // 1. Issue non-destructive steer probe
+                self.issue_steer_probe().await;
+
+                // 2. Issue export check via spawned task (actor never blocks)
+                let hub = self.hub.clone();
+                let sid = self.sid.clone();
+                let self_tx = self.self_tx.clone();
+                let up_id = upstream_id.clone();
+                self.ambiguous_export_in_flight = true;
+                tokio::spawn(async move {
+                    let res = hub.export(&sid).await;
+                    let _ = self_tx
+                        .send(SessionMsg::AmbiguousExportResult {
+                            token,
+                            upstream_id: up_id,
+                            is_last,
+                            result: res,
+                        })
+                        .await;
+                });
+            }
+            SessionMsg::AmbiguousExportResult {
+                token,
+                upstream_id,
+                is_last: _,
+                result,
+            } => {
+                if token != self.ambiguous_check_token {
+                    return;
+                }
+                let Some(inf) = self.turn.inflight.as_ref() else {
+                    return;
+                };
+                if inf.upstream_id != upstream_id || inf.announced {
+                    return;
+                }
+                self.ambiguous_export_in_flight = false;
+                match result {
+                    Ok(export_val) => {
+                        let prompts = honk_wire::export::client_prompts(&export_val);
+                        let n = inf.prompt_index;
+                        let expected_text = crate::rpc::extract_user_text(&inf.params);
+                        if prompts.len() > n && prompts[n] == expected_text {
+                            tracing::info!(
+                                "Session {}: ambiguous prompt {upstream_id} confirmed delivered via export at index {n}",
                                 self.sid
                             );
+                            self.on_ambiguous_delivered_via_export(n).await;
+                            return;
                         }
                     }
+                    Err(e) => {
+                        tracing::error!(
+                            "Session {}: export check for ambiguous prompt failed: {e:#}",
+                            self.sid
+                        );
+                    }
                 }
+
+                self.maybe_finish_ambiguous_not_delivered(&upstream_id)
+                    .await;
             }
             SessionMsg::ProbeTimeout { probe_id } => {
                 if self.active_probe_id.as_deref() == Some(&probe_id) {
@@ -2485,8 +2637,13 @@ impl Session {
                         self.sid
                     );
                     self.active_probe_id = None;
-                    if self.turn.run.is_some() || self.turn.inflight.is_some() {
+                    if self.turn.run.is_some() || self.gap_evidenced {
                         self.issue_steer_probe().await;
+                    } else if let Some(inf) = self.turn.inflight.as_ref()
+                        && !inf.announced
+                    {
+                        let up_id = inf.upstream_id.clone();
+                        self.maybe_finish_ambiguous_not_delivered(&up_id).await;
                     }
                 }
             }
@@ -2670,6 +2827,56 @@ impl Session {
                 }
             }
         }
+    }
+
+    async fn on_ambiguous_delivered_via_export(&mut self, n: usize) {
+        self.ambiguous_check_token += 1;
+        let delivered_info = if let Some(inf) = self.turn.inflight.as_mut()
+            && !inf.announced
+        {
+            inf.announced = true;
+            Some((inf.params.clone(), inf.owners.first().cloned()))
+        } else {
+            None
+        };
+        if let Some((params, Some(owner))) = delivered_info {
+            let synth_action = Action::SynthUser { params, owner };
+            self.execute_actions(vec![synth_action]).await;
+        }
+        if self.turn.client_prompts <= n {
+            self.turn.client_prompts = n + 1;
+            self.sync_inflight().await;
+        }
+        self.gap_evidenced = true;
+        self.issue_steer_probe().await;
+    }
+
+    async fn maybe_finish_ambiguous_not_delivered(&mut self, upstream_id: &str) {
+        if !self.ambiguous_window_expired {
+            return;
+        }
+        if self.ambiguous_export_in_flight {
+            return;
+        }
+        if self.active_probe_id.is_some() {
+            return;
+        }
+        let Some(inf) = self.turn.inflight.as_ref() else {
+            return;
+        };
+        if inf.upstream_id != upstream_id || inf.announced {
+            return;
+        }
+
+        tracing::warn!(
+            "Session {}: ambiguous prompt {upstream_id} window expired with all probes idle and not in export; marking not_delivered",
+            self.sid
+        );
+        self.ambiguous_check_token += 1;
+        let actions = self
+            .turn
+            .on_prompt_not_delivered(upstream_id, &mut self.ids);
+        self.execute_actions(actions).await;
     }
 
     async fn handle_reply_text(

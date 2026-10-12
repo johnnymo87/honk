@@ -935,6 +935,82 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_without_false_negative_not
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn prompt_post_ambiguous_failure_accepted_slow_delivered_dispatches_parked_after_end() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let proxy = TcpProxy::start(fake.addr()).await.unwrap();
+    let proxy_url = format!("http://{}/acp", proxy.addr());
+
+    let h = Honkd::spawn(
+        &proxy_url,
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--ambiguous-inflight-timeout-secs",
+            "6",
+        ],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Goose accepts prompt 1, but is slow to announce run and commit user message to export (~3s).
+    fake.set_run_announcement_delay(Some(Duration::from_secs(3)));
+    fake.set_export_commit_delay(Some(Duration::from_secs(3)));
+    fake.set_export_data(&sid, json!({ "conversation": [] }));
+
+    // Drop connection after sending prompt 1 to simulate ambiguous transport error
+    proxy.set_drop_on_prompt(true);
+
+    let pid1 = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "slow prompt 1", Some("crid-slow-1")),
+        )
+        .await;
+
+    // Wait for transport drop of prompt 1 to complete
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy.set_drop_on_prompt(false);
+
+    // Send prompt 2 while prompt 1 is in-flight (parks behind prompt 1)
+    let pid2 = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "parked prompt 2", Some("crid-parked-2")),
+        )
+        .await;
+
+    // While prompt 1 is in-flight (~1.5s in), FakeGoose must have seen exactly ONE prompt
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        fake.received_prompts(&sid).len(),
+        1,
+        "fake goose must see exactly one prompt while first is running"
+    );
+
+    // Prompt 1 must be delivered and end with end_turn (NOT cancelled/not_delivered)
+    let r1 = v.response_timeout(&pid1, Duration::from_secs(10)).await;
+    assert_eq!(
+        r1["result"]["stopReason"], "end_turn",
+        "slow prompt 1 must complete as end_turn once delivered"
+    );
+
+    // Prompt 2 must only be dispatched after prompt 1 ends, and then complete with end_turn
+    let r2 = v.response_timeout(&pid2, Duration::from_secs(10)).await;
+    assert_eq!(
+        r2["result"]["stopReason"], "end_turn",
+        "parked prompt 2 must complete as end_turn"
+    );
+    assert_eq!(
+        fake.received_prompts(&sid).len(),
+        2,
+        "fake goose must receive prompt 2 only after prompt 1 ends"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(true);
@@ -945,7 +1021,11 @@ async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
     let h = Honkd::spawn(
         &proxy_url,
         fake.secret_file(),
-        &["--allow-unpatched-upstream"],
+        &[
+            "--allow-unpatched-upstream",
+            "--ambiguous-inflight-timeout-secs",
+            "6",
+        ],
     )
     .await;
     let mut v = Viewer::connect(&h).await;
@@ -953,8 +1033,11 @@ async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
 
     // Export remains empty (goose never got prompt 1)
     fake.set_export_data(&sid, json!({ "conversation": [] }));
+    fake.set_drop_prompt_announcement(true);
     fake.set_drop_prompt_reply(true);
     proxy.set_drop_on_prompt(true);
+
+    let start = std::time::Instant::now();
 
     // Send prompt 1 (which will suffer ambiguous drop)
     let pid1 = v
@@ -972,14 +1055,21 @@ async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
         )
         .await;
 
-    // Turn off proxy drop so parked prompt can succeed
+    // Turn off proxy drop and enable prompt execution so parked prompt can succeed
     tokio::time::sleep(Duration::from_millis(200)).await;
     proxy.set_drop_on_prompt(false);
+    fake.set_drop_prompt_announcement(false);
     fake.set_drop_prompt_reply(false);
     fake.script_prompt(vec!["parked prompt done".into()]);
 
-    // Prompt 1 must be finished as not_delivered
-    let r1 = v.response_timeout(&pid1, Duration::from_secs(10)).await;
+    // Prompt 1 must NOT be completed as not_delivered early (e.g. at 400ms)
+    // It must only be finished as not_delivered after the whole window (~6s)
+    let r1 = v.response_timeout(&pid1, Duration::from_secs(12)).await;
+    assert!(
+        start.elapsed() >= Duration::from_millis(5000),
+        "prompt 1 must remain in flight until the ambiguous window passes (elapsed: {:?})",
+        start.elapsed()
+    );
     assert_eq!(r1["result"]["stopReason"], "cancelled");
     assert_eq!(r1["result"]["_meta"]["honk"]["reason"], "not_delivered");
 

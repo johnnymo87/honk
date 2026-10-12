@@ -71,9 +71,19 @@ impl TcpProxy {
                                         Ok(n) => {
                                             let _ = t_write.write_all(&c_buf[..n]).await;
                                             let _ = t_write.flush().await;
-                                            if c_buf[..n].windows(b"session/prompt".len()).any(|w| w == b"session/prompt") {
+                                            let has_prompt = c_buf[..n].windows(b"session/prompt".len()).any(|w| w == b"session/prompt");
+                                            if has_prompt {
                                                 drop(c_read);
                                                 drop(c_write);
+                                                tokio::spawn(async move {
+                                                    let _tw = t_write;
+                                                    let mut discard = vec![0u8; 1024];
+                                                    while let Ok(n) = t_read.read(&mut discard).await {
+                                                        if n == 0 {
+                                                            break;
+                                                        }
+                                                    }
+                                                });
                                                 break;
                                             }
                                         }

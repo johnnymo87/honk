@@ -168,13 +168,6 @@ impl TurnCore {
                 if std::mem::take(&mut self.cancel_pending) {
                     out.push(Action::SendCancel);
                 }
-                for (o, _) in self.parked.drain(..) {
-                    out.push(Action::Reply {
-                        owners: vec![o],
-                        body: Reply::Error(crate::rpc::busy_error(&r)),
-                        user_text: None,
-                    });
-                }
             }
             None => {
                 self.run = None;
@@ -396,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_in_announce_window_parked_then_answered_busy_at_announcement() {
+    fn test_prompt_in_announce_window_parked_then_dispatched_at_turn_end() {
         let mut ids = UpstreamIds::new(1);
         let mut core = TurnCore::default();
 
@@ -419,19 +412,39 @@ mod tests {
         assert_eq!(core.run.as_deref(), Some("run_1"));
         assert_eq!(
             run_actions,
+            vec![Action::SynthUser {
+                params: json!({"prompt": "first"}),
+                owner: owner1.clone(),
+            }]
+        );
+        assert_eq!(core.parked.len(), 1);
+
+        // Run ends
+        let _ = core.on_run_state(None, &mut ids);
+
+        // HTTP prompt reply arrives, ending turn and dispatching parked prompt
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {"text": "done"},
+        });
+        let reply_actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert_eq!(
+            reply_actions,
             vec![
-                Action::SynthUser {
-                    params: json!({"prompt": "first"}),
-                    owner: owner1,
-                },
                 Action::Reply {
-                    owners: vec![owner2],
-                    body: Reply::Error(busy_error("run_1")),
-                    user_text: None,
+                    owners: vec![owner1],
+                    body: Reply::Result(json!({"text": "done"})),
+                    user_text: Some("first".to_string()),
+                },
+                Action::SendPrompt {
+                    upstream_id: "hk1-2".into(),
+                    params: json!({"prompt": "second"}),
                 },
             ]
         );
         assert!(core.parked.is_empty());
+        assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
     }
 
     #[test]

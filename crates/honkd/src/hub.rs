@@ -370,6 +370,9 @@ impl Hub {
                 reactivating: false,
                 reactivation_token: 0,
                 rebuild_token: 0,
+                ambiguous_check_token: 0,
+                ambiguous_window_expired: false,
+                ambiguous_export_in_flight: false,
             };
 
             tokio::spawn(session.run());
@@ -1011,6 +1014,9 @@ impl Hub {
             reactivating: false,
             reactivation_token: 0,
             rebuild_token: 0,
+            ambiguous_check_token: 0,
+            ambiguous_window_expired: false,
+            ambiguous_export_in_flight: false,
         };
 
         tokio::spawn(session.run());
@@ -1374,6 +1380,9 @@ impl Hub {
                 reactivating: false,
                 reactivation_token: 0,
                 rebuild_token: 0,
+                ambiguous_check_token: 0,
+                ambiguous_window_expired: false,
+                ambiguous_export_in_flight: false,
             };
 
             tokio::spawn(session.run());

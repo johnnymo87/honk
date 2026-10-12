@@ -162,6 +162,8 @@ struct FakeGooseInner {
     prompt_status: Mutex<Option<StatusCode>>,
     prompt_error_reply: Mutex<Option<Value>>,
     export_delay: Mutex<Option<Duration>>,
+    run_announcement_delay: Mutex<Option<Duration>>,
+    export_commit_delay: Mutex<Option<Duration>>,
 }
 
 pub struct FakeGoose {
@@ -210,6 +212,8 @@ impl FakeGoose {
             prompt_status: Mutex::new(None),
             prompt_error_reply: Mutex::new(None),
             export_delay: Mutex::new(None),
+            run_announcement_delay: Mutex::new(None),
+            export_commit_delay: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -382,6 +386,27 @@ impl FakeGoose {
         *self.state.prompt_error_reply.lock().unwrap() = err;
     }
 
+    pub fn set_run_announcement_delay(&self, delay: Option<Duration>) {
+        *self.state.run_announcement_delay.lock().unwrap() = delay;
+    }
+
+    pub fn set_export_commit_delay(&self, delay: Option<Duration>) {
+        *self.state.export_commit_delay.lock().unwrap() = delay;
+    }
+
+    pub fn received_prompts(&self, sid: &str) -> Vec<Value> {
+        let frames = self.state.inbound_frames.lock().unwrap();
+        frames
+            .iter()
+            .filter(|f| {
+                f.get("method").and_then(Value::as_str) == Some("session/prompt")
+                    && (f.pointer("/params/sessionId").and_then(Value::as_str) == Some(sid)
+                        || f.get("sessionId").and_then(Value::as_str) == Some(sid))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn emit_frame(&self, sid: &str, frame: Value) {
         let conn_id = {
             let conns = self.state.connections.lock().unwrap();
@@ -455,12 +480,11 @@ async fn handle_post(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    state.inbound_frames.lock().unwrap().push(frame.clone());
-
     let method = frame.get("method").and_then(|m| m.as_str());
     let req_id = frame.get("id").cloned();
 
     if method == Some("initialize") {
+        state.inbound_frames.lock().unwrap().push(frame.clone());
         let conn_id = format!(
             "conn-{}",
             state.next_conn_num.fetch_add(1, Ordering::SeqCst)
@@ -519,6 +543,15 @@ async fn handle_post(
         .and_then(|v| v.as_str())
         .map(String::from);
     let target_session = session_header.or(session_param);
+
+    let mut recorded_frame = frame.clone();
+    if let Some(ref sid) = target_session
+        && recorded_frame.get("sessionId").is_none()
+        && recorded_frame.pointer("/params/sessionId").is_none()
+    {
+        recorded_frame["sessionId"] = json!(sid);
+    }
+    state.inbound_frames.lock().unwrap().push(recorded_frame);
 
     if method.is_some_and(method_requires_session) && target_session.is_none() {
         return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
@@ -775,12 +808,58 @@ async fn handle_post(
                 .unwrap()
                 .insert(sid.clone(), cancel_flag.clone());
 
+            let user_text = frame
+                .pointer("/params/prompt")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter().find_map(|b| {
+                        if b.get("type").and_then(Value::as_str) == Some("text") {
+                            b.get("text").and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .map(String::from);
+
+            let commit_delay = *state.export_commit_delay.lock().unwrap();
+            if let Some(delay) = commit_delay {
+                let state_c = state.clone();
+                let sid_c = sid.clone();
+                let text_c = user_text.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Some(text) = text_c {
+                        let mut data = state_c.export_data.lock().unwrap();
+                        let entry = data
+                            .entry(sid_c)
+                            .or_insert_with(|| json!({ "conversation": [] }));
+                        if let Some(conv) =
+                            entry.get_mut("conversation").and_then(Value::as_array_mut)
+                        {
+                            conv.push(json!({
+                                "role": "user",
+                                "content": [{
+                                    "type": "text",
+                                    "text": text
+                                }]
+                            }));
+                        }
+                    }
+                });
+            }
+
             let state_clone = state.clone();
             let conn_id_clone = conn_id.clone();
             let sid_clone = sid.clone();
             let req_id_clone = req_id.clone();
 
             tokio::spawn(async move {
+                let run_delay = *state_clone.run_announcement_delay.lock().unwrap();
+                if let Some(delay) = run_delay {
+                    tokio::time::sleep(delay).await;
+                }
+
                 let custom_frames = state_clone.scripted_frames.lock().unwrap().clone();
                 let run_id = "run_fake_001".to_string();
 

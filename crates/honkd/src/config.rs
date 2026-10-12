@@ -33,6 +33,8 @@ pub struct Args {
     pub gap_synthesis_grace_ms: u64,
     #[arg(long, default_value_t = 5, hide = true)]
     pub probe_timeout_secs: u64,
+    #[arg(long, default_value_t = 30, hide = true)]
+    pub ambiguous_inflight_timeout_secs: u64,
 }
 
 impl Args {
