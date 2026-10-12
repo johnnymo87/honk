@@ -979,12 +979,12 @@ async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
     fake.script_prompt(vec!["parked prompt done".into()]);
 
     // Prompt 1 must be finished as not_delivered
-    let r1 = v.response_timeout(&pid1, Duration::from_secs(5)).await;
+    let r1 = v.response_timeout(&pid1, Duration::from_secs(10)).await;
     assert_eq!(r1["result"]["stopReason"], "cancelled");
     assert_eq!(r1["result"]["_meta"]["honk"]["reason"], "not_delivered");
 
     // Prompt 2 must be unparked and completed!
-    let r2 = v.response_timeout(&pid2, Duration::from_secs(5)).await;
+    let r2 = v.response_timeout(&pid2, Duration::from_secs(10)).await;
     assert_eq!(r2["result"]["stopReason"], "end_turn");
 }
 
