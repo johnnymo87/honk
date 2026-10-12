@@ -399,6 +399,224 @@ async fn turn_completed_on_upstream_during_honkd_restart_recognized_delivered_an
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn tool_turn_completed_while_honkd_was_down_delivered_and_deduped() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([
+        Turn::ToolCall {
+            tool: "shell".into(),
+            arguments: json!({"command": "echo tool_done"}),
+        },
+        Turn::Text(vec!["final answer after tool".into()]),
+    ]);
+
+    let mut h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Send prompt with client_req_id "r_tool"
+    v.request(
+        "session/prompt",
+        prompt_params(&sid, "run shell tool", Some("r_tool")),
+    )
+    .await;
+
+    // Wait until model receives the request
+    let wait_start = Instant::now();
+    while g.model().turn_requests().is_empty() && wait_start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Kill honkd while tool turn is processing
+    h.kill9();
+
+    // Give stub goose enough time to complete the tool execution and final text turn in SQLite
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Restart honkd
+    h.restart().await;
+
+    // Connect new viewer and send prompt with the same client_req_id "r_tool"
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "run shell tool", Some("r_tool")),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["text"],
+        "final answer after tool"
+    );
+    // Model saw 2 turn requests: 1 for tool call, 1 for final text — both part of that ONE prompt.
+    // Retrying the prompt must NOT dispatch another prompt (model request count stays 2).
+    assert_eq!(
+        g.model().turn_requests().len(),
+        2,
+        "model only processed the single prompt's tool turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_before_post_with_same_text_after_rebuild_reported_not_delivered() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Text(vec!["first response".into()])]);
+
+    let mut h = Honkd::spawn_with_env(&g.url(), g.secret_file(), &[], &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Turn 1 completes with prompt text "repeated"
+    let r1 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "repeated", Some("r1")),
+        )
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    // Detach and kill honkd
+    h.kill9();
+
+    // Restart honkd. Now session is activated fresh from export (triggering rebuild / client_prompts initialization)
+    h.restart_with_env(&[("HONKD_TEST_CRASH_BEFORE_POST", "1")])
+        .await;
+
+    let mut v2 = Viewer::connect(&h).await;
+    // Load triggers activation / rebuild from export where client_prompts is set to 1
+    v2.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    // Turn 2 sends prompt "repeated" again with client_req_id "r2". Crashes before post!
+    v2.request(
+        "session/prompt",
+        prompt_params(&sid, "repeated", Some("r2")),
+    )
+    .await;
+
+    h.wait_for_exit(Duration::from_secs(5)).await;
+
+    // Restart without crash hook
+    h.restart_with_env(&[("HONKD_TEST_CRASH_BEFORE_POST", "0")])
+        .await;
+
+    let mut w = Viewer::connect(&h).await;
+    let r2 = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "repeated", Some("r2")),
+        )
+        .await;
+
+    assert_eq!(r2["result"]["stopReason"], "cancelled");
+    assert_eq!(r2["result"]["_meta"]["honk"]["reason"], "not_delivered");
+    assert_eq!(g.model().turn_requests().len(), 1, "model only saw turn 1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delivered_but_reply_lost_synthesizes_end_turn_after_grace_no_hang() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    fake.set_keepalive_interval(Duration::from_secs(60));
+
+    let mut h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--gap-synthesis-grace-ms", "200"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    fake.script_prompt((0..10).map(|i| format!("c{i}")).collect());
+    v.request(
+        "session/prompt",
+        prompt_params(&sid, "lost prompt", Some("r_lost")),
+    )
+    .await;
+
+    // Wait until run is active (activeRunId is non-null)
+    v.wait_for(|f| {
+        f.pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .is_some()
+    })
+    .await;
+
+    // Kill honkd mid-turn after post was registered and run was active
+    h.kill9();
+
+    // Tell FakeGoose to drop the reply frame on replay and report a Gap so reply is lost
+    fake.gap_on_next_resume(&sid);
+    fake.lose_next(&sid, |f| f.get("result").is_some());
+
+    // Set export with Turn 1 completed in SQLite, but FakeGoose will not send reply on new connection
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "id": "msg_1",
+                    "role": "user",
+                    "created": 1,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "lost prompt"}]
+                },
+                {
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "created": 2,
+                    "metadata": { "userVisible": true },
+                    "content": [{"type": "text", "text": "completed in sqlite"}]
+                }
+            ]
+        }),
+    );
+
+    // Restart honkd
+    h.restart().await;
+
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "lost prompt", Some("r_lost")),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert_eq!(resp["result"]["_meta"]["honk"]["synthesized"], true);
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["text"],
+        "completed in sqlite"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn degraded_mode_reattach_rebuilds_from_export() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(false);

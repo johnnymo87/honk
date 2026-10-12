@@ -317,7 +317,10 @@ impl Hub {
             let last_processed_session = session_log.last_upstream_id();
             let last_processed_conn = held.last_conn_event_id;
 
-            let mut turn = crate::turn::TurnCore::default();
+            let mut turn = crate::turn::TurnCore {
+                client_prompts: held.client_prompts,
+                ..Default::default()
+            };
             if let Some(inf) = &held.inflight {
                 turn.inflight = Some(crate::turn::Inflight::from_persisted(inf.clone()));
             }
@@ -939,6 +942,7 @@ impl Hub {
                         inflight: None,
                         last_active_unix: now,
                         init_result: Some(new_res.clone()),
+                        client_prompts: 0,
                     },
                 );
             })?;
@@ -1267,6 +1271,8 @@ impl Hub {
                 message: format!("failed to create session log: {e:#}"),
             })?;
 
+            let client_prompts = honk_wire::export::client_prompts(&export_val).len();
+
             // Step 6: The session is now held
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1289,6 +1295,7 @@ impl Hub {
                             inflight: None,
                             last_active_unix: now,
                             init_result: Some(load_reply.clone()),
+                            client_prompts,
                         },
                     );
                 })
@@ -1312,7 +1319,10 @@ impl Hub {
                 rx: session_rx,
                 self_tx: session_tx.clone(),
                 log: new_log,
-                turn: crate::turn::TurnCore::default(),
+                turn: crate::turn::TurnCore {
+                    client_prompts,
+                    ..Default::default()
+                },
                 state: crate::session::ActorState::Live,
                 ids: UpstreamIds::new(boot),
                 last_processed_session_id: last_processed_session,

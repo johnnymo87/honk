@@ -92,6 +92,11 @@ pub struct HeldSession {
     pub last_active_unix: u64,
     #[serde(default)]
     pub init_result: Option<Value>,
+    /// Number of client user prompts already delivered to goose for this session.
+    /// Maintained from export transcript at activation/rebuild (or 0 at session/new).
+    /// Incremented when honkd's prompt is known delivered (run announced or reply received).
+    #[serde(default)]
+    pub client_prompts: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -108,6 +113,10 @@ pub struct InflightPrompt {
     pub client_req_ids: Vec<String>,
     pub params: Value,
     pub announced: bool,
+    /// Expected index in goose's export `client_prompts()` list.
+    /// Set to `HeldSession.client_prompts` when the prompt is dispatched.
+    #[serde(default)]
+    pub prompt_index: usize,
 }
 
 /// Boot-time ledger prune policy:
@@ -405,6 +414,7 @@ mod tests {
                 client_req_ids: vec!["live".into(), "live2".into()],
                 params: json!({}),
                 announced: true,
+                prompt_index: 0,
             }),
             ..Default::default()
         };

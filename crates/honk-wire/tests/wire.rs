@@ -260,5 +260,8 @@ fn test_client_prompts_multiturn_fixture() {
     });
 
     let prompts = client_prompts(&session);
-    assert_eq!(prompts, vec!["first prompt".to_string(), "second prompt".to_string()]);
+    assert_eq!(
+        prompts,
+        vec!["first prompt".to_string(), "second prompt".to_string()]
+    );
 }

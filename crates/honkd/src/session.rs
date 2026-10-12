@@ -49,6 +49,7 @@ pub struct ReactivationData {
     pub load_reply: Value,
     pub keys: HashSet<honk_wire::BlockKey>,
     pub initial_events: Vec<Event>,
+    pub client_prompts: usize,
 }
 
 pub enum SessionMsg {
@@ -106,6 +107,7 @@ pub enum SessionMsg {
         frames: Vec<Value>,
         keys: std::collections::HashSet<honk_wire::BlockKey>,
         resume_from: Option<u64>,
+        client_prompts: usize,
     },
     ReplyText {
         owners: Vec<OwnerRef>,
@@ -511,63 +513,7 @@ impl Session {
                     self.fan_out_stamped(&gap_marker, true);
 
                     // Issue non-destructive steer probe
-                    let probe_id = self.ids.next();
-                    self.active_probe_id = Some(probe_id.clone());
-                    let probe_params = json!({
-                        "sessionId": self.sid,
-                        "expectedRunId": format!("honk-probe-{}", self.ids.next()),
-                        "prompt": [{"type": "text", "text": "probe"}]
-                    });
-                    let up = self.up.clone();
-                    let sid = self.sid.clone();
-                    let self_tx = self.self_tx.clone();
-                    tokio::spawn(async move {
-                        let mut backoff = Duration::from_millis(50);
-                        let max_backoff = Duration::from_secs(1);
-                        let max_retries = 5;
-                        for attempt in 0..=max_retries {
-                            if self_tx.is_closed() {
-                                return;
-                            }
-                            match up
-                                .request_with_id(
-                                    json!(probe_id),
-                                    "_goose/unstable/session/steer",
-                                    probe_params.clone(),
-                                    Some(&sid),
-                                )
-                                .await
-                            {
-                                Ok(()) => return,
-                                Err(e) => {
-                                    let gone = honk_upstream::is_gone(&e);
-                                    if gone {
-                                        let _ = self_tx
-                                            .send(SessionMsg::ReattachFailed {
-                                                gone: true,
-                                                error: e.to_string(),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                    if attempt == max_retries {
-                                        tracing::error!(
-                                            "steer probe failed after {max_retries} retries: {e:#}"
-                                        );
-                                        let _ = self_tx
-                                            .send(SessionMsg::ReattachFailed {
-                                                gone: false,
-                                                error: e.to_string(),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                    tokio::time::sleep(backoff).await;
-                                    backoff = (backoff * 2).min(max_backoff);
-                                }
-                            }
-                        }
-                    });
+                    self.issue_steer_probe().await;
                     self.drain_queued_msgs().await;
                 } else {
                     self.start_rebuild().await;
@@ -578,6 +524,69 @@ impl Session {
                 self.drain_queued_msgs().await;
             }
         }
+    }
+
+    pub(crate) async fn issue_steer_probe(&mut self) {
+        if self.active_probe_id.is_some() {
+            return;
+        }
+        let probe_id = self.ids.next();
+        self.active_probe_id = Some(probe_id.clone());
+        let probe_params = json!({
+            "sessionId": self.sid,
+            "expectedRunId": format!("honk-probe-{}", self.ids.next()),
+            "prompt": [{"type": "text", "text": "probe"}]
+        });
+        let up = self.up.clone();
+        let sid = self.sid.clone();
+        let self_tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(50);
+            let max_backoff = Duration::from_secs(1);
+            let max_retries = 5;
+            for attempt in 0..=max_retries {
+                if self_tx.is_closed() {
+                    return;
+                }
+                match up
+                    .request_with_id(
+                        json!(probe_id),
+                        "_goose/unstable/session/steer",
+                        probe_params.clone(),
+                        Some(&sid),
+                    )
+                    .await
+                {
+                    Ok(()) => return,
+                    Err(e) => {
+                        let gone = honk_upstream::is_gone(&e);
+                        if gone {
+                            let _ = self_tx
+                                .send(SessionMsg::ReattachFailed {
+                                    gone: true,
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                        if attempt == max_retries {
+                            tracing::error!(
+                                "steer probe failed after {max_retries} retries: {e:#}"
+                            );
+                            let _ = self_tx
+                                .send(SessionMsg::ReattachFailed {
+                                    gone: false,
+                                    error: e.to_string(),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        });
     }
 
     // In honkd, a 404 (Not Found) returned by goose for a session-scoped connection (POST, GET,
@@ -899,6 +908,7 @@ impl Session {
                 }
 
                 let export_val = hub.export(&sid).await?;
+                let client_prompts = honk_wire::export::client_prompts(&export_val).len();
                 let frames = honk_wire::export::to_updates(&export_val, &sid);
                 let mut keys = HashSet::new();
                 for f in &frames {
@@ -944,6 +954,7 @@ impl Session {
                                 inflight: None,
                                 last_active_unix: now,
                                 init_result: Some(load_reply_clone),
+                                client_prompts,
                             },
                         );
                     })?;
@@ -958,6 +969,7 @@ impl Session {
                     load_reply,
                     keys,
                     initial_events,
+                    client_prompts,
                 })
             }
             .await;
@@ -1002,23 +1014,41 @@ impl Session {
         let Some(inf) = self.turn.inflight.as_ref() else {
             return vec![];
         };
-        let user_text = crate::rpc::extract_user_text(&inf.params);
-        let logged_completed_turns = self
-            .log
-            .entries()
-            .iter()
-            .filter(|e| {
-                e.frame
-                    .pointer("/params/update")
-                    .and_then(honk_wire::run_state)
-                    == Some(None)
-            })
-            .count();
+        let n = inf.prompt_index;
+        let expected_text = crate::rpc::extract_user_text(&inf.params);
 
         match self.hub.export(&self.sid).await {
             Ok(export_val) => {
-                if !export_has_inflight_delivery(&export_val, &user_text, logged_completed_turns) {
+                let prompts = honk_wire::export::client_prompts(&export_val);
+                if prompts.len() == n {
+                    // Goose does not have prompt N; it was never received by goose before the crash.
                     return self.turn.interrupt("not_delivered");
+                } else if prompts.len() > n && prompts[n] == expected_text {
+                    // Prompt N is present in export at the expected index: delivered!
+                    if self.turn.client_prompts <= n {
+                        self.turn.client_prompts = n + 1;
+                        self.sync_inflight().await;
+                    }
+
+                    // Bound the "delivered" wait:
+                    // If goose finished the turn or is idle, issue the steer probe to discover it.
+                    // If goose is idle, it triggers gap rebuild and grace window synthesis.
+                    self.gap_evidenced = true;
+                    self.issue_steer_probe().await;
+                    return vec![];
+                } else {
+                    // Out-of-contract: prompts.len() > n but mismatch.
+                    // Contract: honkd is the sole interactive ACP client for held upstream sessions.
+                    // Prompts sent directly to goose by other clients bypassing honkd are out of contract.
+                    // Safe side: we err toward NOT re-posting automatically to prevent duplicate or
+                    // out-of-order execution. Finish the inflight with cancelled reason "delivery_unknown".
+                    tracing::error!(
+                        "Session {}: export prompt at index {n} ({:?}) does not match inflight expected text ({:?})",
+                        self.sid,
+                        prompts.get(n),
+                        expected_text
+                    );
+                    return self.turn.interrupt("delivery_unknown");
                 }
             }
             Err(e) => {
@@ -1051,6 +1081,7 @@ impl Session {
         tokio::spawn(async move {
             match hub.export(&sid).await {
                 Ok(export_val) => {
+                    let client_prompts = honk_wire::export::client_prompts(&export_val).len();
                     let frames = honk_wire::export::to_updates(&export_val, &sid);
                     let mut keys = HashSet::new();
                     for f in &frames {
@@ -1065,6 +1096,7 @@ impl Session {
                             frames,
                             keys,
                             resume_from,
+                            client_prompts,
                         })
                         .await;
                 }
@@ -1087,6 +1119,7 @@ impl Session {
         frames: Vec<Value>,
         keys: HashSet<honk_wire::BlockKey>,
         resume_from: Option<u64>,
+        client_prompts: usize,
     ) {
         let buffered = std::mem::take(&mut self.rebuilding_buffered_frames);
         let (new_log, _next_epoch) = match create_new_generation_from_export(
@@ -1111,6 +1144,8 @@ impl Session {
         self.log = new_log;
         let head = self.log.head();
         self.last_processed_session_id = self.log.last_upstream_id();
+        self.turn.client_prompts = client_prompts;
+        self.sync_inflight().await;
 
         let reset_frame = json!({
             "jsonrpc": "2.0",
@@ -1321,16 +1356,19 @@ impl Session {
 
     async fn sync_inflight(&self) {
         let target = self.turn.to_persisted();
+        let client_prompts = self.turn.client_prompts;
         let sid = &self.sid;
         let mut s = self.state_store.lock().await;
         if let Some(h) = s.sessions.get(sid)
             && h.inflight == target
+            && h.client_prompts == client_prompts
         {
             return;
         }
         let _ = s.mutate(|st| {
             if let Some(h) = st.sessions.get_mut(sid) {
                 h.inflight = target;
+                h.client_prompts = client_prompts;
             }
         });
     }
@@ -1640,11 +1678,13 @@ impl Session {
                     let sid = self.sid.clone();
                     if let Some(inf) = self.turn.inflight.as_ref() {
                         let persisted = inf.to_persisted();
+                        let client_prompts = self.turn.client_prompts;
                         let mutate_res = {
                             let mut s = self.state_store.lock().await;
                             s.mutate(|st| {
                                 if let Some(h) = st.sessions.get_mut(&sid) {
                                     h.inflight = Some(persisted.clone());
+                                    h.client_prompts = client_prompts;
                                 }
                                 for crid in &persisted.client_req_ids {
                                     st.ledger.insert(
@@ -2230,6 +2270,7 @@ impl Session {
                 frames,
                 keys,
                 resume_from,
+                client_prompts,
             } => {
                 if token != self.rebuild_token
                     || self.state != ActorState::Rebuilding
@@ -2242,7 +2283,8 @@ impl Session {
                     );
                     return;
                 }
-                self.on_rebuilt(frames, keys, resume_from).await;
+                self.on_rebuilt(frames, keys, resume_from, client_prompts)
+                    .await;
             }
             SessionMsg::ReplyText { owners, body, text } => {
                 self.handle_reply_text(owners, body, text).await;
@@ -2293,6 +2335,7 @@ impl Session {
                     load_reply,
                     keys,
                     initial_events,
+                    client_prompts,
                 } = *data;
 
                 let handle = crate::hub::SessionHandle {
@@ -2313,6 +2356,8 @@ impl Session {
                 self.last_processed_conn_id = None;
                 self.init_result = load_reply;
                 self.suppressed_keys = keys;
+                self.turn.client_prompts = client_prompts;
+                self.sync_inflight().await;
 
                 let head = self.log.head();
                 let reset_frame = json!({
@@ -2943,86 +2988,4 @@ pub(crate) fn load_reply_sidecar(path: &Path) -> HashMap<String, Value> {
         }
     }
     map
-}
-
-fn export_has_inflight_delivery(
-    export: &Value,
-    expected_text: &str,
-    logged_completed_turns: usize,
-) -> bool {
-    let Some(conversation) = export.get("conversation").and_then(Value::as_array) else {
-        return false;
-    };
-
-    let export_completed_turns = conversation
-        .iter()
-        .filter(|msg| {
-            honk_wire::export::is_message_user_visible(msg)
-                && msg.get("role").and_then(Value::as_str) == Some("assistant")
-        })
-        .count();
-
-    if export_completed_turns > logged_completed_turns {
-        // Goose completed a turn while honkd was stopped or restarting.
-        // Check if the user message for the latest completed turn matches expected_text.
-        let last_assistant_idx = conversation.iter().rposition(|msg| {
-            honk_wire::export::is_message_user_visible(msg)
-                && msg.get("role").and_then(Value::as_str) == Some("assistant")
-        });
-
-        if let Some(a_idx) = last_assistant_idx {
-            // Find the user-visible user message preceding this assistant message
-            for msg in conversation[..a_idx].iter().rev() {
-                if honk_wire::export::is_message_user_visible(msg)
-                    && msg.get("role").and_then(Value::as_str) == Some("user")
-                {
-                    let mut text = String::new();
-                    if let Some(content) = msg.get("content").and_then(Value::as_array) {
-                        for block in content {
-                            if block.get("type").and_then(Value::as_str) == Some("text")
-                                && let Some(t) = block.get("text").and_then(Value::as_str)
-                            {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                    return text == expected_text;
-                }
-            }
-        }
-    }
-
-    // Otherwise, every completed turn on goose was already processed by honkd.
-    // So the in-flight prompt, if delivered, must be currently in-flight (trailing
-    // after the last completed assistant turn).
-    let last_assistant_idx = conversation.iter().rposition(|msg| {
-        honk_wire::export::is_message_user_visible(msg)
-            && msg.get("role").and_then(Value::as_str) == Some("assistant")
-    });
-
-    let start_idx = match last_assistant_idx {
-        Some(idx) => idx + 1,
-        None => 0,
-    };
-
-    for msg in &conversation[start_idx..] {
-        if honk_wire::export::is_message_user_visible(msg)
-            && msg.get("role").and_then(Value::as_str) == Some("user")
-        {
-            let mut text = String::new();
-            if let Some(content) = msg.get("content").and_then(Value::as_array) {
-                for block in content {
-                    if block.get("type").and_then(Value::as_str) == Some("text")
-                        && let Some(t) = block.get("text").and_then(Value::as_str)
-                    {
-                        text.push_str(t);
-                    }
-                }
-            }
-            if text == expected_text {
-                return true;
-            }
-        }
-    }
-    false
 }

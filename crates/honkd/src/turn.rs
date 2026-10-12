@@ -15,6 +15,7 @@ pub struct Inflight {
     pub owners: Vec<OwnerRef>,
     pub params: Value,
     pub announced: bool,
+    pub prompt_index: usize,
 }
 
 impl Inflight {
@@ -33,6 +34,7 @@ impl Inflight {
             client_req_ids,
             params: self.params.clone(),
             announced: self.announced,
+            prompt_index: self.prompt_index,
         }
     }
 
@@ -65,6 +67,7 @@ impl Inflight {
             owners,
             params: persisted.params,
             announced: persisted.announced,
+            prompt_index: persisted.prompt_index,
         }
     }
 }
@@ -105,6 +108,7 @@ pub struct TurnCore {
     pub cancel_pending: bool,
     pub steers: Vec<(String, ViewerId)>,
     pub consumed_steers: std::collections::BTreeSet<String>,
+    pub client_prompts: usize,
 }
 
 impl TurnCore {
@@ -131,6 +135,7 @@ impl TurnCore {
             owners: vec![owner],
             params: params.clone(),
             announced: false,
+            prompt_index: self.client_prompts,
         });
         vec![Action::SendPrompt {
             upstream_id,
@@ -152,6 +157,7 @@ impl TurnCore {
                     && !inf.announced
                 {
                     inf.announced = true;
+                    self.client_prompts += 1;
                     if let Some(owner) = inf.owners.first().cloned() {
                         out.push(Action::SynthUser {
                             params: inf.params.clone(),
@@ -193,6 +199,10 @@ impl TurnCore {
             return vec![];
         };
         self.cancel_pending = false;
+        let is_busy = crate::rpc::busy_run_id(frame).is_some();
+        if !inf.announced && !is_busy && frame.get("error").is_none() {
+            self.client_prompts += 1;
+        }
         if let Some(run) = crate::rpc::busy_run_id(frame) {
             self.run = Some(run);
         } else {
@@ -618,12 +628,14 @@ mod tests {
         assert_eq!(p.client_req_ids, vec!["req_1", "req_2"]);
         assert_eq!(p.params, json!({"prompt": "hi"}));
         assert!(!p.announced);
+        assert_eq!(p.prompt_index, 0);
 
         let mut restored = TurnCore::from_persisted(persisted.clone());
         assert_eq!(restored.to_persisted(), persisted);
 
         let inf = restored.inflight.as_ref().unwrap();
         assert_eq!(inf.upstream_id, "hk1-1");
+        assert_eq!(inf.prompt_index, 0);
         assert_eq!(inf.owners.len(), 2);
         assert_eq!(
             inf.owners[0],
