@@ -265,3 +265,52 @@ fn test_client_prompts_multiturn_fixture() {
         vec!["first prompt".to_string(), "second prompt".to_string()]
     );
 }
+
+#[test]
+fn test_client_prompts_skips_steers_and_turn_text_stops_at_next_prompt() {
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "turn 1 prompt" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "turn 1 part 1 " }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true, "steer": true },
+                "content": [{ "type": "text", "text": "steer instruction" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "turn 1 part 2" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "turn 2 prompt" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "turn 2 reply" }]
+            }
+        ]
+    });
+
+    let prompts = client_prompts(&session);
+    // Steer message must be excluded from client_prompts!
+    assert_eq!(
+        prompts,
+        vec!["turn 1 prompt".to_string(), "turn 2 prompt".to_string()]
+    );
+
+    // Turn 1 text includes text before and after the steer, but stops before Turn 2 prompt!
+    let text1 = turn_text(&session, "turn 1 prompt");
+    assert_eq!(text1, "turn 1 part 1 turn 1 part 2");
+
+    let text2 = turn_text(&session, "turn 2 prompt");
+    assert_eq!(text2, "turn 2 reply");
+}

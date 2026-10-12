@@ -214,6 +214,13 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
             continue;
         }
         if msg.get("role").and_then(Value::as_str) == Some("user") {
+            let is_steer = msg
+                .pointer("/metadata/steer")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_steer {
+                continue;
+            }
             let user_msg_text = get_user_visible_text(msg);
             if user_msg_text == user_text {
                 last_matching_user_idx = Some(i);
@@ -229,6 +236,28 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
     for msg in &conversation[idx + 1..] {
         if !is_message_user_visible(msg) {
             continue;
+        }
+        // A turn's text stops at the next non-steer client user prompt!
+        if msg.get("role").and_then(Value::as_str) == Some("user") {
+            let is_steer = msg
+                .pointer("/metadata/steer")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_tool_response = msg
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|block| {
+                        let b_type = block.get("type").and_then(Value::as_str);
+                        b_type == Some("toolResponse")
+                            || b_type == Some("toolResult")
+                            || block.get("toolResult").is_some()
+                            || block.get("toolResponse").is_some()
+                    })
+                });
+            if !is_steer && !has_tool_response {
+                break;
+            }
         }
         if msg.get("role").and_then(Value::as_str) == Some("assistant") {
             let Some(content) = msg.get("content").and_then(Value::as_array) else {
@@ -256,6 +285,7 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
 /// - `role == "user"`
 /// - `is_message_user_visible(msg)` is true (drops synthetic turnContext messages)
 /// - content contains no `toolResponse` or `toolResult` blocks (drops tool confirmations)
+/// - message metadata has no `steer == true` (drops consumed steer messages)
 ///
 /// Returns the concatenated user-visible text for each client prompt message in order.
 pub fn client_prompts(export: &Value) -> Vec<String> {
@@ -271,6 +301,13 @@ pub fn client_prompts(export: &Value) -> Vec<String> {
             continue;
         }
         if !is_message_user_visible(msg) {
+            continue;
+        }
+        let is_steer = msg
+            .pointer("/metadata/steer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_steer {
             continue;
         }
         let Some(content) = msg.get("content").and_then(Value::as_array) else {
