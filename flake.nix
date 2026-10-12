@@ -26,6 +26,10 @@
           cargoBuildFlags = [ "-p" "honkd" "-p" "honk" ];
           # Real test suite needs a live goose / stub instance and is run by CI.
           doCheck = false;
+          meta = {
+            mainProgram = "honkd";
+            description = "Durable ACP proxy and relay for goose";
+          };
         };
       in {
         packages = {
