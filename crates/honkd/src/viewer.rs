@@ -436,6 +436,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             viewer_id: viewer.id,
                             viewer: viewer.tx.clone(),
                             after: after.clone(),
+                            load_id: id.clone(),
                             reply: reply_tx,
                         })
                         .await
@@ -450,6 +451,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                         viewer_id: viewer.id,
                                         viewer: viewer.tx.clone(),
                                         after,
+                                        load_id: id.clone(),
                                         reply: reply_tx2,
                                     })
                                     .await;
@@ -468,9 +470,11 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         }
                     }
 
-                    let snapshot = match reply_rx.await {
-                        Ok(s) => s,
-                        Err(_) => {
+                    match reply_rx.await {
+                        Ok(true) => {
+                            viewer.attached_sessions.insert(sid.to_string());
+                        }
+                        _ => {
                             let err_resp =
                                 crate::rpc::error(id, -32603, "Session actor terminated", None);
                             if !viewer
@@ -481,85 +485,6 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             }
                             continue;
                         }
-                    };
-
-                    let mut msgs = Vec::new();
-                    if snapshot.reset {
-                        let reset_frame = json!({
-                            "jsonrpc": "2.0",
-                            "method": "_honk/reset",
-                            "params": {
-                                "sessionId": sid,
-                                "epoch": snapshot.head.epoch,
-                            }
-                        });
-                        msgs.push(Message::Text(reset_frame.to_string().into()));
-                    }
-
-                    for entry in snapshot.entries {
-                        msgs.push(Message::Text(entry.frame.to_string().into()));
-                    }
-
-                    let mut load_res = snapshot.init_result;
-                    if !load_res.is_object() {
-                        load_res = json!({ "sessionId": sid });
-                    }
-                    if let Some(meta) = load_res.get_mut("_meta").and_then(Value::as_object_mut) {
-                        meta.insert(
-                            "honk".to_string(),
-                            json!({
-                                "epoch": snapshot.head.epoch,
-                                "seq": snapshot.head.seq,
-                            }),
-                        );
-                    } else {
-                        load_res["_meta"] = json!({
-                            "honk": {
-                                "epoch": snapshot.head.epoch,
-                                "seq": snapshot.head.seq,
-                            }
-                        });
-                    }
-                    let load_reply_frame = crate::rpc::response(id, load_res);
-                    msgs.push(Message::Text(load_reply_frame.to_string().into()));
-
-                    let replay_done_frame = json!({
-                        "jsonrpc": "2.0",
-                        "method": "_honk/replay_done",
-                        "params": {
-                            "sessionId": sid,
-                            "epoch": snapshot.head.epoch,
-                            "seq": snapshot.head.seq,
-                        }
-                    });
-                    msgs.push(Message::Text(replay_done_frame.to_string().into()));
-
-                    for p in snapshot.pending {
-                        let pending_frame = json!({
-                            "jsonrpc": "2.0",
-                            "id": p.id,
-                            "method": p.method,
-                            "params": p.params,
-                        });
-                        msgs.push(Message::Text(pending_frame.to_string().into()));
-                    }
-
-                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                    if replay_tx
-                        .send(ReplayBatch {
-                            session_id: sid.to_string(),
-                            head: snapshot.head,
-                            msgs,
-                            done_tx: Some(done_tx),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    viewer.attached_sessions.insert(sid.to_string());
-                    if done_rx.await.is_err() {
-                        break;
                     }
                 } else if method == Some("session/new") {
                     match hub.create_session(params).await {

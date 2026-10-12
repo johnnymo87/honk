@@ -436,3 +436,41 @@ async fn log_file_holds_every_frame_with_event_id() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_sends_replay_batch_before_live_frames_fanned_out() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v1 = Viewer::connect(&h).await;
+    let sid = new_session(&mut v1, ".").await;
+
+    // Send a prompt to generate some log frames
+    fake.script_prompt(vec!["history 1".into(), "history 2".into()]);
+    let pid = v1
+        .request("session/prompt", prompt_params(&sid, "test", None))
+        .await;
+    let _ = v1.response_timeout(&pid, Duration::from_secs(5)).await;
+
+    // Now connect a new viewer v2. v2 connects and issues session/load.
+    let mut v2 = Viewer::connect(&h).await;
+    v2.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    v2.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/replay_done"))
+        .await;
+
+    // Verify raw methods received by v2:
+    // First must be _honk/reset, followed by session/update history frames, then session/load response, then _honk/replay_done.
+    let reset_idx = v2.raw_methods.iter().position(|m| m == "_honk/reset");
+    let done_idx = v2.raw_methods.iter().position(|m| m == "_honk/replay_done");
+    assert!(reset_idx.is_some(), "must have received _honk/reset");
+    assert!(done_idx.is_some(), "must have received _honk/replay_done");
+    assert!(
+        reset_idx.unwrap() < done_idx.unwrap(),
+        "_honk/reset must precede _honk/replay_done"
+    );
+}

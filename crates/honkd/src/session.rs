@@ -31,15 +31,6 @@ pub struct PendingSessionRequest {
     pub is_steer: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct AttachSnapshot {
-    pub reset: bool,
-    pub entries: Vec<crate::log::Entry>,
-    pub head: honk_wire::Cursor,
-    pub init_result: Value,
-    pub pending: Vec<crate::state::PendingRequest>,
-}
-
 pub struct ReactivationData {
     pub conn_id: String,
     pub up_handle: UpstreamHandle,
@@ -58,7 +49,8 @@ pub enum SessionMsg {
         viewer_id: ViewerId,
         viewer: ViewerTx,
         after: Option<honk_wire::Cursor>,
-        reply: tokio::sync::oneshot::Sender<AttachSnapshot>,
+        load_id: Value,
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
     AttachLive {
         viewer_id: ViewerId,
@@ -1938,6 +1930,7 @@ impl Session {
                 viewer_id,
                 viewer,
                 after,
+                load_id,
                 reply,
             } => {
                 let (reset, entries) = match self.log.resume(after.as_ref()) {
@@ -1946,18 +1939,88 @@ impl Session {
                 };
                 let head = self.log.head();
 
-                self.viewers.insert(viewer_id, (viewer, true));
+                let mut msgs = Vec::new();
+                if reset {
+                    let reset_frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "_honk/reset",
+                        "params": {
+                            "sessionId": self.sid,
+                            "epoch": head.epoch,
+                        }
+                    });
+                    msgs.push(axum::extract::ws::Message::Text(
+                        reset_frame.to_string().into(),
+                    ));
+                }
 
-                let init_result = self.init_result.clone();
-                let pending = self.pending_server_requests.clone();
+                for entry in entries {
+                    msgs.push(axum::extract::ws::Message::Text(
+                        entry.frame.to_string().into(),
+                    ));
+                }
 
-                let _ = reply.send(AttachSnapshot {
-                    reset,
-                    entries,
-                    head,
-                    init_result,
-                    pending,
+                let mut load_res = self.init_result.clone();
+                if !load_res.is_object() {
+                    load_res = json!({ "sessionId": self.sid });
+                }
+                if let Some(meta) = load_res.get_mut("_meta").and_then(Value::as_object_mut) {
+                    meta.insert(
+                        "honk".to_string(),
+                        json!({
+                            "epoch": head.epoch,
+                            "seq": head.seq,
+                        }),
+                    );
+                } else {
+                    load_res["_meta"] = json!({
+                        "honk": {
+                            "epoch": head.epoch,
+                            "seq": head.seq,
+                        }
+                    });
+                }
+                let load_reply_frame = crate::rpc::response(load_id, load_res);
+                msgs.push(axum::extract::ws::Message::Text(
+                    load_reply_frame.to_string().into(),
+                ));
+
+                let replay_done_frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": {
+                        "sessionId": self.sid,
+                        "epoch": head.epoch,
+                        "seq": head.seq,
+                    }
                 });
+                msgs.push(axum::extract::ws::Message::Text(
+                    replay_done_frame.to_string().into(),
+                ));
+
+                for p in &self.pending_server_requests {
+                    let pending_frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": p.id,
+                        "method": p.method,
+                        "params": p.params,
+                    });
+                    msgs.push(axum::extract::ws::Message::Text(
+                        pending_frame.to_string().into(),
+                    ));
+                }
+
+                let batch = crate::viewer::ReplayBatch {
+                    session_id: self.sid.clone(),
+                    head: head.clone(),
+                    msgs,
+                    done_tx: None,
+                };
+                let sent_ok = viewer.send_replay(batch);
+                if sent_ok {
+                    self.viewers.insert(viewer_id, (viewer, true));
+                }
+                let _ = reply.send(sent_ok);
             }
             SessionMsg::AttachLive {
                 viewer_id,
