@@ -1,0 +1,397 @@
+{
+  "accumulated_cost": 0.005505,
+  "accumulated_usage": {
+    "cache_read_input_tokens": 15725,
+    "cache_write_input_tokens": 1034,
+    "input_tokens": 16779,
+    "output_tokens": 524,
+    "total_tokens": 17303
+  },
+  "archived_at": null,
+  "conversation": [
+    {
+      "content": [
+        {
+          "text": "Think first about what to do. Then execute these steps in order:\n1. Run `ls` using the shell tool in the current directory.\n2. Create a scratch file named `notes.md` using the write tool with content:\n# Notes\nLine 1: Initial\n3. Edit `notes.md` using the edit tool, replacing `Line 1: Initial` with `Line 1: Modified with diff`.\n4. Finally, reply with a markdown answer containing a 3-row table with columns: ID, Status, Summary.",
+          "type": "text"
+        }
+      ],
+      "created": 1791683444,
+      "id": "msg_ca9076a8-de8a-4928-a33b-3242fab24187",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "<turn-context>\n<current-time>2026-10-10 21:50:00 -04:00</current-time>\n<working-directory>/tmp/honk-canonical</working-directory>\n</turn-context>",
+          "type": "text"
+        }
+      ],
+      "created": 1791683444,
+      "id": "msg_32323c23-de47-4e30-860e-3f2b5c455774",
+      "metadata": {
+        "agentVisible": true,
+        "turnContext": true,
+        "userVisible": false
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "signature": "EvwFCoMBCBIQAhgCKkCLDsjf8sT7gvLpWqu1dTvI9aiZu7VnQLnkzxy1r+7jUP2BoDFPoS67EwofIaW44vX7PxkrfXgF7n+mYDYZuy4bMhljbGF1ZGUtaGFpa3UtNC01LTIwMjUxMDAxOABCCHRoaW5raW5nWgszODAwMTA3ODczMqgB9tar1gYSDFwItlid5Yk0ueG1exoMJwNubPP/tvCOcacNIjAR2CACTH7O3A5OAU5y/5QFdBkgG7EGq/yuJDb481rRJY14B++tPYgXM2gGe0gPHssqpQQ0DVJCcP95bVbjhD8CbP00Zinpo3Njj6rPf3TGdmlpbIUw5bjuoHZnp7Zjz5IdNdlaLEqqeNaihfAEXQnOJL4QjkBxT8HRWCve4nZYoThhAHNgfi2uIYo7QY1xzyxGNiAHvtN922776/UnZ4yu6pJ6gkhWvXaL/M7GIkiCs5ebZGmSeYtUYtXmt80ubAUbe25nsDC6UkbfAT27jLHzx4A9XZS+MKFb8NoVxzchGeWcq0l5Goki5CIxvpw5oBqTnUIm3vAq9sx/vZkPSusuNqyKxsLb7S8XVgV2V4G+0zDPp56ZKJ93ReXyasyI/hV2TjM83jjPUu0EdtrHZn2VPRdZiQGkgaHwoPuFhp9ioMKEf0gvXZQCO7cNtEX2ejrZktVz0DsyUABlNViTWsrpxRIDKGeIZp5aWtFtO9w3oOBdD5oZtmifWhl5Nf2+YRSioo3suKW0Ry5q+cQG3TOGotQX5dX6in2Dt3edCCgYGLvQGVgZ5viZ4hax8m5sFxoCjIyNZxSGILxibU6Sy7oa4qRppaS7ZiQaAhpxgA+I4FMz9KqK1Ma9xxs0He+4Y9rMCLsEmtAsOQ7szcnHbvMmo2z31iIrZDAW6ce3rW9uYhUT2oei97D1AlUDGVOJzsMflc8bALqONmYHWLmDS/wFngS4FOO4yUzPECg9a3n3Orq+qW9W2AaSmdZXIS+0pRPO1pgTYX5/WHZeHQpxlWo9TIupxVf9xesYAQ==",
+          "thinking": "The user wants me to:\n1. Run `ls` in the current directory\n2. Create a file `notes.md` with specific content\n3. Edit that file to replace one line\n4. Reply with a markdown table\n\nLet me think about this first:\n- These are sequential steps, some dependent on previous ones\n- Step 1 is independent (ls)\n- Step 2 is independent (create file)\n- Step 3 depends on step 2 (edit the file we created)\n- Step 4 is independent (just reply with a table)\n\nSo I can do steps 1 and 2 together, then do step 3, then do step 4.\n\nLet me execute them:",
+          "type": "thinking"
+        },
+        {
+          "text": "I'll execute these steps in order. Let me start with steps 1 and 2 (which are independent), then step 3, and finally provide the response.",
+          "type": "text"
+        },
+        {
+          "_meta": {
+            "goose.toolCall.providerIndex": 2,
+            "goose_extension": "developer"
+          },
+          "id": "toolu_vrtx_01UCgfne7TkMfcDo4ZDRQkxm",
+          "toolCall": {
+            "status": "success",
+            "value": {
+              "arguments": {
+                "command": "ls"
+              },
+              "name": "shell"
+            }
+          },
+          "type": "toolRequest"
+        }
+      ],
+      "created": 1791683446,
+      "id": "msg_vrtx_011CfucR7pLauqNsvK8QQHqt",
+      "metadata": {
+        "agentVisible": true,
+        "inference": {
+          "provider": "gcp_vertex_ai",
+          "requestedModel": "claude-haiku-4-5@20251001"
+        },
+        "usage": {
+          "cacheReadTokens": 4765,
+          "cacheWriteTokens": 529,
+          "cost": 0.00272775,
+          "costSource": "estimated",
+          "elapsedMs": 2803,
+          "inputTokens": 5304,
+          "outputTokens": 316,
+          "timeToFirstTokenMs": 1937,
+          "totalTokens": 5620
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "id": "toolu_vrtx_01UCgfne7TkMfcDo4ZDRQkxm",
+          "toolResult": {
+            "status": "success",
+            "value": {
+              "content": [
+                {
+                  "annotations": {
+                    "priority": 0.0
+                  },
+                  "text": "(no output)",
+                  "type": "text"
+                }
+              ],
+              "isError": false,
+              "resultType": "complete",
+              "structuredContent": {
+                "exit_code": 0,
+                "stderr": "",
+                "stdout": ""
+              }
+            }
+          },
+          "type": "toolResponse"
+        }
+      ],
+      "created": 1791683447,
+      "id": "msg_78e83b87-19ea-4542-9925-41b79e893c5b",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "_meta": {
+            "goose.toolCall.providerIndex": 3,
+            "goose_extension": "developer"
+          },
+          "id": "toolu_vrtx_01VD4btc3oxpSH8WaCWREB2T",
+          "toolCall": {
+            "status": "success",
+            "value": {
+              "arguments": {
+                "content": "# Notes\nLine 1: Initial\n",
+                "path": "notes.md"
+              },
+              "name": "write"
+            }
+          },
+          "type": "toolRequest"
+        }
+      ],
+      "created": 1791683447,
+      "id": "msg_2b0c0e5d-49e8-426e-bf39-ba8a4f46aa2c",
+      "metadata": {
+        "agentVisible": true,
+        "inference": {
+          "provider": "gcp_vertex_ai",
+          "requestedModel": "claude-haiku-4-5@20251001"
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "id": "toolu_vrtx_01VD4btc3oxpSH8WaCWREB2T",
+          "toolResult": {
+            "status": "success",
+            "value": {
+              "content": [
+                {
+                  "annotations": {
+                    "priority": 0.0
+                  },
+                  "text": "Created notes.md (2 lines)",
+                  "type": "text"
+                }
+              ],
+              "isError": false,
+              "resultType": "complete"
+            }
+          },
+          "type": "toolResponse"
+        }
+      ],
+      "created": 1791683447,
+      "id": "msg_220bc556-65fb-4f08-b1a1-64a634f6a2b8",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Now I'll edit the file as requested:",
+          "type": "text"
+        },
+        {
+          "_meta": {
+            "goose.toolCall.providerIndex": 1,
+            "goose_extension": "developer"
+          },
+          "id": "toolu_vrtx_01PWNzNEVHURQjMSUZvTFY2c",
+          "toolCall": {
+            "status": "success",
+            "value": {
+              "arguments": {
+                "after": "Line 1: Modified with diff",
+                "before": "Line 1: Initial",
+                "path": "notes.md"
+              },
+              "name": "edit"
+            }
+          },
+          "type": "toolRequest"
+        }
+      ],
+      "created": 1791683447,
+      "id": "msg_vrtx_011CfucRJex17uPhVY3n5Vyc",
+      "metadata": {
+        "agentVisible": true,
+        "inference": {
+          "provider": "gcp_vertex_ai",
+          "requestedModel": "claude-haiku-4-5@20251001"
+        },
+        "usage": {
+          "cacheReadTokens": 5294,
+          "cacheWriteTokens": 372,
+          "cost": 0.0015344,
+          "costSource": "estimated",
+          "elapsedMs": 740,
+          "inputTokens": 5671,
+          "outputTokens": 107,
+          "timeToFirstTokenMs": 233,
+          "totalTokens": 5778
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "id": "toolu_vrtx_01PWNzNEVHURQjMSUZvTFY2c",
+          "toolResult": {
+            "status": "success",
+            "value": {
+              "content": [
+                {
+                  "annotations": {
+                    "priority": 0.0
+                  },
+                  "text": "Edited notes.md (1 lines -> 1 lines)",
+                  "type": "text"
+                }
+              ],
+              "isError": false,
+              "resultType": "complete"
+            }
+          },
+          "type": "toolResponse"
+        }
+      ],
+      "created": 1791683448,
+      "id": "msg_029d9c0b-df0e-4687-a909-95428149795e",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Perfect! All steps completed. Here's the requested markdown table:\n\n| ID | Status | Summary |\n|---|---|---|\n| 1 | ✓ Complete | Ran `ls` command in current directory |\n| 2 | ✓ Complete | Created `notes.md` file with initial content |\n| 3 | ✓ Complete | Edited `notes.md` to replace initial line with modified version |",
+          "type": "text"
+        }
+      ],
+      "created": 1791683448,
+      "id": "msg_vrtx_011CfucRMufFdDNyzbaQ1y2o",
+      "metadata": {
+        "agentVisible": true,
+        "inference": {
+          "provider": "gcp_vertex_ai",
+          "requestedModel": "claude-haiku-4-5@20251001"
+        },
+        "usage": {
+          "cacheReadTokens": 5666,
+          "cacheWriteTokens": 133,
+          "cost": 0.00124285,
+          "costSource": "estimated",
+          "elapsedMs": 1014,
+          "inputTokens": 5804,
+          "outputTokens": 101,
+          "timeToFirstTokenMs": 240,
+          "totalTokens": 5905
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    }
+  ],
+  "created_at": "2026-10-11T01:50:44Z",
+  "extension_data": {
+    "enabled_extensions.v0": {
+      "extensions": [
+        {
+          "bundled": true,
+          "description": "Write and edit files, and execute shell commands",
+          "display_name": "Developer",
+          "name": "developer",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables",
+          "display_name": "Top Of Mind",
+          "name": "tom",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Load knowledge and delegate tasks to subagents",
+          "display_name": "Summon",
+          "name": "summon",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Enable extension management tools for discovering, enabling, and disabling extensions",
+          "display_name": "Extension Manager",
+          "name": "Extension Manager",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Analyze code structure with tree-sitter: directory overviews, file details, symbol call graphs",
+          "display_name": "Analyze",
+          "name": "analyze",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.",
+          "display_name": "Apps",
+          "name": "apps",
+          "type": "platform"
+        },
+        {
+          "bundled": true,
+          "description": "Discover and provide skill instructions from filesystem and builtins",
+          "display_name": "Skills",
+          "name": "skills",
+          "type": "platform"
+        }
+      ]
+    }
+  },
+  "goose_mode": "auto",
+  "id": "20261011_85",
+  "last_message_at": "2026-10-11T01:50:48Z",
+  "last_message_snippet": null,
+  "message_count": 8,
+  "model_config": {
+    "max_tokens": 64000,
+    "model_name": "claude-haiku-4-5@20251001",
+    "reasoning": true,
+    "request_params": {
+      "thinking_effort": "low"
+    },
+    "supports_vision": true,
+    "temperature": null,
+    "toolshim": false,
+    "toolshim_model": null
+  },
+  "name": "Scratch file operations practice",
+  "parent_session_id": null,
+  "project_id": null,
+  "provider_name": "gcp_vertex_ai",
+  "recipe": null,
+  "schedule_id": null,
+  "session_type": "acp",
+  "updated_at": "2026-10-11T01:50:49Z",
+  "usage": {
+    "cache_read_input_tokens": 5666,
+    "cache_write_input_tokens": 133,
+    "input_tokens": 5804,
+    "output_tokens": 101,
+    "total_tokens": 5905
+  },
+  "user_recipe_values": null,
+  "user_set_name": false,
+  "working_dir": "/tmp/honk-canonical"
+}

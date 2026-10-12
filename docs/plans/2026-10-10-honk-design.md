@@ -1,8 +1,7 @@
 # honk: a ratatui TUI and session relay for goose over ACP
 
-Status: design approved 2026-10-10, **revised the same day after adversarial and
-oracle review** (see §10), pre-spike. Supporting research:
-[`2026-10-10-honk-research.md`](2026-10-10-honk-research.md) (deep-research survey of
+Status: design approved 2026-10-10, revised after M0 spike (2026-10-11), see m0-findings.md.
+Supporting research: [`2026-10-10-honk-research.md`](2026-10-10-honk-research.md) (deep-research survey of
 ACP clients, ratatui components, relay architecture, effort).
 
 ## 1. Why
@@ -56,8 +55,7 @@ advertising ACP `terminal/*` or `fs/*` client capabilities, forking goose.
 
 ## 3. Key facts about goose (v1.54.0) that shape the design
 
-Verified by reading source (`git show v1.54.0:<path>`); items marked *M0* still need a
-live measurement.
+Verified by reading source (`git show v1.54.0:<path>`) and empirical probe measurements (`m0-findings.md`).
 
 - **Transports.** `goose serve --port N` exposes ACP at `/acp` over WebSocket **and**
   HTTP+SSE (`agent-client-protocol-http` 2.2.0). Auth is the `X-Secret-Key` header or a
@@ -71,32 +69,59 @@ live measurement.
   (`dispatch.rs:143`, `server.rs:2420-2436`). `session/close` cancels whatever run is
   active, even another connection's (`server.rs:2639`): never use it to evict.
 - **Updates for a turn go only to the prompting connection** (`on_prompt`,
-  `forward_agent_stream`, `server.rs:2126-2357`). No broadcast, no subscribe.
-- **Losing the WebSocket cancels the turn.** WS close → `conn.shutdown()` aborts the
+  `forward_agent_stream`, `server.rs:2126-2357`; P3c). No broadcast, no subscribe;
+  cross-connection `session/load` does not divert live frames.
+- **Losing the WebSocket cancels the turn (T5).** WS close → `conn.shutdown()` aborts the
   handler task → `ActiveRunDropGuard` cancels the token (`server.rs:258-280`). This is
   deliberate upstream ("roaming"), and was already true in 1.48; pigeon's comment that
   turns survive disconnect is stale (and pigeon's reconnect path therefore cancels its
   own turns today).
-- **Over HTTP+SSE the logical connection outlives the socket** (oracle reading of the
-  2.2.0 crate): POSTs return 202, outbound frames queue in per-connection/per-session
-  mailboxes keyed by `Acp-Connection-Id`/`Acp-Session-Id`, a new GET takes over the
-  stream and drains the queue; the connection lives until DELETE. One listener per
-  stream (second GET → 409); delivery is at-most-once if a socket dies mid-write;
-  mailboxes are unbounded. *M0.*
+- **Over HTTP+SSE the logical connection outlives the socket:** Turns survive clean
+  disconnects and extended 600s gaps (P2a-c). POSTs return 202, outbound frames queue in
+  per-connection/per-session mailboxes keyed by `Acp-Connection-Id`/`Acp-Session-Id`, a
+  new GET drains the queue, and connections live until DELETE. On clean disconnect (FIN
+  sent), the 409 conflict window is ~0-1ms; on ungraceful half-open drops, 409 persists
+  indefinitely until TCP teardown (P2d). DELETE terminates the connection and cancels
+  active runs (T5, P2d), so it cannot be used to evict a stale subscriber. Delivery is
+  at-most-once: frames written to a dead/frozen socket buffer (chunks, prompt reply,
+  run-end update) are permanently lost (P2d), requiring state reconciliation after every
+  reattach.
 - **Each connection gets its own in-memory agent** (`AgentManager` per
   `GooseAcpAgent`, `server.rs:973`), with its own MCP extension processes. Two
   connections on one session = two agents; extension state is last-writer-wins.
 - **`session/load` is a mutating activation, not a read.** It rewrites the stored cwd
-  if the passed cwd differs (`server.rs:1176-1178`), spawns every MCP extension
-  (`load_session.rs:414`), re-sends persisted pending permissions (`:452-481`), and
-  under `GOOSE_STATE_MACHINE=1` may start a run (`:460-467`). Replay is bounded by
-  `_meta.replayTail` (cuts at a turn boundary, reports `replaySkipped`, `:88-105`,
-  `:443-448`). Read-only alternative: `_goose/unstable/session/export`
-  (`manage_sessions.rs:105-118`).
-- **Pending state.** Tool permissions are persisted and re-sent on load. Elicitation
-  forms time out after 300 s server-side (`mcp_client.rs:424`) and are auto-cancelled
-  unless the client advertises elicitation (`elicitation.rs:26-44`). Unconsumed steers
-  are discarded when a run ends or is cancelled (`server.rs:1929-1935`).
+  if the passed cwd differs (`server.rs:1176-1178`; honkd must pass the stored cwd from
+  `session/list`, P3b) and spawns every MCP extension (`load_session.rs:414`).
+  Same-connection reload mid-run is safe: the running agent is preserved, no extra
+  processes/threads spawn, and in-flight tool subprocesses continue (P3a). Replay delivers
+  COMMITTED messages of the in-flight turn, never the uncommitted in-flight message (P3a).
+  Replay is bounded by `_meta.replayTail` (cuts at turn boundaries, e.g. last turn for N=1,
+  reports `replaySkipped`, `:88-105`, `:443-448`, P6a). Read-only alternative:
+  `_goose/unstable/session/export` (`manage_sessions.rs:105-118`) reads SQLite directly with
+  zero side effects, working mid-run, on fresh connections, before load, and immediately
+  after a goose restart (P3, P5e).
+- **Pending state.** Tool permissions are **NOT persisted mid-turn, NOT re-sent by
+  `session/load`, and NOT redelivered on SSE resume** (P4). Goose's in-memory
+  `ToolConfirmationRouter` awaits confirmation indefinitely on the same connection, and
+  answering the original request ID after a long disconnect (tested 90s) executes the tool
+  and finishes the turn cleanly (P4a). However, a permission frame lost in transit leaves
+  the run parked forever (P4b); answers on a different connection return HTTP 202 but
+  execute nothing (P4c). Elicitation forms time out after 300 s server-side
+  (`mcp_client.rs:424`) and are auto-cancelled unless the client advertises elicitation
+  (`elicitation.rs:26-44`). Steers are consumed early and late during active runs (P5d);
+  unconsumed steers are discarded on run completion or cancellation (`server.rs:1929-1935`).
+- **Cancellation semantics.** `session/cancel` works from any connection in 54–79ms (P5a),
+  but does NOT unblock a run parked on a pending permission request; responding to the
+  permission with `outcome: "cancelled"` terminates it in ~2ms (P5c). Cancel SIGKILLs only
+  the immediate shell process (`bash`); descendant processes are orphaned to init/systemd
+  and continue running (P5a; goose bug, patch candidate #5).
+- **Client-library hazard.** In `agent-client-protocol` 3.x, dropping a `SentRequest`
+  sends `$/cancel_request`. Goose ignores `$/cancel_request` completely (P5b), so the drop
+  hazard is benign today, but keep the pin to goose's own versions (`agent-client-protocol`
+  2.2.0, schema `=1.9.1`) and hold prompt handles explicitly.
+- **Resource footprint.** An active goose session consumes ~0.5–1.7 MB VmRSS and ~9–12 OS
+  threads (P6b). The builtin `developer` extension runs in-process with 0 child processes.
+  All threads are reaped when the connection is DELETED.
 - **Model switch is per session** (`recreate_provider_for_session`). **Extension
   toggles**: use the session-scoped add/remove methods (`extensions.rs:8-36`), never
   the global `set_config_extension_enabled`; there is no "disable", re-enable means
@@ -104,9 +129,6 @@ live measurement.
 - **Subagents** are hidden from `session/list` (`server.rs:144`); their live progress
   arrives as `tool_call_update` with `_meta.toolNotification`.
 - If a client advertises `terminal`, goose routes *all* shell execution to it.
-- **Client-library hazard.** In `agent-client-protocol` 3.x, dropping a `SentRequest`
-  sends `$/cancel_request`. Pin to goose's own versions (`agent-client-protocol`
-  2.2.0, schema `=1.9.1`) and hold prompt handles explicitly.
 
 Consequences:
 1. A long-lived process must own each session's goose connection and fan out its
@@ -165,37 +187,84 @@ Cargo workspace:
 ## 5. Data flow and semantics
 
 **Upstream connection.** One HTTP+SSE logical connection per held session (fault
-isolation; pooling is a later optimization). `{connection_id, session_id}` is persisted
-to honkd's state file; on restart honkd re-GETs each stream to drain queued frames,
-then reconciles (below). Evicting a session = DELETE its connection (never
-`session/close`, which cancels runs); idle sessions are evicted after a TTL to stop
-their MCP processes, never while a run or request is pending.
+isolation; pooling is a later optimization). Live frames for a run are strictly pinned to
+the connection that sent `session/prompt` (P3c; A4); honkd must prompt on and reattach to
+the same persisted connection id per session. `{connection_id, session_id}` is persisted to
+honkd's state file BEFORE use (A15).
+
+On reattach, clean drops clear 409 within 0–1ms, while half-open socket freezes cause 409
+indefinitely until TCP teardown (P2d; A2). honkd retries 409 with exponential backoff and
+never sends DELETE to evict a stale subscriber (DELETE cancels active runs; A2). To avoid
+loopback half-open deadlocks from an alive-but-stuck consumer, honkd decouples SSE socket
+reading from downstream fan-out via large/unbounded internal buffering and slow-viewer
+eviction (A2).
+
+*Orphaned-connection rule (A15)*: On startup, honkd DELETEs connection ids recorded in its
+state file that it is not resuming. Because goose provides no connection-listing endpoint,
+a lost state file leaks connections until goose restarts (accepted and documented).
+
+**Session limits & eviction.** Evicting a session = DELETE its connection (never
+`session/close`, which cancels runs). Resource footprint per session is ~0.5–1.7 MB VmRSS and
+~9–12 threads, with 0 children for builtin extensions (reaped on DELETE; P6b; A14). Initial
+honkd limits: idle TTL 15 minutes (900s), max 16 held sessions (LRU evict idle sessions only;
+never evict while a run or request is pending). Limits to be re-measured when external MCP
+servers are configured.
 
 **Cold attach.** For a session honkd does not hold, a viewer gets a read-only snapshot
-from `_goose/unstable/session/export` (no extension spawn, no cwd rewrite). honkd
-only activates the session upstream (`session/load` with the **stored** cwd from
-`session/list`, bounded `replayTail`) on the first prompt, answer, or config change.
+from `_goose/unstable/session/export` (reads SQLite directly, works mid-run, on fresh
+connections, before load, and after restart; P3, P5e; A6). honkd only activates the session
+upstream (`session/load` with the **stored** cwd from `session/list`, `mcpServers: []`, bounded
+`replayTail`) on the first prompt, answer, or config change (A5).
 
-**Sequencing.** Every logged event carries `(epoch, seq)`; `epoch` changes on each
-honkd start and on every upstream reconcile. A cursor from another epoch gets
-`_honk/reset` + full replay, never a merge. Reconcile after reconnect = drop the log,
-reload, emit reset; never append a replay to live deltas (replay is per content item,
-live is per delta, so merging duplicates text). Stream vs replay message-id
-equality is an *M0* check; block ids and scroll-to depend on it.
+**Sequencing and IDs.** Every logged event carries `(epoch, seq)`; `epoch` changes on each
+honkd start and on every upstream reconcile. A cursor from another epoch gets `_honk/reset` +
+full replay, never a merge. Text/thought `messageId`s and all `toolCallId`s are stable and match
+in identical order across live stream, replay, and export (P6a; A7); the `messageId` carried on a
+tool call is NOT stable between live and replay, so transcript block id = `messageId` for
+text/thought blocks and `toolCallId` for tool blocks (never `messageId:toolCallId`). Replay delivers accumulated blocks and includes
+`user_message_chunk`, but omits `session_info_update` and intermediate `tool_call_update` chunks
+(P6a; A7). `_meta.replayTail: N` cuts at turn boundaries (last turn for N=1).
+
+**Reconcile.** Frames are delivered at-most-once; unread frames in kernel buffers on disconnect
+are lost, meaning prompt replies and run-end notifications can be missed (P2d; A3). Therefore,
+honkd must reconcile session state after EVERY reattach (A3). Turn end is detected from
+`session_info_update` `activeRunId=null` OR the prompt reply OR export polling, never the
+reply alone (A3). Reconcile = rebuild honkd's log keyed by `messageId` (replace committed
+messages from `session/load` or export, keep streaming the in-flight uncommitted message, and
+reconcile again at turn end), still emitting `_honk/reset` + replay to viewers (A5).
 
 **Prompts.** `client_req_id` (in `_meta.honk`) dedupes retries; the ledger is in the
 state file. Semantics:
 - `queue` (TUI default): held until the active run ends; **dropped** if the user
   cancels the run.
-- `steer` (pigeon's default): `_goose/unstable/session/steer`; if it loses the race
-  ("no active run"), it becomes a prompt-now.
+- `steer` (pigeon's default): `_goose/unstable/session/steer`. Early and late steers are
+  consumed during active runs (P5d; A12). Because loop teardown can discard pending steers,
+  honkd confirms consumption (checks for user message with the steer text in stream or
+  export); if unconfirmed or dropped, honkd re-queues the message as a regular prompt (A12).
 - A steer may overtake earlier queued prompts (intended: it targets the current run).
 - The `session/prompt` response (with `stopReason`) goes to the originating client
   when the turn ends, as pigeon expects; for queued prompts it is late by design.
 
-**Cancel.** Forwarded as the `session/cancel` notification; honkd also answers any
-outstanding permission/form with reject/cancel so a run parked on a request stops
-(*M0*: verify cancel alone does not).
+**Pending requests.** Tool permissions are NOT persisted mid-turn, NOT re-sent by `session/load`,
+and NOT redelivered on SSE resume; goose's in-memory `ToolConfirmationRouter` waits indefinitely
+on the same connection, and answering the original id after reconnect works (P4a; A8). Answers
+on another connection return HTTP 202 and do nothing (P4c). Therefore, honkd must persist received
+pending requests (`id` + payload) in its state file BEFORE fanning out to viewers so it can answer
+across restarts on the same connection (A8).
+
+If a permission frame is lost in transit before honkd reads it, the run parks forever; on a
+detected lost request (run active, tool call pending, no request frame seen after reattach),
+honkd surfaces "request lost" and offers cancel = DELETE the connection (which cancels even a
+parked run, unlike `session/cancel`) then re-activates (A8). Elicitation forms time out after
+300s server-side; honkd surfaces the expiry.
+
+**Cancel.** Forwarded as the `session/cancel` notification (works from any connection, 54–79ms,
+P5a; A9). However, `session/cancel` alone does not unblock a run parked on a pending permission
+(P5c); answering `{"outcome": {"outcome": "cancelled"}}` terminates the parked run in ~2ms (A9).
+Therefore, Cancel = `session/cancel` notification + explicitly answering all outstanding
+permission requests with outcome `cancelled` (confirming design §5; A9). Note that cancel
+currently leaves descendant processes of shell commands running due to a goose bug (P5a; A11),
+which candidate patch #5 resolves.
 
 **Viewers.** Each has a bounded outbound queue; overflow disconnects it (it
 reattaches with its cursor). The hello carries a protocol version so long-lived TUIs
@@ -211,21 +280,28 @@ paste, OSC 52.
 ## 6. Failure model
 
 - **honkd restart / crash**: turns keep running in goose (HTTP+SSE connections
-  survive); honkd re-GETs, reconciles, bumps epoch; viewers get reset + replay. Frames
-  lost mid-write are recovered by the reconcile reload. If M0 shows HTTP connections do
-  *not* survive, fallback: WS upstream, honkd treated as an always-up service whose
-  restart is an explicit drain ("wait for no active runs"), and `TurnEnded{cancelled,
-  reason: relay_restart}` made visible to viewers and pigeon.
-- **goose serve restart**: all runs die (goose's own behavior). honkd reconnects with
-  backoff and staggers re-activation so N sessions don't spawn N×extensions at once;
-  viewers see `cancelled`.
+  survive clean drops and 600s gaps; P2a-c; A1). The WS fallback is deleted. On startup,
+  honkd reads its state file, re-attaches to existing connection ids via GET, and drains
+  queued frames. If 409 is returned, honkd retries with exponential backoff (A2).
+  Once re-attached, honkd reconciles session state (A3, A5), bumps epoch, and emits
+  `_honk/reset` + full replay to viewers. Any pending permissions persisted in the state
+  file before restart can still be answered on the re-attached connection (A8). Orphaned
+  connection ids in the state file not being resumed are explicitly DELETED (A15).
+- **goose serve restart**: all runs and connections die (in-flight shell processes die
+  with the cgroup; P5e; A13). Old connection ids return HTTP 404 on POST and GET. Goose
+  accepts fresh `initialize` calls within ~200ms. On 404, honkd re-initializes, reloads
+  sessions via `session/load` passing stored cwd from `session/list`, marks interrupted
+  turns as aborted/unanswered, and offers re-prompt to viewers (A13). Export can be
+  queried immediately on a fresh connection before `session/load` to inspect committed
+  history (A6). honkd reconnects with backoff and staggers re-activation so N sessions
+  don't spawn N×extensions at once.
 - **Turns started outside honkd** (goose CLI, scheduler): invisible until the next
   reconcile; honkd's prompt gets "busy" and falls back to queue-and-poll. Accepted.
 - **Unknown ACP messages**: passed through; the reducer renders unknown updates as a
   dim raw block. Never panic.
-- **Accepted losses on honkd restart**: none of queue / req-id ledger / held sessions
-  (state file); attached-viewer set is not persisted (TUIs reconnect themselves;
-  nightly restore is the switcher's job).
+- **Accepted losses on honkd restart**: none of queue / req-id ledger / held sessions /
+  pending requests (state file); attached-viewer set is not persisted (TUIs reconnect
+  themselves; nightly restore is the switcher's job).
 - **Security**: downstream listener on a 0700 directory under `$XDG_RUNTIME_DIR` (unix
   socket) or 127.0.0.1 with a token; peer uid checked. This is not a boundary against
   the agent itself (same uid); with allow-all permissions that is accepted.
@@ -249,8 +325,8 @@ paste, OSC 52.
 
 | | Scope | Exit criterion |
 |---|---|---|
-| **M0 spike (1-2 days)** | (1) Is goose's agent loop good enough: one real day of root sessions on existing tooling. (2) HTTP+SSE vs WS disconnect behavior on the pinned goose. (3) Two connections on one session: visibility, extension state, `session/load` during another's run. (4) Permission/form with no listener: buffered? answerable later? (5) Cancel while parked on a permission; `$/cancel_request` honored? (6) Stream vs replay message ids. (7) Hydra-acp against `goose serve` (2 h timebox, prior art). (8) Open a goose upstream Discussion proposing opt-in detach-tolerant turns + `session/subscribe` as an extension of roaming. | Findings written; §3 confirmed or design amended. (1) failing kills the project. |
-| **M1** | honkd proxy (HTTP+SSE upstream, state file, attach/replay, pending requests, queue/steer); pigeon repointed at honkd; ~100-line `honk tail`. | A pigeon turn is visible in `honk tail`; `kill -9 honkd` mid-turn, restart: the turn completes and `tail` resumes without duplicated text; restart goose mid-turn: `cancelled` shown, retry not duplicated. |
+| **M0 spike (1-2 days)** | **DONE (2026-10-11)**. Probes T5, P2–P6 complete, P7 skipped, P1 pending author day. Findings written (`m0-findings.md`), patch candidates ranked (`goose-patches.md`), design amended (§10). | Findings written; §3 confirmed or design amended. (P1 pending author run; T5/P2–P6 confirmed HTTP+SSE and amended design). |
+| **M1** | honkd proxy (HTTP+SSE upstream, state file, attach/replay, pending requests, queue/steer); pigeon repointed at honkd; ~100-line `honk tail`. | A pigeon turn is visible in `honk tail`; `kill -9 honkd` mid-turn, restart: the turn completes and `tail` resumes without duplicated text; a permission pending across a honkd restart is still answerable; restart goose mid-turn: `cancelled`/interrupted shown, retry not duplicated. |
 | **M2** | TUI daily-driver: edtui composer, markdown/tables/colors, thinking, tool blocks, inline subagent progress, scrolling, history, interrupt. Used alongside OpenCode v1. | Author uses it for a full day. |
 | **M3** | Forms/permissions, model switch, MCP toggle, usage line, diffs. | All MVP interaction features present. |
 | **M4** | Ecosystem: nvim switcher, `honk new`, nightly restore, terminal title, scroll-to. | OpenCode TUI no longer needed day-to-day. |
@@ -278,7 +354,9 @@ proxy; ~100-180 h with substantial reuse, 200-300+ h owning everything.
   design has the mirror-image cost: honkd becomes load-bearing for swarm delivery.
   Accepted, because honkd is small and single-purpose and pigeon is not.)
 - **Patch goose** to decouple turns from connections and broadcast updates: permanent
-  fork burden; still needs subscription semantics. Proposed upstream instead (M0).
+  fork burden; still needs subscription semantics. Revised by the author: patches *are*
+  carried in the existing goose fork alongside honkd for practice, then considered for
+  upstream.
 - **One TUI per session kept alive by tmux, no relay**: cheapest, but fails the
   thin-client and live-pigeon-turn requirements.
 - **Inline (native scrollback) rendering**: preferred for vim-native yank, but makes
@@ -309,3 +387,13 @@ reading goose v1.54.0 source. Changes they drove:
 - Pins `agent-client-protocol` 2.2.0 / schema 1.9.1 to match goose (3.x drops of
   `SentRequest` emit `$/cancel_request`); auth is `X-Secret-Key`, not bearer.
 - Inline subagent progress added to the MVP (cheap via `toolNotification`).
+
+### M0 revisions (2026-10-11)
+
+Empirical probes on `goose` v1.54.0 (`docs/spike/m0-findings.md`) drove design amendments A1–A16:
+- **Transport confirmed, fallback deleted (A1):** HTTP+SSE turns survive clean disconnects and 600s gaps (P2a-c). The WS fallback in §6 is eliminated.
+- **Reattach and reconciliation (A2, A3, A5):** Clean disconnects clear 409 in 0–1ms; half-open drops cause persistent 409 until TCP teardown, and unread frames in kernel buffers are lost (P2d). honkd retries 409 with backoff, never DELETEs to evict, decouples socket reads from viewer fan-out, and reconciles session state after every reattach via messageId replacement.
+- **Connection binding (A4):** Live stream frames are pinned to the prompting connection (P3c). honkd must prompt on and reattach to the same persisted connection ID.
+- **Permissions (A8):** Pending permissions are NOT persisted mid-turn and NOT re-sent by `session/load`, but wait indefinitely in memory on the same connection (P4a). honkd persists pending requests in its state file before viewer fan-out to answer across restarts; lost requests require cancel-via-DELETE.
+- **Cancellation (A9, A11):** `session/cancel` works across connections (54–79ms) but does not unblock permission-parked runs without an explicit `cancelled` outcome answer (P5a, P5c). Cancel performs both. Orphan descendant leak identified as goose bug (patch candidate #5).
+- **IDs & Limits (A7, A14, A15):** text `messageId`s and `toolCallId`s are stable across live, replay, export (P6), so `block_id = messageId` for text and `toolCallId` for tools (a tool call's own `messageId` differs between live and replay). Resource cost (~0.5–1.7 MB RSS, ~9–12 threads/conn) sets initial limits at 15m idle TTL and max 16 held sessions. Orphaned connections managed via state file DELETE on startup.
