@@ -527,6 +527,9 @@ impl Session {
         });
     }
 
+    /// Restored inflight delivery check used only at restart/boot time.
+    /// Note: After a crash, honkd restarts much later, so goose has usually committed the user message.
+    /// However, there is a residual race if honkd restarts within milliseconds of the prompt POST.
     async fn check_restored_inflight_delivery(&mut self) -> Vec<Action> {
         let Some(inf) = self.turn.inflight.as_ref() else {
             return vec![];
@@ -1130,17 +1133,17 @@ impl Session {
                                 }
                             }
                             PromptPostFailure::Ambiguous => {
-                                // Transport error after send (timeout waiting for 202, connection drop/reset after body).
-                                // Prompt may have reached goose and started executing.
-                                // Keep InFlight in state and ledger. Resolve through delivery check.
+                                // In goose, requests are dispatched concurrently in spawned tasks
+                                // (crates/goose/src/acp/server/dispatch.rs:128,479), so an immediate export
+                                // or steer probe is not a barrier for whether the prompt was accepted.
+                                // Right after transport drop, an export query can predate goose committing
+                                // the user message to SQLite. Therefore, never declare not_delivered on
+                                // Ambiguous while the connection is live. Keep InFlight in state and ledger
+                                // and wait for the announcement or stream reply. A retry attaches as waiter.
                                 tracing::warn!(
-                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); keeping inflight and checking delivery",
+                                    "Session {}: ambiguous prompt POST failure for {upstream_id} ({e:#}); keeping inflight and awaiting stream reply",
                                     sid
                                 );
-                                let actions = self.check_restored_inflight_delivery().await;
-                                for a in actions.into_iter().rev() {
-                                    queue.push_front(a);
-                                }
                             }
                         }
                     }
@@ -1480,7 +1483,14 @@ impl Session {
                     self.queued_msgs.push_back(SessionMsg::Cancel);
                     return;
                 }
-                let actions = self.turn.on_cancel();
+                let mut actions = self.turn.on_cancel();
+
+                // If inflight prompt was unannounced (e.g. prompt POST was ambiguous and never arrived at goose),
+                // cancel resolves it immediately so owners get a cancelled reply and the ledger is updated to Done.
+                if self.turn.inflight.as_ref().is_some_and(|i| !i.announced) {
+                    actions.extend(self.turn.interrupt("cancelled"));
+                }
+
                 self.execute_actions(actions).await;
 
                 if !self.pending_server_requests.is_empty() {

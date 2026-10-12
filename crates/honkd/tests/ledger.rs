@@ -840,7 +840,7 @@ async fn prompt_post_500_failure_clears_ledger_and_allows_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_check() {
+async fn prompt_post_ambiguous_failure_keeps_inflight_without_false_negative_not_delivered() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(true);
     let proxy = TcpProxy::start(fake.addr()).await.unwrap();
@@ -855,18 +855,9 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_
     let mut v = Viewer::connect(&h).await;
     let sid = new_session(&mut v, ".").await;
 
-    // Fake goose has export showing prompt was delivered
-    fake.set_export_data(
-        &sid,
-        json!({
-            "conversation": [{
-                "id": "msg_user_1",
-                "role": "user",
-                "created": 1,
-                "content": [{ "type": "text", "text": "ambiguous delivery text" }]
-            }]
-        }),
-    );
+    // Simulate async commit delay in goose: export does NOT have the user message yet!
+    // Honkd must NOT declare false-negative not_delivered while the connection is live.
+    fake.set_export_data(&sid, json!({ "conversation": [] }));
 
     // Drop automatic prompt reply so we can observe the in-flight state
     fake.set_drop_prompt_reply(true);
@@ -881,10 +872,10 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_
         )
         .await;
 
-    // Wait for delivery check to run
+    // Wait for transport drop to occur
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Check state.json: crid-ambig MUST STILL BE InFlight (not removed!)
+    // Check state.json: crid-ambig MUST STILL BE InFlight (not marked not_delivered!)
     let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
     let state: Value = serde_json::from_str(&state_content).unwrap();
     assert!(
@@ -896,7 +887,7 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_
     );
     assert_eq!(
         state["ledger"]["crid-ambig"]["state"], "in_flight",
-        "ledger entry must remain in_flight"
+        "ledger entry must remain in_flight without false-negative not_delivered"
     );
 
     // A concurrent retry with the same client_req_id attaches to the in-flight prompt
@@ -926,4 +917,64 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_and_resolves_via_delivery_
 
     assert_eq!(r1["result"]["stopReason"], "end_turn");
     assert_eq!(r2["result"]["stopReason"], "end_turn");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_on_unannounced_inflight_ends_with_reply_and_done_ledger() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Fake goose does not announce a run (simulating a prompt that never started/arrived at goose)
+    fake.set_drop_prompt_announcement(true);
+
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(
+                &sid,
+                "prompt never arrives",
+                Some("crid-unannounced-cancel"),
+            ),
+        )
+        .await;
+
+    // Wait for prompt to be in-flight in honkd
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify it is in-flight in ledger
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert_eq!(
+        state["ledger"]["crid-unannounced-cancel"]["state"],
+        "in_flight"
+    );
+
+    // Client cancels the unannounced inflight prompt
+    v.call("session/cancel", json!({ "sessionId": &sid })).await;
+
+    // Prompt owner receives cancelled reply
+    let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
+    assert_eq!(
+        resp["result"]["stopReason"], "cancelled",
+        "cancel on unannounced inflight must reply cancelled: {resp:?}"
+    );
+
+    // State file shows inflight is resolved to Done and held.inflight is None
+    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_content).unwrap();
+    assert_eq!(
+        state["ledger"]["crid-unannounced-cancel"]["state"], "done",
+        "ledger entry must be resolved to Done"
+    );
+    assert!(
+        state["sessions"][&sid]["inflight"].is_null(),
+        "held.inflight must be cleared"
+    );
 }

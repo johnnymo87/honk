@@ -155,6 +155,7 @@ struct FakeGooseInner {
     all_sessions: Mutex<HashMap<String, String>>,
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
+    drop_prompt_announcement: AtomicBool,
     steer_status: Mutex<Option<StatusCode>>,
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
@@ -200,6 +201,7 @@ impl FakeGoose {
             all_sessions: Mutex::new(HashMap::new()),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
+            drop_prompt_announcement: AtomicBool::new(false),
             steer_status: Mutex::new(None),
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
@@ -338,6 +340,12 @@ impl FakeGoose {
 
     pub fn set_drop_prompt_reply(&self, drop: bool) {
         self.state.drop_prompt_reply.store(drop, Ordering::SeqCst);
+    }
+
+    pub fn set_drop_prompt_announcement(&self, drop: bool) {
+        self.state
+            .drop_prompt_announcement
+            .store(drop, Ordering::SeqCst);
     }
 
     pub fn set_steer_status(&self, status: Option<StatusCode>) {
@@ -720,6 +728,10 @@ async fn handle_post(
                         );
                     }
                 });
+                return StatusCode::ACCEPTED.into_response();
+            }
+
+            if state.drop_prompt_announcement.load(Ordering::SeqCst) {
                 return StatusCode::ACCEPTED.into_response();
             }
 
