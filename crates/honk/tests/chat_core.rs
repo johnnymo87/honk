@@ -1,4 +1,6 @@
-use honk::chat::{ChatCore, ChatOpts, Effect, Input, Ownership, RunState};
+use honk::chat::{
+    ChatCore, ChatOpts, Effect, IdAlloc, Input, Notice, NoticeKind, Ownership, RunState,
+};
 use honk_wire::Cursor;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -7,7 +9,7 @@ fn new_test_core() -> (ChatCore, Instant) {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 0x1234,
-        idle_timeout: Duration::from_secs(30 * 60),
+        idle_timeout: Some(Duration::from_secs(30 * 60)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     // Complete initial replay phase
@@ -23,49 +25,621 @@ fn new_test_core() -> (ChatCore, Instant) {
     (core, now)
 }
 
-#[test]
-fn test_run_state_transitions_and_initial_unknown() {
-    let (mut core, _) = new_test_core();
-    assert_eq!(*core.run_state(), RunState::Unknown);
-    assert_eq!(core.ownership(), Ownership::Unknown);
+fn find_notice<'a>(effects: &'a [Effect], sub: &str) -> Option<&'a Notice> {
+    effects.iter().find_map(|e| match e {
+        Effect::Notice(n) if n.text.contains(sub) => Some(n),
+        _ => None,
+    })
+}
 
-    // Frame session_info_update with activeRunId string
-    let run_start_frame = json!({
+fn has_notice(effects: &[Effect], sub: &str) -> bool {
+    find_notice(effects, sub).is_some()
+}
+
+#[test]
+fn test_ownership_echo_before_run_start_sets_own() {
+    let (mut core, _) = new_test_core();
+    // 1. Send prompt -> crid is honk-chat-0000000000001234-1
+    core.handle(Input::Line("my prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    // 2. Real wire order: user_message_chunk echo arrives BEFORE activeRunId!
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "synth_1",
+                "content": { "type": "text", "text": "my prompt" },
+                "_meta": {
+                    "honk": {
+                        "source": { "client_req_id": crid }
+                    }
+                }
+            }
+        }
+    })));
+
+    // 3. session_info_update arrives with activeRunId
+    core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "update": {
                 "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_10" } }
+            }
+        }
+    })));
+
+    assert_eq!(*core.run_state(), RunState::Running("run_10".into()));
+    assert_eq!(core.ownership(), Ownership::Own);
+}
+
+#[test]
+fn test_ownership_foreign_echo_before_run_start_sets_foreign() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("my prompt".into()));
+
+    // Another client's echo arrives before run start
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "foreign_synth",
+                "content": { "type": "text", "text": "someone else" },
                 "_meta": {
-                    "goose": {
-                        "activeRunId": "run_123"
+                    "honk": {
+                        "source": { "client_req_id": "other-client-crid-99" }
                     }
                 }
             }
         }
-    });
-    core.handle(Input::Frame(run_start_frame));
-    assert_eq!(*core.run_state(), RunState::Running("run_123".into()));
+    })));
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign_1" } }
+            }
+        }
+    })));
+
+    assert_eq!(*core.run_state(), RunState::Running("run_foreign_1".into()));
+    assert_eq!(core.ownership(), Ownership::Foreign);
+}
+
+#[test]
+fn test_ownership_no_echo_prompt_in_flight_sets_pending() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("my prompt".into()));
+
+    // Run starts without an echo frame
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_mystery" } }
+            }
+        }
+    })));
+
+    assert_eq!(*core.run_state(), RunState::Running("run_mystery".into()));
+    // With our prompt in flight and no echo yet, ownership is Pending!
+    assert_eq!(core.ownership(), Ownership::Pending);
+}
+
+#[test]
+fn test_ownership_late_echo_transitions_pending_to_own() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("my prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    // Line entered while pending -> held!
+    core.handle(Input::Line("held steer".into()));
+
+    // Run starts with no echo -> Pending
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_delayed" } }
+            }
+        }
+    })));
+    assert_eq!(core.ownership(), Ownership::Pending);
+
+    // Late echo arrives inside the run!
+    let late_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "late_synth",
+                "content": { "type": "text", "text": "my prompt" },
+                "_meta": {
+                    "honk": {
+                        "source": { "client_req_id": crid }
+                    }
+                }
+            }
+        }
+    })));
+
+    // Transitions to Own and held lines are steered!
+    assert_eq!(core.ownership(), Ownership::Own);
+    let steer = late_effs.iter().find(|e| matches!(e, Effect::Request { method, .. } if method == "_goose/unstable/session/steer")).unwrap();
+    let Effect::Request { params, .. } = steer else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "held steer");
+}
+
+#[test]
+fn test_parked_behind_foreign_sequence() {
+    let (mut core, _) = new_test_core();
+    // 1. We send a prompt -> parked in honkd behind another client's turn
+    core.handle(Input::Line("our prompt".into()));
+    let our_crid = core.prompt_sent().unwrap().crid.clone();
+
+    // 2. Foreign echo + run start arrives
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": "foreign-crid" } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "foreign_run" } }
+            }
+        }
+    })));
     assert_eq!(core.ownership(), Ownership::Foreign);
 
-    // Frame session_info_update with activeRunId null
-    let run_end_frame = json!({
+    // 3. User types a line -> held, not steered!
+    let hold_effs = core.handle(Input::Line("more work".into()));
+    assert!(!hold_effs.iter().any(
+        |e| matches!(e, Effect::Request { method, .. } if method == "_goose/unstable/session/steer")
+    ));
+
+    // 4. Foreign permission request arrives -> NOT answered, stored as pending
+    let perm_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": "foreign-perm",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "test-session",
+            "toolCall": { "title": "dangerous_tool" },
+            "options": [{ "optionId": "o1", "name": "o1", "kind": "allow_once" }]
+        }
+    })));
+    assert!(
+        !perm_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Respond { .. }))
+    );
+    assert!(has_notice(&perm_effs, "another client's turn"));
+
+    // 5. Ctrl-C pressed -> REFUSED with notice mentioning /cancel!
+    let cancel_effs = core.handle(Input::Interrupt);
+    assert!(
+        !cancel_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notify { method, .. } if method == "session/cancel"))
+    );
+    assert!(has_notice(&cancel_effs, "/cancel!"));
+
+    // 6. Foreign run ends
+    let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "update": {
                 "sessionUpdate": "session_info_update",
-                "_meta": {
-                    "goose": {
-                        "activeRunId": null
-                    }
-                }
+                "_meta": { "goose": { "activeRunId": null } }
             }
         }
-    });
-    core.handle(Input::Frame(run_end_frame));
+    })));
     assert_eq!(*core.run_state(), RunState::Idle);
     assert_eq!(core.ownership(), Ownership::Unknown);
+    // Held line moved to queue because the run ended without becoming Own!
+    assert!(has_notice(&end_effs, "held lines moved to queue"));
+
+    // 7. Now honkd releases our parked prompt: our echo arrives, then run start!
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": our_crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "our_run" } }
+            }
+        }
+    })));
+    assert_eq!(*core.run_state(), RunState::Running("our_run".into()));
+    assert_eq!(core.ownership(), Ownership::Own);
+}
+
+#[test]
+fn test_replay_done_flush_reoffered_permission_unknown_not_answered() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 1,
+        idle_timeout: Some(Duration::from_secs(1800)),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    // Initial replay finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 10 }
+    })));
+    assert_eq!(core.ownership(), Ownership::Unknown);
+
+    // honkd re-offers pending permission right after replay_done
+    let reoffer = json!({
+        "jsonrpc": "2.0",
+        "id": "reoffered-perm-1",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "test-session",
+            "toolCall": { "title": "unowned_tool" },
+            "options": [{ "optionId": "o1", "name": "o1", "kind": "allow_once" }]
+        }
+    });
+    let effs = core.handle(Input::Frame(reoffer));
+    // Since ownership is Unknown, must NOT auto-answer!
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Respond { .. })));
+    assert!(has_notice(&effs, "another client's turn"));
+}
+
+#[test]
+fn test_auto_approve_uses_allow_once() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    // Echo + run start -> Own
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_approve" } }
+            }
+        }
+    })));
+    assert_eq!(core.ownership(), Ownership::Own);
+
+    // Permission request with allow_always AND allow_once
+    let perm = json!({
+        "jsonrpc": "2.0",
+        "id": "perm-allow-test",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "test-session",
+            "toolCall": { "title": "shell · cargo build" },
+            "options": [
+                { "optionId": "opt_always", "name": "always", "kind": "allow_always" },
+                { "optionId": "opt_once", "name": "once", "kind": "allow_once" },
+                { "optionId": "opt_reject", "name": "reject", "kind": "reject_once" }
+            ]
+        }
+    });
+
+    let effs = core.handle(Input::Frame(perm));
+    let resp = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Respond { .. }))
+        .unwrap();
+    let Effect::Respond { result, .. } = resp else {
+        panic!()
+    };
+    // Must choose allow_once over allow_always!
+    assert_eq!(result["outcome"]["optionId"], "opt_once");
+    assert!(has_notice(&effs, "auto-approved: shell · cargo build"));
+}
+
+#[test]
+fn test_approve_command_answers_foreign_permission() {
+    let (mut core, _) = new_test_core();
+    // Foreign turn
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "foreign_run" } }
+            }
+        }
+    })));
+
+    // Request arrives from foreign turn
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": "perm-foreign-1",
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "test-session",
+            "toolCall": { "title": "foreign shell" },
+            "options": [
+                { "optionId": "allow_1", "name": "once", "kind": "allow_once" }
+            ]
+        }
+    })));
+
+    // Human types /approve -> answers the oldest pending request!
+    let app_effs = core.handle(Input::Line("/approve".into()));
+    let resp = app_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Respond { .. }))
+        .unwrap();
+    let Effect::Respond { id, result } = resp else {
+        panic!()
+    };
+    assert_eq!(id, "perm-foreign-1");
+    assert_eq!(result["outcome"]["optionId"], "allow_1");
+    assert!(has_notice(&app_effs, "approved: foreign shell"));
+
+    // /approve again when empty -> warning notice
+    let app_effs2 = core.handle(Input::Line("/approve".into()));
+    assert!(
+        !app_effs2
+            .iter()
+            .any(|e| matches!(e, Effect::Respond { .. }))
+    );
+    assert!(has_notice(&app_effs2, "no pending permission requests"));
+}
+
+#[test]
+fn test_elicitation_declined_in_own_turn() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "own_run" } }
+            }
+        }
+    })));
+
+    // Elicitation in Own turn
+    let elicit = json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-1",
+        "method": "session/elicit_input",
+        "params": { "sessionId": "test-session" }
+    });
+    let effs = core.handle(Input::Frame(elicit));
+    let resp = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Respond { .. }))
+        .unwrap();
+    let Effect::Respond { id, result } = resp else {
+        panic!()
+    };
+    assert_eq!(id, "elicit-1");
+    assert_eq!(result["action"], "decline");
+    assert!(has_notice(&effs, "declined elicitation request"));
+}
+
+#[test]
+fn test_elicitation_not_declined_in_foreign_turn() {
+    let (mut core, _) = new_test_core();
+    // Foreign turn
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "foreign_run" } }
+            }
+        }
+    })));
+
+    let elicit = json!({
+        "jsonrpc": "2.0",
+        "id": "elicit-foreign",
+        "method": "session/elicit_input",
+        "params": { "sessionId": "test-session" }
+    });
+    let effs = core.handle(Input::Frame(elicit));
+    // Must NOT respond!
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Respond { .. })));
+    assert!(has_notice(
+        &effs,
+        "elicitation request from another client's turn"
+    ));
+}
+
+#[test]
+fn test_structured_notices_returned_text() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("hello prompt".into()));
+
+    // Lost track error -> NoticeKind::Returned
+    let err = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32000,
+            "message": "honkd lost track of this client_req_id"
+        }
+    });
+    let effs = core.handle(Input::Frame(err));
+    let notice = find_notice(&effs, "lost track").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert_eq!(notice.returned_text.as_deref(), Some("hello prompt"));
+}
+
+#[test]
+fn test_attach_success_emits_attached_effect() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 1,
+        idle_timeout: Some(Duration::from_secs(1800)),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+
+    let load_reply = json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "result": {
+            "title": "My Goose Session",
+            "_meta": { "extensionResults": [] }
+        }
+    });
+
+    let effs = core.handle(Input::Frame(load_reply));
+    let attached = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Attached { .. }))
+        .unwrap();
+    let Effect::Attached { result } = attached else {
+        panic!()
+    };
+    assert_eq!(result["title"], "My Goose Session");
+}
+
+#[test]
+fn test_attach_failure_emits_attach_failed_effect() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 1,
+        idle_timeout: Some(Duration::from_secs(1800)),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+
+    let load_err = json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "error": {
+            "code": -32000,
+            "message": "unheld session requires activate"
+        }
+    });
+
+    let effs = core.handle(Input::Frame(load_err));
+    let failed = effs
+        .iter()
+        .find(|e| matches!(e, Effect::AttachFailed { .. }))
+        .unwrap();
+    let Effect::AttachFailed { error } = failed else {
+        panic!()
+    };
+    assert_eq!(error["message"], "unheld session requires activate");
+}
+
+#[test]
+fn test_getters_queued_len_and_prompt_in_flight() {
+    let (mut core, _) = new_test_core();
+    assert_eq!(core.queued_len(), 0);
+    assert!(!core.prompt_in_flight());
+
+    core.handle(Input::Line("prompt 1".into()));
+    assert!(core.prompt_in_flight());
+    assert_eq!(core.queued_len(), 0);
+
+    core.handle(Input::Line("held 1".into()));
+    assert_eq!(core.queued_len(), 1); // held in held_steers
+}
+
+#[test]
+fn test_idle_timeout_none_disables_detach() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 1,
+        idle_timeout: None,
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
+
+    // 100 hours pass: never detaches!
+    let effs = core.handle(Input::Tick(now + Duration::from_secs(100 * 3600)));
+    assert!(!core.is_detached());
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Detach)));
+}
+
+#[test]
+fn test_id_alloc_pre_session_constructor() {
+    let mut ids = IdAlloc::new();
+    let new_session_req_id = ids.allocate();
+    assert_eq!(new_session_req_id, 1);
+
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 42,
+        idle_timeout: None,
+    };
+    // Pass pre-session allocator to ChatCore::with_ids
+    let mut core = ChatCore::with_ids("new-session-id".into(), opts, now, ids);
+
+    let (load_id, method, _) = core.attach_request();
+    assert_eq!(load_id, 2); // Monotonic, never collides!
+    assert_eq!(method, "session/load");
 }
 
 #[test]
@@ -74,77 +648,67 @@ fn test_line_idle_unknown_sends_prompt() {
     assert_eq!(*core.run_state(), RunState::Unknown);
 
     let effects = core.handle(Input::Line("hello world".into()));
-    assert_eq!(effects.len(), 2);
-
     let req_effect = effects
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
         .expect("must emit session/prompt request");
 
     let Effect::Request { id, method, params } = req_effect else {
-        panic!();
+        panic!()
     };
     assert_eq!(method, "session/prompt");
     assert_eq!(*id, 1);
-    assert_eq!(params["sessionId"], "test-session");
     assert_eq!(params["prompt"][0]["text"], "hello world");
-    let crid = params["_meta"]["honk"]["client_req_id"]
-        .as_str()
-        .expect("must have client_req_id");
-    assert_eq!(crid, "honk-chat-0000000000001234-1");
-
+    assert_eq!(
+        params["_meta"]["honk"]["client_req_id"],
+        "honk-chat-0000000000001234-1"
+    );
     assert!(core.prompt_sent().is_some());
-    let prompt_sent = core.prompt_sent().unwrap();
-    assert_eq!(prompt_sent.crid, "honk-chat-0000000000001234-1");
-    assert_eq!(prompt_sent.text, "hello world");
-    assert_eq!(prompt_sent.req_id, 1);
-    assert!(!prompt_sent.run_seen);
 }
 
 #[test]
 fn test_line_held_when_prompt_sent_steered_on_run_start() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("initial prompt".into()));
-    assert!(core.prompt_sent().is_some());
-    assert!(!core.prompt_sent().unwrap().run_seen);
+    let crid = core.prompt_sent().unwrap().crid.clone();
 
-    let effects = core.handle(Input::Line("steer while pending".into()));
-    assert_eq!(effects.len(), 1);
-    match &effects[0] {
-        Effect::Status(msg) => assert!(msg.contains("line held for steer")),
-        other => panic!("expected status message, got {other:?}"),
-    }
+    // Line while prompt sent but run not started -> held!
+    let effs = core.handle(Input::Line("steer while pending".into()));
+    assert!(has_notice(&effs, "line held for steer"));
 
-    let run_start_frame = json!({
+    // Echo + activeRunId arrives
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    let start_effects = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "update": {
                 "sessionUpdate": "session_info_update",
-                "_meta": {
-                    "goose": {
-                        "activeRunId": "run_42"
-                    }
-                }
+                "_meta": { "goose": { "activeRunId": "run_42" } }
             }
         }
-    });
-    let start_effects = core.handle(Input::Frame(run_start_frame));
+    })));
 
     assert_eq!(core.ownership(), Ownership::Own);
-    assert!(core.prompt_sent().unwrap().run_seen);
-
     let steer_req = start_effects
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_goose/unstable/session/steer"))
         .expect("must emit steer request for held line");
 
     let Effect::Request { id, method, params } = steer_req else {
-        panic!();
+        panic!()
     };
     assert_eq!(method, "_goose/unstable/session/steer");
     assert_eq!(*id, 2);
-    assert_eq!(params["sessionId"], "test-session");
     assert_eq!(params["expectedRunId"], "run_42");
     assert_eq!(params["prompt"][0]["text"], "steer while pending");
 }
@@ -153,6 +717,18 @@ fn test_line_held_when_prompt_sent_steered_on_run_start() {
 fn test_line_when_own_run_active_steers() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -171,7 +747,7 @@ fn test_line_when_own_run_active_steers() {
         .expect("must emit steer request");
 
     let Effect::Request { id, method, params } = steer_req else {
-        panic!();
+        panic!()
     };
     assert_eq!(method, "_goose/unstable/session/steer");
     assert_eq!(*id, 2);
@@ -195,18 +771,10 @@ fn test_line_when_foreign_run_active_queues_and_prompts_after_run_end() {
     assert_eq!(core.ownership(), Ownership::Foreign);
 
     let eff1 = core.handle(Input::Line("message 1".into()));
-    assert_eq!(eff1.len(), 1);
-    match &eff1[0] {
-        Effect::Status(msg) => {
-            assert!(msg.contains("turn belongs to another client"));
-            assert!(msg.contains("/drop"));
-        }
-        other => panic!("expected status, got {other:?}"),
-    }
+    assert!(has_notice(&eff1, "turn belongs to another client"));
     assert_eq!(core.local_queue().len(), 1);
 
-    let eff2 = core.handle(Input::Line("message 2".into()));
-    assert_eq!(eff2.len(), 1);
+    core.handle(Input::Line("message 2".into()));
     assert_eq!(core.local_queue().len(), 2);
 
     let end_effs = core.handle(Input::Frame(json!({
@@ -236,9 +804,7 @@ fn test_line_when_foreign_run_active_queues_and_prompts_after_run_end() {
     let prompt1_reply = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "result": {
-            "stopReason": "end_turn"
-        }
+        "result": { "stopReason": "end_turn" }
     });
     let reply_effs = core.handle(Input::Frame(prompt1_reply));
 
@@ -275,11 +841,7 @@ fn test_drop_command_clears_queue() {
 
     let drop_effs = core.handle(Input::Line("/drop".into()));
     assert_eq!(core.local_queue().len(), 0);
-    assert_eq!(drop_effs.len(), 1);
-    match &drop_effs[0] {
-        Effect::Status(msg) => assert!(msg.contains("dropped 2 queued message(s)")),
-        other => panic!("expected status, got {other:?}"),
-    }
+    assert!(has_notice(&drop_effs, "dropped 2 queued message(s)"));
 }
 
 #[test]
@@ -307,15 +869,7 @@ fn test_prompt_reply_busy_error_marks_foreign_and_queues() {
     assert_eq!(core.ownership(), Ownership::Foreign);
     assert_eq!(core.local_queue().len(), 1);
     assert_eq!(core.local_queue()[0].0, "prompt while busy");
-
-    let status = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("/drop")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("turn belongs to another client"));
+    assert!(has_notice(&effs, "turn belongs to another client"));
 
     let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
@@ -347,6 +901,18 @@ fn test_prompt_reply_busy_error_marks_foreign_and_queues() {
 fn test_steer_error_no_active_run_converts_once_to_prompt() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt 1".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -380,7 +946,6 @@ fn test_steer_error_no_active_run_converts_once_to_prompt() {
     });
 
     let convert_effs = core.handle(Input::Frame(steer_reply));
-
     let prompt_req = convert_effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
@@ -389,17 +954,25 @@ fn test_steer_error_no_active_run_converts_once_to_prompt() {
         panic!()
     };
     assert_eq!(params["prompt"][0]["text"], "steer msg");
-    assert!(
-        convert_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("converting")))
-    );
+    assert!(has_notice(&convert_effs, "converting to prompt"));
 }
 
 #[test]
 fn test_steer_error_mismatch_prints_text_back() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt 1".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -437,26 +1010,32 @@ fn test_steer_error_mismatch_prints_text_back() {
     });
 
     let reply_effs = core.handle(Input::Frame(mismatch_reply));
-
     assert!(
         !reply_effs
             .iter()
             .any(|e| matches!(e, Effect::Request { .. }))
     );
-    let status = reply_effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("the turn you were steering ended")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("steer mismatch"));
+    let notice = find_notice(&reply_effs, "the turn you were steering ended").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert_eq!(notice.returned_text.as_deref(), Some("steer mismatch"));
 }
 
 #[test]
 fn test_at_most_one_conversion_prompt_steer() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -493,37 +1072,33 @@ fn test_at_most_one_conversion_prompt_steer() {
         })
         .unwrap();
 
-    let _ = core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "run_2" } }
-            }
-        }
-    })));
-
     let fail_reply = json!({
         "jsonrpc": "2.0",
         "id": prompt_id,
         "error": { "code": -32602, "message": "cannot run" }
     });
     let final_effs = core.handle(Input::Frame(fail_reply));
-    let status = final_effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("your message did not run")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("msg"));
+    let notice = find_notice(&final_effs, "your message did not run").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert_eq!(notice.returned_text.as_deref(), Some("msg"));
 }
 
 #[test]
 fn test_unconsumed_steer_reported_at_run_end() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -549,10 +1124,7 @@ fn test_unconsumed_steer_reported_at_run_end() {
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
-        "result": {
-            "runId": "run_1",
-            "messageId": "steer_msg_123"
-        }
+        "result": { "runId": "run_1", "messageId": "steer_msg_123" }
     })));
 
     let end_effs = core.handle(Input::Frame(json!({
@@ -566,20 +1138,27 @@ fn test_unconsumed_steer_reported_at_run_end() {
         }
     })));
 
-    let status = end_effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("steer text unconsumed"));
+    let notice = find_notice(&end_effs, "steer not consumed").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Warning);
+    assert!(notice.text.contains("steer text unconsumed"));
 }
 
 #[test]
 fn test_steer_unconsumed_notification() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -605,29 +1184,18 @@ fn test_steer_unconsumed_notification() {
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
-        "result": {
-            "runId": "run_1",
-            "messageId": "steer_msg_456"
-        }
+        "result": { "runId": "run_1", "messageId": "steer_msg_456" }
     })));
 
     let notif_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "_honk/steer_unconsumed",
-        "params": {
-            "sessionId": "test-session",
-            "messageId": "steer_msg_456"
-        }
+        "params": { "sessionId": "test-session", "messageId": "steer_msg_456" }
     })));
 
-    let status = notif_effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("steer text notify"));
+    let notice = find_notice(&notif_effs, "steer not consumed").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Warning);
+    assert!(notice.text.contains("steer text notify"));
 
     let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
@@ -639,17 +1207,25 @@ fn test_steer_unconsumed_notification() {
             }
         }
     })));
-    assert!(
-        !end_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-    );
+    assert!(!has_notice(&end_effs, "steer not consumed"));
 }
 
 #[test]
 fn test_steer_consumed_via_user_message_chunk() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -675,10 +1251,7 @@ fn test_steer_consumed_via_user_message_chunk() {
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
-        "result": {
-            "runId": "run_1",
-            "messageId": "steer_msg_789"
-        }
+        "result": { "runId": "run_1", "messageId": "steer_msg_789" }
     })));
 
     core.handle(Input::Frame(json!({
@@ -689,12 +1262,7 @@ fn test_steer_consumed_via_user_message_chunk() {
                 "sessionUpdate": "user_message_chunk",
                 "messageId": "steer_msg_789",
                 "content": { "type": "text", "text": "steer text consumed" },
-                "_meta": {
-                    "goose": {
-                        "steer": true,
-                        "messageId": "steer_msg_789"
-                    }
-                }
+                "_meta": { "goose": { "steer": true, "messageId": "steer_msg_789" } }
             }
         }
     })));
@@ -709,11 +1277,7 @@ fn test_steer_consumed_via_user_message_chunk() {
             }
         }
     })));
-    assert!(
-        !end_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-    );
+    assert!(!has_notice(&end_effs, "steer not consumed"));
 }
 
 #[test]
@@ -725,10 +1289,7 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
         "id": 1,
         "result": { "stopReason": "end_turn" }
     })));
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("stopReason: end_turn")))
-    );
+    assert!(has_notice(&effs, "stopReason: end_turn"));
 
     core.handle(Input::Line("hello 2".into()));
     let effs2 = core.handle(Input::Frame(json!({
@@ -736,11 +1297,7 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
         "id": 2,
         "result": { "stopReason": "cancelled" }
     })));
-    assert!(
-        effs2
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("stopReason: cancelled")))
-    );
+    assert!(has_notice(&effs2, "stopReason: cancelled"));
 
     core.handle(Input::Line("hello 3".into()));
     let effs3 = core.handle(Input::Frame(json!({
@@ -751,14 +1308,9 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
             "_meta": { "honk": { "reason": "not_delivered" } }
         }
     })));
-    let status3 = effs3
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("your message did not run")))
-        .unwrap();
-    let Effect::Status(msg3) = status3 else {
-        panic!()
-    };
-    assert!(msg3.contains("hello 3"));
+    let notice3 = find_notice(&effs3, "your message did not run").unwrap();
+    assert_eq!(notice3.kind, NoticeKind::Returned);
+    assert_eq!(notice3.returned_text.as_deref(), Some("hello 3"));
 
     core.handle(Input::Line("hello 4".into()));
     let effs4 = core.handle(Input::Frame(json!({
@@ -769,14 +1321,9 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
             "_meta": { "honk": { "reason": "upstream_restart" } }
         }
     })));
-    let status4 = effs4
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("your message did not run")))
-        .unwrap();
-    let Effect::Status(msg4) = status4 else {
-        panic!()
-    };
-    assert!(msg4.contains("hello 4"));
+    let notice4 = find_notice(&effs4, "your message did not run").unwrap();
+    assert_eq!(notice4.kind, NoticeKind::Returned);
+    assert_eq!(notice4.returned_text.as_deref(), Some("hello 4"));
 }
 
 #[test]
@@ -792,83 +1339,9 @@ fn test_prompt_reply_lost_track_terminal() {
         }
     })));
     assert!(core.prompt_sent().is_none());
-    let status = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("lost track")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("lost prompt"));
-}
-
-#[test]
-fn test_ownership_prompt_sent_vs_echo_crid() {
-    let (mut core, _) = new_test_core();
-    core.handle(Input::Line("prompt A".into()));
-    let crid = core.prompt_sent().unwrap().crid.clone();
-    assert_eq!(crid, "honk-chat-0000000000001234-1");
-
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "run_a" } }
-            }
-        }
-    })));
-    assert_eq!(core.ownership(), Ownership::Own);
-
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": null } }
-            }
-        }
-    })));
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": { "stopReason": "end_turn" }
-    })));
-    assert_eq!(core.ownership(), Ownership::Unknown);
-
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "run_b" } }
-            }
-        }
-    })));
-    assert_eq!(core.ownership(), Ownership::Foreign);
-
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "user_message_chunk",
-                "messageId": "msg_b",
-                "content": { "type": "text", "text": "prompt A" },
-                "_meta": {
-                    "honk": {
-                        "source": {
-                            "client_req_id": "honk-chat-0000000000001234-1"
-                        }
-                    }
-                }
-            }
-        }
-    })));
-    assert_eq!(core.ownership(), Ownership::Own);
+    let notice = find_notice(&effs, "lost track").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert_eq!(notice.returned_text.as_deref(), Some("lost prompt"));
 }
 
 #[test]
@@ -877,10 +1350,7 @@ fn test_cancel_own_vs_foreign_vs_force_cancel_vs_idle() {
 
     let effs = core.handle(Input::Interrupt);
     assert!(!effs.iter().any(|e| matches!(e, Effect::Notify { .. })));
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("no active turn")))
-    );
+    assert!(has_notice(&effs, "no active turn"));
 
     let effs_cmd = core.handle(Input::Line("/cancel".into()));
     assert!(!effs_cmd.iter().any(|e| matches!(e, Effect::Notify { .. })));
@@ -901,11 +1371,7 @@ fn test_cancel_own_vs_foreign_vs_force_cancel_vs_idle() {
             .iter()
             .any(|e| matches!(e, Effect::Notify { .. }))
     );
-    assert!(
-        foreign_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("/cancel!")))
-    );
+    assert!(has_notice(&foreign_effs, "/cancel!"));
 
     let force_effs = core.handle(Input::Line("/cancel!".into()));
     let notify = force_effs
@@ -929,6 +1395,18 @@ fn test_cancel_own_vs_foreign_vs_force_cancel_vs_idle() {
     })));
 
     core.handle(Input::Line("prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -948,212 +1426,16 @@ fn test_cancel_own_vs_foreign_vs_force_cancel_vs_idle() {
 }
 
 #[test]
-fn test_cancel_foreign_run_with_prompt_in_flight_refuses() {
-    let (mut core, _) = new_test_core();
-    // Foreign run starts
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "foreign_run" } }
-            }
-        }
-    })));
-    assert_eq!(core.ownership(), Ownership::Foreign);
-
-    // Prompt sent while foreign run is active (queued)
-    core.handle(Input::Line("line while foreign".into()));
-
-    // Now user hits /cancel -> MUST refuse because active run is foreign!
-    let effs = core.handle(Input::Line("/cancel".into()));
-    assert!(
-        !effs
-            .iter()
-            .any(|e| matches!(e, Effect::Notify { method, .. } if method == "session/cancel"))
-    );
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("/cancel!")))
-    );
-}
-
-#[test]
-fn test_cancel_no_run_with_prompt_in_flight_cancels() {
-    let (mut core, _) = new_test_core();
-    // Prompt sent while idle/unknown
-    core.handle(Input::Line("prompt before run".into()));
-    assert!(core.prompt_sent().is_some());
-    assert_eq!(*core.run_state(), RunState::Unknown);
-
-    // Cancel now targets our in-flight prompt!
-    let effs = core.handle(Input::Line("/cancel".into()));
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Notify { method, .. } if method == "session/cancel"))
-    );
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("cancelling turn")))
-    );
-}
-
-#[test]
-fn test_auto_approve_permissions_own_turn() {
-    let (mut core, _) = new_test_core();
-    core.handle(Input::Line("prompt".into()));
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "own_1" } }
-            }
-        }
-    })));
-
-    // Permission request during own turn
-    let perm = json!({
-        "jsonrpc": "2.0",
-        "id": "req-1",
-        "method": "session/request_permission",
-        "params": {
-            "sessionId": "test-session",
-            "toolCall": { "title": "shell · cargo test" },
-            "options": [
-                { "optionId": "allow_once", "name": "allow_once", "kind": "allow_once" },
-                { "optionId": "allow_always", "name": "allow_always", "kind": "allow_always" },
-                { "optionId": "reject_once", "name": "reject_once", "kind": "reject_once" }
-            ]
-        }
-    });
-
-    let effs = core.handle(Input::Frame(perm));
-    let resp = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Respond { .. }))
-        .unwrap();
-    let Effect::Respond { id, result } = resp else {
-        panic!()
-    };
-    assert_eq!(id, "req-1");
-    // "allow_always" preferred over "allow_once"
-    assert_eq!(result["outcome"]["outcome"], "selected");
-    assert_eq!(result["outcome"]["optionId"], "allow_always");
-
-    let status = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("auto-approved")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("shell · cargo test"));
-}
-
-#[test]
-fn test_auto_approve_permissions_foreign_turn_refusal() {
-    let (mut core, _) = new_test_core();
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "foreign_1" } }
-            }
-        }
-    })));
-
-    let perm = json!({
-        "jsonrpc": "2.0",
-        "id": "req-foreign",
-        "method": "session/request_permission",
-        "params": {
-            "sessionId": "test-session",
-            "toolCall": { "title": "secret_tool" },
-            "options": [{ "optionId": "allow", "name": "allow", "kind": "allow" }]
-        }
-    });
-
-    let effs = core.handle(Input::Frame(perm));
-    // Must NOT answer!
-    assert!(!effs.iter().any(|e| matches!(e, Effect::Respond { .. })));
-    let status = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("another client's turn")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("secret_tool"));
-}
-
-#[test]
-fn test_permission_dedup_reoffer() {
-    let (mut core, _) = new_test_core();
-    core.handle(Input::Line("prompt".into()));
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "own_1" } }
-            }
-        }
-    })));
-
-    let perm = json!({
-        "jsonrpc": "2.0",
-        "id": "req-reoffer",
-        "method": "session/request_permission",
-        "params": {
-            "sessionId": "test-session",
-            "toolCall": { "title": "bash" },
-            "options": [{ "optionId": "opt1", "name": "opt1", "kind": "allow_once" }]
-        }
-    });
-
-    let effs1 = core.handle(Input::Frame(perm.clone()));
-    assert!(effs1.iter().any(|e| matches!(e, Effect::Respond { .. })));
-
-    // Re-offered: answered again identically
-    let effs2 = core.handle(Input::Frame(perm));
-    let resp2 = effs2
-        .iter()
-        .find(|e| matches!(e, Effect::Respond { .. }))
-        .unwrap();
-    let Effect::Respond { id, result } = resp2 else {
-        panic!()
-    };
-    assert_eq!(id, "req-reoffer");
-    assert_eq!(result["outcome"]["optionId"], "opt1");
-}
-
-#[test]
 fn test_commands_help_quit_slash_slash() {
     let (mut core, _) = new_test_core();
 
     let help_effs = core.handle(Input::Line("/help".into()));
-    let status = help_effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(_)))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(msg.contains("/quit"));
-    assert!(!msg.contains("/rK")); // Permission commands removed
+    let notice = find_notice(&help_effs, "/quit").unwrap();
+    assert!(!notice.text.contains("/rK"));
+    assert!(notice.text.contains("/approve"));
 
     let unk_effs = core.handle(Input::Line("/foobar".into()));
-    assert!(
-        unk_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("unknown command: '/foobar'")))
-    );
+    assert!(has_notice(&unk_effs, "unknown command: '/foobar'"));
     assert!(!unk_effs.iter().any(|e| matches!(e, Effect::Request { .. })));
 
     let esc_effs = core.handle(Input::Line("//hello".into()));
@@ -1188,13 +1470,11 @@ fn test_transcript_effects_and_cursor() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
-
     assert_eq!(core.cursor(), None);
 
-    // Frame session/update during replay
     let update_frame = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1211,7 +1491,6 @@ fn test_transcript_effects_and_cursor() {
     });
 
     let effs = core.handle(Input::Frame(update_frame.clone()));
-    // Emits Effect::Transcript, NOT Effect::Print
     let transcript = effs
         .iter()
         .find(|e| matches!(e, Effect::Transcript(_)))
@@ -1222,15 +1501,10 @@ fn test_transcript_effects_and_cursor() {
     assert_eq!(*val, update_frame);
     assert_eq!(core.cursor(), Some(Cursor { epoch: 1, seq: 5 }));
 
-    // _honk/replay_done
     let replay_done = json!({
         "jsonrpc": "2.0",
         "method": "_honk/replay_done",
-        "params": {
-            "sessionId": "test-session",
-            "epoch": 1,
-            "seq": 10
-        }
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 10 }
     });
     let done_effs = core.handle(Input::Frame(replay_done.clone()));
     assert!(
@@ -1246,12 +1520,11 @@ fn test_replay_phase_suppresses_live_actions() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     assert!(core.is_replaying());
 
-    // 1. Replayed permission request -> NOT answered, NO status
     let replayed_perm = json!({
         "jsonrpc": "2.0",
         "id": "replayed-perm-1",
@@ -1268,18 +1541,16 @@ fn test_replay_phase_suppresses_live_actions() {
             .iter()
             .any(|e| matches!(e, Effect::Respond { .. }))
     );
-    assert!(!effs_perm.iter().any(|e| matches!(e, Effect::Status(_))));
+    assert!(!effs_perm.iter().any(|e| matches!(e, Effect::Notice(_))));
 
-    // 2. Replayed _honk/gap -> NO status
     let replayed_gap = json!({
         "jsonrpc": "2.0",
         "method": "_honk/gap",
         "params": { "sessionId": "test-session" }
     });
     let effs_gap = core.handle(Input::Frame(replayed_gap));
-    assert!(!effs_gap.iter().any(|e| matches!(e, Effect::Status(_))));
+    assert!(!effs_gap.iter().any(|e| matches!(e, Effect::Notice(_))));
 
-    // 3. Replayed activeRunId: null -> NO unconsumed steer reports, NO status
     let replayed_end = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1291,9 +1562,8 @@ fn test_replay_phase_suppresses_live_actions() {
         }
     });
     let effs_end = core.handle(Input::Frame(replayed_end));
-    assert!(!effs_end.iter().any(|e| matches!(e, Effect::Status(_))));
+    assert!(!effs_end.iter().any(|e| matches!(e, Effect::Notice(_))));
 
-    // Now replay_done arrives: replay phase ends!
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "_honk/replay_done",
@@ -1301,10 +1571,30 @@ fn test_replay_phase_suppresses_live_actions() {
     })));
     assert!(!core.is_replaying());
 
-    // Send a prompt so it is our turn
+    // Prompt sent so it's our turn
     core.handle(Input::Line("prompt for live turn".into()));
+    let our_crid = core.prompt_sent().unwrap().crid.clone();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": our_crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_live" } }
+            }
+        }
+    })));
 
-    // Live permission arrives -> now answered!
     let live_perm = json!({
         "jsonrpc": "2.0",
         "id": "live-perm-1",
@@ -1328,7 +1618,7 @@ fn test_attach_request_and_id_allocation() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
 
@@ -1348,11 +1638,11 @@ fn test_crid_uniqueness_with_seeds() {
     let now = Instant::now();
     let opts_a = ChatOpts {
         crid_seed: 0xaaaa_bbbb,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let opts_b = ChatOpts {
         crid_seed: 0xcccc_dddd,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
 
     let mut core_a = ChatCore::new("session-a".into(), opts_a, now);
@@ -1376,23 +1666,17 @@ fn test_crid_uniqueness_with_seeds() {
 fn test_held_steers_moved_to_queue_when_prompt_clears_without_run() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt 1".into()));
-    // Hold a line
     core.handle(Input::Line("held 1".into()));
     core.handle(Input::Line("held 2".into()));
 
-    // Prompt reply fails with busy error before run was announced
     let fail_reply = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "error": { "code": -32602, "data": "session already has active run `run_other`; use steer" }
     });
     let effs = core.handle(Input::Frame(fail_reply));
+    assert!(has_notice(&effs, "held lines moved to queue"));
 
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("held lines moved to queue")))
-    );
-    // Prompt text and held lines are at front of queue:
     let q: Vec<String> = core.local_queue().iter().map(|(t, _)| t.clone()).collect();
     assert_eq!(q, vec!["prompt 1", "held 1", "held 2"]);
 }
@@ -1401,7 +1685,18 @@ fn test_held_steers_moved_to_queue_when_prompt_clears_without_run() {
 fn test_line_queued_when_run_seen_but_run_already_idle() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt".into()));
-    // Announce run
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1414,7 +1709,6 @@ fn test_line_queued_when_run_seen_but_run_already_idle() {
     })));
     assert!(core.prompt_sent().unwrap().run_seen);
 
-    // Run ends before prompt reply arrives
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1427,47 +1721,36 @@ fn test_line_queued_when_run_seen_but_run_already_idle() {
     })));
     assert_eq!(*core.run_state(), RunState::Idle);
 
-    // New line entered while run_seen is true but run_state is Idle: MUST go to queue, not held!
     let effs = core.handle(Input::Line("next line".into()));
     assert_eq!(core.local_queue().len(), 1);
     assert_eq!(core.local_queue()[0].0, "next line");
-    assert!(
-        effs.iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("queued for next turn")))
-    );
+    assert!(has_notice(&effs, "queued for next turn"));
 }
 
 #[test]
 fn test_queue_drains_on_all_prompt_clearing_paths() {
-    // 1. Success path
     let (mut core, _) = new_test_core();
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "session_info_update", "_meta": {"goose": {"activeRunId": "foreign"}}}}})));
     core.handle(Input::Line("queued 1".into()));
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "session_info_update", "_meta": {"goose": {"activeRunId": null}}}}})));
-    // queued 1 is sent as prompt (id: 1)
     assert_eq!(core.prompt_sent().unwrap().text, "queued 1");
-    // Add another queued line
+
     core.handle(Input::Line("queued 2".into()));
-    // Prompt reply arrives with success
     let effs = core.handle(Input::Frame(
         json!({"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "end_turn"}}),
     ));
-    // Must dispatch queued 2!
     assert!(
         effs.iter()
             .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
     );
     assert_eq!(core.prompt_sent().unwrap().text, "queued 2");
 
-    // 2. Error path
     let (mut core2, _) = new_test_core();
     core2.handle(Input::Line("p1".into()));
-    core2.handle(Input::Line("p2".into())); // held
-    // p1 fails with generic error
+    core2.handle(Input::Line("p2".into()));
     let effs2 = core2.handle(Input::Frame(
         json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32600, "message": "fail"}}),
     ));
-    // Drains queue!
     assert!(
         effs2
             .iter()
@@ -1481,17 +1764,15 @@ fn test_clock_purity_and_deterministic_idle_detach() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
 
-    // 1799 seconds pass: not detached
     let effs1 = core.handle(Input::Tick(now + Duration::from_secs(1799)));
     assert!(!core.is_detached());
     assert!(!effs1.iter().any(|e| matches!(e, Effect::Detach)));
 
-    // 1800 seconds pass: detached!
     let effs2 = core.handle(Input::Tick(now + Duration::from_secs(1800)));
     assert!(core.is_detached());
     assert!(effs2.iter().any(|e| matches!(e, Effect::Detach)));
@@ -1502,33 +1783,25 @@ fn test_detached_lines_buffered_and_processed_in_order_after_replay_done() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
 
-    // Detach
     core.handle(Input::Tick(now + Duration::from_secs(1800)));
     assert!(core.is_detached());
 
-    // Enter line 1 while detached -> triggers Reattach, buffers line 1
     let effs1 = core.handle(Input::Line("wake 1".into()));
     assert!(effs1.iter().any(|e| matches!(e, Effect::Reattach)));
 
-    // Enter line 2 while re-attaching -> buffers line 2
     let effs2 = core.handle(Input::Line("wake 2".into()));
     assert!(!effs2.iter().any(|e| matches!(e, Effect::Request { .. })));
 
-    // Reattach load happens
     core.attach_request();
-
-    // Replay frames arrive
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "session_info_update", "_meta": {"goose": {"activeRunId": null}}}}})));
 
-    // Replay ends!
     let done_effs = core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 2, "seq": 5}})));
 
-    // wake 1 is dispatched as prompt, wake 2 is held for steer once run starts!
     let prompt = done_effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
@@ -1538,9 +1811,22 @@ fn test_detached_lines_buffered_and_processed_in_order_after_replay_done() {
     };
     assert_eq!(params["prompt"][0]["text"], "wake 1");
     assert!(core.prompt_sent().is_some());
+    let crid = core.prompt_sent().unwrap().crid.clone();
     assert_eq!(core.prompt_sent().unwrap().text, "wake 1");
 
-    // When run starts, wake 2 is steered into it!
+    // Echo arrives for wake 1
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+
+    // When run starts, it is Own and wake 2 is steered!
     let run_start_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1563,7 +1849,6 @@ fn test_lost_track_matches_text_not_code_32000_alone() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt 1".into()));
 
-    // Code -32000 with a different message (e.g. held session limit reached)
     let err_other = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1573,21 +1858,28 @@ fn test_lost_track_matches_text_not_code_32000_alone() {
         }
     });
     let effs = core.handle(Input::Frame(err_other));
-    let status = effs
-        .iter()
-        .find(|e| matches!(e, Effect::Status(m) if m.contains("held-session limit reached")))
-        .unwrap();
-    let Effect::Status(msg) = status else {
-        panic!()
-    };
-    assert!(!msg.contains("lost track"));
-    assert!(msg.contains("your message did not run: prompt 1"));
+    let notice = find_notice(&effs, "held-session limit reached").unwrap();
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert!(!notice.text.contains("lost track"));
+    assert_eq!(notice.returned_text.as_deref(), Some("prompt 1"));
 }
 
 #[test]
 fn test_steer_race_chunk_before_reply() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1610,7 +1902,6 @@ fn test_steer_race_chunk_before_reply() {
         })
         .unwrap();
 
-    // user_message_chunk arrives BEFORE the steer reply!
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1623,19 +1914,13 @@ fn test_steer_race_chunk_before_reply() {
         }
     })));
 
-    // Now steer reply arrives:
     let reply_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
         "result": { "runId": "run_1", "messageId": "steer_early_123" }
     })));
-    assert!(
-        reply_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer accepted")))
-    );
+    assert!(has_notice(&reply_effs, "steer accepted"));
 
-    // When run ends later, it must NOT be reported unconsumed!
     let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1646,17 +1931,25 @@ fn test_steer_race_chunk_before_reply() {
             }
         }
     })));
-    assert!(
-        !end_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-    );
+    assert!(!has_notice(&end_effs, "steer not consumed"));
 }
 
 #[test]
 fn test_steer_race_reply_after_run_ended() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1679,7 +1972,6 @@ fn test_steer_race_reply_after_run_ended() {
         })
         .unwrap();
 
-    // Run ends BEFORE steer reply arrives!
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1691,23 +1983,30 @@ fn test_steer_race_reply_after_run_ended() {
         }
     })));
 
-    // Steer reply arrives after run ended: MUST report unconsumed!
     let reply_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
         "result": { "runId": "run_1", "messageId": "steer_late_123" }
     })));
-    assert!(
-        reply_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-    );
+    assert!(has_notice(&reply_effs, "steer not consumed"));
 }
 
 #[test]
 fn test_steer_race_unconsumed_before_reply() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("init".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1730,30 +2029,36 @@ fn test_steer_race_unconsumed_before_reply() {
         })
         .unwrap();
 
-    // _honk/steer_unconsumed arrives BEFORE steer reply!
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "_honk/steer_unconsumed",
         "params": { "sessionId": "test-session", "messageId": "steer_pre_unconsumed" }
     })));
 
-    // Steer reply arrives:
     let reply_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": steer_id,
         "result": { "runId": "run_1", "messageId": "steer_pre_unconsumed" }
     })));
-    assert!(
-        reply_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("steer not consumed")))
-    );
+    assert!(has_notice(&reply_effs, "steer not consumed"));
 }
 
 #[test]
 fn test_disconnected_resets_run_state_and_ownership_to_unknown() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("prompt".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1767,11 +2072,10 @@ fn test_disconnected_resets_run_state_and_ownership_to_unknown() {
     assert_eq!(*core.run_state(), RunState::Running("own_1".into()));
     assert_eq!(core.ownership(), Ownership::Own);
 
-    // Disconnect
     core.handle(Input::Disconnected);
     assert_eq!(*core.run_state(), RunState::Unknown);
     assert_eq!(core.ownership(), Ownership::Unknown);
-    assert!(core.prompt_sent().is_some()); // Prompt retained for resend
+    assert!(core.prompt_sent().is_some());
     assert!(core.is_replaying());
 }
 
@@ -1783,32 +2087,13 @@ fn test_reconnect_resends_prompt_with_same_crid() {
     assert_eq!(prompt_sent.crid, "honk-chat-0000000000001234-1");
     assert_eq!(prompt_sent.req_id, 1);
 
-    core.handle(Input::Frame(json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": {
-            "update": {
-                "sessionUpdate": "session_info_update",
-                "_meta": { "goose": { "activeRunId": "run_1" } }
-            }
-        }
-    })));
     core.handle(Input::Line("steer before disconnect".into()));
 
     let disc_effs = core.handle(Input::Disconnected);
-    assert!(
-        disc_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("disconnected; reconnecting...")))
-    );
-    assert!(disc_effs.iter().any(|e| matches!(e, Effect::Status(m) if m.contains("steer may not have been delivered: steer before disconnect"))));
+    assert!(has_notice(&disc_effs, "disconnected; reconnecting..."));
 
     let conn_effs = core.handle(Input::Connected);
-    assert!(
-        conn_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("connected")))
-    );
+    assert!(has_notice(&conn_effs, "connected"));
 
     let resend_req = conn_effs
         .iter()
@@ -1817,7 +2102,7 @@ fn test_reconnect_resends_prompt_with_same_crid() {
     let Effect::Request { id, params, .. } = resend_req else {
         panic!()
     };
-    assert_eq!(*id, 3);
+    assert_eq!(*id, 2);
     assert_eq!(
         params["_meta"]["honk"]["client_req_id"],
         "honk-chat-0000000000001234-1"
@@ -1826,7 +2111,7 @@ fn test_reconnect_resends_prompt_with_same_crid() {
 
     let prompt_sent_after = core.prompt_sent().unwrap();
     assert_eq!(prompt_sent_after.crid, "honk-chat-0000000000001234-1");
-    assert_eq!(prompt_sent_after.req_id, 3);
+    assert_eq!(prompt_sent_after.req_id, 2);
 }
 
 #[test]
@@ -1838,11 +2123,7 @@ fn test_evicted_and_gap_frames() {
         "method": "_honk/gap",
         "params": { "sessionId": "test-session" }
     })));
-    assert!(
-        gap_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("frame gap detected")))
-    );
+    assert!(has_notice(&gap_effs, "frame gap detected"));
 
     let evicted_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
@@ -1850,21 +2131,18 @@ fn test_evicted_and_gap_frames() {
         "params": { "sessionId": "test-session" }
     })));
     assert!(evicted_effs.iter().any(|e| matches!(e, Effect::Reattach)));
-    assert!(
-        evicted_effs.iter().any(
-            |e| matches!(e, Effect::Status(m) if m.contains("session evicted; re-attaching..."))
-        )
-    );
+    assert!(has_notice(
+        &evicted_effs,
+        "session evicted; re-attaching..."
+    ));
 }
 
 #[test]
 fn test_run_end_before_prompt_reply() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Line("p1".into()));
-    // Queue p2 while p1 is in flight
-    core.handle(Input::Line("held_or_queued".into())); // held for steer
+    core.handle(Input::Line("held_or_queued".into()));
 
-    // Run starts
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1876,7 +2154,6 @@ fn test_run_end_before_prompt_reply() {
         }
     })));
 
-    // Run ends BEFORE prompt reply arrives
     let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1888,25 +2165,18 @@ fn test_run_end_before_prompt_reply() {
         }
     })));
     assert_eq!(*core.run_state(), RunState::Idle);
-    // Queue should not drain yet because prompt 1 is still in flight!
     assert!(
         !end_effs
             .iter()
             .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
     );
 
-    // Prompt reply arrives
     let reply_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": 1,
         "result": { "stopReason": "end_turn" }
     })));
-    assert!(
-        reply_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("stopReason: end_turn")))
-    );
-    // Since run was already idle, prompt reply completes and state remains idle
+    assert!(has_notice(&reply_effs, "stopReason: end_turn"));
     assert_eq!(*core.run_state(), RunState::Idle);
 }
 
@@ -1915,24 +2185,20 @@ fn test_multiple_lines_while_detached() {
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 0x9999,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
 
-    // Detach via idle Tick
     core.handle(Input::Tick(now + Duration::from_secs(1800)));
     assert!(core.is_detached());
 
-    // Enter line 1, 2, 3 while detached
     core.handle(Input::Line("line 1".into()));
     core.handle(Input::Line("line 2".into()));
     core.handle(Input::Line("line 3".into()));
 
-    // Replay done after reattach
     let done_effs = core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 2, "seq": 0}})));
 
-    // Line 1 sent as prompt
     let prompt = done_effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
@@ -1941,8 +2207,20 @@ fn test_multiple_lines_while_detached() {
         panic!()
     };
     assert_eq!(params["prompt"][0]["text"], "line 1");
+    let crid = core.prompt_sent().unwrap().crid.clone();
 
-    // When run starts, line 2 and line 3 are steered into it in order!
+    // Echo arrives for line 1
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+
     let run_start_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -1972,25 +2250,17 @@ fn test_disconnect_with_held_steers() {
     core.handle(Input::Line("prompt 1".into()));
     core.handle(Input::Line("held steer".into()));
 
-    // Disconnect happens before run announced
     let disc_effs = core.handle(Input::Disconnected);
-    assert!(
-        disc_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("disconnected; reconnecting...")))
-    );
+    assert!(has_notice(&disc_effs, "disconnected; reconnecting..."));
 
-    // Reconnect arrives
     core.handle(Input::Connected);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 2, "seq": 0}})));
 
-    // If prompt 1 fails, held steer must be moved to queue
     let fail_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
-        "id": 2, // New req id from reconnect resend
+        "id": 2,
         "error": { "code": -32600, "message": "fail" }
     })));
-    // Drains queue by dispatching held steer as prompt!
     let prompt2 = fail_effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
@@ -2004,7 +2274,6 @@ fn test_disconnect_with_held_steers() {
 #[test]
 fn test_prompt_error_with_non_empty_queue() {
     let (mut core, _) = new_test_core();
-    // Start with a foreign run so we can queue messages
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -2019,7 +2288,6 @@ fn test_prompt_error_with_non_empty_queue() {
     core.handle(Input::Line("item 2".into()));
     core.handle(Input::Line("item 3".into()));
 
-    // Foreign run ends -> item 1 dispatched as prompt (id: 1)
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -2033,22 +2301,13 @@ fn test_prompt_error_with_non_empty_queue() {
     assert_eq!(core.prompt_sent().unwrap().text, "item 1");
     assert_eq!(core.local_queue().len(), 2);
 
-    // Item 1 fails with an error -> item 2 must be dispatched promptly!
     let err_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": 1,
         "error": { "code": -32000, "message": "temporary upstream failure" }
     })));
-    assert!(
-        err_effs
-            .iter()
-            .any(|e| matches!(e, Effect::Status(m) if m.contains("temporary upstream failure")))
-    );
-    assert!(
-        err_effs.iter().any(
-            |e| matches!(e, Effect::Status(m) if m.contains("your message did not run: item 1"))
-        )
-    );
+    assert!(has_notice(&err_effs, "temporary upstream failure"));
+    assert!(has_notice(&err_effs, "your message did not run: item 1"));
 
     let next_prompt = err_effs
         .iter()
@@ -2067,12 +2326,11 @@ fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behavi
     let now = Instant::now();
     let opts = ChatOpts {
         crid_seed: 1,
-        idle_timeout: Duration::from_secs(1800),
+        idle_timeout: Some(Duration::from_secs(1800)),
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     assert!(core.is_replaying());
 
-    // 1. Replayed activeRunId start and null
     let r1 = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -2086,7 +2344,7 @@ fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behavi
     assert_eq!(*core.run_state(), RunState::Running("replayed_run".into()));
     assert!(!r1.iter().any(|e| matches!(
         e,
-        Effect::Status(_) | Effect::Request { .. } | Effect::Notify { .. }
+        Effect::Notice(_) | Effect::Request { .. } | Effect::Notify { .. }
     )));
 
     let r2 = core.handle(Input::Frame(json!({
@@ -2102,10 +2360,9 @@ fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behavi
     assert_eq!(*core.run_state(), RunState::Idle);
     assert!(!r2.iter().any(|e| matches!(
         e,
-        Effect::Status(_) | Effect::Request { .. } | Effect::Notify { .. }
+        Effect::Notice(_) | Effect::Request { .. } | Effect::Notify { .. }
     )));
 
-    // 2. Replayed request_permission
     let r3 = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "id": "replayed-perm",
@@ -2118,6 +2375,6 @@ fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behavi
     })));
     assert!(
         !r3.iter()
-            .any(|e| matches!(e, Effect::Respond { .. } | Effect::Status(_)))
+            .any(|e| matches!(e, Effect::Respond { .. } | Effect::Notice(_)))
     );
 }

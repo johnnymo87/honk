@@ -12,6 +12,55 @@ pub enum Input {
     Disconnected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Warning,
+    Error,
+    Returned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: String,
+    pub returned_text: Option<String>,
+}
+
+impl Notice {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Info,
+            text: text.into(),
+            returned_text: None,
+        }
+    }
+
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Warning,
+            text: text.into(),
+            returned_text: None,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Error,
+            text: text.into(),
+            returned_text: None,
+        }
+    }
+
+    pub fn returned(text: impl Into<String>, returned: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Returned,
+            text: text.into(),
+            returned_text: Some(returned.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Request {
@@ -28,7 +77,13 @@ pub enum Effect {
         result: Value,
     },
     Transcript(Value),
-    Status(String),
+    Notice(Notice),
+    Attached {
+        result: Value,
+    },
+    AttachFailed {
+        error: Value,
+    },
     Detach,
     Reattach,
     Exit(i32),
@@ -51,21 +106,39 @@ impl RunState {
 pub enum Ownership {
     Unknown,
     Own,
+    Pending,
     Foreign,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChatOpts {
     pub crid_seed: u64,
-    pub idle_timeout: Duration,
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for ChatOpts {
     fn default() -> Self {
         Self {
             crid_seed: 0,
-            idle_timeout: Duration::from_secs(30 * 60),
+            idle_timeout: Some(Duration::from_secs(30 * 60)),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IdAlloc {
+    next_id: u64,
+}
+
+impl IdAlloc {
+    pub fn new() -> Self {
+        Self { next_id: 1 }
+    }
+
+    pub fn allocate(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 }
 
@@ -83,6 +156,13 @@ pub struct PermissionOption {
     pub option_id: String,
     pub name: String,
     pub kind: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingPermission {
+    pub goose_req_id: Value,
+    pub tool_title: String,
+    pub options: Vec<PermissionOption>,
 }
 
 #[derive(Clone, Debug)]
