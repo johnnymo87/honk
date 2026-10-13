@@ -17,6 +17,9 @@ enum Commands {
     /// List sessions tracked by honkd
     List(ListArgs),
     /// Interactive ratatui TUI client for a goose session
+    #[command(
+        long_about = "Interactive ratatui TUI client for a goose session.\n\nSee docs/chat.md for key map, commands, shared session rules, and tmux configuration."
+    )]
     Chat(ChatArgs),
 }
 
