@@ -73,6 +73,7 @@ pub struct Transcript {
     pub tools_expanded: bool,
     pub layout_cache: HashMap<LayoutKey, CachedBlock>,
     pub render_count: usize,
+    last_width: Option<u16>,
     cached_prefix_sums: Option<CachedPrefixSums>,
     pending_rebuild: Option<Box<Transcript>>,
     is_rebuilding: bool,
@@ -97,6 +98,7 @@ impl Transcript {
             tools_expanded: false,
             layout_cache: HashMap::new(),
             render_count: 0,
+            last_width: None,
             cached_prefix_sums: None,
             pending_rebuild: None,
             is_rebuilding: false,
@@ -376,6 +378,11 @@ impl Transcript {
             flags,
         };
 
+        if self.last_width != Some(width) {
+            self.layout_cache.retain(|k, _| k.width == width);
+            self.last_width = Some(width);
+        }
+
         if let Some(entry) = self
             .layout_cache
             .get(&key)
@@ -383,9 +390,6 @@ impl Transcript {
         {
             return entry.lines.clone();
         }
-
-        // Bound total cache: drop entries for different widths on resize
-        self.layout_cache.retain(|k, _| k.width == width);
 
         self.render_count += 1;
 
@@ -784,16 +788,45 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 current_width += token.width;
             } else {
                 // Token itself exceeds max_width (e.g. 100-char continuous string)
-                for c in token.text.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-                    if current_width + cw > max_width && current_width > 0 {
+                // Coalesce: split an over-wide token into chunks of available width,
+                // one span per wrapped line.
+                let mut chars = token.text.chars().peekable();
+                while chars.peek().is_some() {
+                    let avail = max_width.saturating_sub(current_width);
+                    if avail == 0 {
+                        let mut l = Line::from(std::mem::take(&mut current_spans));
+                        l.style = line_style;
+                        result.push(l);
+                        current_width = 0;
+                        continue;
+                    }
+                    let mut chunk = String::new();
+                    let mut chunk_w = 0;
+                    while let Some(&c) = chars.peek() {
+                        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+                        if chunk_w + cw <= avail {
+                            chunk.push(c);
+                            chunk_w += cw;
+                            chars.next();
+                        } else {
+                            if chunk_w == 0 && current_width == 0 {
+                                chunk.push(c);
+                                chunk_w += cw;
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        current_spans.push(Span::styled(chunk, token.style));
+                        current_width += chunk_w;
+                    }
+                    if current_width >= max_width && chars.peek().is_some() {
                         let mut l = Line::from(std::mem::take(&mut current_spans));
                         l.style = line_style;
                         result.push(l);
                         current_width = 0;
                     }
-                    current_spans.push(Span::styled(c.to_string(), token.style));
-                    current_width += cw;
                 }
             }
         }
@@ -891,21 +924,27 @@ fn render_assistant(raw: &str, width: u16) -> Vec<Line<'static>> {
     };
 
     if !committed.is_empty() {
-        let md_text = tui_markdown::from_str(committed);
-        let unclosed = ends_with_unclosed_code_block(committed);
-        let mut lines = md_text.lines;
-        if unclosed
-            && !lines.is_empty()
-            && let Some(last) = lines.last()
-        {
-            let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
-            if text.trim() == "```" || text.trim() == "~~~" {
-                lines.pop();
+        if raw.len() > 200 * 1024 {
+            for line in committed.lines() {
+                out_lines.extend(wrap_line(Line::from(line.to_string()), width as usize));
             }
-        }
-        for line in lines {
-            let owned = to_owned_line(line);
-            out_lines.extend(wrap_line(owned, width as usize));
+        } else {
+            let md_text = tui_markdown::from_str(committed);
+            let unclosed = ends_with_unclosed_code_block(committed);
+            let mut lines = md_text.lines;
+            if unclosed
+                && !lines.is_empty()
+                && let Some(last) = lines.last()
+            {
+                let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+                if text.trim() == "```" || text.trim() == "~~~" {
+                    lines.pop();
+                }
+            }
+            for line in lines {
+                let owned = to_owned_line(line);
+                out_lines.extend(wrap_line(owned, width as usize));
+            }
         }
     }
 
@@ -939,6 +978,24 @@ fn render_thought(raw: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
     }
 }
 
+fn truncate_tool_text(text: &str) -> (Vec<String>, usize) {
+    let mut lines = Vec::new();
+    let mut total_lines: usize = 0;
+    for (i, raw_line) in text.lines().enumerate() {
+        total_lines += 1;
+        if i < 40 {
+            let mut char_iter = raw_line.chars();
+            let mut prefix: String = char_iter.by_ref().take(200).collect();
+            if char_iter.next().is_some() {
+                prefix.push('…');
+            }
+            lines.push(prefix);
+        }
+    }
+    let more_count = total_lines.saturating_sub(40);
+    (lines, more_count)
+}
+
 fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> {
     let (glyph, glyph_style) = match block.status.as_str() {
         "completed" | "success" => ("✓ ", Style::default().fg(Color::Green)),
@@ -965,14 +1022,13 @@ fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> 
                 "  Input:",
                 Style::default().add_modifier(Modifier::DIM),
             )));
-            let in_lines: Vec<&str> = block.input_text.lines().collect();
-            let limit = 40.min(in_lines.len());
-            for l in &in_lines[..limit] {
+            let (in_lines, more_count) = truncate_tool_text(&block.input_text);
+            for l in in_lines {
                 out.extend(wrap_line(Line::from(format!("    {}", l)), width as usize));
             }
-            if in_lines.len() > 40 {
+            if more_count > 0 {
                 out.push(Line::from(Span::styled(
-                    format!("    … {} more lines", in_lines.len() - 40),
+                    format!("    … {} more lines", more_count),
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
@@ -982,14 +1038,13 @@ fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> 
                 "  Output:",
                 Style::default().add_modifier(Modifier::DIM),
             )));
-            let out_lines: Vec<&str> = block.output_text.lines().collect();
-            let limit = 40.min(out_lines.len());
-            for l in &out_lines[..limit] {
+            let (out_lines, more_count) = truncate_tool_text(&block.output_text);
+            for l in out_lines {
                 out.extend(wrap_line(Line::from(format!("    {}", l)), width as usize));
             }
-            if out_lines.len() > 40 {
+            if more_count > 0 {
                 out.push(Line::from(Span::styled(
-                    format!("    … {} more lines", out_lines.len() - 40),
+                    format!("    … {} more lines", more_count),
                     Style::default().add_modifier(Modifier::DIM),
                 )));
             }
@@ -2044,5 +2099,112 @@ mod tests {
         transcript.apply_frame(&u2);
         let l4 = transcript.render_block(4, 80);
         assert_eq!(l4[0].to_string(), ""); // Leading blank line before next user block
+    }
+
+    #[test]
+    fn test_wrap_line_coalesces_wide_tokens() {
+        let long_word = "a".repeat(100);
+        let line = Line::from(long_word);
+        let wrapped = wrap_line(line, 40);
+        assert_eq!(wrapped.len(), 3);
+        // Each wrapped line must have only 1 span, not 40 spans!
+        assert_eq!(wrapped[0].spans.len(), 1);
+        assert_eq!(wrapped[1].spans.len(), 1);
+        assert_eq!(wrapped[2].spans.len(), 1);
+    }
+
+    #[test]
+    fn test_assistant_huge_message_plain_text_fallback() {
+        let mut transcript = Transcript::new();
+        // 250 KB assistant message
+        let huge_text = format!("{}\n", "hello world ".repeat(22_000));
+        assert!(huge_text.len() > 200 * 1024);
+        let chunk = make_chunk_frame("agent_message_chunk", "huge_1", &huge_text);
+        transcript.apply_frame(&chunk);
+        let lines = transcript.render_block(0, 80);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn test_tool_line_length_truncation_with_ellipsis() {
+        let mut transcript = Transcript::new();
+        let long_line = "a".repeat(300);
+        let tool_call = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t_long",
+                    "title": "shell · long",
+                    "status": "completed",
+                    "rawInput": long_line,
+                }
+            }
+        });
+        transcript.apply_frame(&tool_call);
+        transcript.toggle_tools();
+        let lines = transcript.render_block(0, 80);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(joined.contains('…'));
+    }
+
+    #[test]
+    fn test_5k_blocks_with_huge_tool_outputs_relayout_fast() {
+        let mut transcript = Transcript::new();
+        let mut viewport = Viewport::new();
+
+        let huge_json = format!("{{\"file\":\"{}\"}}", "x".repeat(1_000_000));
+
+        for i in 0..5000 {
+            if i % 250 == 0 && i > 0 {
+                // Tool block with 1 MB input
+                let tool_call = json!({
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": format!("tool_{i}"),
+                            "title": format!("write · large_{i}.json"),
+                            "status": "completed",
+                            "rawInput": huge_json.clone(),
+                        }
+                    }
+                });
+                transcript.apply_frame(&tool_call);
+            } else {
+                let chunk = make_chunk_frame(
+                    "user_message_chunk",
+                    &format!("u_{i}"),
+                    &format!("message {i}\n"),
+                );
+                transcript.apply_frame(&chunk);
+            }
+        }
+
+        // Toggle tools to expanded
+        let start = std::time::Instant::now();
+        transcript.toggle_tools();
+        let lines = viewport.visible_lines(&mut transcript, 80, 20);
+        let elapsed = start.elapsed();
+
+        assert_eq!(lines.len(), 20);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "relayout took too long: {:?}",
+            elapsed
+        );
+
+        let total_cached_lines: usize = transcript
+            .layout_cache
+            .values()
+            .map(|entry| entry.height)
+            .sum();
+        assert!(
+            total_cached_lines < 500_000,
+            "cached lines exceeded bound: {total_cached_lines}"
+        );
     }
 }
