@@ -887,28 +887,22 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn activation_follows_session_list_pagination() {
+async fn activation_finds_stored_cwd_via_session_info() {
     let fake = honk_testgoose::FakeGoose::start().await;
     fake.advertise_patched(true);
 
-    // 6 sessions, page size 2: ses_01 & ses_02 (p1), ses_03 & ses_04 (p2), ses_05 & ses_06 (p3)
-    fake.insert_session("ses_01", "/tmp/cwd1");
-    fake.insert_session("ses_02", "/tmp/cwd2");
-    fake.insert_session("ses_03", "/tmp/cwd3");
-    fake.insert_session("ses_04", "/tmp/cwd4");
-    fake.insert_session("ses_05", "/tmp/cwd5");
-    fake.insert_session("ses_06", "/tmp/cwd6");
-    fake.set_session_list_page_size(2);
+    // Old session stored upstream
+    fake.insert_session("ses_old", "/tmp/cwd_old");
 
     let h = Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await);
     let mut v = Viewer::connect(&h).await;
 
-    // Loading ses_05 (on page 3) must activate successfully
+    // Loading ses_old must activate successfully
     let load_res = v
         .call(
             "session/load",
             json!({
-                "sessionId": "ses_05",
+                "sessionId": "ses_old",
                 "cwd": "/ignored",
                 "mcpServers": []
             }),
@@ -916,7 +910,21 @@ async fn activation_follows_session_list_pagination() {
         .await;
     assert!(
         load_res.get("error").is_none(),
-        "expected ses_05 on page 3 to activate successfully, got: {load_res}"
+        "expected ses_old to activate successfully, got: {load_res}"
+    );
+
+    // Verify session/info was called in one call for ses_old
+    let info_calls = fake
+        .inbound()
+        .iter()
+        .filter(|f| {
+            f.get("method").and_then(Value::as_str) == Some("_goose/unstable/session/info")
+                && f.pointer("/params/sessionId").and_then(Value::as_str) == Some("ses_old")
+        })
+        .count();
+    assert_eq!(
+        info_calls, 1,
+        "session/info must be called in exactly one call"
     );
 
     // Loading a truly missing session must fail with -32602 "Session not found"

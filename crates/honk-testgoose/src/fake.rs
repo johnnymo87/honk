@@ -578,12 +578,14 @@ async fn handle_post(
                 .entry(sid.clone())
                 .or_insert_with(StreamState::new);
         }
-        state
-            .all_sessions
-            .lock()
-            .unwrap()
-            .entry(sid.clone())
-            .or_insert_with(|| "/tmp".to_string());
+        if method != Some("_goose/unstable/session/info") {
+            state
+                .all_sessions
+                .lock()
+                .unwrap()
+                .entry(sid.clone())
+                .or_insert_with(|| "/tmp".to_string());
+        }
     }
 
     let patched = state.advertise_patched.load(Ordering::SeqCst);
@@ -712,6 +714,56 @@ async fn handle_post(
                     let stream = conn
                         .sessions
                         .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
+                } else {
+                    conn.conn_stream.push_frame(resp, patched, false);
+                }
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/info") => {
+            let target_sid = target_session.clone().or_else(|| {
+                frame
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+
+            let sid = target_sid.unwrap_or_default();
+            let cwd_opt = state.all_sessions.lock().unwrap().get(&sid).cloned();
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = match cwd_opt {
+                    Some(cwd) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "session": {
+                                "sessionId": sid,
+                                "cwd": cwd,
+                                "title": Value::Null,
+                                "updatedAt": Value::Null
+                            }
+                        }
+                    }),
+                    None => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32002,
+                            "message": format!("Session not found: {sid}"),
+                            "data": format!("Session not found: {sid}")
+                        }
+                    }),
+                };
+                if let Some(target) = &target_session {
+                    let stream = conn
+                        .sessions
+                        .entry(target.clone())
                         .or_insert_with(StreamState::new);
                     stream.push_frame(resp, patched, false);
                 } else {

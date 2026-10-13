@@ -629,67 +629,133 @@ impl Hub {
     }
 
     pub async fn get_stored_cwd(&self, sid: &str) -> Result<String, ActivationError> {
-        const MAX_PAGES: usize = 200;
-        let mut cursor: Option<String> = None;
+        let init_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
 
-        for _ in 0..MAX_PAGES {
-            let params = match &cursor {
-                Some(c) => json!({ "cursor": c }),
-                None => json!({}),
-            };
+        let recorder = if let Some(rec_path) = &self.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor).map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("recorder init failed: {e:#}"),
+            })?
+        } else {
+            Recorder::disabled()
+        };
 
-            let list_res = self
-                .control_request("session/list", params, json!(1))
+        let mut side_up = Upstream::initialize_with(
+            &self.upstream_url,
+            self.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await
+        .map_err(|e| ActivationError {
+            code: -32603,
+            message: format!("failed to initialize session/info side connection: {e:#}"),
+        })?;
+
+        let conn_id = side_up.conn_id().to_string();
+
+        {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })
+            .map_err(|e| ActivationError {
+                code: -32603,
+                message: format!("failed to record orphan conn: {e:#}"),
+            })?;
+        }
+
+        let info_result: Result<String, ActivationError> = async {
+            side_up
+                .subscribe_with(
+                    Some(sid),
+                    SubscribeOpts {
+                        takeover: false,
+                        resume_after: None,
+                    },
+                )
                 .await
                 .map_err(|e| ActivationError {
                     code: -32603,
-                    message: format!("control session/list failed: {e:#}"),
+                    message: format!("failed to subscribe session stream: {e:#}"),
                 })?;
 
-            if let Some(err) = list_res.get("error") {
-                return Err(ActivationError {
-                    code: -32603,
-                    message: format!("control session/list failed: {err}"),
-                });
-            }
+            let (_key, resp) = side_up
+                .call_full(
+                    "_goose/unstable/session/info",
+                    serde_json::json!({ "sessionId": sid }),
+                    Some(sid),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| {
+                    let err_str = e.to_string();
+                    if err_str.contains("Session not found") || err_str.contains("-32002") {
+                        ActivationError {
+                            code: -32602,
+                            message: format!("Session not found: {sid}"),
+                        }
+                    } else {
+                        ActivationError {
+                            code: -32603,
+                            message: format!("failed to call session/info: {e:#}"),
+                        }
+                    }
+                })?;
 
-            let sessions = list_res
-                .pointer("/result/sessions")
-                .and_then(Value::as_array);
-            let stored_cwd = sessions
-                .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
-                .and_then(|s| s["cwd"].as_str())
-                .map(|s| s.to_string());
-
-            if let Some(cwd) = stored_cwd {
-                return Ok(cwd);
-            }
-
-            let next_cursor = list_res
-                .pointer("/result/nextCursor")
-                .or_else(|| list_res.pointer("/result/next_cursor"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-
-            match next_cursor {
-                Some(nc) if !nc.is_empty() => {
-                    cursor = Some(nc);
-                }
-                _ => {
+            if let Some(err) = resp.get("error") {
+                let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+                let data = err.get("data").and_then(Value::as_str).unwrap_or("");
+                let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                if code == -32602
+                    || code == -32002
+                    || msg.contains("Session not found")
+                    || data.contains("Session not found")
+                {
                     return Err(ActivationError {
                         code: -32602,
                         message: format!("Session not found: {sid}"),
                     });
                 }
+                return Err(ActivationError {
+                    code: -32603,
+                    message: format!("session/info returned error: {err}"),
+                });
             }
+
+            let cwd = resp
+                .pointer("/result/session/cwd")
+                .or_else(|| resp.pointer("/result/cwd"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| ActivationError {
+                    code: -32602,
+                    message: format!("Session not found: {sid}"),
+                })?;
+
+            Ok(cwd)
+        }
+        .await;
+
+        let _ = side_up.delete().await;
+        {
+            let mut s = self.state.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.retain(|c| c != &conn_id);
+            });
         }
 
-        Err(ActivationError {
-            code: -32603,
-            message: format!(
-                "pagination limit of {MAX_PAGES} pages reached while searching for session: {sid}"
-            ),
-        })
+        info_result
     }
 
     pub async fn control_request(
