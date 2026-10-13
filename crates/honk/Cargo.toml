@@ -15,10 +15,13 @@ anyhow.workspace = true
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures.workspace = true
 honk-wire = { path = "../honk-wire" }
+ratatui = "0.30"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
 tokio-tungstenite = "0.30.0"
+tui-markdown = "0.3"
+unicode-width = "0.2.2"
 url = "2.5.4"
 
 [dev-dependencies]

@@ -192,6 +192,7 @@ impl Renderer {
                             return Ok(());
                         }
                     }
+                    BlockKey::Notice(_) => {}
                 }
 
                 if self.is_resetting {
@@ -241,6 +242,7 @@ impl Renderer {
                 let tool_str = format_tool_line(title, status);
                 self.shadow.insert(key.clone(), tool_str);
             }
+            BlockKey::Notice(_) => {}
         }
     }
 
@@ -296,6 +298,7 @@ impl Renderer {
                     *printed_so_far = target_str;
                 }
             }
+            BlockKey::Notice(_) => {}
         }
         Ok(())
     }
