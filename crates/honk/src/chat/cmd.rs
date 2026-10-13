@@ -21,8 +21,12 @@ impl ChatCore {
         }
 
         if trimmed == "/drop" {
-            let count = self.local_queue.len();
+            let count = self.local_queue.len()
+                + self.held_steers.len()
+                + self.detached_buffered_lines.len();
             self.local_queue.clear();
+            self.held_steers.clear();
+            self.detached_buffered_lines.clear();
             effects.push(Effect::Notice(Notice::info(format!(
                 "[honk] dropped {count} queued message(s)"
             ))));
@@ -59,6 +63,7 @@ impl ChatCore {
         }
 
         let perm = self.pending_permissions.remove(0);
+        let id_key = perm.goose_req_id.to_string();
         let chosen = perm
             .options
             .iter()
@@ -81,6 +86,7 @@ impl ChatCore {
             })
         };
 
+        self.answered_permissions.insert(id_key, result.clone());
         effects.push(Effect::Respond {
             id: perm.goose_req_id,
             result,
@@ -104,6 +110,19 @@ impl ChatCore {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("tool")
             .to_string();
+
+        if let Some(cached_result) = self.answered_permissions.get(&id_key) {
+            self.pending_permissions
+                .retain(|p| p.goose_req_id != goose_req_id);
+            effects.push(Effect::Respond {
+                id: goose_req_id,
+                result: cached_result.clone(),
+            });
+            effects.push(Effect::Notice(Notice::info(format!(
+                "[honk] auto-approved (re-offered): {tool_title}"
+            ))));
+            return;
+        }
 
         let mut options = Vec::new();
         if let Some(opts_arr) = frame
@@ -137,17 +156,6 @@ impl ChatCore {
         let is_own_turn = self.run_ownership == Ownership::Own;
 
         if is_own_turn {
-            if let Some(cached_result) = self.answered_permissions.get(&id_key) {
-                effects.push(Effect::Respond {
-                    id: goose_req_id,
-                    result: cached_result.clone(),
-                });
-                effects.push(Effect::Notice(Notice::info(format!(
-                    "[honk] auto-approved (re-offered): {tool_title}"
-                ))));
-                return;
-            }
-
             let chosen = options
                 .iter()
                 .find(|o| o.kind == "allow_once")
@@ -169,6 +177,8 @@ impl ChatCore {
                 })
             };
 
+            self.pending_permissions
+                .retain(|p| p.goose_req_id != goose_req_id);
             self.answered_permissions.insert(id_key, result.clone());
             effects.push(Effect::Respond {
                 id: goose_req_id,
@@ -204,24 +214,16 @@ impl ChatCore {
             return;
         }
 
-        if self.run_state.is_running() {
-            if self.run_ownership == Ownership::Own {
-                effects.push(Effect::Notify {
-                    method: "session/cancel".into(),
-                    params: json!({"sessionId": self.session_id}),
-                });
-                effects.push(Effect::Notice(Notice::info("[honk] cancelling turn...")));
-            } else {
-                effects.push(Effect::Notice(Notice::warning(
-                    "[honk] this turn belongs to another client; /cancel! cancels it anyway",
-                )));
-            }
-        } else if self.prompt_sent.is_some() {
+        if self.run_ownership == Ownership::Own {
             effects.push(Effect::Notify {
                 method: "session/cancel".into(),
                 params: json!({"sessionId": self.session_id}),
             });
             effects.push(Effect::Notice(Notice::info("[honk] cancelling turn...")));
+        } else if self.run_state.is_running() || self.prompt_sent.is_some() {
+            effects.push(Effect::Notice(Notice::warning(
+                "[honk] this turn belongs to another client; /cancel! cancels it anyway",
+            )));
         } else {
             effects.push(Effect::Notice(Notice::warning(
                 "[honk] no active turn to cancel",

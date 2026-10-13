@@ -494,7 +494,7 @@ impl ChatCore {
                 }
             }
 
-            if !prompt.run_seen && !self.held_steers.is_empty() {
+            if !self.held_steers.is_empty() {
                 let held = std::mem::take(&mut self.held_steers);
                 unstarted_to_queue.extend(held);
                 effects.push(Effect::Notice(Notice::info(
@@ -585,9 +585,16 @@ impl ChatCore {
         }
 
         match method {
+            honk_wire::method::RESET => {
+                self.is_replaying = true;
+                self.last_echo_crid = None;
+                self.pending_permissions.clear();
+                effects.push(Effect::Transcript(frame.clone()));
+            }
             honk_wire::method::REPLAY_DONE => {
                 self.is_replaying = false;
                 self.is_reattaching = false;
+                self.last_echo_crid = None;
                 if let (Some(epoch), Some(seq)) = (
                     frame.pointer("/params/epoch").and_then(Value::as_u64),
                     frame.pointer("/params/seq").and_then(Value::as_u64),
@@ -612,27 +619,33 @@ impl ChatCore {
                             self.consumed_steer_ids.insert(mid.to_string());
                             self.pending_steers.remove(mid);
                         }
-                        if let Some(crid) = u
-                            .pointer("/_meta/honk/source/client_req_id")
-                            .and_then(Value::as_str)
+                        if !self.is_replaying
+                            && let Some(crid) = u
+                                .pointer("/_meta/honk/source/client_req_id")
+                                .and_then(Value::as_str)
                         {
-                            self.last_echo_crid = Some(crid.to_string());
-                            if self.run_state.is_running() && self.our_crids.contains(crid) {
-                                self.run_ownership = Ownership::Own;
-                                if let Some(p) = self.prompt_sent.as_mut() {
-                                    p.run_seen = true;
-                                }
-                                if let RunState::Running(ref run_id) = self.run_state {
-                                    let run_id = run_id.clone();
-                                    let held = std::mem::take(&mut self.held_steers);
-                                    for (held_text, conv_count) in held {
-                                        self.send_steer(
-                                            held_text,
-                                            run_id.clone(),
-                                            conv_count,
-                                            effects,
-                                        );
+                            if !self.run_state.is_running() {
+                                self.last_echo_crid = Some(crid.to_string());
+                            } else if self.run_ownership == Ownership::Pending {
+                                if self.prompt_sent.as_ref().is_some_and(|p| p.crid == crid) {
+                                    self.run_ownership = Ownership::Own;
+                                    if let Some(p) = self.prompt_sent.as_mut() {
+                                        p.run_seen = true;
                                     }
+                                    if let RunState::Running(ref run_id) = self.run_state {
+                                        let run_id = run_id.clone();
+                                        let held = std::mem::take(&mut self.held_steers);
+                                        for (held_text, conv_count) in held {
+                                            self.send_steer(
+                                                held_text,
+                                                run_id.clone(),
+                                                conv_count,
+                                                effects,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    self.run_ownership = Ownership::Foreign;
                                 }
                             }
                         }
@@ -643,32 +656,30 @@ impl ChatCore {
                             Some(run_id) => {
                                 self.run_state = RunState::Running(run_id.clone());
                                 if !self.is_replaying {
-                                    match self.last_echo_crid.take() {
-                                        Some(crid) if self.our_crids.contains(&crid) => {
-                                            self.run_ownership = Ownership::Own;
-                                            if let Some(p) = self.prompt_sent.as_mut() {
-                                                p.run_seen = true;
-                                            }
-                                            let held = std::mem::take(&mut self.held_steers);
-                                            for (held_text, conv_count) in held {
-                                                self.send_steer(
-                                                    held_text,
-                                                    run_id.clone(),
-                                                    conv_count,
-                                                    effects,
-                                                );
-                                            }
+                                    let echo_crid = self.last_echo_crid.take();
+                                    let is_own = self.prompt_sent.as_ref().is_some_and(|p| {
+                                        echo_crid.as_deref() == Some(p.crid.as_str())
+                                    });
+                                    if is_own {
+                                        self.run_ownership = Ownership::Own;
+                                        if let Some(p) = self.prompt_sent.as_mut() {
+                                            p.run_seen = true;
                                         }
-                                        Some(_) => {
-                                            self.run_ownership = Ownership::Foreign;
+                                        let held = std::mem::take(&mut self.held_steers);
+                                        for (held_text, conv_count) in held {
+                                            self.send_steer(
+                                                held_text,
+                                                run_id.clone(),
+                                                conv_count,
+                                                effects,
+                                            );
                                         }
-                                        None => {
-                                            if self.prompt_sent.is_some() {
-                                                self.run_ownership = Ownership::Pending;
-                                            } else {
-                                                self.run_ownership = Ownership::Foreign;
-                                            }
-                                        }
+                                    } else if echo_crid.is_some() {
+                                        self.run_ownership = Ownership::Foreign;
+                                    } else if self.prompt_sent.is_some() {
+                                        self.run_ownership = Ownership::Pending;
+                                    } else {
+                                        self.run_ownership = Ownership::Foreign;
                                     }
                                 }
                             }
@@ -681,6 +692,7 @@ impl ChatCore {
                                 self.run_state = RunState::Idle;
                                 self.run_ownership = Ownership::Unknown;
                                 self.last_echo_crid = None;
+                                self.pending_permissions.clear();
                                 if !self.is_replaying {
                                     if was_ownership != Ownership::Own
                                         && !self.held_steers.is_empty()
@@ -795,6 +807,7 @@ impl ChatCore {
         )));
         self.run_state = RunState::Unknown;
         self.run_ownership = Ownership::Unknown;
+        self.last_echo_crid = None;
         self.is_replaying = true;
         self.pending_permissions.clear();
         for (_req_id, inflight) in self.pending_steer_reqs.drain() {
