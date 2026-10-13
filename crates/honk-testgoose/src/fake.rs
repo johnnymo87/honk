@@ -483,6 +483,29 @@ fn method_requires_session(method: &str) -> bool {
     )
 }
 
+fn register_new_session(
+    state: &FakeGooseInner,
+    conn_id: &str,
+    sid: &str,
+    req_id: Option<Value>,
+    patched: bool,
+) {
+    let mut conns = state.connections.lock().unwrap();
+    if let Some(conn) = conns.get_mut(conn_id) {
+        conn.sessions.insert(sid.to_string(), StreamState::new());
+        if let Some(id) = req_id {
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "sessionId": sid
+                }
+            });
+            conn.conn_stream.push_frame(resp, patched, false);
+        }
+    }
+}
+
 async fn handle_post(
     State(state): State<Arc<FakeGooseInner>>,
     Query(query): Query<AuthQuery>,
@@ -625,29 +648,19 @@ async fn handle_post(
             state.all_sessions.lock().unwrap().insert(sid.clone(), cwd);
 
             let delay_opt = *state.session_new_delay.lock().unwrap();
+            let Some(delay) = delay_opt else {
+                // No delay configured: register the session and answer before
+                // returning 202, as before the delay knob existed (callers
+                // rely on the session being registered once the POST returns).
+                register_new_session(&state, &conn_id, &sid, req_id, patched);
+                return StatusCode::ACCEPTED.into_response();
+            };
             let state_clone = state.clone();
             let conn_id_clone = conn_id.clone();
             let sid_clone = sid.clone();
-            let req_id_clone = req_id.clone();
-
             tokio::spawn(async move {
-                if let Some(delay) = delay_opt {
-                    tokio::time::sleep(delay).await;
-                }
-                let mut conns = state_clone.connections.lock().unwrap();
-                if let Some(conn) = conns.get_mut(&conn_id_clone) {
-                    conn.sessions.insert(sid_clone.clone(), StreamState::new());
-                    if let Some(id) = req_id_clone {
-                        let resp = json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "sessionId": sid_clone
-                            }
-                        });
-                        conn.conn_stream.push_frame(resp, patched, false);
-                    }
-                }
+                tokio::time::sleep(delay).await;
+                register_new_session(&state_clone, &conn_id_clone, &sid_clone, req_id, patched);
             });
 
             StatusCode::ACCEPTED.into_response()
