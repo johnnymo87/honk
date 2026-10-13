@@ -1914,3 +1914,103 @@ async fn test_driver_attach_failed_auth_error_on_reconnect_is_fatal() {
     assert!(join_res.is_ok(), "task must complete on fatal auth error");
     let _ = server_task.await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_info_with_cwd_emitted_on_attach_and_new() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        eprintln!("skipping test: StubGoose unset");
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+
+    // Part 1: Target::Attach
+    let mut client = honk::Client::connect(&h.ws_url(), &h.secret())
+        .await
+        .expect("raw connect");
+
+    let new_res = client
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": g.cwd().to_str().unwrap(),
+                "mcpServers": [],
+            }),
+        )
+        .await
+        .expect("session/new");
+    let sid = new_res["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    let _ = client
+        .call(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "initial prompt" }]
+            }),
+        )
+        .await
+        .expect("session/prompt");
+    drop(client);
+
+    let opts = DriverOpts::new(h.ws_url(), h.secret(), Target::Attach(sid.clone()));
+    let (handle, mut rx) = start(opts).await.expect("start driver attach");
+
+    let mut session_info_seen = false;
+    let mut seen_cwd = None;
+
+    let start_time = std::time::Instant::now();
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::SessionInfo { title: _, cwd } = evt {
+            session_info_seen = true;
+            seen_cwd = cwd;
+            break;
+        }
+        if start_time.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for SessionInfo on attach");
+        }
+    }
+
+    assert!(session_info_seen, "SessionInfo must be emitted on attach");
+    assert_eq!(seen_cwd.as_deref(), Some(g.cwd().to_str().unwrap()));
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+
+    // Part 2: Target::New
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let tmp_cwd = tmp.path().to_path_buf();
+    let opts_new = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: tmp_cwd.clone(),
+            extensions: None,
+        },
+    );
+    let (handle_new, mut rx_new) = start(opts_new).await.expect("start driver new");
+
+    let mut session_info_new_seen = false;
+    let mut seen_cwd_new = None;
+
+    let start_time = std::time::Instant::now();
+    while let Some(evt) = rx_new.recv().await {
+        if let UiEvent::SessionInfo { title: _, cwd } = evt {
+            session_info_new_seen = true;
+            seen_cwd_new = cwd;
+            break;
+        }
+        if start_time.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for SessionInfo on new");
+        }
+    }
+
+    assert!(session_info_new_seen, "SessionInfo must be emitted on new");
+    assert_eq!(seen_cwd_new.as_deref(), Some(tmp_cwd.to_str().unwrap()));
+    handle_new.send(UiCommand::Shutdown).expect("send shutdown");
+}

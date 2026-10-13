@@ -242,6 +242,23 @@ mod tests {
     }
 
     #[test]
+    fn test_status_bar_renders_at_width_140() {
+        let bar = StatusBar {
+            session_id: "20261013_133",
+            session_title: Some("Shell echo hello test"),
+            cwd: Some("/tmp/opencode/chatcwd"),
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+        };
+        let line = bar.to_line(140);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains("Shell echo hello test — /tmp/opencode/chatcwd"));
+        assert!(rendered.contains("NORMAL"));
+        assert!(rendered.contains("idle"));
+        assert!(rendered.contains("live"));
+    }
+
+    #[test]
     fn test_run_states_and_ownership() {
         // Pending -> "waiting"
         let snap_pending = make_snapshot(

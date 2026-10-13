@@ -412,11 +412,10 @@ impl App {
                 {
                     self.session_title = Some(title.to_string());
                 }
-                if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
-                    self.cwd = Some(cwd.to_string());
-                } else if let Some(cwd) = result
-                    .get("session")
-                    .and_then(|s| s.get("cwd"))
+                if let Some(cwd) = result
+                    .get("cwd")
+                    .or_else(|| result.pointer("/_meta/workingDir"))
+                    .or_else(|| result.pointer("/session/cwd"))
                     .and_then(Value::as_str)
                 {
                     self.cwd = Some(cwd.to_string());
@@ -438,11 +437,10 @@ impl App {
                 {
                     self.session_title = Some(title.to_string());
                 }
-                if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
-                    self.cwd = Some(cwd.to_string());
-                } else if let Some(cwd) = result
-                    .get("session")
-                    .and_then(|s| s.get("cwd"))
+                if let Some(cwd) = result
+                    .get("cwd")
+                    .or_else(|| result.pointer("/_meta/workingDir"))
+                    .or_else(|| result.pointer("/session/cwd"))
                     .and_then(Value::as_str)
                 {
                     self.cwd = Some(cwd.to_string());

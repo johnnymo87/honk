@@ -119,14 +119,29 @@ async fn main() -> anyhow::Result<()> {
                 thoughts: args.thoughts,
                 exit_on_turn_end: args.exit_on_turn_end,
             };
-            honk::run(opts, stdout()).await?;
+            if let Err(e) = honk::run(opts, stdout()).await {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>()
+                    && io_err.kind() == std::io::ErrorKind::BrokenPipe
+                {
+                    std::process::exit(0);
+                }
+                return Err(e);
+            }
         }
         Commands::List(args) => {
             let secret = resolve_secret(args.secret.as_deref())?;
             let mut client = Client::connect(&args.url, &secret).await?;
             let sessions = client.list_sessions().await?;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            use std::io::Write;
             for s in sessions {
-                println!("{}", s.format_line());
+                if let Err(e) = writeln!(handle, "{}", s.format_line()) {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        std::process::exit(0);
+                    }
+                    return Err(e.into());
+                }
             }
         }
         Commands::Chat(args) => {

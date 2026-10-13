@@ -123,6 +123,19 @@ impl DriverHandle {
     }
 }
 
+fn id_matches(frame_id: Option<&Value>, expected: u64) -> bool {
+    let Some(id) = frame_id else {
+        return false;
+    };
+    if let Some(n) = id.as_u64() {
+        n == expected
+    } else if let Some(s) = id.as_str() {
+        s.parse::<u64>().ok() == Some(expected)
+    } else {
+        false
+    }
+}
+
 fn random_seed() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let mut hasher = DefaultHasher::new();
@@ -196,6 +209,7 @@ async fn process_effects(
     attach_retry_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     connection_state: &mut ConnectionState,
     pending_list_id: &mut Option<u64>,
+    known_cwd: &mut Option<String>,
 ) -> EffectAction {
     for effect in effects {
         match effect {
@@ -233,6 +247,13 @@ async fn process_effects(
                 *is_first_attach = false;
                 *attach_failed_attempts = 0;
                 *attach_retry_timer = None;
+                if let Some(wd) = result
+                    .pointer("/_meta/workingDir")
+                    .or_else(|| result.get("cwd"))
+                    .and_then(Value::as_str)
+                {
+                    *known_cwd = Some(wd.to_string());
+                }
                 let _ = ui_tx.send(UiEvent::Attached { result });
                 if let Some(conn) = conn_opt.as_mut() {
                     let list_id = core.allocate_id();
@@ -473,6 +494,10 @@ async fn run_driver(
     let mut reconnect_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reconnect_attempt = 1u32;
     let mut pending_list_id: Option<u64> = None;
+    let mut known_cwd = match &opts.target {
+        Target::New { cwd, .. } => Some(cwd.to_string_lossy().to_string()),
+        Target::Attach(_) => None,
+    };
 
     loop {
         tokio::select! {
@@ -499,6 +524,7 @@ async fn run_driver(
                             &mut attach_retry_timer,
                             &mut connection_state,
                             &mut pending_list_id,
+                            &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -530,6 +556,7 @@ async fn run_driver(
                             &mut attach_retry_timer,
                             &mut connection_state,
                             &mut pending_list_id,
+                            &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -561,6 +588,7 @@ async fn run_driver(
                             &mut attach_retry_timer,
                             &mut connection_state,
                             &mut pending_list_id,
+                            &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -623,7 +651,7 @@ async fn run_driver(
                 match frame_opt {
                     Some(frame) => {
                         if let Some(list_id) = pending_list_id
-                            && frame.get("id").and_then(Value::as_u64) == Some(list_id)
+                            && id_matches(frame.get("id"), list_id)
                             && frame.get("method").is_none()
                         {
                             pending_list_id = None;
@@ -631,27 +659,49 @@ async fn run_driver(
                             let mut cwd = None;
                             let sessions = frame
                                 .pointer("/result/sessions")
+                                .or_else(|| frame.get("sessions"))
                                 .or_else(|| frame.get("result"))
                                 .and_then(Value::as_array);
                             if let Some(arr) = sessions {
                                 for s in arr {
-                                    if s.get("sessionId").and_then(Value::as_str)
-                                        == Some(&core.session_id)
-                                    {
+                                    let sid_matches = s
+                                        .get("sessionId")
+                                        .or_else(|| s.get("id"))
+                                        .and_then(Value::as_str)
+                                        == Some(&core.session_id);
+                                    if sid_matches {
                                         title = s
                                             .get("title")
+                                            .or_else(|| s.get("name"))
                                             .and_then(Value::as_str)
                                             .map(String::from);
                                         cwd = s
                                             .get("cwd")
+                                            .or_else(|| s.pointer("/_meta/workingDir"))
                                             .and_then(Value::as_str)
                                             .map(String::from);
                                         break;
                                     }
                                 }
                             }
+                            if cwd.is_none() {
+                                cwd = known_cwd.clone();
+                            }
                             let _ = ui_tx.send(UiEvent::SessionInfo { title, cwd });
                             continue;
+                        }
+
+                        // Re-fetch session/list when a run ends (activeRunId -> null)
+                        if let Some(u) = frame.pointer("/params/update")
+                            && let Some(state) = honk_wire::run_state(u)
+                            && state.is_none()
+                            && connection_state == ConnectionState::Live
+                            && !core.is_replaying()
+                            && let Some(conn) = conn_opt.as_mut()
+                        {
+                            let list_id = core.allocate_id();
+                            pending_list_id = Some(list_id);
+                            let _ = conn.send_request(list_id, "session/list", json!({})).await;
                         }
 
                         let effects = core.handle(Input::Frame(frame));
@@ -665,6 +715,7 @@ async fn run_driver(
                             &mut attach_retry_timer,
                             &mut connection_state,
                             &mut pending_list_id,
+                            &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -754,6 +805,7 @@ async fn run_driver(
                                 &mut attach_retry_timer,
                                 &mut connection_state,
                                 &mut pending_list_id,
+                                &mut known_cwd,
                             ).await;
                             if matches!(action, EffectAction::Exit) {
                                 return;
@@ -807,6 +859,7 @@ async fn run_driver(
                     &mut attach_retry_timer,
                     &mut connection_state,
                     &mut pending_list_id,
+                    &mut known_cwd,
                 ).await;
                 if matches!(action, EffectAction::Exit) {
                     return;
