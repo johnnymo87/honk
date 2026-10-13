@@ -113,6 +113,10 @@ pub struct TurnCore {
 }
 
 impl TurnCore {
+    pub fn is_running(&self) -> bool {
+        self.run.is_some() || self.inflight.is_some() || !self.parked.is_empty()
+    }
+
     pub fn on_prompt(
         &mut self,
         owner: OwnerRef,

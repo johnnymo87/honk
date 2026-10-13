@@ -275,7 +275,7 @@ impl Drop for Session {
 impl Session {
     fn sync_running(&self) {
         self.hub
-            .set_session_running(&self.sid, self.turn.run.is_some());
+            .set_session_running(&self.sid, self.turn.is_running());
     }
 
     pub async fn run(mut self) {
