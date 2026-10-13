@@ -25,38 +25,60 @@ answers another client's permission requests.
 - Layout: transcript pane / one-line status bar / composer (grows to ~8 lines).
 - Transcript: user, assistant (markdown via `tui-markdown`, newline-gated streaming:
   committed lines are markdown, the incomplete tail is plain), thinking (dim, collapsed to
-  one line by default, `zt` toggles all), tool calls (one row: status glyph + title;
-  `zo`/`zc` on the focused block or `za` all expands input/output text), honk notices
+  one line by default, `zt` toggles all), tool calls (one row: status glyph + title + the
+  latest `_meta.toolNotification` line, so subagent progress is visible; `za` expands all
+  tool input/output), code blocks syntax-highlighted (tui-markdown default), honk notices
   (dim `[honk] …` rows). Blocks keyed by `BlockKey`; `_honk/reset` rebuilds the model and
   keeps the viewport anchor if the block still exists.
 - Viewport: layout cache per (block, width); follow-tail unless the user scrolled away;
-  anchor = (block key, line offset). Keys in normal mode: `ctrl-e/y/d/u/f/b`, `gg`/`G`
-  (when the composer is empty), plus mouse wheel.
-- Composer: `edtui` (vim modes). Insert mode: Enter submits, Alt-Enter / Shift-Enter
-  newline; bracketed paste inserts verbatim. Normal mode: edtui grammar; app keys above
-  only where edtui has no binding. Prompt history: `ctrl-p`/`ctrl-n`.
+  anchor = (block key, line offset). The whole committed prefix of a message is rendered
+  as one markdown document (fences/lists survive); cached output owns its strings.
+- Keys are resolved by a pure function (mode, composer empty?, key) → action, unit-tested
+  as a matrix. Normal mode: `ctrl-e/y/d/u/f/b` and `gg`/`G` scroll the transcript (these
+  bindings are removed from edtui, which otherwise owns them); `:` opens a one-line app
+  command line (`:q`, plus the slash commands). Insert mode: Enter submits; newline =
+  Alt-Enter and Ctrl-J (Shift-Enter only when keyboard-enhancement flags are supported and
+  pushed: tmux without `extended-keys` reports it as Enter); bracketed paste verbatim.
+  Prompt history `ctrl-p`/`ctrl-n`. edtui's `system-editor` feature stays off.
+- No mouse capture (so terminal text selection works); alternate-scroll mode (`?1007`)
+  maps the wheel to scrolling. `:yank` copies the last assistant message via OSC 52;
+  `:dump` writes the transcript as markdown to a temp file and opens `$PAGER`/`$EDITOR`.
 - Status bar: session title (or id), cwd, run state (`idle` / `running` / `running
   (other client)` / `queued: N`), connection state (`live` / `reconnecting…`).
-- Ctrl-C: own run → cancel; foreign → notice "turn belongs to another client; `/cancel!`";
-  idle → clears the composer. Quit: `:q` in normal mode or Ctrl-D on an empty composer.
-  Slash commands in the composer: `/cancel`, `/cancel!`, `/drop`, `/quit`, `/help`,
+- Ctrl-C: in insert mode with text → leaves insert mode (vim habit), nothing else;
+  otherwise own run → cancel; foreign/pending → notice "not your turn; `/cancel!`";
+  idle → clears the composer. Quit: `:q`, `/quit`, or Ctrl-D in insert mode on an empty
+  composer. Slash commands: `/cancel`, `/cancel!`, `/drop`, `/approve`, `/quit`, `/help`,
   `//text`.
 - Terminal title = session title. Panic hook + Drop guard restore the terminal.
-- Permissions: none shown. Requests in own turns are auto-approved (`allow_always` >
-  `allow_once` > first option) with a notice; others' requests are left to their owner
-  (notice only).
+- Permissions: none shown. Requests in **confirmed own** turns (Protocol 7) are
+  auto-approved with `allow_once` (not `allow_always`, which goose may persist as policy)
+  with a notice; others' requests are left to their owner (notice only). `/approve`
+  answers the oldest pending request allow-once: the escape hatch for a turn parked on a
+  request whose owner is gone. Elicitation in own turns is declined with a notice (no
+  form UI yet; otherwise the turn waits 300 s).
 - `--new`: `session/new {cwd, mcpServers: []}` **without** `_meta.enabledExtensions`, so
   goose loads every extension enabled in the host goose config (author's choice: maximum
   experimentation). `--ext NAME` (repeatable) narrows to named platform extensions. The
-  loaded set (`_meta.extensionResults`) is shown as a notice. Never retried automatically.
+  loaded set (`_meta.extensionResults`) is shown as a notice, and failed extensions are
+  shown on every attach. Never retried automatically; on timeout/error the notice says a
+  session may have been created (see `honk list`). After `session/new` the driver sends
+  `session/load {sessionId}` (no cursor) so the core gets a replay + `_honk/replay_done`
+  like any attach (honkd's attach-live after `session/new` sends no `replay_done`).
 - honkd: default `--max-sessions` 16 → 64 (per-session goose cost measured at
   0.5–1.7 MB with builtin extensions; external MCP extensions add per-session processes,
-  so re-measure if the host config enables many).
+  so re-measure if the host config enables many; not measured yet). Open TUIs pin slots
+  (honkd evicts only viewer-less sessions); at the cap, pigeon launches, stall-watch and
+  `--new` all get `-32000 held-session limit reached`. honkd also gains a DELETE of the
+  upstream connection when `session/new` fails or times out (today it leaks until restart).
 
 **Later (own beads):** syntax highlighting in code blocks, table holdback, unified diffs
 for edit tools, model switch, per-session extension toggle, cost/context readout, inline
 subagent progress, elicitation forms, session picker / nvim switcher, scroll-to-message,
-restore after nightly reset, `$EDITOR` compose, `final_output` (recipe) reply rendering.
+restore after nightly reset, `$EDITOR` compose, `final_output` (recipe) reply rendering,
+per-block expand/collapse, honkd-side fix for the duplicate user block after a log rebuild
+(`create_new_generation_from_export` keeps `synth_<crid>` next to goose's copy; v1 tolerates
+the duplicate rather than guessing by text).
 
 ## Protocol use (honk-aware viewer; see M1 plan "Downstream contract")
 
@@ -97,10 +119,15 @@ All wire ids come from the core's single allocator (`attach_request`, `allocate_
      never appeared as a `user_message_chunk` with that id is reported unconsumed with
      its text (works across reconnects, unlike `_honk/steer_unconsumed`, which goes only
      to the sending socket; that notification is also honoured).
-7. **Ownership**: a run is *own* if this client's prompt is in `PromptSent` and its run
-   was announced while in that state, or the run's `user_message_chunk` echo carries
-   `_meta.honk.source.client_req_id` equal to one of this client's crids. Only own runs
-   are cancelled by Ctrl-C / `/cancel`.
+7. **Ownership** (gates every side effect: steer, auto-approve, Ctrl-C cancel): a run is
+   **Own only if its run-start echo carries one of our `client_req_id`s**. honkd logs the
+   `synth_<crid>` echo before the `activeRunId` frame; the core remembers the last echo's
+   crid and checks it when the run starts, and also accepts an echo arriving after the run
+   start (honkd's delayed-delivery paths). Our prompt merely being in flight makes the run
+   **Pending** (it may be parked in honkd behind another client's prompt): no steer (lines
+   stay held), no auto-approve, Ctrl-C refuses (a cancel then would also kill other
+   clients' parked prompts). An echo with another crid, or none → **Foreign**. Unknown
+   never authorizes a side effect.
 8. **Echo**: goose does not echo the sender's prompt; honkd synthesizes a
    `user_message_chunk` (`synth_<crid>`, `_meta.honk.source`) when the run starts. Consumed
    steers arrive as `user_message_chunk` with `_meta.goose.steer: true`. The transcript shows
@@ -132,7 +159,9 @@ All wire ids come from the core's single allocator (`attach_request`, `allocate_
   retry. Not `resume_only` (that refuses the first-delivery case).
 - A steer in flight at disconnect is not re-sent; "[honk] steer may not have been
   delivered" + text.
-- Duplicate user block after a rebuild: handled in the transcript model (Task 4).
+- Duplicate user block after a rebuild: tolerated in v1 (honkd fix is a later bead).
+- `session/load` failures on reconnect retry with backoff at most 5 times (each attempt can
+  activate the session and spawn its extensions), then stop with a notice; any key retries.
 
 ## Interaction with other clients of the same session
 
@@ -151,8 +180,12 @@ All wire ids come from the core's single allocator (`attach_request`, `allocate_
 - `conn.rs` (done) — split WebSocket; `send_request(id, …)`, `notify`, `respond`.
 - `chat/core.rs` (done) — pure protocol state machine. Inputs `Line | Interrupt | Eof |
   Tick | Frame | Connected | Disconnected`; effects `Request | Notify | Respond |
-  Transcript(frame) | Status | Detach | Reattach | Exit`. Idle auto-detach is disabled in
-  the TUI (the live view of other clients' turns is the point).
+  Transcript(frame) | Status | Detach | Reattach | Exit`, plus (Task 3 adds): structured
+  `Notice{kind, text, returned_text}` (so "your message did not run" can refill the
+  composer), `Attached{result}` (title, `extensionResults`) and `AttachFailed{error}` (driver
+  classifies fatal vs retryable), and getters for run state, ownership, queued/held line
+  counts. `idle_timeout: Option` — disabled in the TUI (the live view of other clients'
+  turns is the point).
 - `chat/driver.rs` — async: connect, attach, reconnect with backoff, run effects, feed
   frames/input/ticks to the core; exposes a channel of `UiEvent`s (transcript frames,
   notices, run/connection state) and accepts `UiCommand`s. No terminal code: testable
