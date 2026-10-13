@@ -885,3 +885,64 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
         "must use real reply 2, not stale sidecar reply 1"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activation_follows_session_list_pagination() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    // 6 sessions, page size 2: ses_01 & ses_02 (p1), ses_03 & ses_04 (p2), ses_05 & ses_06 (p3)
+    fake.insert_session("ses_01", "/tmp/cwd1");
+    fake.insert_session("ses_02", "/tmp/cwd2");
+    fake.insert_session("ses_03", "/tmp/cwd3");
+    fake.insert_session("ses_04", "/tmp/cwd4");
+    fake.insert_session("ses_05", "/tmp/cwd5");
+    fake.insert_session("ses_06", "/tmp/cwd6");
+    fake.set_session_list_page_size(2);
+
+    let h = Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await);
+    let mut v = Viewer::connect(&h).await;
+
+    // Loading ses_05 (on page 3) must activate successfully
+    let load_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_05",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    assert!(
+        load_res.get("error").is_none(),
+        "expected ses_05 on page 3 to activate successfully, got: {load_res}"
+    );
+
+    // Loading a truly missing session must fail with -32602 "Session not found"
+    let missing_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_missing",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    let err = missing_res
+        .get("error")
+        .expect("expected error for missing session");
+    assert_eq!(
+        err.get("code").and_then(Value::as_i64),
+        Some(-32602),
+        "expected -32602 for missing session, got: {missing_res}"
+    );
+    assert!(
+        err.get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("Session not found: ses_missing"),
+        "expected 'Session not found: ses_missing', got: {missing_res}"
+    );
+}

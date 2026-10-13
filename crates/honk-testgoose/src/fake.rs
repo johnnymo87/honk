@@ -153,6 +153,7 @@ struct FakeGooseInner {
     active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     active_runs: Mutex<HashMap<String, String>>,
     all_sessions: Mutex<HashMap<String, String>>,
+    session_list_page_size: Mutex<Option<usize>>,
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
     drop_prompt_announcement: AtomicBool,
@@ -203,6 +204,7 @@ impl FakeGoose {
             active_prompt_cancels: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(HashMap::new()),
             all_sessions: Mutex::new(HashMap::new()),
+            session_list_page_size: Mutex::new(None),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
             drop_prompt_announcement: AtomicBool::new(false),
@@ -269,6 +271,18 @@ impl FakeGoose {
 
     pub fn remove_session(&self, sid: &str) {
         self.state.all_sessions.lock().unwrap().remove(sid);
+    }
+
+    pub fn insert_session(&self, sid: &str, cwd: &str) {
+        self.state
+            .all_sessions
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), cwd.to_string());
+    }
+
+    pub fn set_session_list_page_size(&self, page_size: usize) {
+        *self.state.session_list_page_size.lock().unwrap() = Some(page_size);
     }
 
     pub fn gap_on_next_resume(&self, sid: &str) {
@@ -605,29 +619,80 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/list") => {
-            let sessions_guard = state.all_sessions.lock().unwrap();
-            let sessions_list: Vec<Value> = sessions_guard
-                .iter()
-                .map(|(s, cwd)| {
-                    json!({
-                        "sessionId": s,
-                        "cwd": cwd,
-                        "title": Value::Null,
-                        "updatedAt": Value::Null
-                    })
-                })
-                .collect();
+            let page_size = *state.session_list_page_size.lock().unwrap();
+            let (sessions_list, next_cursor) = match page_size {
+                Some(limit) => {
+                    let mut sessions: Vec<(String, String)> = state
+                        .all_sessions
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .into_iter()
+                        .collect();
+                    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    let req_cursor = frame.pointer("/params/cursor").and_then(|v| v.as_str());
+                    let start_idx = req_cursor
+                        .and_then(|c| {
+                            c.strip_prefix("cur_")
+                                .and_then(|idx| idx.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let end_idx = (start_idx + limit).min(sessions.len());
+                    let slice = if start_idx < sessions.len() {
+                        &sessions[start_idx..end_idx]
+                    } else {
+                        &[]
+                    };
+                    let list: Vec<Value> = slice
+                        .iter()
+                        .map(|(s, cwd)| {
+                            json!({
+                                "sessionId": s,
+                                "cwd": cwd,
+                                "title": Value::Null,
+                                "updatedAt": Value::Null
+                            })
+                        })
+                        .collect();
+                    let next = if end_idx < sessions.len() {
+                        Some(format!("cur_{end_idx}"))
+                    } else {
+                        None
+                    };
+                    (list, next)
+                }
+                None => {
+                    let sessions_guard = state.all_sessions.lock().unwrap();
+                    let list: Vec<Value> = sessions_guard
+                        .iter()
+                        .map(|(s, cwd)| {
+                            json!({
+                                "sessionId": s,
+                                "cwd": cwd,
+                                "title": Value::Null,
+                                "updatedAt": Value::Null
+                            })
+                        })
+                        .collect();
+                    (list, None)
+                }
+            };
 
             let mut conns = state.connections.lock().unwrap();
             if let Some(conn) = conns.get_mut(&conn_id)
                 && let Some(id) = req_id
             {
+                let mut result = json!({
+                    "sessions": sessions_list
+                });
+                if let Some(nc) = next_cursor {
+                    result["nextCursor"] = json!(nc);
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {
-                        "sessions": sessions_list
-                    }
+                    "result": result
                 });
                 conn.conn_stream.push_frame(resp, patched, false);
             }

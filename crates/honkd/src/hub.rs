@@ -627,25 +627,66 @@ impl Hub {
     }
 
     pub async fn get_stored_cwd(&self, sid: &str) -> Result<String, ActivationError> {
-        let list_res = self
-            .control_request("session/list", json!({}), json!(1))
-            .await
-            .map_err(|e| ActivationError {
-                code: -32603,
-                message: format!("control session/list failed: {e:#}"),
-            })?;
+        const MAX_PAGES: usize = 200;
+        let mut cursor: Option<String> = None;
 
-        let sessions = list_res
-            .pointer("/result/sessions")
-            .and_then(Value::as_array);
-        let stored_cwd = sessions
-            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
-            .and_then(|s| s["cwd"].as_str())
-            .map(|s| s.to_string());
+        for _ in 0..MAX_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
 
-        stored_cwd.ok_or_else(|| ActivationError {
-            code: -32602,
-            message: format!("Session not found: {sid}"),
+            let list_res = self
+                .control_request("session/list", params, json!(1))
+                .await
+                .map_err(|e| ActivationError {
+                    code: -32603,
+                    message: format!("control session/list failed: {e:#}"),
+                })?;
+
+            if let Some(err) = list_res.get("error") {
+                return Err(ActivationError {
+                    code: -32603,
+                    message: format!("control session/list failed: {err}"),
+                });
+            }
+
+            let sessions = list_res
+                .pointer("/result/sessions")
+                .and_then(Value::as_array);
+            let stored_cwd = sessions
+                .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
+                .and_then(|s| s["cwd"].as_str())
+                .map(|s| s.to_string());
+
+            if let Some(cwd) = stored_cwd {
+                return Ok(cwd);
+            }
+
+            let next_cursor = list_res
+                .pointer("/result/nextCursor")
+                .or_else(|| list_res.pointer("/result/next_cursor"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            match next_cursor {
+                Some(nc) if !nc.is_empty() => {
+                    cursor = Some(nc);
+                }
+                _ => {
+                    return Err(ActivationError {
+                        code: -32602,
+                        message: format!("Session not found: {sid}"),
+                    });
+                }
+            }
+        }
+
+        Err(ActivationError {
+            code: -32603,
+            message: format!(
+                "pagination limit of {MAX_PAGES} pages reached while searching for session: {sid}"
+            ),
         })
     }
 
