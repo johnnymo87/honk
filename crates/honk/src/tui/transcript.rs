@@ -9,8 +9,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::chat::driver::UiEvent;
+use crate::chat::driver::{ConnectionState, UiEvent};
 use crate::chat::types::{Notice, NoticeKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,7 +38,7 @@ pub struct Block {
     pub notice: Option<Notice>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ExpansionFlags {
     pub thoughts: bool,
     pub tools: bool,
@@ -47,8 +48,22 @@ pub struct ExpansionFlags {
 pub struct LayoutKey {
     pub key: BlockKey,
     pub width: u16,
-    pub revision: u64,
     pub flags: ExpansionFlags,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedBlock {
+    pub revision: u64,
+    pub height: usize,
+    pub lines: Arc<[Line<'static>]>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedPrefixSums {
+    width: u16,
+    flags: ExpansionFlags,
+    sums: Vec<usize>,
+    valid_up_to: usize,
 }
 
 pub struct Transcript {
@@ -56,7 +71,9 @@ pub struct Transcript {
     pub block_indices: HashMap<BlockKey, usize>,
     pub thoughts_expanded: bool,
     pub tools_expanded: bool,
-    pub layout_cache: HashMap<LayoutKey, Vec<Line<'static>>>,
+    pub layout_cache: HashMap<LayoutKey, CachedBlock>,
+    pub render_count: usize,
+    cached_prefix_sums: Option<CachedPrefixSums>,
     pending_rebuild: Option<Box<Transcript>>,
     is_rebuilding: bool,
     next_notice_id: u64,
@@ -79,12 +96,20 @@ impl Transcript {
             thoughts_expanded: false,
             tools_expanded: false,
             layout_cache: HashMap::new(),
+            render_count: 0,
+            cached_prefix_sums: None,
             pending_rebuild: None,
             is_rebuilding: false,
             next_notice_id: 1,
             anchor_idx_before_reset: None,
             anchor_key_before_reset: None,
             anchor_offset_before_reset: 0,
+        }
+    }
+
+    fn invalidate_prefix_sums_from(&mut self, idx: usize) {
+        if let Some(ref mut c) = self.cached_prefix_sums {
+            c.valid_up_to = c.valid_up_to.min(idx);
         }
     }
 
@@ -101,7 +126,6 @@ impl Transcript {
             }
             Some(honk_wire::method::REPLAY_DONE) => {
                 if let Some(mut fresh) = self.pending_rebuild.take() {
-                    // Re-append local notices from self to fresh
                     for b in &self.blocks {
                         if b.kind == BlockKind::Notice {
                             let idx = fresh.blocks.len();
@@ -112,8 +136,9 @@ impl Transcript {
                     self.blocks = fresh.blocks;
                     self.block_indices = fresh.block_indices;
                     self.layout_cache.clear();
+                    self.cached_prefix_sums = None;
                     self.is_rebuilding = false;
-                    self.next_notice_id = fresh.next_notice_id;
+                    self.next_notice_id = self.next_notice_id.max(fresh.next_notice_id);
                     true
                 } else {
                     false
@@ -169,6 +194,8 @@ impl Transcript {
             i
         };
 
+        self.invalidate_prefix_sums_from(idx);
+
         let block = &mut self.blocks[idx];
         block.revision += 1;
 
@@ -204,7 +231,12 @@ impl Transcript {
     pub fn apply_notice(&mut self, notice: Notice) {
         let key = BlockKey::Notice(format!("notice_{}", self.next_notice_id));
         self.next_notice_id += 1;
+        if let Some(ref mut fresh) = self.pending_rebuild {
+            fresh.next_notice_id = fresh.next_notice_id.max(self.next_notice_id);
+        }
+
         let idx = self.blocks.len();
+        self.invalidate_prefix_sums_from(idx);
         self.blocks.push(Block {
             key: key.clone(),
             kind: BlockKind::Notice,
@@ -219,6 +251,13 @@ impl Transcript {
             notice: Some(notice),
         });
         self.block_indices.insert(key, idx);
+    }
+
+    pub fn abort_rebuild(&mut self) {
+        if self.is_rebuilding {
+            self.pending_rebuild = None;
+            self.is_rebuilding = false;
+        }
     }
 
     pub fn apply_ui_event(&mut self, event: &UiEvent, viewport: &mut Viewport) {
@@ -261,38 +300,52 @@ impl Transcript {
             UiEvent::Notice(notice) => {
                 self.apply_notice(notice.clone());
             }
+            UiEvent::State(snapshot) if snapshot.connection != ConnectionState::Live => {
+                self.abort_rebuild();
+            }
             _ => {}
         }
     }
 
     pub fn toggle_thoughts(&mut self) {
         self.thoughts_expanded = !self.thoughts_expanded;
+        self.cached_prefix_sums = None;
     }
 
     pub fn toggle_tools(&mut self) {
         self.tools_expanded = !self.tools_expanded;
+        self.cached_prefix_sums = None;
     }
 
-    pub fn render_block(&mut self, block_idx: usize, width: u16) -> Vec<Line<'static>> {
+    pub fn render_block(&mut self, block_idx: usize, width: u16) -> Arc<[Line<'static>]> {
         if block_idx >= self.blocks.len() {
-            return Vec::new();
+            return Arc::new([]);
         }
         let block = &self.blocks[block_idx];
+        let flags = ExpansionFlags {
+            thoughts: self.thoughts_expanded,
+            tools: self.tools_expanded,
+        };
         let key = LayoutKey {
             key: block.key.clone(),
             width,
-            revision: block.revision,
-            flags: ExpansionFlags {
-                thoughts: self.thoughts_expanded,
-                tools: self.tools_expanded,
-            },
+            flags,
         };
 
-        if let Some(lines) = self.layout_cache.get(&key) {
-            return lines.clone();
+        if let Some(entry) = self
+            .layout_cache
+            .get(&key)
+            .filter(|e| e.revision == block.revision)
+        {
+            return entry.lines.clone();
         }
 
-        let lines = match block.kind {
+        // Bound total cache: drop entries for different widths on resize
+        self.layout_cache.retain(|k, _| k.width == width);
+
+        self.render_count += 1;
+
+        let lines_vec = match block.kind {
             BlockKind::User => render_user(&block.text, width),
             BlockKind::Assistant => render_assistant(&block.text, width),
             BlockKind::Thought => render_thought(&block.text, self.thoughts_expanded, width),
@@ -300,29 +353,93 @@ impl Transcript {
             BlockKind::Notice => render_notice(block, width),
         };
 
-        self.layout_cache.insert(key, lines.clone());
-        lines
+        let height = lines_vec.len();
+        let arc_lines: Arc<[Line<'static>]> = lines_vec.into();
+        self.layout_cache.insert(
+            key,
+            CachedBlock {
+                revision: block.revision,
+                height,
+                lines: arc_lines.clone(),
+            },
+        );
+        arc_lines
     }
 
     pub fn block_height(&mut self, block_idx: usize, width: u16) -> usize {
+        if block_idx >= self.blocks.len() {
+            return 0;
+        }
+        let block = &self.blocks[block_idx];
+        let key = LayoutKey {
+            key: block.key.clone(),
+            width,
+            flags: ExpansionFlags {
+                thoughts: self.thoughts_expanded,
+                tools: self.tools_expanded,
+            },
+        };
+
+        if let Some(entry) = self
+            .layout_cache
+            .get(&key)
+            .filter(|e| e.revision == block.revision)
+        {
+            return entry.height;
+        }
+
         self.render_block(block_idx, width).len()
     }
 
-    pub fn prefix_sums(&mut self, width: u16) -> Vec<usize> {
-        let mut sums = Vec::with_capacity(self.blocks.len() + 1);
-        sums.push(0);
-        let mut current = 0;
-        for i in 0..self.blocks.len() {
+    fn ensure_prefix_sums(&mut self, width: u16) {
+        let flags = ExpansionFlags {
+            thoughts: self.thoughts_expanded,
+            tools: self.tools_expanded,
+        };
+        let n_blocks = self.blocks.len();
+        let (valid_up_to, start_sum) = match &self.cached_prefix_sums {
+            Some(c) if c.width == width && c.flags == flags => {
+                let v = c.valid_up_to.min(n_blocks);
+                let sum = if v < c.sums.len() { c.sums[v] } else { 0 };
+                (v, sum)
+            }
+            _ => (0, 0),
+        };
+
+        if valid_up_to == 0 {
+            self.cached_prefix_sums = Some(CachedPrefixSums {
+                width,
+                flags,
+                sums: vec![0],
+                valid_up_to: 0,
+            });
+        } else if let Some(ref mut c) = self.cached_prefix_sums {
+            c.sums.truncate(valid_up_to + 1);
+        }
+
+        let mut current = start_sum;
+        for i in valid_up_to..n_blocks {
             let h = self.block_height(i, width);
             current += h;
-            sums.push(current);
+            self.cached_prefix_sums.as_mut().unwrap().sums.push(current);
         }
-        sums
+        self.cached_prefix_sums.as_mut().unwrap().valid_up_to = n_blocks;
+    }
+
+    pub fn prefix_sums(&mut self, width: u16) -> Vec<usize> {
+        self.ensure_prefix_sums(width);
+        self.cached_prefix_sums.as_ref().unwrap().sums.clone()
     }
 
     pub fn total_height(&mut self, width: u16) -> usize {
-        let sums = self.prefix_sums(width);
-        *sums.last().unwrap_or(&0)
+        self.ensure_prefix_sums(width);
+        *self
+            .cached_prefix_sums
+            .as_ref()
+            .unwrap()
+            .sums
+            .last()
+            .unwrap_or(&0)
     }
 
     pub fn to_markdown(&self) -> String {
@@ -478,6 +595,7 @@ struct Token {
 }
 
 pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let line_style = line.style;
     let max_width = width.max(1);
     let total_width: usize = line
         .spans
@@ -574,7 +692,9 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
     for token in tokens {
         if token.is_newline {
-            result.push(Line::from(std::mem::take(&mut current_spans)));
+            let mut l = Line::from(std::mem::take(&mut current_spans));
+            l.style = line_style;
+            result.push(l);
             current_width = 0;
             is_start_of_original_line = true;
             continue;
@@ -590,7 +710,9 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 current_spans.push(Span::styled(token.text, token.style));
                 current_width += token.width;
             } else {
-                result.push(Line::from(std::mem::take(&mut current_spans)));
+                let mut l = Line::from(std::mem::take(&mut current_spans));
+                l.style = line_style;
+                result.push(l);
                 current_width = 0;
             }
             continue;
@@ -603,7 +725,9 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             current_width += token.width;
         } else {
             if current_width > 0 {
-                result.push(Line::from(std::mem::take(&mut current_spans)));
+                let mut l = Line::from(std::mem::take(&mut current_spans));
+                l.style = line_style;
+                result.push(l);
                 current_width = 0;
             }
 
@@ -615,7 +739,9 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 for c in token.text.chars() {
                     let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
                     if current_width + cw > max_width && current_width > 0 {
-                        result.push(Line::from(std::mem::take(&mut current_spans)));
+                        let mut l = Line::from(std::mem::take(&mut current_spans));
+                        l.style = line_style;
+                        result.push(l);
                         current_width = 0;
                     }
                     current_spans.push(Span::styled(c.to_string(), token.style));
@@ -626,7 +752,9 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     }
 
     if !current_spans.is_empty() || result.is_empty() {
-        result.push(Line::from(current_spans));
+        let mut l = Line::from(current_spans);
+        l.style = line_style;
+        result.push(l);
     }
 
     result
@@ -653,15 +781,36 @@ fn render_user(raw: &str, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-fn has_unclosed_fence(s: &str) -> bool {
-    let mut open = false;
+fn ends_with_unclosed_code_block(s: &str) -> bool {
+    let mut open_fence: Option<(char, usize)> = None;
     for line in s.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            open = !open;
+        let indent = line.len() - trimmed.len();
+        if indent > 3 {
+            continue;
+        }
+        if let Some((fence_char, fence_len)) = open_fence {
+            let fence_run = trimmed.chars().take_while(|&c| c == fence_char).count();
+            if fence_run >= fence_len && trimmed[fence_run..].trim().is_empty() {
+                open_fence = None;
+            }
+        } else {
+            let (ch, run) = if trimmed.starts_with("```") {
+                ('`', trimmed.chars().take_while(|&c| c == '`').count())
+            } else if trimmed.starts_with("~~~") {
+                ('~', trimmed.chars().take_while(|&c| c == '~').count())
+            } else {
+                (' ', 0)
+            };
+            if run >= 3 {
+                let info = &trimmed[run..];
+                if ch != '`' || !info.contains('`') {
+                    open_fence = Some((ch, run));
+                }
+            }
         }
     }
-    open
+    open_fence.is_some()
 }
 
 fn to_owned_line(line: Line<'_>) -> Line<'static> {
@@ -683,15 +832,15 @@ fn render_assistant(raw: &str, width: u16) -> Vec<Line<'static>> {
 
     if !committed.is_empty() {
         let md_text = tui_markdown::from_str(committed);
-        let unclosed = has_unclosed_fence(committed);
+        let unclosed = ends_with_unclosed_code_block(committed);
         let mut lines = md_text.lines;
-        if unclosed && !lines.is_empty() {
-            // Drop synthesized closing fence line
-            if let Some(last) = lines.last() {
-                let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
-                if text.trim() == "```" || text.trim() == "~~~" {
-                    lines.pop();
-                }
+        if unclosed
+            && !lines.is_empty()
+            && let Some(last) = lines.last()
+        {
+            let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+            if text.trim() == "```" || text.trim() == "~~~" {
+                lines.pop();
             }
         }
         for line in lines {
@@ -859,42 +1008,51 @@ impl Viewport {
             return Vec::new();
         }
 
-        let sums = transcript.prefix_sums(width);
-        let total_h = *sums.last().unwrap_or(&0);
+        transcript.ensure_prefix_sums(width);
+        let (_total_h, v_start, v_end) = {
+            let sums = &transcript.cached_prefix_sums.as_ref().unwrap().sums;
+            let total_h = *sums.last().unwrap_or(&0);
 
-        let (v_start, v_end) = if total_h <= height {
-            self.follow = true;
-            self.anchor = (transcript.blocks[0].key.clone(), 0);
-            (0, total_h)
-        } else if self.follow {
-            let start = total_h - height;
-            for i in 0..transcript.blocks.len() {
-                if sums[i] <= start && start < sums[i + 1] {
-                    self.anchor = (transcript.blocks[i].key.clone(), start - sums[i]);
-                    break;
-                }
-            }
-            (start, total_h)
-        } else {
-            let start = if let Some(&idx) = transcript.block_indices.get(&self.anchor.0) {
-                let block_h = sums[idx + 1] - sums[idx];
-                let offset = self.anchor.1.min(block_h.saturating_sub(1));
-                (sums[idx] + offset).min(total_h.saturating_sub(height))
-            } else {
-                0
-            };
-            if start + height >= total_h {
+            if total_h <= height {
                 self.follow = true;
+                self.anchor = (transcript.blocks[0].key.clone(), 0);
+                (total_h, 0, total_h)
+            } else if self.follow {
+                let start = total_h - height;
+                let anchor_idx = sums[1..].partition_point(|&end| end <= start);
+                self.anchor = (
+                    transcript.blocks[anchor_idx].key.clone(),
+                    start - sums[anchor_idx],
+                );
+                (total_h, start, total_h)
+            } else {
+                let start = if let Some(&idx) = transcript.block_indices.get(&self.anchor.0) {
+                    let block_h = sums[idx + 1] - sums[idx];
+                    let offset = self.anchor.1.min(block_h.saturating_sub(1));
+                    (sums[idx] + offset).min(total_h.saturating_sub(height))
+                } else {
+                    0
+                };
+                if start + height >= total_h {
+                    self.follow = true;
+                }
+                (total_h, start, (start + height).min(total_h))
             }
-            (start, (start + height).min(total_h))
+        };
+
+        let first_idx = {
+            let sums = &transcript.cached_prefix_sums.as_ref().unwrap().sums;
+            sums[1..].partition_point(|&end| end <= v_start)
         };
 
         let mut out = Vec::new();
-        for i in 0..transcript.blocks.len() {
-            let b_start = sums[i];
-            let b_end = sums[i + 1];
-            if b_end <= v_start || b_start >= v_end {
-                continue;
+        for i in first_idx..transcript.blocks.len() {
+            let (b_start, b_end) = {
+                let sums = &transcript.cached_prefix_sums.as_ref().unwrap().sums;
+                (sums[i], sums[i + 1])
+            };
+            if b_start >= v_end {
+                break;
             }
             let lines = transcript.render_block(i, width);
             let slice_start = v_start.saturating_sub(b_start);
@@ -923,7 +1081,8 @@ impl Viewport {
         if transcript.blocks.is_empty() || height == 0 {
             return;
         }
-        let sums = transcript.prefix_sums(width);
+        transcript.ensure_prefix_sums(width);
+        let sums = &transcript.cached_prefix_sums.as_ref().unwrap().sums;
         let total_h = *sums.last().unwrap_or(&0);
         if total_h <= height {
             self.follow = true;
@@ -944,12 +1103,11 @@ impl Viewport {
         let new_start = (current_start as i64 + delta as i64).clamp(0, max_start as i64) as usize;
         self.follow = new_start >= max_start;
 
-        for i in 0..transcript.blocks.len() {
-            if sums[i] <= new_start && new_start < sums[i + 1] {
-                self.anchor = (transcript.blocks[i].key.clone(), new_start - sums[i]);
-                break;
-            }
-        }
+        let anchor_idx = sums[1..].partition_point(|&end| end <= new_start);
+        self.anchor = (
+            transcript.blocks[anchor_idx].key.clone(),
+            new_start - sums[anchor_idx],
+        );
     }
 
     pub fn half_page(&mut self, dir: i32, transcript: &mut Transcript, width: u16, height: usize) {
@@ -1062,7 +1220,7 @@ mod tests {
         let lines = transcript.render_block(0, 40);
         // At width 40, 100 characters must wrap into 3 lines (40, 40, 20)
         assert_eq!(lines.len(), 3);
-        for line in &lines {
+        for line in lines.iter() {
             let width: usize = line
                 .spans
                 .iter()
@@ -1081,7 +1239,7 @@ mod tests {
         transcript.apply_frame(&chunk);
         let lines = transcript.render_block(0, 10);
         assert_eq!(lines.len(), 2); // 10 cols, then 6 cols
-        for line in &lines {
+        for line in lines.iter() {
             let width: usize = line
                 .spans
                 .iter()
@@ -1501,5 +1659,139 @@ mod tests {
         assert!(md.contains("What is 2+2?"));
         assert!(md.contains("Computing math"));
         assert!(md.contains("Done!"));
+    }
+
+    #[test]
+    fn test_wrapped_line_style() {
+        let line = Line::from("this is a line that will definitely wrap across multiple lines")
+            .style(Style::default().bg(Color::Blue));
+        let wrapped = wrap_line(line, 15);
+        assert!(wrapped.len() > 1);
+        for l in &wrapped {
+            assert_eq!(l.style, Style::default().bg(Color::Blue));
+        }
+    }
+
+    #[test]
+    fn test_four_backtick_fence_keeps_three_backtick_content() {
+        let mut transcript = Transcript::new();
+        let chunk = make_chunk_frame("agent_message_chunk", "a1", "````markdown\n```\n````\n");
+        transcript.apply_frame(&chunk);
+        let lines = transcript.render_block(0, 80);
+        let text_lines: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // The inner ``` must be present as content AND the closing fence must be present
+        let fence_count = text_lines.iter().filter(|l| l.trim() == "```").count();
+        assert_eq!(
+            fence_count, 2,
+            "expected 2 ``` lines (content + closing fence), got: {:?}",
+            text_lines
+        );
+    }
+
+    #[test]
+    fn test_abort_rebuild_path() {
+        use crate::chat::driver::ConnectionState;
+        use crate::chat::types::{Ownership, RunState};
+        let mut transcript = Transcript::new();
+        let mut viewport = Viewport::new();
+
+        let chunk = make_chunk_frame("user_message_chunk", "u1", "hello");
+        transcript.apply_ui_event(&UiEvent::Transcript(chunk), &mut viewport);
+        assert_eq!(transcript.blocks.len(), 1);
+
+        let reset = json!({"method": "_honk/reset"});
+        transcript.apply_ui_event(&UiEvent::Transcript(reset), &mut viewport);
+        assert!(transcript.is_rebuilding);
+
+        // Connection drops into reconnecting
+        let snapshot = crate::chat::driver::StateSnapshot {
+            run_state: RunState::Idle,
+            ownership: Ownership::Unknown,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Reconnecting { attempt: 1 },
+        };
+        transcript.apply_ui_event(&UiEvent::State(snapshot), &mut viewport);
+        assert!(!transcript.is_rebuilding);
+        assert_eq!(transcript.blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_notice_ids_unique_across_reset() {
+        let mut transcript = Transcript::new();
+        let mut viewport = Viewport::new();
+
+        transcript.apply_notice(Notice::info("n1"));
+        let reset = json!({"method": "_honk/reset"});
+        transcript.apply_ui_event(&UiEvent::Transcript(reset), &mut viewport);
+        transcript.apply_notice(Notice::info("n2"));
+        let done = json!({"method": "_honk/replay_done"});
+        transcript.apply_ui_event(&UiEvent::Transcript(done), &mut viewport);
+        transcript.apply_notice(Notice::info("n3"));
+
+        let keys: Vec<BlockKey> = transcript.blocks.iter().map(|b| b.key.clone()).collect();
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(keys.len(), unique.len(), "keys had duplicates: {:?}", keys);
+    }
+
+    #[test]
+    fn test_streaming_300_chunks_bounds_cache() {
+        let mut transcript = Transcript::new();
+        for i in 1..=300 {
+            let chunk = make_chunk_frame("agent_message_chunk", "stream_msg", &format!("word{i} "));
+            transcript.apply_frame(&chunk);
+            transcript.render_block(0, 80);
+        }
+        assert_eq!(
+            transcript.layout_cache.len(),
+            1,
+            "cache leaked intermediate streaming frames: len={}",
+            transcript.layout_cache.len()
+        );
+    }
+
+    #[test]
+    fn test_5k_blocks_incremental_render_counter() {
+        let mut transcript = Transcript::new();
+        let mut viewport = Viewport::new();
+
+        for i in 0..5000 {
+            let chunk = make_chunk_frame(
+                "user_message_chunk",
+                &format!("u_{i}"),
+                &format!("msg {i}\n"),
+            );
+            transcript.apply_frame(&chunk);
+        }
+
+        // Render viewport of height 20
+        let lines = viewport.visible_lines(&mut transcript, 80, 20);
+        assert_eq!(lines.len(), 20);
+        let initial_renders = transcript.render_count;
+        assert_eq!(initial_renders, 5000);
+
+        // Now stream a chunk into the last block (4999)
+        let chunk_last = make_chunk_frame("user_message_chunk", "u_4999", " appended\n");
+        transcript.apply_frame(&chunk_last);
+
+        // Render viewport again
+        let _ = viewport.visible_lines(&mut transcript, 80, 20);
+        let delta_renders = transcript.render_count - initial_renders;
+        // Only the modified block should have been re-rendered!
+        assert_eq!(
+            delta_renders, 1,
+            "prefix sums re-rendered untouched blocks: delta={delta_renders}"
+        );
     }
 }
