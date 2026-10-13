@@ -50,7 +50,8 @@ Composer input:
 | Input | Effect |
 |---|---|
 | text + Enter, no run active | `session/prompt` (fresh `_meta.honk.client_req_id`) |
-| text + Enter, run active | `_goose/unstable/session/steer` into that run |
+| text + Enter, **own** run active | `_goose/unstable/session/steer` into that run |
+| text + Enter, **another client's** run active (or ownership unknown) | queued locally; sent as `session/prompt` when the run ends (`/drop` discards the queue) |
 | text + Enter, own prompt sent but its run not started | held locally; steered once the run starts |
 | line ending in `\` | continue on the next line (multi-line message) |
 | Ctrl-C or `/cancel` | cancel the run **only if it is this client's own** (below); otherwise print "this turn belongs to another client; `/cancel!` cancels it anyway" |
@@ -99,13 +100,17 @@ reason), reconnecting, detached-for-idle, errors.
    The reply arrives at turn end (stopReason; `_meta.honk.text` unused — the transcript
    already shows it).
    - Busy reply (detected by the `data` text "session already has active run", not by
-     the code: `-32602` is also used for other errors) → convert once to a steer with
-     `expectedRunId` from the error data. The prompt leaves the in-flight slot
-     immediately (its ledger entry is gone, so it must never be re-sent as a prompt).
+     the code: `-32602` is also used for other errors) → the run is foreign: the text goes
+     to the local queue and is re-prompted (fresh crid) when `activeRunId` goes null. The
+     prompt leaves the in-flight slot immediately (its ledger entry is gone). **Never steer
+     into a foreign run**: in recipe/`final_output` sessions (stall-watch coordinators) goose
+     drains pending steers and then ends the turn without another model call, so the steer
+     is recorded as consumed but never answered (goose `agent.rs` loop; honk-9qf.1 design
+     §3.2).
    - Reply `stopReason: cancelled` with `_meta.honk.reason` `not_delivered` or
      `upstream_restart` → "[honk] your message did not run:" + text printed back.
 6. **Steer**: `_goose/unstable/session/steer {sessionId, expectedRunId, prompt:[…]}`.
-   - "no active run to steer" → convert once to a prompt.
+   - Only into own runs. "no active run to steer" → convert once to a prompt.
    - run-id mismatch → **not** retargeted: print the text back ("the turn you were
      steering ended; re-send to send it to the current one").
    - At most one prompt↔steer conversion per line; after that the text is printed back.
@@ -166,8 +171,11 @@ reason), reconnecting, detached-for-idle, errors.
 
 ## Interaction with other clients of the same session
 
-- Another client's turn is running: human text steers into it (visible in the transcript
-  to everyone); Ctrl-C does not cancel it.
+- Another client's turn is running: human text is queued and prompted when that turn ends
+  (never steered into it, see Protocol 5); Ctrl-C does not cancel it.
+- Coordinator sessions force a `final_output` tool on every turn; replies show as a
+  `recipe: final output` tool line plus the closing agent text. Legible rendering of that
+  is M2 polish, not this plan.
 - Another client prompts while the human's turn runs: it gets the busy error; its policy
   (honk-9qf.1 for stall-watch).
 - Pigeon-launched sessions: pigeon's runner auto-answers permissions with `options[0]`, so
