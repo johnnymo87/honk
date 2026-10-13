@@ -111,8 +111,20 @@ pub fn resolve(
             // Unmodified keys
             if key_event.modifiers == KeyModifiers::NONE {
                 match key_event.code {
-                    KeyCode::Up => return Action::ScrollLines(-3),
-                    KeyCode::Down => return Action::ScrollLines(3),
+                    KeyCode::Up => {
+                        if composer_empty {
+                            return Action::ScrollLines(-3);
+                        } else {
+                            return Action::Edtui(key_event);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if composer_empty {
+                            return Action::ScrollLines(3);
+                        } else {
+                            return Action::Edtui(key_event);
+                        }
+                    }
                     KeyCode::Char(':') => return Action::OpenCommand,
                     KeyCode::Char('z') => return Action::PendingPrefix('z'),
                     KeyCode::Char('g') => {
@@ -138,6 +150,27 @@ pub fn resolve(
             Action::Edtui(key_event)
         }
         EditorMode::Insert => {
+            // Up/Down in insert mode: scroll transcript if empty, editor cursor if non-empty
+            if key_event.modifiers == KeyModifiers::NONE {
+                match key_event.code {
+                    KeyCode::Up => {
+                        if composer_empty {
+                            return Action::ScrollLines(-3);
+                        } else {
+                            return Action::Edtui(key_event);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if composer_empty {
+                            return Action::ScrollLines(3);
+                        } else {
+                            return Action::Edtui(key_event);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Ctrl-C
             if key_event.modifiers == KeyModifiers::CONTROL && key_event.code == KeyCode::Char('c')
             {
@@ -148,13 +181,13 @@ pub fn resolve(
                 }
             }
 
-            // Ctrl-D
+            // Ctrl-D: quit if empty, no-op (Ignore) if non-empty (removed from edtui handler)
             if key_event.modifiers == KeyModifiers::CONTROL && key_event.code == KeyCode::Char('d')
             {
                 if composer_empty {
                     return Action::Quit;
                 } else {
-                    return Action::Edtui(key_event);
+                    return Action::Ignore;
                 }
             }
 
@@ -260,13 +293,47 @@ mod tests {
             resolve(EditorMode::Normal, true, ctrl('b'), None, false),
             Action::ScrollPage(-1)
         );
+    }
+
+    #[test]
+    fn test_up_down_empty_vs_non_empty_in_both_modes() {
+        let up = key(KeyCode::Up);
+        let down = key(KeyCode::Down);
+
+        // When composer is empty: Up/Down scroll transcript 3 lines in BOTH modes
         assert_eq!(
-            resolve(EditorMode::Normal, true, key(KeyCode::Up), None, false),
+            resolve(EditorMode::Normal, true, up, None, false),
             Action::ScrollLines(-3)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, key(KeyCode::Down), None, false),
+            resolve(EditorMode::Normal, true, down, None, false),
             Action::ScrollLines(3)
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, up, None, false),
+            Action::ScrollLines(-3)
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, down, None, false),
+            Action::ScrollLines(3)
+        );
+
+        // When composer is NOT empty: Up/Down pass through to edtui in BOTH modes
+        assert_eq!(
+            resolve(EditorMode::Normal, false, up, None, false),
+            Action::Edtui(up)
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, false, down, None, false),
+            Action::Edtui(down)
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, false, up, None, false),
+            Action::Edtui(up)
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, false, down, None, false),
+            Action::Edtui(down)
         );
     }
 
@@ -409,10 +476,10 @@ mod tests {
             resolve(EditorMode::Insert, true, ctrl('d'), None, false),
             Action::Quit
         );
-        // In Insert mode: ctrl-d on non-empty composer goes to Edtui
+        // In Insert mode: ctrl-d on non-empty composer is Ignore (consistent with removal from edtui)
         assert_eq!(
             resolve(EditorMode::Insert, false, ctrl('d'), None, false),
-            Action::Edtui(ctrl('d'))
+            Action::Ignore
         );
     }
 

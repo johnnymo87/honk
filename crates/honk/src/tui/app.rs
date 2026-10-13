@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
@@ -34,6 +35,7 @@ pub struct App {
     pub fatal_error: Option<String>,
     pub cmd_tx: mpsc::UnboundedSender<UiCommand>,
     pub last_transcript_area: Rect,
+    pub pending_dump: bool,
 }
 
 impl App {
@@ -65,6 +67,7 @@ impl App {
             fatal_error: None,
             cmd_tx,
             last_transcript_area: Rect::new(0, 0, 80, 24),
+            pending_dump: false,
         }
     }
 
@@ -101,6 +104,13 @@ impl App {
             .as_ref()
             .map(|s| &s.connection)
             .unwrap_or(&ConnectionState::Live)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        match &self.state_snapshot {
+            Some(s) => !s.run_state.is_running() && !s.prompt_in_flight,
+            None => true,
+        }
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
@@ -243,7 +253,11 @@ impl App {
                 }
             }
             Action::Interrupt => {
-                let _ = self.cmd_tx.send(UiCommand::Interrupt);
+                if self.is_idle() && !self.is_composer_empty() {
+                    self.set_composer_text("");
+                } else {
+                    let _ = self.cmd_tx.send(UiCommand::Interrupt);
+                }
             }
             Action::LeaveInsertMode => {
                 self.composer.mode = EditorMode::Normal;
@@ -265,10 +279,11 @@ impl App {
                 let _ = self.cmd_tx.send(UiCommand::Eof);
             }
             "yank" => {
-                self.yank_last_assistant();
+                let mut stdout = std::io::stdout();
+                self.yank_last_assistant(&mut stdout);
             }
             "dump" => {
-                let _ = self.dump_transcript();
+                self.pending_dump = true;
             }
             "cancel" => {
                 let _ = self.cmd_tx.send(UiCommand::Line("/cancel".into()));
@@ -292,14 +307,20 @@ impl App {
         }
     }
 
-    pub fn yank_last_assistant(&mut self) {
+    pub fn yank_last_assistant<W: Write>(&mut self, writer: &mut W) {
         if let Some(text) = self.transcript.last_assistant_text() {
             use base64::Engine;
             let encoded = base64::prelude::BASE64_STANDARD.encode(text.as_bytes());
+            if encoded.len() > 100 * 1024 {
+                self.transcript.apply_notice(Notice::warning(format!(
+                    "assistant message too large to yank via OSC 52 ({} KB > 100 KB limit)",
+                    encoded.len() / 1024
+                )));
+                return;
+            }
             let osc = format!("\x1b]52;c;{encoded}\x07");
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(osc.as_bytes());
-            let _ = stdout.flush();
+            let _ = writer.write_all(osc.as_bytes());
+            let _ = writer.flush();
         }
     }
 
@@ -534,6 +555,8 @@ impl App {
     }
 }
 
+static RESTORED: AtomicBool = AtomicBool::new(false);
+
 pub struct TerminalGuard {
     pub enhanced_keyboard: bool,
 }
@@ -545,6 +568,9 @@ impl Drop for TerminalGuard {
 }
 
 pub fn restore_terminal(enhanced_keyboard: bool) {
+    if RESTORED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let mut stdout = std::io::stdout();
     let _ = crossterm::terminal::disable_raw_mode();
     if enhanced_keyboard {
@@ -556,7 +582,8 @@ pub fn restore_terminal(enhanced_keyboard: bool) {
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::cursor::Show
     );
-    let _ = stdout.write_all(b"\x1b[?1007l\x1b]0;\x07");
+    // Disable alternate scroll mode and pop title from stack
+    let _ = stdout.write_all(b"\x1b[?1007l\x1b[23;0t");
     let _ = stdout.flush();
 }
 
@@ -564,6 +591,7 @@ pub fn setup_terminal() -> anyhow::Result<(
     ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     TerminalGuard,
 )> {
+    RESTORED.store(false, Ordering::SeqCst);
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(
@@ -573,7 +601,8 @@ pub fn setup_terminal() -> anyhow::Result<(
         crossterm::cursor::Hide
     )?;
 
-    stdout.write_all(b"\x1b[?1007h")?;
+    // Push terminal title onto stack and enable alternate scroll
+    stdout.write_all(b"\x1b[22;0t\x1b[?1007h")?;
     stdout.flush()?;
 
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -613,6 +642,10 @@ pub async fn run_app(
     let mut render_interval = tokio::time::interval(std::time::Duration::from_millis(33));
     render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     terminal.draw(|f| app.draw(f))?;
     let mut dirty = false;
 
@@ -627,6 +660,15 @@ pub async fn run_app(
                     terminal.draw(|f| app.draw(f))?;
                     dirty = false;
                 }
+            }
+            _ = sigterm.recv() => {
+                break;
+            }
+            _ = sighup.recv() => {
+                break;
+            }
+            _ = sigint.recv() => {
+                break;
             }
             maybe_event = futures::StreamExt::next(&mut event_stream) => {
                 match maybe_event {
@@ -646,7 +688,10 @@ pub async fn run_app(
                             _ => {}
                         }
                     }
-                    Some(Err(_)) => {}
+                    Some(Err(_)) => {
+                        // Pty died or input stream error -> exit cleanly
+                        break;
+                    }
                     None => break,
                 }
             }
@@ -664,6 +709,53 @@ pub async fn run_app(
                     None => break,
                 }
             }
+        }
+
+        if app.pending_dump {
+            app.pending_dump = false;
+            let markdown = app.transcript.to_markdown();
+
+            // 1. Drop event_stream so crossterm doesn't read stdin while pager runs
+            drop(event_stream);
+
+            // 2. Suspend terminal
+            let _ = app.suspend_terminal();
+
+            // 3. Write markdown to tempfile and run pager via tokio::process
+            let temp_opt = tempfile::Builder::new()
+                .prefix("honk-dump-")
+                .suffix(".md")
+                .tempfile();
+
+            if let Ok(mut temp) = temp_opt {
+                use std::io::Write;
+                let _ = temp.write_all(markdown.as_bytes());
+                let _ = temp.flush();
+                let path = temp.path().to_path_buf();
+
+                let prog = std::env::var("PAGER")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .unwrap_or_else(|_| "less -R".to_string());
+
+                let _ = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("{} \"$1\"", prog))
+                    .arg("sh")
+                    .arg(&path)
+                    .status()
+                    .await;
+            }
+
+            // 4. Resume terminal
+            let _ = app.resume_terminal();
+
+            // 5. Clear terminal
+            let _ = terminal.clear();
+
+            // 6. Recreate event stream
+            event_stream = crossterm::event::EventStream::new();
+
+            dirty = true;
         }
     }
 
@@ -687,6 +779,7 @@ pub async fn run_app(
 mod tests {
     use super::*;
     use crate::chat::types::{NoticeKind, Ownership, RunState};
+    use crate::tui::BlockKind;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -865,19 +958,43 @@ mod tests {
             Some("Hello, assistant text here!\n")
         );
 
-        // Execute :yank
-        app.handle_key(key(KeyCode::Char(':')));
-        for c in "yank".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
-        app.handle_key(key(KeyCode::Enter));
-        assert!(app.command_line.is_none());
+        // Execute yank to test buffer (no escape codes leaking to stdout)
+        let mut buf = Vec::new();
+        app.yank_last_assistant(&mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.starts_with("\x1b]52;c;"));
+        assert!(output.ends_with("\x07"));
+
+        // Refuse with notice when text is above 100 KB base64
+        let large_text = "A".repeat(80_000); // 80 KB raw -> ~106 KB base64
+        let chunk_large = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "msg_large",
+                    "content": {
+                        "type": "text",
+                        "text": large_text
+                    }
+                }
+            }
+        });
+        app.handle_ui_event(UiEvent::Transcript(chunk_large));
+
+        let mut buf2 = Vec::new();
+        app.yank_last_assistant(&mut buf2);
+        assert!(buf2.is_empty(), "Large text must not be written to sink");
+        // Check that a notice was applied
+        let last_block = app.transcript.blocks.last().unwrap();
+        assert_eq!(last_block.kind, BlockKind::Notice);
     }
 
     #[test]
     fn test_colon_dump() {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_1", cmd_tx);
+        app.composer.mode = EditorMode::Normal;
 
         let chunk = json!({
             "method": "session/update",
@@ -894,6 +1011,14 @@ mod tests {
         });
         app.handle_ui_event(UiEvent::Transcript(chunk));
 
+        // Execute :dump
+        app.handle_key(key(KeyCode::Char(':')));
+        for c in "dump".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.pending_dump);
         let md = app.transcript.to_markdown();
         assert!(md.contains("Markdown Header"));
     }
@@ -1030,6 +1155,37 @@ mod tests {
         app.set_composer_text("");
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
+    }
+
+    #[test]
+    fn test_ctrl_c_idle_with_text_clears_composer() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+        app.composer.mode = EditorMode::Normal;
+        app.set_composer_text("some draft in normal mode");
+
+        // When idle and composer non-empty in normal mode: clears composer, does NOT send Interrupt
+        app.handle_key(ctrl('c'));
+        assert!(app.is_composer_empty());
+        assert!(cmd_rx.try_recv().is_err());
+
+        // When composer is now empty in normal mode: sends Interrupt
+        app.handle_key(ctrl('c'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
+
+        // When active run is running and composer is non-empty in normal mode: sends Interrupt (does NOT clear)
+        app.set_composer_text("draft during active run");
+        app.state_snapshot = Some(StateSnapshot {
+            run_state: RunState::Running("run_1".into()),
+            ownership: Ownership::Own,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+        });
+        app.handle_key(ctrl('c'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
+        assert_eq!(app.get_composer_text(), "draft during active run");
     }
 
     #[test]

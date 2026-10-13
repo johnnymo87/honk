@@ -84,6 +84,27 @@ struct ListArgs {
     secret: Option<String>,
 }
 
+fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Target> {
+    if args.new {
+        let cwd = match &args.cwd {
+            Some(c) => c
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("invalid --cwd: {}", e))?,
+            None => std::env::current_dir()?.canonicalize()?,
+        };
+        let extensions = if args.ext.is_empty() {
+            None
+        } else {
+            Some(args.ext.clone())
+        };
+        Ok(honk::chat::driver::Target::New { cwd, extensions })
+    } else {
+        Ok(honk::chat::driver::Target::Attach(
+            args.session.clone().unwrap(),
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -110,20 +131,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Chat(args) => {
             let secret = resolve_secret(args.secret.as_deref())?;
-            let target = if args.new {
-                let cwd = match args.cwd {
-                    Some(c) => c,
-                    None => std::env::current_dir()?,
-                };
-                let extensions = if args.ext.is_empty() {
-                    None
-                } else {
-                    Some(args.ext)
-                };
-                honk::chat::driver::Target::New { cwd, extensions }
-            } else {
-                honk::chat::driver::Target::Attach(args.session.unwrap())
-            };
+            let target = resolve_chat_target(&args)?;
 
             let session_id = match &target {
                 honk::chat::driver::Target::Attach(id) => id.clone(),
@@ -137,4 +145,44 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_target_nonexistent_cwd_errors() {
+        let args = ChatArgs {
+            session: None,
+            new: true,
+            cwd: Some(PathBuf::from("/nonexistent_path_xyz_123")),
+            ext: vec![],
+            url: "http://127.0.0.1:4280/acp".into(),
+            secret: None,
+        };
+        let err = resolve_chat_target(&args).unwrap_err();
+        assert!(err.to_string().contains("invalid --cwd:"));
+    }
+
+    #[test]
+    fn test_chat_target_existing_cwd_canonicalized() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = ChatArgs {
+            session: None,
+            new: true,
+            cwd: Some(temp.path().to_path_buf()),
+            ext: vec!["dev".into()],
+            url: "http://127.0.0.1:4280/acp".into(),
+            secret: None,
+        };
+        let target = resolve_chat_target(&args).unwrap();
+        match target {
+            honk::chat::driver::Target::New { cwd, extensions } => {
+                assert_eq!(cwd, temp.path().canonicalize().unwrap());
+                assert_eq!(extensions, Some(vec!["dev".into()]));
+            }
+            _ => panic!("expected Target::New"),
+        }
+    }
 }

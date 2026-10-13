@@ -29,6 +29,8 @@ honk chat --new --cwd /path/to/project
 honk chat --new --cwd /path/to/project --ext developer --ext summon
 ```
 
+*(Note: `--cwd` is validated and canonicalized; it returns an error if the directory does not exist. If omitted, `--new` defaults to the canonicalized current working directory).*
+
 ### Connecting to honkd
 
 By default, `honk chat` connects to `http://127.0.0.1:4280/acp`. You can override this using:
@@ -79,8 +81,9 @@ The user interface consists of three distinct vertical areas:
 | `Alt-Enter` | Insert a newline. |
 | `Ctrl-J` | Insert a newline. |
 | `Shift-Enter` | Insert a newline (requires terminal/tmux keyboard enhancement support; otherwise treated as `Enter`). |
+| `Up` / `Down` | Scroll transcript up / down 3 lines (when composer is empty, e.g. mouse wheel via `?1007`); moves cursor in editor when composer has text. |
 | `Ctrl-C` | If composer has text: exits to **Normal Mode** (vim habit). If composer is empty: interrupts active turn (`Action::Interrupt`). |
-| `Ctrl-D` | If composer is empty: quits `honk chat` (`Action::Quit`). If composer has text: forwarded to editor. |
+| `Ctrl-D` | If composer is empty: quits `honk chat` (`Action::Quit`). If composer has text: ignored (no-op). |
 | `Ctrl-P` | Previous history entry. |
 | `Ctrl-N` | Next history entry. |
 
@@ -96,14 +99,14 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `Ctrl-U` | Scroll transcript up half a page. |
 | `Ctrl-F` | Scroll transcript down full page. |
 | `Ctrl-B` | Scroll transcript up full page. |
-| `Up` / `Down` | Scroll transcript up / down 3 lines. |
+| `Up` / `Down` | Scroll transcript up / down 3 lines (when composer is empty); moves cursor in editor when composer has text. |
 | `g g` | Scroll to top of transcript (when composer is empty). |
 | `G` (Shift-G) | Scroll to bottom of transcript (when composer is empty). |
 | `z a` | Toggle tool call expansion (expand/collapse tool arguments and outputs). |
 | `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
-| `Ctrl-C` | Interrupt active turn (or clear composer). |
+| `Ctrl-C` | If idle and composer has text: clears composer. Otherwise: interrupts active turn (`Action::Interrupt`). |
 | Standard Vim | `h`, `j`, `k`, `l`, `w`, `b`, `x`, `u`, `dd`, etc. for composer text manipulation. |
 
 ### Command Line Mode (`:`)
@@ -128,7 +131,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/cancel!` | `:cancel!` | Unconditionally cancel active turn upstream, regardless of who started it. |
 | `/drop` | `:drop` | Discard all locally queued or held messages. |
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
-| `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52. |
+| `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
 | `//text` | — | Escape sequence: sends literal `/text` as a user message instead of parsing as a command. |
 
@@ -173,8 +176,8 @@ When creating a new session with `honk chat --new`:
 
 - **Terminal Selection**: Mouse capture is intentionally disabled. Native terminal mouse selection (click and drag, Shift-drag in certain terminals) and standard copy shortcuts (`Ctrl-Shift-C`, `Cmd-C`) work out of the box.
 - **Mouse Wheel**: Alternate-scroll mode (`\x1b[?1007h`) is enabled so mouse wheel gestures scroll the viewport smoothly.
-- **OSC 52 Yank (`:yank`)**: Copies the complete markdown text of the most recent assistant message directly to your system clipboard using standard ANSI OSC 52 sequences.
-- **Dump (`:dump`)**: Exports the complete formatted session markdown to a temporary file and launches `$PAGER` or `$EDITOR` (e.g. `less -R`).
+- **OSC 52 Yank (`:yank`)**: Copies the complete markdown text of the most recent assistant message directly to your system clipboard using standard ANSI OSC 52 sequences (refused with a warning notice if base64 size exceeds 100 KB).
+- **Dump (`:dump`)**: Exports the complete formatted session markdown to a temporary file and launches `$PAGER` or `$EDITOR` (e.g. `less -R`) with the terminal suspended and event reading paused.
 
 ---
 
