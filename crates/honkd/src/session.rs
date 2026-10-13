@@ -2002,11 +2002,11 @@ impl Session {
                                 let text = match export_res {
                                     Ok(exp) => {
                                         let u_text = user_text.as_deref().unwrap_or("");
-                                        if let Some(idx) = prompt_index {
+                                        let indexed = prompt_index.and_then(|idx| {
                                             honk_wire::export::turn_text_at_index(&exp, idx, u_text)
-                                        } else {
-                                            honk_wire::export::turn_text(&exp, u_text)
-                                        }
+                                        });
+                                        indexed
+                                            .or_else(|| honk_wire::export::turn_text(&exp, u_text))
                                     }
                                     Err(e) => {
                                         tracing::warn!(

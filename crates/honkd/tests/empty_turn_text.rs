@@ -1,5 +1,5 @@
 use common::{Honkd, Viewer, new_session};
-use honk_testgoose::{StubGoose, Turn};
+use honk_testgoose::{FakeGoose, StubGoose, Turn};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -294,5 +294,149 @@ async fn two_prompts_kill_between_reply_and_export_never_gets_second_prompt_text
         text1,
         Some("second reply"),
         "crid-1 must NEVER receive crid-2's text"
+    );
+}
+
+/// On the live path, if prompt_index drifts (e.g. goose history was replaced/cleared),
+/// honkd falls back to text matching so the reply carries the text.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_path_prompt_index_drift_falls_back_to_text_match() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // First prompt advances honkd's client_prompts to 1:
+    fake.script_prompt(vec!["p1".into()]);
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "p1" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "reply 1" }]
+                }
+            ]
+        }),
+    );
+    let r1 = v
+        .call("session/prompt", params(&sid, "p1", "c1", false))
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    // Next prompt has prompt_index = 1 in honkd, but goose export was cleared to only have p2 at index 0:
+    fake.script_prompt(vec!["p2".into()]);
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "p2" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "reply 2" }]
+                }
+            ]
+        }),
+    );
+
+    let r2 = v
+        .call("session/prompt", params(&sid, "p2", "c2", false))
+        .await;
+    assert_eq!(r2["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        r2["result"]["_meta"]["honk"]["text"], "reply 2",
+        "live path must fall back to text match when prompt_index drifts: {r2}"
+    );
+}
+
+/// On the boot path, prompt recovery stays strictly index-only: if prompt_index drifted,
+/// text remains absent (does not fall back to text match).
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_path_prompt_index_drift_leaves_text_absent() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Write sidecar file where prompt_index is drifted (e.g. 5 instead of 0)
+    let sidecar_path = h
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.replies.jsonl"));
+    let line = json!({
+        "upstream_id": "hk1_1-1",
+        "reply": {
+            "jsonrpc": "2.0",
+            "id": "hk1_1-1",
+            "result": { "stopReason": "end_turn" }
+        },
+        "user_text": "drifted prompt",
+        "prompt_index": 5
+    });
+    std::fs::write(&sidecar_path, format!("{line}\n")).unwrap();
+
+    // Export in FakeGoose has "drifted prompt" at index 0 (not 5)
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": sid,
+            "conversation": [
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "drifted prompt" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "cached text" }]
+                }
+            ]
+        }),
+    );
+
+    // Mutate state.json so ledger has crid_drift as InFlight, but held.inflight is None
+    {
+        let state_path = h.state_dir.path().join("state.json");
+        let content = std::fs::read_to_string(&state_path).unwrap();
+        let mut state: Value = serde_json::from_str(&content).unwrap();
+        state["ledger"]["crid_drift"] = json!({
+            "state": "in_flight",
+            "session": sid,
+            "upstream_id": "hk1_1-1"
+        });
+        state["sessions"][&sid]["inflight"] = Value::Null;
+        std::fs::write(&state_path, state.to_string()).unwrap();
+    }
+
+    h.restart().await;
+
+    let mut w = Viewer::connect(&h).await;
+    let resp = w
+        .call(
+            "session/prompt",
+            params(&sid, "drifted prompt", "crid_drift", true),
+        )
+        .await;
+
+    assert_eq!(resp["result"]["stopReason"], "end_turn");
+    assert!(
+        resp.pointer("/result/_meta/honk/text").is_none(),
+        "boot path must remain index-only and leave text absent on index drift: {resp}"
     );
 }
