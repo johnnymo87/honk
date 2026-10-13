@@ -17,7 +17,7 @@ pub struct ChatCore {
     pub(crate) run_state: RunState,
     pub(crate) run_ownership: Ownership,
     pub(crate) last_echo_crid: Option<String>,
-    pub(crate) our_crids: HashSet<String>,
+    pub(crate) replay_echo_matched_inflight: bool,
     pub(crate) crid_counter: u64,
     pub(crate) pending_load_req_id: Option<u64>,
     pub(crate) is_replaying: bool,
@@ -64,7 +64,7 @@ impl ChatCore {
             run_state: RunState::Unknown,
             run_ownership: Ownership::Unknown,
             last_echo_crid: None,
-            our_crids: HashSet::new(),
+            replay_echo_matched_inflight: false,
             crid_counter: 0,
             pending_load_req_id: None,
             is_replaying: true,
@@ -296,7 +296,6 @@ impl ChatCore {
             }
         });
 
-        self.our_crids.insert(crid.clone());
         self.prompt_sent = Some(PromptSent {
             crid,
             text,
@@ -474,6 +473,8 @@ impl ChatCore {
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .unwrap_or("end_turn");
+                self.run_state = RunState::Idle;
+                self.run_ownership = Ownership::Unknown;
                 if stop_reason == "cancelled" {
                     let honk_reason = res.pointer("/_meta/honk/reason").and_then(Value::as_str);
                     if honk_reason == Some("not_delivered")
@@ -584,7 +585,10 @@ impl ChatCore {
         match method {
             honk_wire::method::RESET => {
                 self.is_replaying = true;
+                self.run_state = RunState::Unknown;
+                self.run_ownership = Ownership::Unknown;
                 self.last_echo_crid = None;
+                self.replay_echo_matched_inflight = false;
                 self.pending_permissions.clear();
                 effects.push(Effect::Transcript(frame.clone()));
             }
@@ -598,6 +602,28 @@ impl ChatCore {
                 ) {
                     self.last_cursor = Some(Cursor { epoch, seq });
                 }
+
+                if let Some(p) = self.prompt_sent.as_mut() {
+                    if self.replay_echo_matched_inflight {
+                        if let RunState::Running(ref run_id) = self.run_state {
+                            self.run_ownership = Ownership::Own;
+                            p.run_seen = true;
+                            let run_id = run_id.clone();
+                            let held = std::mem::take(&mut self.held_steers);
+                            for (held_text, conv_count) in held {
+                                self.send_steer(held_text, run_id.clone(), conv_count, effects);
+                            }
+                        } else {
+                            self.last_echo_crid = Some(p.crid.clone());
+                        }
+                    } else {
+                        self.run_ownership = Ownership::Unknown;
+                    }
+                } else {
+                    self.run_ownership = Ownership::Unknown;
+                }
+                self.replay_echo_matched_inflight = false;
+
                 let buffered = std::mem::take(&mut self.detached_buffered_lines);
                 for line in buffered {
                     self.handle_line(line, effects);
@@ -616,12 +642,15 @@ impl ChatCore {
                             self.consumed_steer_ids.insert(mid.to_string());
                             self.pending_steers.remove(mid);
                         }
-                        if !self.is_replaying
-                            && let Some(crid) = u
-                                .pointer("/_meta/honk/source/client_req_id")
-                                .and_then(Value::as_str)
+                        if let Some(crid) = u
+                            .pointer("/_meta/honk/source/client_req_id")
+                            .and_then(Value::as_str)
                         {
-                            if !self.run_state.is_running() {
+                            if self.is_replaying {
+                                if self.prompt_sent.as_ref().is_some_and(|p| p.crid == crid) {
+                                    self.replay_echo_matched_inflight = true;
+                                }
+                            } else if !self.run_state.is_running() {
                                 self.last_echo_crid = Some(crid.to_string());
                             } else if self.run_ownership == Ownership::Pending {
                                 if self.prompt_sent.as_ref().is_some_and(|p| p.crid == crid) {
@@ -689,6 +718,7 @@ impl ChatCore {
                                 self.run_state = RunState::Idle;
                                 self.run_ownership = Ownership::Unknown;
                                 self.last_echo_crid = None;
+                                self.replay_echo_matched_inflight = false;
                                 self.pending_permissions.clear();
                                 if !self.is_replaying {
                                     if was_ownership != Ownership::Own
@@ -808,6 +838,7 @@ impl ChatCore {
         self.run_state = RunState::Unknown;
         self.run_ownership = Ownership::Unknown;
         self.last_echo_crid = None;
+        self.replay_echo_matched_inflight = false;
         self.is_replaying = true;
         self.pending_permissions.clear();
         for (_req_id, inflight) in self.pending_steer_reqs.drain() {

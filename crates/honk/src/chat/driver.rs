@@ -318,6 +318,14 @@ async fn process_effects(
     EffectAction::Continue
 }
 
+fn reconnect_backoff(attempt: u32) -> Duration {
+    if attempt <= 1 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((250 * (1 << (attempt.saturating_sub(2)).min(5))).min(5000))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn trigger_disconnect(
     core: &mut ChatCore,
@@ -329,6 +337,7 @@ fn trigger_disconnect(
     connection_state: &mut ConnectionState,
     last_state: &mut Option<StateSnapshot>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    live_since: &mut Option<Instant>,
 ) {
     let effects = core.handle(Input::Disconnected);
     for effect in effects {
@@ -345,12 +354,20 @@ fn trigger_disconnect(
     *conn_opt = None;
     *frame_rx_opt = None;
     *attach_retry_timer = None;
-    *reconnect_attempt = 1;
+    let was_stable = live_since
+        .take()
+        .is_some_and(|t| t.elapsed() >= Duration::from_secs(10));
+    if was_stable {
+        *reconnect_attempt = 1;
+    } else {
+        *reconnect_attempt = reconnect_attempt.saturating_add(1);
+    }
     *connection_state = ConnectionState::Reconnecting {
         attempt: *reconnect_attempt,
     };
     maybe_emit_state(core, connection_state, last_state, ui_tx);
-    *reconnect_timer = Some(Box::pin(tokio::time::sleep(Duration::ZERO)));
+    let delay = reconnect_backoff(*reconnect_attempt);
+    *reconnect_timer = Some(Box::pin(tokio::time::sleep(delay)));
 }
 
 async fn run_driver(
@@ -498,6 +515,7 @@ async fn run_driver(
         Target::New { cwd, .. } => Some(cwd.to_string_lossy().to_string()),
         Target::Attach(_) => None,
     };
+    let mut live_since: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -540,6 +558,7 @@ async fn run_driver(
                                 &mut connection_state,
                                 &mut last_state,
                                 &ui_tx,
+                                &mut live_since,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -572,6 +591,7 @@ async fn run_driver(
                                 &mut connection_state,
                                 &mut last_state,
                                 &ui_tx,
+                                &mut live_since,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -620,6 +640,7 @@ async fn run_driver(
                                         &mut connection_state,
                                         &mut last_state,
                                         &ui_tx,
+                                        &mut live_since,
                                     );
                                 } else {
                                     connection_state = ConnectionState::Live;
@@ -636,6 +657,7 @@ async fn run_driver(
                                     &mut connection_state,
                                     &mut last_state,
                                     &ui_tx,
+                                    &mut live_since,
                                 );
                             }
                         }
@@ -704,6 +726,18 @@ async fn run_driver(
                             let _ = conn.send_request(list_id, "session/list", json!({})).await;
                         }
 
+                        if frame.get("method").and_then(Value::as_str)
+                            == Some(honk_wire::method::REPLAY_DONE)
+                            && connection_state == ConnectionState::Live
+                        {
+                            live_since = Some(Instant::now());
+                        }
+                        if frame.get("method").and_then(Value::as_str)
+                            == Some(honk_wire::method::RESET)
+                        {
+                            live_since = None;
+                        }
+
                         let effects = core.handle(Input::Frame(frame));
                         let action = process_effects(
                             effects,
@@ -731,6 +765,7 @@ async fn run_driver(
                                 &mut connection_state,
                                 &mut last_state,
                                 &ui_tx,
+                                &mut live_since,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -746,6 +781,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut last_state,
                             &ui_tx,
+                            &mut live_since,
                         );
                     }
                 }
@@ -770,6 +806,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut last_state,
                             &ui_tx,
+                            &mut live_since,
                         );
                     }
                 }
@@ -785,12 +822,11 @@ async fn run_driver(
                     Ok((new_conn, new_frame_rx, _init_res)) => {
                         let (load_id, method, params) = core.attach_request();
                         if new_conn.send_request(load_id, &method, params).await.is_err() {
+                            live_since = None;
                             reconnect_attempt = reconnect_attempt.saturating_add(1);
                             connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
                             maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                            let backoff = Duration::from_millis(
-                                (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
-                            );
+                            let backoff = reconnect_backoff(reconnect_attempt);
                             reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
                         } else {
                             let effects = core.handle(Input::Connected);
@@ -811,12 +847,11 @@ async fn run_driver(
                                 return;
                             }
                             if matches!(action, EffectAction::Reattach) {
+                                live_since = None;
                                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                                 connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
                                 maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                                let backoff = Duration::from_millis(
-                                    (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
-                                );
+                                let backoff = reconnect_backoff(reconnect_attempt);
                                 reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
                             } else {
                                 conn_opt = temp_conn;
@@ -837,12 +872,11 @@ async fn run_driver(
                             let _ = ui_tx.send(UiEvent::Exit(1));
                             return;
                         }
+                        live_since = None;
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                         connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                        let backoff = Duration::from_millis(
-                            (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
-                        );
+                        let backoff = reconnect_backoff(reconnect_attempt);
                         reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
                     }
                 }
@@ -875,6 +909,7 @@ async fn run_driver(
                         &mut connection_state,
                         &mut last_state,
                         &ui_tx,
+                        &mut live_since,
                     );
                 }
                 maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);

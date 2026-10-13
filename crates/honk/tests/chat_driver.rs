@@ -2014,3 +2014,144 @@ async fn test_session_info_with_cwd_emitted_on_attach_and_new() {
     assert_eq!(seen_cwd_new.as_deref(), Some(tmp_cwd.to_str().unwrap()));
     handle_new.send(UiCommand::Shutdown).expect("send shutdown");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconnect_backoff_successive_delays_grow() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            // Connection 1: initialize + session/load, then drop immediately
+            let (tcp1, _) = listener.accept().await.unwrap();
+            let mut ws1 =
+                tokio_tungstenite::accept_hdr_async(tcp1, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws1.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws1.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws1.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let load_id = v["id"].clone();
+            ws1.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": load_id, "result": { "sessionId": "s1" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let drop_1_time = Instant::now();
+            drop(ws1);
+
+            // Connection 2: must reconnect after backoff (250ms)
+            let (tcp2, _) = listener.accept().await.unwrap();
+            let connect_2_time = Instant::now();
+            let delay1 = connect_2_time.duration_since(drop_1_time);
+
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(tcp2, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let load_id = v["id"].clone();
+            ws2.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": load_id, "result": { "sessionId": "s1" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let drop_2_time = Instant::now();
+            drop(ws2);
+
+            // Connection 3: must reconnect after larger backoff (500ms)
+            let (tcp3, _) = listener.accept().await.unwrap();
+            let connect_3_time = Instant::now();
+            let delay2 = connect_3_time.duration_since(drop_2_time);
+
+            assert!(
+                delay1 >= Duration::from_millis(180),
+                "delay 1 should be around 250ms, got: {delay1:?}"
+            );
+            assert!(
+                delay2 >= Duration::from_millis(380),
+                "delay 2 should be around 500ms, got: {delay2:?}"
+            );
+            assert!(
+                delay2 > delay1,
+                "successive reconnect delays must grow: delay1={delay1:?}, delay2={delay2:?}"
+            );
+
+            let mut ws3 =
+                tokio_tungstenite::accept_hdr_async(tcp3, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+            let msg = ws3.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws3.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            drop(ws3);
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("s1".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    // Server task handles connection 1, connection 2, connection 3 and verifies delays
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
+
+    let mut attempt_2_seen = false;
+    let mut attempt_3_seen = false;
+    while let Ok(evt) = rx.try_recv() {
+        if let UiEvent::State(s) = evt
+            && let ConnectionState::Reconnecting { attempt } = s.connection
+        {
+            if attempt == 2 {
+                attempt_2_seen = true;
+            }
+            if attempt == 3 {
+                attempt_3_seen = true;
+            }
+        }
+    }
+
+    assert!(attempt_2_seen, "must see Reconnecting attempt 2");
+    assert!(attempt_3_seen, "must see Reconnecting attempt 3");
+
+    let _ = handle.send(UiCommand::Shutdown);
+}

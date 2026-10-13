@@ -214,6 +214,13 @@ impl ChatCore {
             return;
         }
 
+        if self.is_replaying {
+            effects.push(Effect::Notice(Notice::warning(
+                "this turn belongs to another client; /cancel! cancels it anyway",
+            )));
+            return;
+        }
+
         if self.run_ownership == Ownership::Own {
             effects.push(Effect::Notify {
                 method: "session/cancel".into(),
