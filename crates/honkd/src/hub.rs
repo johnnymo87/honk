@@ -50,6 +50,7 @@ pub struct Hub {
     pub upstream_ids: Arc<Mutex<UpstreamIds>>,
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
+    pub running_sessions: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     pub self_weak: std::sync::RwLock<Option<std::sync::Weak<Hub>>>,
     pub activating: Arc<Mutex<HashMap<String, ActivatingReceiver>>>,
     pub evicting: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
@@ -206,6 +207,7 @@ impl Hub {
             upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            running_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             self_weak: std::sync::RwLock::new(None),
             activating: Arc::new(Mutex::new(HashMap::new())),
             evicting: Arc::new(Mutex::new(HashMap::new())),
@@ -747,7 +749,7 @@ impl Hub {
                 for entry in sessions_arr {
                     let sid = entry.get("sessionId").and_then(Value::as_str).unwrap_or("");
                     let is_held = held_sids.contains(sid);
-                    let is_running = self.is_session_running(sid);
+                    let is_running = is_held && self.is_session_running(sid);
                     if let Some(meta_obj) = entry.get_mut("_meta").and_then(Value::as_object_mut) {
                         meta_obj.insert(
                             "honk".to_string(),
@@ -768,9 +770,21 @@ impl Hub {
         Ok(resp)
     }
 
-    pub fn is_session_running(&self, _sid: &str) -> bool {
-        // Wired for actor lookup in A9; returns false for now
-        false
+    pub fn set_session_running(&self, sid: &str, running: bool) {
+        if let Ok(mut set) = self.running_sessions.write() {
+            if running {
+                set.insert(sid.to_string());
+            } else {
+                set.remove(sid);
+            }
+        }
+    }
+
+    pub fn is_session_running(&self, sid: &str) -> bool {
+        self.running_sessions
+            .read()
+            .map(|set| set.contains(sid))
+            .unwrap_or(false)
     }
 
     pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
