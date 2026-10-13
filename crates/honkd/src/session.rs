@@ -2186,9 +2186,27 @@ impl Session {
                     );
                     return;
                 }
-                let meta = honk_wire::honk_meta(&params);
-                let client_req_id = meta.client_req_id;
-                let resume_only = meta.resume_only;
+                let resume_only = honk_wire::resume_only_requested(&params);
+                let client_req_id = honk_wire::client_req_id(&params).map(String::from);
+
+                let owner = OwnerRef {
+                    viewer: Some(viewer_id),
+                    downstream_id: id.clone(),
+                    client_req_id: client_req_id.clone(),
+                };
+
+                if let Some(crid) = &client_req_id
+                    && let Some(waiters) = self.finalizing_waiters.get_mut(crid)
+                {
+                    waiters.push(owner);
+                    return;
+                }
+
+                if let Some(crid) = &client_req_id
+                    && self.turn.attach_waiter(crid, owner.clone())
+                {
+                    return;
+                }
 
                 if let Some(crid) = &client_req_id {
                     let cached = {
@@ -2222,25 +2240,6 @@ impl Session {
                         }
                         None => {}
                     }
-                }
-
-                let owner = OwnerRef {
-                    viewer: Some(viewer_id),
-                    downstream_id: id.clone(),
-                    client_req_id: client_req_id.clone(),
-                };
-
-                if let Some(crid) = &client_req_id
-                    && self.turn.attach_waiter(crid, owner.clone())
-                {
-                    return;
-                }
-
-                if let Some(crid) = &client_req_id
-                    && let Some(waiters) = self.finalizing_waiters.get_mut(crid)
-                {
-                    waiters.push(owner);
-                    return;
                 }
 
                 if let Some(crid) = &client_req_id {

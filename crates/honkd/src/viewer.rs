@@ -558,6 +558,60 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             sessions.get(sid).map(|h| h.tx.clone())
                         };
 
+                        if session_tx.is_none() && honk_wire::resume_only_requested(&params) {
+                            let crid_opt = honk_wire::client_req_id(&params);
+                            let cached = match crid_opt {
+                                None => Some(Err(crate::rpc::error(
+                                    id.clone(),
+                                    honk_wire::ERR_UNKNOWN_CLIENT_REQ_ID,
+                                    "unknown client_req_id; resume_only prompt not started",
+                                    None,
+                                ))),
+                                Some(crid) => {
+                                    let s = hub.state.lock().await;
+                                    match s.ledger.get(crid) {
+                                        Some(entry) if entry.session() != sid => {
+                                            Some(Err(crate::rpc::error(
+                                                id.clone(),
+                                                -32602,
+                                                "client_req_id belongs to another session",
+                                                None,
+                                            )))
+                                        }
+                                        Some(crate::state::LedgerEntry::Done {
+                                            response, ..
+                                        }) => {
+                                            let mut resp = response.clone();
+                                            resp["id"] = id.clone();
+                                            Some(Ok(resp))
+                                        }
+                                        Some(crate::state::LedgerEntry::InFlight { .. }) => None,
+                                        None => Some(Err(crate::rpc::error(
+                                            id.clone(),
+                                            honk_wire::ERR_UNKNOWN_CLIENT_REQ_ID,
+                                            "unknown client_req_id; resume_only prompt not started",
+                                            None,
+                                        ))),
+                                    }
+                                }
+                            };
+                            if let Some(Ok(resp)) = cached {
+                                if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if let Some(Err(err_resp)) = cached {
+                                if !viewer
+                                    .tx
+                                    .send_frame(Message::Text(err_resp.to_string().into()))
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+
                         let tx = match session_tx {
                             Some(tx) => Some(tx),
                             None => match hub.get_or_activate_session(sid).await {

@@ -104,7 +104,7 @@ pub enum Action {
 pub struct TurnCore {
     pub run: Option<String>,
     pub inflight: Option<Inflight>,
-    pub parked: Vec<(OwnerRef, Value)>,
+    pub parked: Vec<(Vec<OwnerRef>, Value)>,
     pub cancel_pending: bool,
     pub steers: Vec<(String, ViewerId)>,
     pub consumed_steers: std::collections::BTreeSet<String>,
@@ -126,7 +126,7 @@ impl TurnCore {
             }];
         }
         if self.inflight.is_some() {
-            self.parked.push((owner, params));
+            self.parked.push((vec![owner], params));
             return vec![];
         }
         let upstream_id = ids.next();
@@ -269,8 +269,19 @@ impl TurnCore {
         if self.parked.is_empty() {
             return vec![];
         }
-        let (owner, params) = self.parked.remove(0);
-        self.on_prompt(owner, params, ids)
+        let (owners, params) = self.parked.remove(0);
+        let upstream_id = ids.next();
+        self.inflight = Some(Inflight {
+            upstream_id: upstream_id.clone(),
+            owners,
+            params: params.clone(),
+            announced: false,
+            prompt_index: self.client_prompts,
+        });
+        vec![Action::SendPrompt {
+            upstream_id,
+            params,
+        }]
     }
 
     pub fn on_steer_ok(&mut self, message_id: String, viewer: ViewerId) -> Vec<Action> {
@@ -307,7 +318,7 @@ impl TurnCore {
             .map(|i| i.owners)
             .unwrap_or_default()
             .into_iter()
-            .chain(self.parked.drain(..).map(|(o, _)| o))
+            .chain(self.parked.drain(..).flat_map(|(owners, _)| owners))
             .collect();
         if owners.is_empty() {
             return vec![];
@@ -327,18 +338,25 @@ impl TurnCore {
     }
 
     pub fn attach_waiter(&mut self, client_req_id: &str, owner: OwnerRef) -> bool {
-        match self.inflight.as_mut() {
-            Some(inf)
-                if inf
-                    .owners
-                    .iter()
-                    .any(|o| o.client_req_id.as_deref() == Some(client_req_id)) =>
-            {
-                inf.owners.push(owner);
-                true
-            }
-            _ => false,
+        if let Some(inf) = self.inflight.as_mut()
+            && inf
+                .owners
+                .iter()
+                .any(|o| o.client_req_id.as_deref() == Some(client_req_id))
+        {
+            inf.owners.push(owner);
+            return true;
         }
+        for (owners, _params) in &mut self.parked {
+            if owners
+                .iter()
+                .any(|o| o.client_req_id.as_deref() == Some(client_req_id))
+            {
+                owners.push(owner);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn to_persisted(&self) -> Option<crate::state::InflightPrompt> {
@@ -931,5 +949,52 @@ mod tests {
 
         assert_eq!(actions, vec![]);
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-1");
+    }
+
+    #[test]
+    fn test_attach_waiter_finds_parked_prompt_by_client_req_id() {
+        let mut core = TurnCore::default();
+        let mut ids = UpstreamIds::new(1);
+
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1, json!({"prompt": "first"}), &mut ids);
+
+        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+        let _ = core.on_prompt(owner2.clone(), json!({"prompt": "second"}), &mut ids);
+        assert_eq!(core.parked.len(), 1);
+
+        // Attach waiter with crid "req_2" matching the parked prompt
+        let owner3 = make_owner(Some(3), 30, Some("req_2"));
+        assert!(core.attach_waiter("req_2", owner3.clone()));
+
+        // End turn 1
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+        let _ = core.on_run_state(None, &mut ids);
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {"text": "done1"},
+        });
+        let _ = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+
+        // Now prompt 2 should be in-flight with BOTH owner2 and owner3
+        let inf = core.inflight.as_ref().unwrap();
+        assert_eq!(inf.owners, vec![owner2.clone(), owner3.clone()]);
+
+        // When prompt 2 completes, both owners get the reply
+        let reply_frame2 = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-2",
+            "result": {"text": "done2"},
+        });
+        let reply2_actions = core.on_prompt_reply("hk1-2", &reply_frame2, &mut ids);
+        assert_eq!(
+            reply2_actions,
+            vec![Action::Reply {
+                owners: vec![owner2, owner3],
+                body: Reply::Result(json!({"text": "done2"})),
+                user_text: Some("second".to_string()),
+            }]
+        );
     }
 }

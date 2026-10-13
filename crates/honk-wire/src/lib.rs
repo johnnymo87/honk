@@ -89,6 +89,20 @@ pub fn honk_meta(params: &Value) -> HonkMeta {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default()
 }
+/// Returns true if `/_meta/honk/resume_only` is present and not JSON `false`.
+pub fn resume_only_requested(params: &Value) -> bool {
+    match params.pointer("/_meta/honk/resume_only") {
+        None => false,
+        Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+/// Returns the client request id if `/_meta/honk/client_req_id` is a string.
+pub fn client_req_id(params: &Value) -> Option<&str> {
+    params
+        .pointer("/_meta/honk/client_req_id")
+        .and_then(Value::as_str)
+}
 pub fn frame_cursor(frame: &Value) -> Option<Cursor> {
     frame
         .pointer("/params/_meta/honk")

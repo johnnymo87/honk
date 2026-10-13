@@ -36,6 +36,11 @@ impl State {
                 session,
                 upstream_id,
             } => {
+                if state_dir.is_none() {
+                    // Runtime prune: do not resolve InFlight entries to lost-track.
+                    // The prompt-time inconsistent-inflight check covers runtime.
+                    return sessions.contains_key(session);
+                }
                 if let Some(held) = sessions.get(session) {
                     if let Some(inf) = &held.inflight {
                         if inf.client_req_ids.contains(crid) {
@@ -528,9 +533,20 @@ mod tests {
         assert!(
             matches!(
                 st.ledger.get("orphan_mismatched_crid"),
+                Some(LedgerEntry::InFlight { .. })
+            ),
+            "Runtime prune (state_dir == None) must leave InFlight alone"
+        );
+
+        // Boot prune (state_dir == Some) resolves mismatched InFlight to Done
+        let temp_dir = tempfile::tempdir().unwrap();
+        st.prune_ledger(100_000, 24 * 3600, 1000, Some(temp_dir.path()));
+        assert!(
+            matches!(
+                st.ledger.get("orphan_mismatched_crid"),
                 Some(LedgerEntry::Done { .. })
             ),
-            "InFlight not in held.inflight.client_req_ids must be resolved to Done"
+            "Boot prune (state_dir == Some) must resolve mismatched InFlight to Done"
         );
 
         // When exceeding max_entries, old Done entries are dropped, but never InFlight

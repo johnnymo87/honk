@@ -365,3 +365,50 @@ fn test_honk_meta_resume_only_deserialization() {
     assert!(parsed_with.resume_only);
     assert_eq!(parsed_with.client_req_id.as_deref(), Some("crid-4"));
 }
+
+#[test]
+fn test_resume_only_requested_and_client_req_id_fail_closed() {
+    use honk_wire::{client_req_id, resume_only_requested};
+
+    // absent
+    let p_absent = serde_json::json!({});
+    assert!(!resume_only_requested(&p_absent));
+    assert_eq!(client_req_id(&p_absent), None);
+
+    // explicit false
+    let p_false = serde_json::json!({
+        "_meta": { "honk": { "resume_only": false } }
+    });
+    assert!(!resume_only_requested(&p_false));
+
+    // explicit true
+    let p_true = serde_json::json!({
+        "_meta": { "honk": { "resume_only": true, "client_req_id": "c1" } }
+    });
+    assert!(resume_only_requested(&p_true));
+    assert_eq!(client_req_id(&p_true), Some("c1"));
+
+    // null
+    let p_null = serde_json::json!({
+        "_meta": { "honk": { "resume_only": null } }
+    });
+    assert!(resume_only_requested(&p_null));
+
+    // "true" (string)
+    let p_str_true = serde_json::json!({
+        "_meta": { "honk": { "resume_only": "true" } }
+    });
+    assert!(resume_only_requested(&p_str_true));
+
+    // 1 (number)
+    let p_num_1 = serde_json::json!({
+        "_meta": { "honk": { "resume_only": 1 } }
+    });
+    assert!(resume_only_requested(&p_num_1));
+
+    // numeric client_req_id
+    let p_num_crid = serde_json::json!({
+        "_meta": { "honk": { "client_req_id": 12345 } }
+    });
+    assert_eq!(client_req_id(&p_num_crid), None);
+}
