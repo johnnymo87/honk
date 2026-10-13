@@ -60,6 +60,7 @@ Composer input:
 | `/rK deny` | answer `rK` with its first `reject_*` option, else `cancelled` |
 | `/N` | shorthand, accepted only when exactly one request is pending **and** it is the one most recently printed; otherwise refused with the list re-printed |
 | Ctrl-D or `/quit` | detach (`session/close`) and exit. The session and any running turn continue |
+| `/drop` | discard text queued for after a foreign run |
 | `/help` | list commands |
 | `//text` | send `/text` literally |
 
@@ -211,7 +212,7 @@ TDD; integration tests use the honkd binary + `honk-testgoose` (`StubGoose`/`Fak
    id-without-method. `list`/`tail` unchanged (their tests pass).
 2. **Chat core.** Unit tests (frames as JSON literals) for: prompt/steer selection per
    run state incl. `Unknown`; held line in the sent-not-started window, steered when the run
-   starts; busy → one steer conversion (expectedRunId from data); no-run steer → one prompt;
+   starts; busy → queued and re-prompted at run end (never steered); foreign run → queue, `/drop`; no-run steer → one prompt;
    mismatch → printed back; ownership (own via PromptSent, own via echo crid, foreign);
    Ctrl-C own → cancel, foreign → refusal, `/cancel!` → cancel; permission tags, `/rK N`,
    `/rK deny`, `/N` accepted/refused, request resolved between display and answer,
