@@ -1,5 +1,5 @@
 use super::core::ChatCore;
-use super::types::{Effect, Notice, Ownership};
+use super::types::{Effect, Notice, Ownership, RunState};
 use serde_json::json;
 
 impl ChatCore {
@@ -230,6 +230,12 @@ impl ChatCore {
         } else if self.run_state.is_running() || self.prompt_sent.is_some() {
             effects.push(Effect::Notice(Notice::warning(
                 "this turn belongs to another client; /cancel! cancels it anyway",
+            )));
+        } else if matches!(self.run_state, RunState::Unknown) {
+            // Run state is not known yet (e.g. right after a reset/attach): a run
+            // may be active, so refuse rather than claim there is nothing to cancel.
+            effects.push(Effect::Notice(Notice::warning(
+                "turn state unknown; /cancel! cancels any active turn anyway",
             )));
         } else {
             effects.push(Effect::Notice(Notice::warning("no active turn to cancel")));

@@ -1358,6 +1358,22 @@ fn test_prompt_reply_lost_track_terminal() {
 fn test_cancel_own_vs_foreign_vs_force_cancel_vs_idle() {
     let (mut core, _) = new_test_core();
 
+    // Run state still Unknown after attach: refuse, never claim "nothing to cancel".
+    let effs = core.handle(Input::Interrupt);
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notify { .. })));
+    assert!(has_notice(&effs, "/cancel!"));
+
+    // Known idle: nothing to cancel.
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
     let effs = core.handle(Input::Interrupt);
     assert!(!effs.iter().any(|e| matches!(e, Effect::Notify { .. })));
     assert!(has_notice(&effs, "no active turn"));
