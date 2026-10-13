@@ -201,11 +201,8 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
     updates
 }
 
-pub fn turn_text(export: &Value, user_text: &str) -> String {
-    let conversation = match export.get("conversation").and_then(Value::as_array) {
-        Some(c) => c,
-        None => return String::new(),
-    };
+pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
+    let conversation = export.get("conversation").and_then(Value::as_array)?;
 
     let mut last_matching_user_idx = None;
 
@@ -228,9 +225,7 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
         }
     }
 
-    let Some(idx) = last_matching_user_idx else {
-        return String::new();
-    };
+    let idx = last_matching_user_idx?;
 
     let mut out = String::new();
     for msg in &conversation[idx + 1..] {
@@ -276,7 +271,7 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
         }
     }
 
-    out
+    Some(out)
 }
 
 /// Extracts client user prompts from an export transcript.

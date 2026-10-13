@@ -26,7 +26,7 @@ impl State {
         ttl_secs: u64,
         max_entries: usize,
         state_dir: Option<&std::path::Path>,
-    ) {
+    ) -> Vec<(String, String)> {
         let sessions = &self.sessions;
         let mut to_resolve_lost = Vec::new();
 
@@ -63,6 +63,7 @@ impl State {
             }
         });
 
+        let mut resolved_from_sidecar = Vec::new();
         for (crid, session, upstream_id) in to_resolve_lost {
             // Check if replies sidecar has cached reply for this upstream_id
             let cached_reply = state_dir.and_then(|dir| {
@@ -85,6 +86,7 @@ impl State {
             });
 
             if let Some(reply) = cached_reply {
+                resolved_from_sidecar.push((crid.clone(), session.clone()));
                 self.ledger.insert(
                     crid,
                     LedgerEntry::Done {
@@ -127,6 +129,8 @@ impl State {
                 self.ledger.remove(&k);
             }
         }
+
+        resolved_from_sidecar
     }
 
     pub fn insert_done_entry(
@@ -371,7 +375,12 @@ impl StateStore {
         Ok(result)
     }
 
-    pub fn prune_ledger(&mut self, now_unix: u64, ttl_secs: u64, max_entries: usize) -> Result<()> {
+    pub fn prune_ledger(
+        &mut self,
+        now_unix: u64,
+        ttl_secs: u64,
+        max_entries: usize,
+    ) -> Result<Vec<(String, String)>> {
         let dir = self.dir.clone();
         self.mutate(|st| st.prune_ledger(now_unix, ttl_secs, max_entries, Some(&dir)))
     }
@@ -614,7 +623,7 @@ mod tests {
         let sidecar_file = sessions_dir.join("s.replies.jsonl");
         let line = json!({
             "upstream_id": "u_completed",
-            "reply": { "result": { "stopReason": "end_turn", "text": "cached" } }
+            "reply": { "result": { "stopReason": "end_turn" } }
         });
         std::fs::write(&sidecar_file, format!("{line}\n")).unwrap();
 
@@ -638,13 +647,14 @@ mod tests {
             },
         );
 
-        st.prune_ledger(100_000, 24 * 3600, 1000, Some(temp_dir.path()));
+        let resolved = st.prune_ledger(100_000, 24 * 3600, 1000, Some(temp_dir.path()));
+        assert_eq!(resolved, vec![("crid1".to_string(), "s".to_string())]);
 
         // crid1 matched sidecar reply -> resolved to Done with cached reply!
         match st.ledger.get("crid1") {
             Some(LedgerEntry::Done { response, .. }) => {
                 assert_eq!(response["result"]["stopReason"], "end_turn");
-                assert_eq!(response["result"]["text"], "cached");
+                assert!(response["result"].get("text").is_none());
             }
             other => panic!("expected Done with cached reply, got {other:?}"),
         }

@@ -111,14 +111,14 @@ impl Hub {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        {
+        let resolved_sidecar = {
             let mut s = state.lock().await;
             s.prune_ledger(
                 now_unix,
                 crate::state::LEDGER_PRUNE_TTL_SECS,
                 crate::state::LEDGER_PRUNE_MAX_ENTRIES,
-            )?;
-        }
+            )?
+        };
 
         // 3. Initialize a new control connection, persisting its id first
         let recorder = if let Some(rec_path) = &args.record {
@@ -388,6 +388,10 @@ impl Hub {
         }
 
         *hub.sessions.write().await = session_handles;
+
+        for (crid, sid) in resolved_sidecar {
+            hub.recover_sidecar_text(&crid, &sid).await;
+        }
 
         Ok(hub)
     }
@@ -812,6 +816,45 @@ impl Hub {
         }
 
         export_result
+    }
+
+    pub async fn recover_sidecar_text(&self, crid: &str, sid: &str) {
+        let user_text = find_user_text_for_crid(&self.state_dir, sid, crid);
+
+        let export_res = self.export(sid).await;
+        let Ok(exp) = export_res else {
+            tracing::warn!("Session {sid}: failed to export session to recover text for {crid}");
+            return;
+        };
+
+        let prompt_text = user_text.or_else(|| honk_wire::export::client_prompts(&exp).pop());
+
+        let Some(u_text) = prompt_text else {
+            tracing::warn!("Session {sid}: no prompt text found to recover text for {crid}");
+            return;
+        };
+
+        let Some(text) = honk_wire::export::turn_text(&exp, &u_text) else {
+            tracing::warn!("Session {sid}: turn_text returned None for {crid}");
+            return;
+        };
+
+        let mut s = self.state.lock().await;
+        let _ = s.mutate(|st| {
+            if let Some(crate::state::LedgerEntry::Done { response, .. }) = st.ledger.get_mut(crid)
+                && let Some(res) = response.get_mut("result").and_then(Value::as_object_mut)
+            {
+                if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
+                    if let Some(honk) = meta.get_mut("honk").and_then(Value::as_object_mut) {
+                        honk.insert("text".to_string(), Value::String(text.clone()));
+                    } else {
+                        meta.insert("honk".to_string(), json!({ "text": text }));
+                    }
+                } else {
+                    res.insert("_meta".to_string(), json!({ "honk": { "text": text } }));
+                }
+            }
+        });
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {
@@ -1427,4 +1470,25 @@ impl Hub {
             }
         }
     }
+}
+
+fn find_user_text_for_crid(state_dir: &std::path::Path, sid: &str, crid: &str) -> Option<String> {
+    let log_path = state_dir.join("sessions").join(format!("{sid}.log.jsonl"));
+    let content = std::fs::read_to_string(log_path).ok()?;
+    for line in content.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            let frame = v.get("frame").unwrap_or(&v);
+            if frame
+                .pointer("/params/update/_meta/honk/source/client_req_id")
+                .and_then(Value::as_str)
+                == Some(crid)
+                && let Some(text) = frame
+                    .pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+            {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }

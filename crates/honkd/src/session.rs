@@ -1982,12 +1982,17 @@ impl Session {
                             let sid = self.sid.clone();
                             let self_tx = self.self_tx.clone();
                             tokio::spawn(async move {
+                                // Test hook: test-controlled delay before export task to simulate kill between reply and export
+                                if let Ok(delay_str) = std::env::var("HONKD_TEST_EXPORT_DELAY_MS")
+                                    && let Ok(ms) = delay_str.parse::<u64>()
+                                {
+                                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                                }
                                 let export_res = hub.export(&sid).await;
                                 let text = match export_res {
                                     Ok(exp) => {
                                         let u_text = user_text.as_deref().unwrap_or("");
-                                        let t = honk_wire::export::turn_text(&exp, u_text);
-                                        if t.is_empty() { None } else { Some(t) }
+                                        honk_wire::export::turn_text(&exp, u_text)
                                     }
                                     Err(e) => {
                                         tracing::warn!(

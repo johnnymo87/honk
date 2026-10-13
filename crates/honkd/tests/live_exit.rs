@@ -294,7 +294,7 @@ async fn e1_pigeon_turn_visible_in_tail() {
     let _tail_outcome = tail_handle.await.expect("join tail").expect("tail run");
 
     let export = direct_export(&upstream_url, &secret, &sid).await;
-    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text);
+    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text).unwrap_or_default();
     let tail_text = tail_buf.text();
     let pigeon_receipt = pigeon.receipt_text();
 
@@ -380,7 +380,7 @@ async fn e2_kill9_honkd_mid_turn_delta_resume() {
     );
 
     let export = direct_export(&upstream_url, &secret, &sid).await;
-    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text);
+    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text).unwrap_or_default();
     let tail_text = tail_buf.text();
     let pigeon_receipt = pigeon2.receipt_text();
 
@@ -488,7 +488,7 @@ async fn e3_goose_restart_mid_turn() {
     eprintln!("[e3 finding] tail printed [honk: transcript rebuilt]: {tail_has_rebuild_marker}");
 
     let export_mid = direct_export(&upstream_url, &secret, &sid).await;
-    let mid_text = honk_wire::export::turn_text(&export_mid, prompt_text);
+    let mid_text = honk_wire::export::turn_text(&export_mid, prompt_text).unwrap_or_default();
     eprintln!("[e3 finding] export mid_text: {mid_text:?}");
     eprintln!(
         "[e3 finding] pigeon.receipt_text(): {:?}",
@@ -885,7 +885,7 @@ async fn takeover_and_resume_live() {
     );
 
     let export = direct_export(&upstream_url, &secret, &sid).await;
-    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text);
+    let exp_turn_text = honk_wire::export::turn_text(&export, prompt_text).unwrap_or_default();
     let tail_text = tail_buf.text();
 
     assert_eq!(
