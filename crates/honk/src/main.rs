@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use honk::{Client, TailOpts, resolve_secret};
 use std::io::stdout;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "honk", about = "CLI client for honk relay", version)]
@@ -15,6 +16,35 @@ enum Commands {
     Tail(TailArgs),
     /// List sessions tracked by honkd
     List(ListArgs),
+    /// Interactive ratatui TUI client for a goose session
+    Chat(ChatArgs),
+}
+
+#[derive(Args, Debug)]
+struct ChatArgs {
+    /// Session ID to attach to
+    #[arg(conflicts_with = "new", required_unless_present = "new")]
+    session: Option<String>,
+
+    /// Start a new session
+    #[arg(long, conflicts_with = "session")]
+    new: bool,
+
+    /// Working directory for a new session
+    #[arg(long, requires = "new")]
+    cwd: Option<PathBuf>,
+
+    /// Extensions to enable for a new session (repeatable)
+    #[arg(long = "ext", requires = "new")]
+    ext: Vec<String>,
+
+    /// honkd WebSocket or HTTP endpoint
+    #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
+    url: String,
+
+    /// Secret auth token (defaults to $HONK_SECRET or state file)
+    #[arg(long)]
+    secret: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -74,6 +104,33 @@ async fn main() -> anyhow::Result<()> {
             for s in sessions {
                 println!("{}", s.format_line());
             }
+        }
+        Commands::Chat(args) => {
+            let secret = resolve_secret(args.secret.as_deref())?;
+            let target = if args.new {
+                let cwd = match args.cwd {
+                    Some(c) => c,
+                    None => std::env::current_dir()?,
+                };
+                let extensions = if args.ext.is_empty() {
+                    None
+                } else {
+                    Some(args.ext)
+                };
+                honk::chat::driver::Target::New { cwd, extensions }
+            } else {
+                honk::chat::driver::Target::Attach(args.session.unwrap())
+            };
+
+            let session_id = match &target {
+                honk::chat::driver::Target::Attach(id) => id.clone(),
+                honk::chat::driver::Target::New { .. } => String::new(),
+            };
+
+            let opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
+            let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
+            let app = honk::tui::App::new(session_id, handle.cmd_tx());
+            honk::tui::app::run_app(app, ui_rx, handle).await?;
         }
     }
     Ok(())

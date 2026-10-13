@@ -101,6 +101,10 @@ impl DriverHandle {
         self.cmd_tx.send(cmd)
     }
 
+    pub fn cmd_tx(&self) -> mpsc::UnboundedSender<UiCommand> {
+        self.cmd_tx.clone()
+    }
+
     pub async fn join(&self) -> Result<(), tokio::task::JoinError> {
         let mut guard = self.join_handle.lock().await;
         if let Some(h) = guard.take() {
