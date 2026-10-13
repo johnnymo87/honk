@@ -111,6 +111,25 @@ impl Conn {
         Ok(id)
     }
 
+    pub async fn send_request(&self, id: u64, method: &str, params: Value) -> anyhow::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            anyhow::bail!("failed to send {method} request: connection closed");
+        }
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.write_tx
+            .send(Message::Text(req.to_string().into()))
+            .map_err(|_| {
+                self.closed.store(true, Ordering::SeqCst);
+                anyhow::anyhow!("failed to send {method} request: connection closed")
+            })?;
+        Ok(())
+    }
+
     pub async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("failed to send {method} notification: connection closed");

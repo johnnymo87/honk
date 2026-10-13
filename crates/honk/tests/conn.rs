@@ -649,3 +649,47 @@ async fn test_server_close_causes_subsequent_request_to_error() {
 
     server_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_send_request_with_explicit_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}/acp");
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            let msg = ws.next().await.unwrap().unwrap();
+            if let Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v["method"], "custom_method");
+                assert_eq!(v["id"], 42);
+                assert_eq!(v["params"]["foo"], "bar");
+
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "result": {"status": "ok"}
+                });
+                ws.send(Message::Text(resp.to_string().into()))
+                    .await
+                    .unwrap();
+            } else {
+                panic!("expected Text message");
+            }
+        })
+    })
+    .await;
+
+    let (conn, mut frame_rx, _) = Conn::connect(&url, "test-secret-123").await.unwrap();
+    conn.send_request(42, "custom_method", json!({"foo": "bar"}))
+        .await
+        .unwrap();
+
+    let frame = frame_rx.recv().await.unwrap();
+    assert_eq!(frame["id"], 42);
+    assert_eq!(frame["result"]["status"], "ok");
+
+    server_handle.await.unwrap();
+}
