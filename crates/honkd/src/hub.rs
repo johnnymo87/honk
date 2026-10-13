@@ -111,14 +111,14 @@ impl Hub {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        {
+        let resolved_sidecar = {
             let mut s = state.lock().await;
             s.prune_ledger(
                 now_unix,
                 crate::state::LEDGER_PRUNE_TTL_SECS,
                 crate::state::LEDGER_PRUNE_MAX_ENTRIES,
-            )?;
-        }
+            )?
+        };
 
         // 3. Initialize a new control connection, persisting its id first
         let recorder = if let Some(rec_path) = &args.record {
@@ -388,6 +388,10 @@ impl Hub {
         }
 
         *hub.sessions.write().await = session_handles;
+
+        for info in resolved_sidecar {
+            hub.recover_sidecar_text(&info).await;
+        }
 
         Ok(hub)
     }
@@ -812,6 +816,68 @@ impl Hub {
         }
 
         export_result
+    }
+
+    pub async fn recover_sidecar_text(&self, info: &crate::state::SidecarRecoveryInfo) {
+        let (Some(user_text), Some(prompt_index)) = (&info.user_text, info.prompt_index) else {
+            // Old sidecar lines without these fields -> leave text absent.
+            return;
+        };
+
+        if user_text.is_empty() {
+            return;
+        }
+
+        // Export with timeout (~15s) per item 3
+        let export_res =
+            match tokio::time::timeout(Duration::from_secs(15), self.export(&info.session)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(
+                        "Session {}: timed out exporting session to recover text for {}",
+                        info.session,
+                        info.crid
+                    );
+                    return;
+                }
+            };
+
+        let Ok(exp) = export_res else {
+            tracing::warn!(
+                "Session {}: failed to export session to recover text for {}",
+                info.session,
+                info.crid
+            );
+            return;
+        };
+
+        let Some(text) = honk_wire::export::turn_text_at_index(&exp, prompt_index, user_text)
+        else {
+            tracing::warn!(
+                "Session {}: turn_text_at_index returned None for prompt_index {prompt_index} and crid {}",
+                info.session,
+                info.crid
+            );
+            return;
+        };
+
+        let mut s = self.state.lock().await;
+        let _ = s.mutate(|st| {
+            if let Some(crate::state::LedgerEntry::Done { response, .. }) =
+                st.ledger.get_mut(&info.crid)
+                && let Some(res) = response.get_mut("result").and_then(Value::as_object_mut)
+            {
+                if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
+                    if let Some(honk) = meta.get_mut("honk").and_then(Value::as_object_mut) {
+                        honk.insert("text".to_string(), Value::String(text.clone()));
+                    } else {
+                        meta.insert("honk".to_string(), json!({ "text": text }));
+                    }
+                } else {
+                    res.insert("_meta".to_string(), json!({ "honk": { "text": text } }));
+                }
+            }
+        });
     }
 
     pub async fn create_session(&self, params: Value) -> anyhow::Result<Value> {

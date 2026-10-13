@@ -195,8 +195,11 @@ fn test_turn_text_equals_live_agent_chunks() {
     }
 
     let computed_turn_text = turn_text(&export, canonical_prompt);
-    assert_eq!(computed_turn_text, live_agent_text);
-    assert!(!computed_turn_text.is_empty());
+    assert_eq!(
+        computed_turn_text.as_deref(),
+        Some(live_agent_text.as_str())
+    );
+    assert!(!computed_turn_text.unwrap().is_empty());
 }
 
 #[test]
@@ -309,10 +312,10 @@ fn test_client_prompts_skips_steers_and_turn_text_stops_at_next_prompt() {
 
     // Turn 1 text includes text before and after the steer, but stops before Turn 2 prompt!
     let text1 = turn_text(&session, "turn 1 prompt");
-    assert_eq!(text1, "turn 1 part 1 turn 1 part 2");
+    assert_eq!(text1.as_deref(), Some("turn 1 part 1 turn 1 part 2"));
 
     let text2 = turn_text(&session, "turn 2 prompt");
-    assert_eq!(text2, "turn 2 reply");
+    assert_eq!(text2.as_deref(), Some("turn 2 reply"));
 }
 
 #[test]
@@ -411,4 +414,172 @@ fn test_resume_only_requested_and_client_req_id_fail_closed() {
         "_meta": { "honk": { "client_req_id": 12345 } }
     });
     assert_eq!(client_req_id(&p_num_crid), None);
+}
+
+#[test]
+fn test_turn_text_none_vs_some_empty() {
+    // 1. Missing conversation -> None
+    let no_conv = serde_json::json!({});
+    assert_eq!(turn_text(&no_conv, "prompt"), None);
+
+    // 2. Empty conversation -> None
+    let empty_conv = serde_json::json!({ "conversation": [] });
+    assert_eq!(turn_text(&empty_conv, "prompt"), None);
+
+    // 3. User prompt not matching -> None
+    let wrong_prompt = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "different prompt" }]
+            }
+        ]
+    });
+    assert_eq!(turn_text(&wrong_prompt, "prompt"), None);
+
+    // 4. Prompt found, no assistant messages after it -> Some("")
+    let prompt_only = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "prompt" }]
+            }
+        ]
+    });
+    assert_eq!(turn_text(&prompt_only, "prompt"), Some("".to_string()));
+
+    // 5. Prompt found, assistant message has tool call only (no text) -> Some("")
+    let tool_call_only = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "prompt" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "toolRequest", "tool": "shell" }]
+            }
+        ]
+    });
+    assert_eq!(turn_text(&tool_call_only, "prompt"), Some("".to_string()));
+
+    // 6. Prompt found with assistant text -> Some("hello")
+    let with_text = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "prompt" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "hello" }]
+            }
+        ]
+    });
+    assert_eq!(turn_text(&with_text, "prompt"), Some("hello".to_string()));
+}
+
+#[test]
+fn test_turn_text_identical_text_consecutive_prompts() {
+    use honk_wire::export::turn_text_at_index;
+
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "ping" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "pong 1" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "ping" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "pong 2" }]
+            }
+        ]
+    });
+
+    // turn_text_at_index can disambiguate identical consecutive prompts:
+    assert_eq!(
+        turn_text_at_index(&session, 0, "ping"),
+        Some("pong 1".to_string())
+    );
+    assert_eq!(
+        turn_text_at_index(&session, 1, "ping"),
+        Some("pong 2".to_string())
+    );
+    // Text mismatch at index 0 returns None:
+    assert_eq!(turn_text_at_index(&session, 0, "wrong"), None);
+    // Out-of-bounds index returns None:
+    assert_eq!(turn_text_at_index(&session, 2, "ping"), None);
+}
+
+#[test]
+fn test_turn_text_empty_user_text_returns_none() {
+    use honk_wire::export::turn_text_at_index;
+
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "reply" }]
+            }
+        ]
+    });
+
+    // Empty user_text (image/resource-only prompts) returns None on both APIs
+    assert_eq!(turn_text(&session, ""), None);
+    assert_eq!(turn_text_at_index(&session, 0, ""), None);
+}
+
+#[test]
+fn test_turn_text_skips_tool_response_messages() {
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "run command" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "toolRequest", "tool": "shell" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [
+                    { "type": "toolResponse", "text": "matching text" }
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "all done" }]
+            }
+        ]
+    });
+
+    // toolResponse user messages must not be matched as client prompts:
+    assert_eq!(turn_text(&session, "matching text"), None);
+    // Real client prompt matches:
+    assert_eq!(
+        turn_text(&session, "run command"),
+        Some("all done".to_string())
+    );
 }

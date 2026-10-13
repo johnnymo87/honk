@@ -201,37 +201,73 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
     updates
 }
 
-pub fn turn_text(export: &Value, user_text: &str) -> String {
-    let conversation = match export.get("conversation").and_then(Value::as_array) {
-        Some(c) => c,
-        None => return String::new(),
-    };
-
-    let mut last_matching_user_idx = None;
-
-    for (i, msg) in conversation.iter().enumerate() {
-        if !is_message_user_visible(msg) {
-            continue;
+/// Helper that iterates through conversation and yields `(conversation_idx, client_prompt_text)`
+/// for all user messages that qualify as client prompts.
+pub fn client_prompt_entries<'a>(
+    conversation: &'a [Value],
+) -> impl Iterator<Item = (usize, String)> + 'a {
+    conversation.iter().enumerate().filter_map(|(i, msg)| {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
         }
-        if msg.get("role").and_then(Value::as_str) == Some("user") {
-            let is_steer = msg
-                .pointer("/metadata/steer")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if is_steer {
-                continue;
-            }
-            let user_msg_text = get_user_visible_text(msg);
-            if user_msg_text == user_text {
-                last_matching_user_idx = Some(i);
-            }
+        if !is_message_user_visible(msg) {
+            return None;
+        }
+        let is_steer = msg
+            .pointer("/metadata/steer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_steer {
+            return None;
+        }
+        let content = msg.get("content").and_then(Value::as_array)?;
+        let has_tool_response = content.iter().any(|block| {
+            let b_type = block.get("type").and_then(Value::as_str);
+            b_type == Some("toolResponse")
+                || b_type == Some("toolResult")
+                || block.get("toolResult").is_some()
+                || block.get("toolResponse").is_some()
+        });
+        if has_tool_response {
+            return None;
+        }
+
+        Some((i, get_user_visible_text(msg)))
+    })
+}
+
+pub fn turn_text_at_index(
+    export: &Value,
+    prompt_index: usize,
+    expected_text: &str,
+) -> Option<String> {
+    if expected_text.is_empty() {
+        return None;
+    }
+    let conversation = export.get("conversation").and_then(Value::as_array)?;
+    let (idx, text) = client_prompt_entries(conversation).nth(prompt_index)?;
+    if text != expected_text {
+        return None;
+    }
+    extract_assistant_text_after(conversation, idx)
+}
+
+pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
+    if user_text.is_empty() {
+        return None;
+    }
+    let conversation = export.get("conversation").and_then(Value::as_array)?;
+    let mut last_idx = None;
+    for (idx, text) in client_prompt_entries(conversation) {
+        if text == user_text {
+            last_idx = Some(idx);
         }
     }
+    let idx = last_idx?;
+    extract_assistant_text_after(conversation, idx)
+}
 
-    let Some(idx) = last_matching_user_idx else {
-        return String::new();
-    };
-
+fn extract_assistant_text_after(conversation: &[Value], idx: usize) -> Option<String> {
     let mut out = String::new();
     for msg in &conversation[idx + 1..] {
         if !is_message_user_visible(msg) {
@@ -276,7 +312,7 @@ pub fn turn_text(export: &Value, user_text: &str) -> String {
         }
     }
 
-    out
+    Some(out)
 }
 
 /// Extracts client user prompts from an export transcript.
@@ -293,50 +329,7 @@ pub fn client_prompts(export: &Value) -> Vec<String> {
         Some(c) => c,
         None => return Vec::new(),
     };
-
-    let mut prompts = Vec::new();
-
-    for msg in conversation {
-        if msg.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        if !is_message_user_visible(msg) {
-            continue;
-        }
-        let is_steer = msg
-            .pointer("/metadata/steer")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if is_steer {
-            continue;
-        }
-        let Some(content) = msg.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        let has_tool_response = content.iter().any(|block| {
-            let b_type = block.get("type").and_then(Value::as_str);
-            b_type == Some("toolResponse")
-                || b_type == Some("toolResult")
-                || block.get("toolResult").is_some()
-                || block.get("toolResponse").is_some()
-        });
-        if has_tool_response {
-            continue;
-        }
-
-        let mut text = String::new();
-        for block in content {
-            if !is_content_user_visible(block) {
-                continue;
-            }
-            if block.get("type").and_then(Value::as_str) == Some("text")
-                && let Some(t) = block.get("text").and_then(Value::as_str)
-            {
-                text.push_str(t);
-            }
-        }
-        prompts.push(text);
-    }
-
-    prompts
+    client_prompt_entries(conversation)
+        .map(|(_, text)| text)
+        .collect()
 }
