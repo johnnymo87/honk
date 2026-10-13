@@ -201,7 +201,65 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
     updates
 }
 
+pub fn turn_text_at_index(
+    export: &Value,
+    prompt_index: usize,
+    expected_text: &str,
+) -> Option<String> {
+    if expected_text.is_empty() {
+        return None;
+    }
+    let conversation = export.get("conversation").and_then(Value::as_array)?;
+
+    let mut current_client_prompt = 0;
+    let mut matching_user_idx = None;
+
+    for (i, msg) in conversation.iter().enumerate() {
+        if !is_message_user_visible(msg) {
+            continue;
+        }
+        if msg.get("role").and_then(Value::as_str) == Some("user") {
+            let is_steer = msg
+                .pointer("/metadata/steer")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_steer {
+                continue;
+            }
+            let has_tool_response =
+                msg.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|block| {
+                            let b_type = block.get("type").and_then(Value::as_str);
+                            b_type == Some("toolResponse")
+                                || b_type == Some("toolResult")
+                                || block.get("toolResult").is_some()
+                                || block.get("toolResponse").is_some()
+                        })
+                    });
+            if has_tool_response {
+                continue;
+            }
+            if current_client_prompt == prompt_index {
+                let user_msg_text = get_user_visible_text(msg);
+                if user_msg_text == expected_text {
+                    matching_user_idx = Some(i);
+                }
+                break;
+            }
+            current_client_prompt += 1;
+        }
+    }
+
+    let idx = matching_user_idx?;
+    extract_assistant_text_after(conversation, idx)
+}
+
 pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
+    if user_text.is_empty() {
+        return None;
+    }
     let conversation = export.get("conversation").and_then(Value::as_array)?;
 
     let mut last_matching_user_idx = None;
@@ -218,6 +276,21 @@ pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
             if is_steer {
                 continue;
             }
+            let has_tool_response =
+                msg.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|block| {
+                            let b_type = block.get("type").and_then(Value::as_str);
+                            b_type == Some("toolResponse")
+                                || b_type == Some("toolResult")
+                                || block.get("toolResult").is_some()
+                                || block.get("toolResponse").is_some()
+                        })
+                    });
+            if has_tool_response {
+                continue;
+            }
             let user_msg_text = get_user_visible_text(msg);
             if user_msg_text == user_text {
                 last_matching_user_idx = Some(i);
@@ -226,7 +299,10 @@ pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
     }
 
     let idx = last_matching_user_idx?;
+    extract_assistant_text_after(conversation, idx)
+}
 
+fn extract_assistant_text_after(conversation: &[Value], idx: usize) -> Option<String> {
     let mut out = String::new();
     for msg in &conversation[idx + 1..] {
         if !is_message_user_visible(msg) {

@@ -1668,13 +1668,21 @@ impl Session {
 
                         if is_inflight_reply {
                             self.ambiguous_check_token += 1;
-                            let upstream_id =
-                                self.turn.inflight.as_ref().unwrap().upstream_id.clone();
+                            let inf = self.turn.inflight.as_ref().unwrap();
+                            let upstream_id = inf.upstream_id.clone();
+                            let user_text = crate::rpc::extract_user_text(&inf.params);
+                            let prompt_index = inf.prompt_index;
                             let sidecar_path = self
                                 .state_dir
                                 .join("sessions")
                                 .join(format!("{}.replies.jsonl", self.sid));
-                            let _ = append_reply_sidecar(&sidecar_path, &upstream_id, &frame);
+                            let _ = append_reply_sidecar(
+                                &sidecar_path,
+                                &upstream_id,
+                                &frame,
+                                Some(&user_text),
+                                Some(prompt_index),
+                            );
 
                             let actions =
                                 self.turn
@@ -1701,7 +1709,8 @@ impl Session {
                                     .state_dir
                                     .join("sessions")
                                     .join(format!("{}.replies.jsonl", self.sid));
-                                let _ = append_reply_sidecar(&sidecar_path, id_str, &frame);
+                                let _ =
+                                    append_reply_sidecar(&sidecar_path, id_str, &frame, None, None);
                             } else {
                                 // Unmatched upstream response -> warn with upstream id only
                                 let id_disp = frame
@@ -1963,6 +1972,7 @@ impl Session {
                     owners,
                     body,
                     user_text,
+                    prompt_index,
                 } => match body {
                     Reply::Error(err) => {
                         self.handle_reply_text(owners, Reply::Error(err), None)
@@ -1992,7 +2002,11 @@ impl Session {
                                 let text = match export_res {
                                     Ok(exp) => {
                                         let u_text = user_text.as_deref().unwrap_or("");
-                                        honk_wire::export::turn_text(&exp, u_text)
+                                        if let Some(idx) = prompt_index {
+                                            honk_wire::export::turn_text_at_index(&exp, idx, u_text)
+                                        } else {
+                                            honk_wire::export::turn_text(&exp, u_text)
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -3337,6 +3351,8 @@ pub(crate) fn append_reply_sidecar(
     path: &Path,
     upstream_id: &str,
     reply: &Value,
+    user_text: Option<&str>,
+    prompt_index: Option<usize>,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -3349,10 +3365,16 @@ pub(crate) fn append_reply_sidecar(
         opts.mode(0o600);
     }
     let mut file = opts.open(path)?;
-    let line = json!({
+    let mut line = json!({
         "upstream_id": upstream_id,
         "reply": reply,
     });
+    if let Some(t) = user_text {
+        line["user_text"] = json!(t);
+    }
+    if let Some(idx) = prompt_index {
+        line["prompt_index"] = json!(idx);
+    }
     let mut s = serde_json::to_string(&line)?;
     s.push('\n');
     file.write_all(s.as_bytes())?;

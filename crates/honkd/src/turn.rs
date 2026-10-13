@@ -93,6 +93,7 @@ pub enum Action {
         owners: Vec<OwnerRef>,
         body: Reply,
         user_text: Option<String>,
+        prompt_index: Option<usize>,
     },
     NotifySteerUnconsumed {
         viewer: ViewerId,
@@ -123,6 +124,7 @@ impl TurnCore {
                 owners: vec![owner],
                 body: Reply::Error(crate::rpc::busy_error(run)),
                 user_text: None,
+                prompt_index: None,
             }];
         }
         if self.inflight.is_some() {
@@ -206,10 +208,12 @@ impl TurnCore {
             None => Reply::Result(frame.get("result").cloned().unwrap_or(Value::Null)),
         };
         let user_text = Some(crate::rpc::extract_user_text(&inf.params));
+        let prompt_index = Some(inf.prompt_index);
         let mut out = vec![Action::Reply {
             owners: inf.owners,
             body,
             user_text,
+            prompt_index,
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -231,6 +235,7 @@ impl TurnCore {
             owners: inf.owners,
             body: Reply::Error(error),
             user_text: None,
+            prompt_index: Some(inf.prompt_index),
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -258,6 +263,7 @@ impl TurnCore {
                 }
             })),
             user_text: None,
+            prompt_index: Some(inf.prompt_index),
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -312,6 +318,7 @@ impl TurnCore {
         self.cancel_pending = false;
         self.steers.clear();
         self.consumed_steers.clear();
+        let prompt_index = self.inflight.as_ref().map(|i| i.prompt_index);
         let owners: Vec<OwnerRef> = self
             .inflight
             .take()
@@ -334,6 +341,7 @@ impl TurnCore {
                 }
             })),
             user_text: None,
+            prompt_index,
         }]
     }
 
@@ -401,6 +409,7 @@ mod tests {
                 owners: vec![owner],
                 body: Reply::Error(busy_error("run_active")),
                 user_text: None,
+                prompt_index: None,
             }]
         );
         assert!(core.inflight.is_none());
@@ -454,6 +463,7 @@ mod tests {
                     owners: vec![owner1],
                     body: Reply::Result(json!({"text": "done"})),
                     user_text: Some("first".to_string()),
+                    prompt_index: Some(0),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -492,6 +502,7 @@ mod tests {
                     owners: vec![owner1],
                     body: Reply::Result(json!({"text": "done"})),
                     user_text: Some("first".into()),
+                    prompt_index: Some(0),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -531,6 +542,7 @@ mod tests {
                 owners: vec![owner],
                 body: Reply::Result(json!({"status": "ok"})),
                 user_text: Some("hi".into()),
+                prompt_index: Some(0),
             }]
         );
         assert!(core.inflight.is_none());
@@ -618,6 +630,7 @@ mod tests {
                     }
                 })),
                 user_text: None,
+                prompt_index: Some(0),
             }]
         );
         assert!(core.run.is_none());
@@ -867,6 +880,7 @@ mod tests {
                 owners: vec![owner1],
                 body: Reply::Error(busy_err.clone()),
                 user_text: Some("p1".into()),
+                prompt_index: Some(0),
             }]
         );
         // 2. Run is recorded
@@ -883,6 +897,7 @@ mod tests {
                 owners: vec![owner3],
                 body: Reply::Error(busy_err),
                 user_text: None,
+                prompt_index: None,
             }]
         );
         assert_eq!(core.parked.len(), 1);
@@ -924,6 +939,7 @@ mod tests {
                     owners: vec![owner1],
                     body: Reply::Error(err),
                     user_text: None,
+                    prompt_index: Some(0),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -994,6 +1010,7 @@ mod tests {
                 owners: vec![owner2, owner3],
                 body: Reply::Result(json!({"text": "done2"})),
                 user_text: Some("second".to_string()),
+                prompt_index: Some(1),
             }]
         );
     }

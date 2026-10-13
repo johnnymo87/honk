@@ -19,6 +19,14 @@ pub struct State {
     pub ledger: BTreeMap<String, LedgerEntry>, // client_req_id → entry
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidecarRecoveryInfo {
+    pub crid: String,
+    pub session: String,
+    pub user_text: Option<String>,
+    pub prompt_index: Option<usize>,
+}
+
 impl State {
     pub fn prune_ledger(
         &mut self,
@@ -26,7 +34,7 @@ impl State {
         ttl_secs: u64,
         max_entries: usize,
         state_dir: Option<&std::path::Path>,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<SidecarRecoveryInfo> {
         let sessions = &self.sessions;
         let mut to_resolve_lost = Vec::new();
 
@@ -79,14 +87,25 @@ impl State {
                         && uid == upstream_id
                         && let Some(reply) = v.get("reply")
                     {
-                        return Some(reply.clone());
+                        let user_text =
+                            v.get("user_text").and_then(Value::as_str).map(String::from);
+                        let prompt_index = v
+                            .get("prompt_index")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize);
+                        return Some((reply.clone(), user_text, prompt_index));
                     }
                 }
                 None
             });
 
-            if let Some(reply) = cached_reply {
-                resolved_from_sidecar.push((crid.clone(), session.clone()));
+            if let Some((reply, user_text, prompt_index)) = cached_reply {
+                resolved_from_sidecar.push(SidecarRecoveryInfo {
+                    crid: crid.clone(),
+                    session: session.clone(),
+                    user_text,
+                    prompt_index,
+                });
                 self.ledger.insert(
                     crid,
                     LedgerEntry::Done {
@@ -380,7 +399,7 @@ impl StateStore {
         now_unix: u64,
         ttl_secs: u64,
         max_entries: usize,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<SidecarRecoveryInfo>> {
         let dir = self.dir.clone();
         self.mutate(|st| st.prune_ledger(now_unix, ttl_secs, max_entries, Some(&dir)))
     }
@@ -623,7 +642,9 @@ mod tests {
         let sidecar_file = sessions_dir.join("s.replies.jsonl");
         let line = json!({
             "upstream_id": "u_completed",
-            "reply": { "result": { "stopReason": "end_turn" } }
+            "reply": { "result": { "stopReason": "end_turn" } },
+            "user_text": "cached prompt",
+            "prompt_index": 0
         });
         std::fs::write(&sidecar_file, format!("{line}\n")).unwrap();
 
@@ -648,7 +669,15 @@ mod tests {
         );
 
         let resolved = st.prune_ledger(100_000, 24 * 3600, 1000, Some(temp_dir.path()));
-        assert_eq!(resolved, vec![("crid1".to_string(), "s".to_string())]);
+        assert_eq!(
+            resolved,
+            vec![SidecarRecoveryInfo {
+                crid: "crid1".to_string(),
+                session: "s".to_string(),
+                user_text: Some("cached prompt".to_string()),
+                prompt_index: Some(0),
+            }]
+        );
 
         // crid1 matched sidecar reply -> resolved to Done with cached reply!
         match st.ledger.get("crid1") {

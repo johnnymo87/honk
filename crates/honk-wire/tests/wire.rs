@@ -482,3 +482,104 @@ fn test_turn_text_none_vs_some_empty() {
     });
     assert_eq!(turn_text(&with_text, "prompt"), Some("hello".to_string()));
 }
+
+#[test]
+fn test_turn_text_identical_text_consecutive_prompts() {
+    use honk_wire::export::turn_text_at_index;
+
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "ping" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "pong 1" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "ping" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "pong 2" }]
+            }
+        ]
+    });
+
+    // turn_text_at_index can disambiguate identical consecutive prompts:
+    assert_eq!(
+        turn_text_at_index(&session, 0, "ping"),
+        Some("pong 1".to_string())
+    );
+    assert_eq!(
+        turn_text_at_index(&session, 1, "ping"),
+        Some("pong 2".to_string())
+    );
+    // Text mismatch at index 0 returns None:
+    assert_eq!(turn_text_at_index(&session, 0, "wrong"), None);
+    // Out-of-bounds index returns None:
+    assert_eq!(turn_text_at_index(&session, 2, "ping"), None);
+}
+
+#[test]
+fn test_turn_text_empty_user_text_returns_none() {
+    use honk_wire::export::turn_text_at_index;
+
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "reply" }]
+            }
+        ]
+    });
+
+    // Empty user_text (image/resource-only prompts) returns None on both APIs
+    assert_eq!(turn_text(&session, ""), None);
+    assert_eq!(turn_text_at_index(&session, 0, ""), None);
+}
+
+#[test]
+fn test_turn_text_skips_tool_response_messages() {
+    let session = serde_json::json!({
+        "conversation": [
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [{ "type": "text", "text": "run command" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "toolRequest", "tool": "shell" }]
+            },
+            {
+                "role": "user",
+                "metadata": { "userVisible": true },
+                "content": [
+                    { "type": "toolResponse", "text": "matching text" }
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "all done" }]
+            }
+        ]
+    });
+
+    // toolResponse user messages must not be matched as client prompts:
+    assert_eq!(turn_text(&session, "matching text"), None);
+    // Real client prompt matches:
+    assert_eq!(
+        turn_text(&session, "run command"),
+        Some("all done".to_string())
+    );
+}

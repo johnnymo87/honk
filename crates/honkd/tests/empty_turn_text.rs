@@ -147,22 +147,14 @@ async fn restart_between_reply_and_export_recovers_text() {
     g.model()
         .push([Turn::Text(vec!["text before ".into(), "export".into()])]);
 
-    // Set delay hook so export task in honkd pauses, allowing us to kill honkd reliably
-    // between goose reply and export completion.
-    struct EnvGuard(&'static str);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(self.0);
-            }
-        }
-    }
-    let guard = EnvGuard("HONKD_TEST_EXPORT_DELAY_MS");
-    unsafe {
-        std::env::set_var("HONKD_TEST_EXPORT_DELAY_MS", "5000");
-    }
-
-    let mut h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    // Set delay hook so export task in honkd pauses, passed via spawn_with_env per-process env
+    let mut h = Honkd::spawn_with_env(
+        &g.url(),
+        g.secret_file(),
+        &[],
+        &[("HONKD_TEST_EXPORT_DELAY_MS", "5000")],
+    )
+    .await;
     let mut v1 = Viewer::connect(&h).await;
     let sid = new_session(&mut v1, g.cwd().to_str().unwrap()).await;
     let _req = v1
@@ -196,9 +188,7 @@ async fn restart_between_reply_and_export_recovers_text() {
     drop(v1);
     h.kill9();
 
-    // Remove delay before restart
-    drop(guard);
-
+    // Restart without delay
     h.restart().await;
 
     let mut v2 = Viewer::connect(&h).await;
@@ -213,5 +203,96 @@ async fn restart_between_reply_and_export_recovers_text() {
     assert_eq!(
         r["result"]["_meta"]["honk"]["text"], "text before export",
         "recovered reply must have text: {r}"
+    );
+}
+
+/// Two prompts: second prompt arrives and is parked/dispatched while first prompt's reply
+/// arrives. Honkd is killed before first prompt's export completes. On restart, crid1 must
+/// get crid1's text (or absent), NEVER crid2's text!
+#[tokio::test(flavor = "multi_thread")]
+async fn two_prompts_kill_between_reply_and_export_never_gets_second_prompt_text() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model()
+        .push([Turn::Text(vec!["first ".into(), "reply".into()])]);
+    g.model()
+        .push([Turn::Text(vec!["second ".into(), "reply".into()])]);
+
+    let mut h = Honkd::spawn_with_env(
+        &g.url(),
+        g.secret_file(),
+        &[],
+        &[("HONKD_TEST_EXPORT_DELAY_MS", "5000")],
+    )
+    .await;
+    let mut v1 = Viewer::connect(&h).await;
+    let sid = new_session(&mut v1, g.cwd().to_str().unwrap()).await;
+
+    // Send Prompt 1
+    let _req1 = v1
+        .request(
+            "session/prompt",
+            params(&sid, "turn 1 prompt", "crid-1", false),
+        )
+        .await;
+    wait_turn_request(&g, 1).await;
+
+    // Send Prompt 2 while Prompt 1 is finalizing/in-flight (gets parked)
+    let _req2 = v1
+        .request(
+            "session/prompt",
+            params(&sid, "turn 2 prompt", "crid-2", false),
+        )
+        .await;
+
+    // Wait until sidecar has the reply for Prompt 1 recorded
+    let sidecar_path = h
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.replies.jsonl"));
+    let start = std::time::Instant::now();
+    loop {
+        if sidecar_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&sidecar_path)
+            && !content.trim().is_empty()
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for sidecar reply to be written"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(v1);
+    h.kill9();
+
+    // Restart without the delay
+    h.restart().await;
+
+    let mut v2 = Viewer::connect(&h).await;
+    let r1 = v2
+        .call(
+            "session/prompt",
+            params(&sid, "turn 1 prompt", "crid-1", true),
+        )
+        .await;
+
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+    let text1 = r1
+        .pointer("/result/_meta/honk/text")
+        .and_then(Value::as_str);
+    assert_eq!(
+        text1,
+        Some("first reply"),
+        "crid-1 must have crid-1's text: {r1}"
+    );
+    assert_ne!(
+        text1,
+        Some("second reply"),
+        "crid-1 must NEVER receive crid-2's text"
     );
 }

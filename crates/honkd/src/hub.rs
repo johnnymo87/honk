@@ -389,8 +389,8 @@ impl Hub {
 
         *hub.sessions.write().await = session_handles;
 
-        for (crid, sid) in resolved_sidecar {
-            hub.recover_sidecar_text(&crid, &sid).await;
+        for info in resolved_sidecar {
+            hub.recover_sidecar_text(&info).await;
         }
 
         Ok(hub)
@@ -818,30 +818,53 @@ impl Hub {
         export_result
     }
 
-    pub async fn recover_sidecar_text(&self, crid: &str, sid: &str) {
-        let user_text = find_user_text_for_crid(&self.state_dir, sid, crid);
+    pub async fn recover_sidecar_text(&self, info: &crate::state::SidecarRecoveryInfo) {
+        let (Some(user_text), Some(prompt_index)) = (&info.user_text, info.prompt_index) else {
+            // Old sidecar lines without these fields -> leave text absent.
+            return;
+        };
 
-        let export_res = self.export(sid).await;
+        if user_text.is_empty() {
+            return;
+        }
+
+        // Export with timeout (~15s) per item 3
+        let export_res =
+            match tokio::time::timeout(Duration::from_secs(15), self.export(&info.session)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(
+                        "Session {}: timed out exporting session to recover text for {}",
+                        info.session,
+                        info.crid
+                    );
+                    return;
+                }
+            };
+
         let Ok(exp) = export_res else {
-            tracing::warn!("Session {sid}: failed to export session to recover text for {crid}");
+            tracing::warn!(
+                "Session {}: failed to export session to recover text for {}",
+                info.session,
+                info.crid
+            );
             return;
         };
 
-        let prompt_text = user_text.or_else(|| honk_wire::export::client_prompts(&exp).pop());
-
-        let Some(u_text) = prompt_text else {
-            tracing::warn!("Session {sid}: no prompt text found to recover text for {crid}");
-            return;
-        };
-
-        let Some(text) = honk_wire::export::turn_text(&exp, &u_text) else {
-            tracing::warn!("Session {sid}: turn_text returned None for {crid}");
+        let Some(text) = honk_wire::export::turn_text_at_index(&exp, prompt_index, user_text)
+        else {
+            tracing::warn!(
+                "Session {}: turn_text_at_index returned None for prompt_index {prompt_index} and crid {}",
+                info.session,
+                info.crid
+            );
             return;
         };
 
         let mut s = self.state.lock().await;
         let _ = s.mutate(|st| {
-            if let Some(crate::state::LedgerEntry::Done { response, .. }) = st.ledger.get_mut(crid)
+            if let Some(crate::state::LedgerEntry::Done { response, .. }) =
+                st.ledger.get_mut(&info.crid)
                 && let Some(res) = response.get_mut("result").and_then(Value::as_object_mut)
             {
                 if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
@@ -1470,25 +1493,4 @@ impl Hub {
             }
         }
     }
-}
-
-fn find_user_text_for_crid(state_dir: &std::path::Path, sid: &str, crid: &str) -> Option<String> {
-    let log_path = state_dir.join("sessions").join(format!("{sid}.log.jsonl"));
-    let content = std::fs::read_to_string(log_path).ok()?;
-    for line in content.lines() {
-        if let Ok(v) = serde_json::from_str::<Value>(line) {
-            let frame = v.get("frame").unwrap_or(&v);
-            if frame
-                .pointer("/params/update/_meta/honk/source/client_req_id")
-                .and_then(Value::as_str)
-                == Some(crid)
-                && let Some(text) = frame
-                    .pointer("/params/update/content/text")
-                    .and_then(Value::as_str)
-            {
-                return Some(text.to_string());
-            }
-        }
-    }
-    None
 }
