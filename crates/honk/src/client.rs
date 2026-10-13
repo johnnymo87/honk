@@ -118,45 +118,80 @@ pub struct Client {
     next_req_id: u64,
 }
 
+pub async fn connect_and_initialize(
+    url: &str,
+    secret: &str,
+) -> anyhow::Result<(
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Value,
+)> {
+    let ws_url = normalize_ws_url(url);
+    let mut req = ws_url.into_client_request()?;
+    req.headers_mut().insert(
+        "x-secret-key",
+        secret
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid secret header: {e}"))?,
+    );
+
+    let (mut ws, _) = match tokio_tungstenite::connect_async(req).await {
+        Ok(pair) => pair,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp))
+            if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 =>
+        {
+            anyhow::bail!("fatal: authentication failed (HTTP {})", resp.status());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Send honk-aware initialize
+    let init_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "_meta": { "honk": {} }
+        }
+    });
+    ws.send(Message::Text(init_req.to_string().into()))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to send initialize request: {e}"))?;
+
+    let init_res = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t)
+                    && v.get("id") == Some(&json!(1))
+                {
+                    break v;
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                let _ = ws.send(Message::Pong(payload)).await;
+            }
+            Some(Ok(Message::Close(_))) => {
+                anyhow::bail!("connection closed while awaiting initialize response");
+            }
+            Some(Err(e)) => return Err(e.into()),
+            None => anyhow::bail!("stream ended while awaiting initialize response"),
+            _ => {}
+        }
+    };
+
+    if let Some(err) = init_res.get("error") {
+        anyhow::bail!("fatal: honkd initialize failed: {err}");
+    }
+
+    let init_result = init_res.get("result").cloned().unwrap_or(init_res);
+    Ok((ws, init_result))
+}
+
 impl Client {
     pub async fn connect(url: &str, secret: &str) -> anyhow::Result<Self> {
-        let ws_url = normalize_ws_url(url);
-        let mut req = ws_url.into_client_request()?;
-        req.headers_mut().insert(
-            "x-secret-key",
-            secret
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid secret header: {e}"))?,
-        );
-
-        let (ws, _) = match tokio_tungstenite::connect_async(req).await {
-            Ok(pair) => pair,
-            Err(tokio_tungstenite::tungstenite::Error::Http(resp))
-                if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 =>
-            {
-                anyhow::bail!("fatal: authentication failed (HTTP {})", resp.status());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut client = Self { ws, next_req_id: 1 };
-
-        // Send honk-aware initialize
-        let init_res = client
-            .call(
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {},
-                    "_meta": { "honk": {} }
-                }),
-            )
-            .await?;
-
-        if let Some(err) = init_res.get("error") {
-            anyhow::bail!("fatal: honkd initialize failed: {err}");
-        }
-
-        Ok(client)
+        let (ws, _init_result) = connect_and_initialize(url, secret).await?;
+        Ok(Self { ws, next_req_id: 2 })
     }
 
     pub async fn request(&mut self, method: &str, params: Value) -> anyhow::Result<u64> {

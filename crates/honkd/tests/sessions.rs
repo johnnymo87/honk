@@ -1,5 +1,6 @@
 use common::{Honkd, Viewer};
 use honk_testgoose::{FakeGoose, StubGoose};
+use std::time::Duration;
 
 mod common;
 
@@ -308,4 +309,104 @@ async fn invalid_frame_returns_32600() {
     // Missing method, not a response -> invalid
     let res = v.call("", serde_json::json!({})).await;
     assert_eq!(res["error"]["code"], -32600);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_new_failure_deletes_upstream_connection() {
+    let fake = FakeGoose::start().await;
+    fake.set_session_new_status(Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    let res = v
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": "/tmp",
+                "mcpServers": [],
+            }),
+        )
+        .await;
+
+    assert!(
+        res.get("error").is_some(),
+        "expected session/new to fail, got: {res}"
+    );
+
+    // After a failed session/new, FakeGoose must have seen a DELETE for that connection
+    assert!(
+        !fake.deletes().is_empty(),
+        "expected FakeGoose to record DELETE for the failed connection, got deletes: {:?}",
+        fake.deletes()
+    );
+
+    // State file must have no orphan connections and no held sessions
+    let state_bytes = std::fs::read(h.state_dir.path().join("state.json")).expect("read state");
+    let state: honkd::state::State = serde_json::from_slice(&state_bytes).expect("parse state");
+    assert!(
+        state.orphan_conns.is_empty(),
+        "orphans must be cleared after failed session/new, got: {:?}",
+        state.orphan_conns
+    );
+    assert!(
+        state.sessions.is_empty(),
+        "sessions must be empty after failed session/new"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_new_timeout_deletes_upstream_connection() {
+    let fake = FakeGoose::start().await;
+    fake.set_session_new_delay(Some(Duration::from_millis(1500)));
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--session-new-timeout-ms",
+            "100",
+        ],
+    )
+    .await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    let res = v
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": "/tmp",
+                "mcpServers": [],
+            }),
+        )
+        .await;
+
+    assert!(
+        res.get("error").is_some(),
+        "expected session/new to time out, got: {res}"
+    );
+
+    // After a timed-out session/new, FakeGoose must have seen a DELETE for that connection
+    assert!(
+        !fake.deletes().is_empty(),
+        "expected FakeGoose to record DELETE for the timed out connection, got deletes: {:?}",
+        fake.deletes()
+    );
+
+    // State file must have no orphan connections and no held sessions
+    let state_bytes = std::fs::read(h.state_dir.path().join("state.json")).expect("read state");
+    let state: honkd::state::State = serde_json::from_slice(&state_bytes).expect("parse state");
+    assert!(
+        state.orphan_conns.is_empty(),
+        "orphans must be cleared after timed out session/new, got: {:?}",
+        state.orphan_conns
+    );
+    assert!(
+        state.sessions.is_empty(),
+        "sessions must be empty after timed out session/new"
+    );
 }
