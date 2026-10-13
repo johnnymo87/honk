@@ -314,3 +314,54 @@ fn test_client_prompts_skips_steers_and_turn_text_stops_at_next_prompt() {
     let text2 = turn_text(&session, "turn 2 prompt");
     assert_eq!(text2, "turn 2 reply");
 }
+
+#[test]
+fn test_honk_meta_resume_only_deserialization() {
+    use honk_wire::{ERR_UNKNOWN_CLIENT_REQ_ID, FEATURE_RESUME_ONLY, HonkMeta, honk_meta};
+
+    assert_eq!(FEATURE_RESUME_ONLY, "resume_only");
+    assert_eq!(ERR_UNKNOWN_CLIENT_REQ_ID, -32004);
+
+    // Default: resume_only is false
+    let meta_empty: HonkMeta = serde_json::from_str("{}").unwrap();
+    assert!(!meta_empty.resume_only);
+    assert_eq!(meta_empty.client_req_id, None);
+
+    let meta_crid_only: HonkMeta = serde_json::from_str(r#"{"client_req_id": "crid-1"}"#).unwrap();
+    assert!(!meta_crid_only.resume_only);
+    assert_eq!(meta_crid_only.client_req_id.as_deref(), Some("crid-1"));
+
+    // Explicit false
+    let meta_false: HonkMeta = serde_json::from_str(r#"{"resume_only": false}"#).unwrap();
+    assert!(!meta_false.resume_only);
+
+    // Explicit true
+    let meta_true: HonkMeta =
+        serde_json::from_str(r#"{"client_req_id": "crid-2", "resume_only": true}"#).unwrap();
+    assert!(meta_true.resume_only);
+    assert_eq!(meta_true.client_req_id.as_deref(), Some("crid-2"));
+
+    // Through honk_meta helper
+    let params_without = serde_json::json!({
+        "_meta": {
+            "honk": {
+                "client_req_id": "crid-3"
+            }
+        }
+    });
+    let parsed_without = honk_meta(&params_without);
+    assert!(!parsed_without.resume_only);
+    assert_eq!(parsed_without.client_req_id.as_deref(), Some("crid-3"));
+
+    let params_with = serde_json::json!({
+        "_meta": {
+            "honk": {
+                "client_req_id": "crid-4",
+                "resume_only": true
+            }
+        }
+    });
+    let parsed_with = honk_meta(&params_with);
+    assert!(parsed_with.resume_only);
+    assert_eq!(parsed_with.client_req_id.as_deref(), Some("crid-4"));
+}

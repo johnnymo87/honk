@@ -5,6 +5,9 @@ use std::collections::HashMap;
 pub mod export;
 
 pub const PROTOCOL: u32 = 1;
+pub const FEATURE_RESUME_ONLY: &str = "resume_only";
+pub const ERR_UNKNOWN_CLIENT_REQ_ID: i64 = -32004;
+
 pub mod method {
     pub const RESET: &str = "_honk/reset";
     pub const REPLAY_DONE: &str = "_honk/replay_done";
@@ -77,6 +80,8 @@ pub struct HonkMeta {
     pub client_req_id: Option<String>,
     #[serde(default)]
     pub after: Option<Cursor>,
+    #[serde(default)]
+    pub resume_only: bool,
 }
 pub fn honk_meta(params: &Value) -> HonkMeta {
     params

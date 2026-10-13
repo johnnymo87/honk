@@ -2186,7 +2186,9 @@ impl Session {
                     );
                     return;
                 }
-                let client_req_id = honk_wire::honk_meta(&params).client_req_id;
+                let meta = honk_wire::honk_meta(&params);
+                let client_req_id = meta.client_req_id;
+                let resume_only = meta.resume_only;
 
                 if let Some(crid) = &client_req_id {
                     let cached = {
@@ -2259,6 +2261,17 @@ impl Session {
                         self.send_to_viewer(viewer_id, err_resp);
                         return;
                     }
+                }
+
+                if resume_only {
+                    let err_resp = crate::rpc::error(
+                        id,
+                        honk_wire::ERR_UNKNOWN_CLIENT_REQ_ID,
+                        "unknown client_req_id; resume_only prompt not started",
+                        None,
+                    );
+                    self.send_to_viewer(viewer_id, err_resp);
+                    return;
                 }
 
                 let actions = self.turn.on_prompt(owner, params, &mut self.ids);
