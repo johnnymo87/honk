@@ -518,3 +518,134 @@ async fn test_notify_sends_notification_frame() {
 
     server_handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_ping_answered_while_inbound_receiver_has_many_unread_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Send 300 unread frames (well over bounded channel size 128)
+            for i in 0..300 {
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "update",
+                    "params": { "i": i }
+                });
+                ws.send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+
+            // Server sends Ping
+            ws.send(Message::Ping(vec![77, 88].into())).await.unwrap();
+
+            // Client must answer Pong even though receiver hasn't read frames
+            let pong_res = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                while let Some(msg) = ws.next().await {
+                    if let Ok(Message::Pong(payload)) = msg {
+                        assert_eq!(payload.as_ref(), &[77, 88]);
+                        return;
+                    }
+                }
+                panic!("stream ended without pong");
+            })
+            .await;
+
+            assert!(pong_res.is_ok(), "server must receive pong within timeout");
+        })
+    })
+    .await;
+
+    let (_conn, mut rx, _) = Conn::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    // Client does NOT read frames until after ping is answered
+    server_handle.await.unwrap();
+
+    // Now verify all 300 frames can still be read
+    for i in 0..300 {
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame["params"]["i"], i);
+    }
+}
+
+#[tokio::test]
+async fn test_drop_conn_closes_socket_on_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Wait for client to close/drop socket
+            let next_msg =
+                tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await;
+
+            match next_msg {
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {}
+                Ok(other) => panic!("expected close or None, got: {other:?}"),
+                Err(_) => panic!("timed out waiting for socket to close on drop"),
+            }
+        })
+    })
+    .await;
+
+    let (conn, _rx, _) = Conn::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    // Dropping conn without calling close() must close the socket
+    drop(conn);
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_server_close_causes_subsequent_request_to_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Server abruptly drops the connection without a clean close frame
+            drop(ws);
+        })
+    })
+    .await;
+
+    let (conn, mut rx, _) = Conn::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    // Drain receiver until EOF
+    assert_eq!(rx.recv().await, None);
+
+    // Subsequent request must return Err promptly
+    let res = conn.request("test_method", json!({})).await;
+    assert!(
+        res.is_err(),
+        "request after server drop must error, got: {res:?}"
+    );
+
+    let notif_res = conn.notify("test_notif", json!({})).await;
+    assert!(
+        notif_res.is_err(),
+        "notify after server drop must error, got: {notif_res:?}"
+    );
+
+    let resp_res = conn.respond(json!(1), json!({})).await;
+    assert!(
+        resp_res.is_err(),
+        "respond after server drop must error, got: {resp_res:?}"
+    );
+
+    server_handle.await.unwrap();
+}
