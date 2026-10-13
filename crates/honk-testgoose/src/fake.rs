@@ -161,6 +161,9 @@ struct FakeGooseInner {
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
     prompt_error_reply: Mutex<Option<Value>>,
+    session_new_status: Mutex<Option<StatusCode>>,
+    session_new_error_reply: Mutex<Option<Value>>,
+    session_new_delay: Mutex<Option<Duration>>,
     export_delay: Mutex<Option<Duration>>,
     run_announcement_delay: Mutex<Option<Duration>>,
     export_commit_delay: Mutex<Option<Duration>>,
@@ -211,6 +214,9 @@ impl FakeGoose {
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
             prompt_error_reply: Mutex::new(None),
+            session_new_status: Mutex::new(None),
+            session_new_error_reply: Mutex::new(None),
+            session_new_delay: Mutex::new(None),
             export_delay: Mutex::new(None),
             run_announcement_delay: Mutex::new(None),
             export_commit_delay: Mutex::new(None),
@@ -384,6 +390,18 @@ impl FakeGoose {
 
     pub fn set_prompt_error_reply(&self, err: Option<Value>) {
         *self.state.prompt_error_reply.lock().unwrap() = err;
+    }
+
+    pub fn set_session_new_status(&self, status: Option<StatusCode>) {
+        *self.state.session_new_status.lock().unwrap() = status;
+    }
+
+    pub fn set_session_new_error_reply(&self, err: Option<Value>) {
+        *self.state.session_new_error_reply.lock().unwrap() = err;
+    }
+
+    pub fn set_session_new_delay(&self, delay: Option<Duration>) {
+        *self.state.session_new_delay.lock().unwrap() = delay;
     }
 
     pub fn set_run_announcement_delay(&self, delay: Option<Duration>) {
@@ -576,6 +594,24 @@ async fn handle_post(
 
     match method {
         Some("session/new") => {
+            if let Some(status) = *state.session_new_status.lock().unwrap() {
+                return status.into_response();
+            }
+            if let Some(err_val) = state.session_new_error_reply.lock().unwrap().clone() {
+                let mut conns = state.connections.lock().unwrap();
+                if let Some(conn) = conns.get_mut(&conn_id)
+                    && let Some(id) = req_id
+                {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": err_val
+                    });
+                    conn.conn_stream.push_frame(resp, patched, false);
+                }
+                return StatusCode::ACCEPTED.into_response();
+            }
+
             let sid = format!(
                 "ses_{}",
                 state.next_session_num.fetch_add(1, Ordering::SeqCst)
@@ -588,20 +624,32 @@ async fn handle_post(
 
             state.all_sessions.lock().unwrap().insert(sid.clone(), cwd);
 
-            let mut conns = state.connections.lock().unwrap();
-            if let Some(conn) = conns.get_mut(&conn_id) {
-                conn.sessions.insert(sid.clone(), StreamState::new());
-                if let Some(id) = req_id {
-                    let resp = json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "sessionId": sid
-                        }
-                    });
-                    conn.conn_stream.push_frame(resp, patched, false);
+            let delay_opt = *state.session_new_delay.lock().unwrap();
+            let state_clone = state.clone();
+            let conn_id_clone = conn_id.clone();
+            let sid_clone = sid.clone();
+            let req_id_clone = req_id.clone();
+
+            tokio::spawn(async move {
+                if let Some(delay) = delay_opt {
+                    tokio::time::sleep(delay).await;
                 }
-            }
+                let mut conns = state_clone.connections.lock().unwrap();
+                if let Some(conn) = conns.get_mut(&conn_id_clone) {
+                    conn.sessions.insert(sid_clone.clone(), StreamState::new());
+                    if let Some(id) = req_id_clone {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "sessionId": sid_clone
+                            }
+                        });
+                        conn.conn_stream.push_frame(resp, patched, false);
+                    }
+                }
+            });
+
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/list") => {
