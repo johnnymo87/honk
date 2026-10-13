@@ -65,8 +65,16 @@ pub struct StateSnapshot {
 pub enum UiEvent {
     Transcript(Value),
     Notice(Notice),
-    Attached { result: Value },
-    SessionNew { result: Value },
+    Attached {
+        result: Value,
+    },
+    SessionNew {
+        result: Value,
+    },
+    SessionInfo {
+        title: Option<String>,
+        cwd: Option<String>,
+    },
     State(StateSnapshot),
     Fatal(String),
     Exit(i32),
@@ -187,6 +195,7 @@ async fn process_effects(
     attach_failed_attempts: &mut u32,
     attach_retry_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     connection_state: &mut ConnectionState,
+    pending_list_id: &mut Option<u64>,
 ) -> EffectAction {
     for effect in effects {
         match effect {
@@ -225,6 +234,11 @@ async fn process_effects(
                 *attach_failed_attempts = 0;
                 *attach_retry_timer = None;
                 let _ = ui_tx.send(UiEvent::Attached { result });
+                if let Some(conn) = conn_opt.as_mut() {
+                    let list_id = core.allocate_id();
+                    *pending_list_id = Some(list_id);
+                    let _ = conn.send_request(list_id, "session/list", json!({})).await;
+                }
             }
             Effect::AttachFailed { error } => {
                 if *is_first_attach || is_auth_error(&error) {
@@ -243,7 +257,7 @@ async fn process_effects(
                         (250 * (1 << (*attach_failed_attempts - 1))).min(5000),
                     );
                     let _ = ui_tx.send(UiEvent::Notice(Notice::warning(format!(
-                        "[honk] attach failed ({error}); retrying in {delay:?}..."
+                        "attach failed ({error}); retrying in {delay:?}..."
                     ))));
                     *attach_retry_timer = Some(Box::pin(tokio::time::sleep(delay)));
                 } else {
@@ -252,7 +266,7 @@ async fn process_effects(
                         reason: format!("attach failed after 5 attempts: {error}"),
                     };
                     let _ = ui_tx.send(UiEvent::Notice(Notice::warning(
-                        "[honk] attach failed 5 times; press any key to retry",
+                        "attach failed 5 times; press any key to retry",
                     )));
                 }
             }
@@ -458,6 +472,7 @@ async fn run_driver(
     let mut attach_retry_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reconnect_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reconnect_attempt = 1u32;
+    let mut pending_list_id: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -483,6 +498,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
+                            &mut pending_list_id,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -513,6 +529,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
+                            &mut pending_list_id,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -543,6 +560,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
+                            &mut pending_list_id,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -604,6 +622,38 @@ async fn run_driver(
             } => {
                 match frame_opt {
                     Some(frame) => {
+                        if let Some(list_id) = pending_list_id
+                            && frame.get("id").and_then(Value::as_u64) == Some(list_id)
+                            && frame.get("method").is_none()
+                        {
+                            pending_list_id = None;
+                            let mut title = None;
+                            let mut cwd = None;
+                            let sessions = frame
+                                .pointer("/result/sessions")
+                                .or_else(|| frame.get("result"))
+                                .and_then(Value::as_array);
+                            if let Some(arr) = sessions {
+                                for s in arr {
+                                    if s.get("sessionId").and_then(Value::as_str)
+                                        == Some(&core.session_id)
+                                    {
+                                        title = s
+                                            .get("title")
+                                            .and_then(Value::as_str)
+                                            .map(String::from);
+                                        cwd = s
+                                            .get("cwd")
+                                            .and_then(Value::as_str)
+                                            .map(String::from);
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = ui_tx.send(UiEvent::SessionInfo { title, cwd });
+                            continue;
+                        }
+
                         let effects = core.handle(Input::Frame(frame));
                         let action = process_effects(
                             effects,
@@ -614,6 +664,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
+                            &mut pending_list_id,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -702,6 +753,7 @@ async fn run_driver(
                                 &mut attach_failed_attempts,
                                 &mut attach_retry_timer,
                                 &mut connection_state,
+                                &mut pending_list_id,
                             ).await;
                             if matches!(action, EffectAction::Exit) {
                                 return;
@@ -754,6 +806,7 @@ async fn run_driver(
                     &mut attach_failed_attempts,
                     &mut attach_retry_timer,
                     &mut connection_state,
+                    &mut pending_list_id,
                 ).await;
                 if matches!(action, EffectAction::Exit) {
                     return;

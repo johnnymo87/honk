@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "[honk] commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -28,7 +28,7 @@ impl ChatCore {
             self.held_steers.clear();
             self.detached_buffered_lines.clear();
             effects.push(Effect::Notice(Notice::info(format!(
-                "[honk] dropped {count} queued message(s)"
+                "dropped {count} queued message(s)"
             ))));
             return true;
         }
@@ -49,7 +49,7 @@ impl ChatCore {
         }
 
         effects.push(Effect::Notice(Notice::warning(format!(
-            "[honk] unknown command: '{trimmed}'; type /help for commands"
+            "unknown command: '{trimmed}'; type /help for commands"
         ))));
         true
     }
@@ -57,7 +57,7 @@ impl ChatCore {
     pub(crate) fn handle_approve_command(&mut self, effects: &mut Vec<Effect>) {
         if self.pending_permissions.is_empty() {
             effects.push(Effect::Notice(Notice::warning(
-                "[honk] no pending permission requests to approve",
+                "no pending permission requests to approve",
             )));
             return;
         }
@@ -92,7 +92,7 @@ impl ChatCore {
             result,
         });
         effects.push(Effect::Notice(Notice::info(format!(
-            "[honk] approved: {}",
+            "approved: {}",
             perm.tool_title
         ))));
     }
@@ -119,7 +119,7 @@ impl ChatCore {
                 result: cached_result.clone(),
             });
             effects.push(Effect::Notice(Notice::info(format!(
-                "[honk] auto-approved (re-offered): {tool_title}"
+                "auto-approved (re-offered): {tool_title}"
             ))));
             return;
         }
@@ -185,7 +185,7 @@ impl ChatCore {
                 result,
             });
             effects.push(Effect::Notice(Notice::info(format!(
-                "[honk] auto-approved: {tool_title}"
+                "auto-approved: {tool_title}"
             ))));
         } else if !self
             .pending_permissions
@@ -199,7 +199,7 @@ impl ChatCore {
                     options,
                 });
             effects.push(Effect::Notice(Notice::info(format!(
-                "[honk] permission request from another client's turn: {tool_title}"
+                "permission request from another client's turn: {tool_title}"
             ))));
         }
     }
@@ -210,7 +210,7 @@ impl ChatCore {
                 method: "session/cancel".into(),
                 params: json!({"sessionId": self.session_id}),
             });
-            effects.push(Effect::Notice(Notice::info("[honk] cancelling turn...")));
+            effects.push(Effect::Notice(Notice::info("cancelling turn...")));
             return;
         }
 
@@ -219,15 +219,13 @@ impl ChatCore {
                 method: "session/cancel".into(),
                 params: json!({"sessionId": self.session_id}),
             });
-            effects.push(Effect::Notice(Notice::info("[honk] cancelling turn...")));
+            effects.push(Effect::Notice(Notice::info("cancelling turn...")));
         } else if self.run_state.is_running() || self.prompt_sent.is_some() {
             effects.push(Effect::Notice(Notice::warning(
-                "[honk] this turn belongs to another client; /cancel! cancels it anyway",
+                "this turn belongs to another client; /cancel! cancels it anyway",
             )));
         } else {
-            effects.push(Effect::Notice(Notice::warning(
-                "[honk] no active turn to cancel",
-            )));
+            effects.push(Effect::Notice(Notice::warning("no active turn to cancel")));
         }
     }
 }

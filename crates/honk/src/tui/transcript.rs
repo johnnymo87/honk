@@ -162,6 +162,28 @@ impl Transcript {
         let Some(u) = frame.pointer("/params/update") else {
             return;
         };
+
+        if let Some(state) = honk_wire::run_state(u)
+            && state.is_none()
+        {
+            // Run ended (activeRunId null): mark any pending/in-progress tool blocks as interrupted
+            let mut first_modified = None;
+            for (idx, b) in self.blocks.iter_mut().enumerate() {
+                if b.kind == BlockKind::Tool
+                    && (b.status == "pending" || b.status == "in_progress" || b.status.is_empty())
+                {
+                    b.status = "interrupted".to_string();
+                    b.revision += 1;
+                    if first_modified.is_none() {
+                        first_modified = Some(idx);
+                    }
+                }
+            }
+            if let Some(idx) = first_modified {
+                self.invalidate_prefix_sums_from(idx);
+            }
+        }
+
         let Some(key) = honk_wire::block_key(u) else {
             return;
         };
@@ -235,13 +257,20 @@ impl Transcript {
             fresh.next_notice_id = fresh.next_notice_id.max(self.next_notice_id);
         }
 
+        let clean_text = notice
+            .text
+            .strip_prefix("[honk] ")
+            .or_else(|| notice.text.strip_prefix("[honk]"))
+            .unwrap_or(&notice.text)
+            .to_string();
+
         let idx = self.blocks.len();
         self.invalidate_prefix_sums_from(idx);
         self.blocks.push(Block {
             key: key.clone(),
             kind: BlockKind::Notice,
             revision: 1,
-            text: notice.text.clone(),
+            text: clean_text,
             title: String::new(),
             status: String::new(),
             tool_kind: None,
@@ -300,6 +329,21 @@ impl Transcript {
             UiEvent::Notice(notice) => {
                 self.apply_notice(notice.clone());
             }
+            UiEvent::SessionNew { result } => {
+                if let Some((text, has_failures)) = format_extension_results(result) {
+                    let notice = if has_failures {
+                        Notice::warning(text)
+                    } else {
+                        Notice::info(text)
+                    };
+                    self.apply_notice(notice);
+                }
+            }
+            UiEvent::Attached { result } => {
+                if let Some(text) = format_failed_extensions(result) {
+                    self.apply_notice(Notice::warning(text));
+                }
+            }
             UiEvent::State(snapshot) if snapshot.connection != ConnectionState::Live => {
                 self.abort_rebuild();
             }
@@ -345,13 +389,17 @@ impl Transcript {
 
         self.render_count += 1;
 
-        let lines_vec = match block.kind {
+        let mut lines_vec = match block.kind {
             BlockKind::User => render_user(&block.text, width),
             BlockKind::Assistant => render_assistant(&block.text, width),
             BlockKind::Thought => render_thought(&block.text, self.thoughts_expanded, width),
             BlockKind::Tool => render_tool(block, self.tools_expanded, width),
             BlockKind::Notice => render_notice(block, width),
         };
+
+        if block_idx > 0 && needs_separator(self.blocks[block_idx - 1].kind, block.kind) {
+            lines_vec.insert(0, Line::raw(""));
+        }
 
         let height = lines_vec.len();
         let arc_lines: Arc<[Line<'static>]> = lines_vec.into();
@@ -760,6 +808,18 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     result
 }
 
+fn needs_separator(prev_kind: BlockKind, curr_kind: BlockKind) -> bool {
+    if prev_kind == curr_kind {
+        return false;
+    }
+    // Consecutive tools form a group: no separator between tools
+    // Thought before assistant: keep tight
+    if prev_kind == BlockKind::Thought && curr_kind == BlockKind::Assistant {
+        return false;
+    }
+    true
+}
+
 fn render_user(raw: &str, width: u16) -> Vec<Line<'static>> {
     let prefix_style = Style::default()
         .add_modifier(Modifier::BOLD)
@@ -883,6 +943,7 @@ fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> 
     let (glyph, glyph_style) = match block.status.as_str() {
         "completed" | "success" => ("✓ ", Style::default().fg(Color::Green)),
         "failed" | "error" => ("✗ ", Style::default().fg(Color::Red)),
+        "interrupted" | "cancelled" => ("⊘ ", Style::default().add_modifier(Modifier::DIM)),
         _ => ("◌ ", Style::default().fg(Color::Yellow)),
     };
     let title_style = Style::default().add_modifier(Modifier::BOLD);
@@ -936,6 +997,66 @@ fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> 
     }
 
     out
+}
+
+fn format_extension_results(result: &Value) -> Option<(String, bool)> {
+    let exts = result
+        .pointer("/_meta/extensionResults")
+        .or_else(|| result.get("extensionResults"))
+        .and_then(Value::as_array)?;
+
+    if exts.is_empty() {
+        return None;
+    }
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+
+    for ext in exts {
+        let name = ext.get("name").and_then(Value::as_str).unwrap_or("unknown");
+        let success = ext.get("success").and_then(Value::as_bool).unwrap_or(true);
+        if success {
+            successes.push(format!("{name} ✓"));
+        } else {
+            failures.push(format!("{name} ✗"));
+        }
+    }
+
+    let has_failures = !failures.is_empty();
+    let text = match (successes.is_empty(), failures.is_empty()) {
+        (false, false) => format!(
+            "extensions: {}; failed: {}",
+            successes.join(", "),
+            failures.join(", ")
+        ),
+        (false, true) => format!("extensions: {}", successes.join(", ")),
+        (true, false) => format!("failed extensions: {}", failures.join(", ")),
+        (true, true) => return None,
+    };
+
+    Some((text, has_failures))
+}
+
+fn format_failed_extensions(result: &Value) -> Option<String> {
+    let exts = result
+        .pointer("/_meta/extensionResults")
+        .or_else(|| result.get("extensionResults"))
+        .and_then(Value::as_array)?;
+
+    let mut failures = Vec::new();
+    for ext in exts {
+        let name = ext.get("name").and_then(Value::as_str).unwrap_or("unknown");
+        let success = ext.get("success").and_then(Value::as_bool).unwrap_or(true);
+        if !success {
+            failures.push(format!("{name} ✗"));
+        }
+    }
+
+    if failures.is_empty() {
+        None
+    } else {
+        Some(format!("failed extensions: {}", failures.join(", ")))
+    }
 }
 
 fn render_notice(block: &Block, width: u16) -> Vec<Line<'static>> {
@@ -1793,5 +1914,135 @@ mod tests {
             delta_renders, 1,
             "prefix sums re-rendered untouched blocks: delta={delta_renders}"
         );
+    }
+
+    #[test]
+    fn test_cancelled_run_marks_pending_tool_interrupted() {
+        let mut transcript = Transcript::new();
+        let call = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "shell · ls",
+                    "status": "in_progress",
+                }
+            }
+        });
+        transcript.apply_frame(&call);
+        assert_eq!(transcript.blocks[0].status, "in_progress");
+
+        // Run ends
+        let run_end = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": null
+                        }
+                    }
+                }
+            }
+        });
+        transcript.apply_frame(&run_end);
+        assert_eq!(transcript.blocks[0].status, "interrupted");
+        let lines = transcript.render_block(0, 80);
+        let plain: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(plain.contains('⊘'));
+    }
+
+    #[test]
+    fn test_extension_results_notices_session_new_and_attached() {
+        let mut transcript = Transcript::new();
+        let mut viewport = Viewport::new();
+
+        // SessionNew with developer success and failed extension
+        let new_evt = UiEvent::SessionNew {
+            result: json!({
+                "_meta": {
+                    "extensionResults": [
+                        {"name": "developer", "success": true},
+                        {"name": "broken_ext", "success": false}
+                    ]
+                }
+            }),
+        };
+        transcript.apply_ui_event(&new_evt, &mut viewport);
+        assert_eq!(transcript.blocks.len(), 1);
+        assert!(transcript.blocks[0].text.contains("developer ✓"));
+        assert!(transcript.blocks[0].text.contains("broken_ext ✗"));
+
+        // Attached with failed extension emits warning notice
+        let attach_evt = UiEvent::Attached {
+            result: json!({
+                "_meta": {
+                    "extensionResults": [
+                        {"name": "developer", "success": true},
+                        {"name": "failed_ext_2", "success": false}
+                    ]
+                }
+            }),
+        };
+        transcript.apply_ui_event(&attach_evt, &mut viewport);
+        assert_eq!(transcript.blocks.len(), 2);
+        assert!(transcript.blocks[1].text.contains("failed_ext_2 ✗"));
+    }
+
+    #[test]
+    fn test_blank_line_separator_between_different_kinds() {
+        let mut transcript = Transcript::new();
+
+        // 0. User block
+        let u1 = make_chunk_frame("user_message_chunk", "u1", "User line 1\n");
+        transcript.apply_frame(&u1);
+        let l0 = transcript.render_block(0, 80);
+        assert_ne!(l0[0].to_string(), ""); // No leading blank line for block 0
+
+        // 1. Assistant block
+        let a1 = make_chunk_frame("agent_message_chunk", "a1", "Assistant reply\n");
+        transcript.apply_frame(&a1);
+        let l1 = transcript.render_block(1, 80);
+        assert_eq!(l1[0].to_string(), ""); // Leading blank line before assistant
+
+        // 2. Tool 1
+        let t1 = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "shell · ls",
+                    "status": "completed",
+                }
+            }
+        });
+        transcript.apply_frame(&t1);
+        let l2 = transcript.render_block(2, 80);
+        assert_eq!(l2[0].to_string(), ""); // Leading blank line before tool group
+
+        // 3. Tool 2 (consecutive tool in same group)
+        let t2 = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t2",
+                    "title": "shell · pwd",
+                    "status": "completed",
+                }
+            }
+        });
+        transcript.apply_frame(&t2);
+        let l3 = transcript.render_block(3, 80);
+        assert_ne!(l3[0].to_string(), ""); // NO leading blank line between tools in group!
+
+        // 4. User block 2
+        let u2 = make_chunk_frame("user_message_chunk", "u2", "User line 2\n");
+        transcript.apply_frame(&u2);
+        let l4 = transcript.render_block(4, 80);
+        assert_eq!(l4[0].to_string(), ""); // Leading blank line before next user block
     }
 }

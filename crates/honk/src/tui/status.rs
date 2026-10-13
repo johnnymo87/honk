@@ -7,6 +7,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+pub fn shorten_home(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        if path == home {
+            return "~".to_string();
+        } else if let Some(stripped) = path.strip_prefix(&home)
+            && stripped.starts_with('/')
+        {
+            return format!("~{stripped}");
+        }
+    }
+    path.to_string()
+}
+
 pub struct StatusBar<'a> {
     pub session_id: &'a str,
     pub session_title: Option<&'a str>,
@@ -24,6 +39,23 @@ impl<'a> StatusBar<'a> {
 
     pub fn cwd_text(&self) -> &str {
         self.cwd.unwrap_or("")
+    }
+
+    pub fn title_and_cwd(&self, max_width: usize) -> String {
+        let title = self.title_text();
+        let cwd_raw = self.cwd_text();
+        let full = if !cwd_raw.is_empty() {
+            let shortened = shorten_home(cwd_raw);
+            format!("{title} — {shortened}")
+        } else {
+            title.to_string()
+        };
+
+        if full.len() > max_width && max_width > 3 {
+            format!("{}…", &full[..max_width - 1])
+        } else {
+            full
+        }
     }
 
     pub fn run_state_text(&self) -> &'static str {
@@ -95,21 +127,14 @@ impl<'a> StatusBar<'a> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
         spans.push(Span::styled(" ", base_style));
 
-        // Title
+        // Title — CWD
         let title_style = Style::default()
             .bg(Color::DarkGray)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        spans.push(Span::styled(self.title_text().to_string(), title_style));
-
-        // CWD
-        let cwd = self.cwd_text();
-        if !cwd.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", cwd),
-                Style::default().bg(Color::DarkGray).fg(Color::Gray),
-            ));
-        }
+        let max_title_w = (_width as usize).saturating_sub(45).max(10);
+        let display_title = self.title_and_cwd(max_title_w);
+        spans.push(Span::styled(display_title, title_style));
 
         // Run state
         let run_state = self.run_state_text();
@@ -189,6 +214,10 @@ mod tests {
         };
         assert_eq!(bar.title_text(), "My Special Session");
         assert_eq!(bar.cwd_text(), "/tmp/test-project");
+        assert_eq!(
+            bar.title_and_cwd(80),
+            "My Special Session — /tmp/test-project"
+        );
 
         let bar_fallback = StatusBar {
             session_id: "ses_123",
@@ -199,6 +228,17 @@ mod tests {
         };
         assert_eq!(bar_fallback.title_text(), "ses_123");
         assert_eq!(bar_fallback.cwd_text(), "");
+        assert_eq!(bar_fallback.title_and_cwd(80), "ses_123");
+    }
+
+    #[test]
+    fn test_shorten_home() {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = format!("{home}/projects/honk");
+            assert_eq!(shorten_home(&path), "~/projects/honk");
+            assert_eq!(shorten_home(&home), "~");
+        }
+        assert_eq!(shorten_home("/var/log"), "/var/log");
     }
 
     #[test]

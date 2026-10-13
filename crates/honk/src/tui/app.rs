@@ -268,6 +268,10 @@ impl App {
             Action::Edtui(key) => {
                 self.event_handler.on_key_event(key, &mut self.composer);
             }
+            Action::EscKey(next_key) => {
+                self.composer.mode = EditorMode::Normal;
+                self.handle_key(next_key);
+            }
             Action::PendingPrefix(_) | Action::Ignore => {}
         }
     }
@@ -448,6 +452,15 @@ impl App {
                 }
                 self.update_terminal_title();
             }
+            UiEvent::SessionInfo { title, cwd } => {
+                if let Some(t) = title {
+                    self.session_title = Some(t);
+                    self.update_terminal_title();
+                }
+                if let Some(c) = cwd {
+                    self.cwd = Some(c);
+                }
+            }
             UiEvent::State(snapshot) => {
                 self.state_snapshot = Some(snapshot);
             }
@@ -530,7 +543,10 @@ impl App {
         frame.render_widget(status_bar, status_area);
 
         // 3. Composer
-        let editor_view = edtui::EditorView::new(&mut self.composer).wrap(true);
+        let theme = edtui::EditorTheme::default().hide_status_line();
+        let editor_view = edtui::EditorView::new(&mut self.composer)
+            .wrap(true)
+            .theme(theme);
         frame.render_widget(editor_view, composer_area);
 
         // 4. Command line if active
@@ -884,6 +900,20 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_esc_colon_in_insert_mode_opens_command() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+        app.composer.mode = EditorMode::Insert;
+
+        // Fast Esc + : arrives as Alt+:
+        let alt_colon = press(KeyCode::Char(':'), KeyModifiers::ALT);
+        app.handle_key(alt_colon);
+
+        assert_eq!(app.composer.mode, EditorMode::Normal);
+        assert_eq!(app.command_line, Some(String::new()));
+    }
+
+    #[test]
     fn test_colon_q_sends_eof() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_1", cmd_tx);
@@ -1232,8 +1262,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let buffer_str: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
 
-        assert!(buffer_str.contains("My Active Session"));
-        assert!(buffer_str.contains("/tmp/test-work"));
+        assert!(buffer_str.contains("My Active Session — /tmp/test-work"));
         assert!(buffer_str.contains("running (other client)"));
         assert!(buffer_str.contains("queued: 2"));
         assert!(buffer_str.contains("live"));

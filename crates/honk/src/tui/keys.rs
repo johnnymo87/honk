@@ -4,6 +4,7 @@ use edtui::EditorMode;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Edtui(KeyEvent),
+    EscKey(KeyEvent),
     Submit,
     Newline,
     ScrollLines(i32),
@@ -150,6 +151,23 @@ pub fn resolve(
             Action::Edtui(key_event)
         }
         EditorMode::Insert => {
+            // Alt+<printable> in insert mode (fast typing Esc followed by key):
+            // Treat as Esc followed by that key (vim behavior).
+            // Alt-Enter is preserved as Newline.
+            if key_event.modifiers.contains(KeyModifiers::ALT)
+                && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                if key_event.code == KeyCode::Enter {
+                    return Action::Newline;
+                } else if let KeyCode::Char(c) = key_event.code
+                    && !c.is_control()
+                {
+                    let mut next = key_event;
+                    next.modifiers.remove(KeyModifiers::ALT);
+                    return Action::EscKey(next);
+                }
+            }
+
             // Up/Down in insert mode: scroll transcript if empty, editor cursor if non-empty
             if key_event.modifiers == KeyModifiers::NONE {
                 match key_event.code {
@@ -547,6 +565,28 @@ mod tests {
         );
         assert_eq!(
             resolve(EditorMode::Insert, true, ctrl_j, None, false),
+            Action::Newline
+        );
+    }
+
+    #[test]
+    fn test_alt_printable_in_insert_mode_yields_esc_key() {
+        let alt_colon = press(KeyCode::Char(':'), KeyModifiers::ALT);
+        assert_eq!(
+            resolve(EditorMode::Insert, false, alt_colon, None, false),
+            Action::EscKey(key(KeyCode::Char(':')))
+        );
+
+        let alt_q = press(KeyCode::Char('q'), KeyModifiers::ALT);
+        assert_eq!(
+            resolve(EditorMode::Insert, false, alt_q, None, false),
+            Action::EscKey(key(KeyCode::Char('q')))
+        );
+
+        // Alt-Enter is still Newline
+        let alt_enter = press(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(
+            resolve(EditorMode::Insert, false, alt_enter, None, false),
             Action::Newline
         );
     }

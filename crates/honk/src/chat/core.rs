@@ -36,6 +36,7 @@ pub struct ChatCore {
     pub(crate) last_cursor: Option<Cursor>,
     pub(crate) current_time: Instant,
     pub(crate) last_activity: Instant,
+    pub(crate) disconnected: bool,
 }
 
 impl ChatCore {
@@ -82,6 +83,7 @@ impl ChatCore {
             last_cursor: None,
             current_time: now,
             last_activity: now,
+            disconnected: false,
         }
     }
 
@@ -196,7 +198,7 @@ impl ChatCore {
             self.is_detached = false;
             self.is_reattaching = true;
             effects.push(Effect::Reattach);
-            effects.push(Effect::Notice(Notice::info("[honk] re-attaching...")));
+            effects.push(Effect::Notice(Notice::info("re-attaching...")));
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 self.detached_buffered_lines.push(line);
@@ -239,20 +241,20 @@ impl ChatCore {
             if !prompt.run_seen || self.run_ownership == Ownership::Pending {
                 self.held_steers.push((text, conversion_count));
                 effects.push(Effect::Notice(Notice::info(
-                    "[honk] prompt sent, waiting for turn to start; line held for steer",
+                    "prompt sent, waiting for turn to start; line held for steer",
                 )));
                 return;
             } else if self.run_state.is_running() {
                 // Foreign run active while our prompt is parked
                 self.held_steers.push((text, conversion_count));
                 effects.push(Effect::Notice(Notice::info(
-                    "[honk] prompt sent, waiting for turn to start; line held for steer",
+                    "prompt sent, waiting for turn to start; line held for steer",
                 )));
                 return;
             } else {
                 self.local_queue.push_back((text, conversion_count));
                 effects.push(Effect::Notice(Notice::info(
-                    "[honk] turn ended; message queued for next turn",
+                    "turn ended; message queued for next turn",
                 )));
                 return;
             }
@@ -269,7 +271,7 @@ impl ChatCore {
                 } else {
                     self.local_queue.push_back((text, conversion_count));
                     effects.push(Effect::Notice(Notice::info(
-                        "[honk] turn belongs to another client; message queued for after it ends (use /drop to discard)",
+                        "turn belongs to another client; message queued for after it ends (use /drop to discard)",
                     )));
                 }
             }
@@ -308,7 +310,6 @@ impl ChatCore {
             method: "session/prompt".into(),
             params,
         });
-        effects.push(Effect::Notice(Notice::info("[honk] prompt sent")));
     }
 
     fn send_steer(
@@ -340,7 +341,6 @@ impl ChatCore {
             method: "_goose/unstable/session/steer".into(),
             params,
         });
-        effects.push(Effect::Notice(Notice::info("[honk] steer sent")));
     }
 
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
@@ -370,7 +370,7 @@ impl ChatCore {
             self.is_detached = true;
             effects.push(Effect::Detach);
             effects.push(Effect::Notice(Notice::info(
-                "[honk] detached (idle); press Enter to re-attach",
+                "detached (idle); press Enter to re-attach",
             )));
         }
     }
@@ -406,11 +406,11 @@ impl ChatCore {
                         result: json!({"action": "decline"}),
                     });
                     effects.push(Effect::Notice(Notice::info(format!(
-                        "[honk] declined elicitation request: {method}"
+                        "declined elicitation request: {method}"
                     ))));
                 } else {
                     effects.push(Effect::Notice(Notice::info(format!(
-                        "[honk] elicitation request from another client's turn: {method}"
+                        "elicitation request from another client's turn: {method}"
                     ))));
                 }
                 return;
@@ -419,7 +419,7 @@ impl ChatCore {
                 self.handle_permission_request(&frame, effects);
             } else {
                 effects.push(Effect::Notice(Notice::warning(format!(
-                    "[honk] unsupported request {method}; answer it from another client"
+                    "unsupported request {method}; answer it from another client"
                 ))));
             }
             return;
@@ -445,12 +445,12 @@ impl ChatCore {
                     }
                     unstarted_to_queue.push((prompt.text, prompt.conversion_count));
                     effects.push(Effect::Notice(Notice::info(
-                        "[honk] turn belongs to another client; message queued for after it ends (use /drop to discard)",
+                        "turn belongs to another client; message queued for after it ends (use /drop to discard)",
                     )));
                 } else if is_lost_track(err) {
                     effects.push(Effect::Notice(Notice::returned(
                         format!(
-                            "[honk] lost track of prompt; your message did not run: {}",
+                            "lost track of prompt; your message did not run: {}",
                             prompt.text
                         ),
                         prompt.text.clone(),
@@ -462,7 +462,7 @@ impl ChatCore {
                         .unwrap_or("unknown error");
                     effects.push(Effect::Notice(Notice::returned(
                         format!(
-                            "[honk] prompt error: {msg}; your message did not run: {}",
+                            "prompt error: {msg}; your message did not run: {}",
                             prompt.text
                         ),
                         prompt.text.clone(),
@@ -480,17 +480,17 @@ impl ChatCore {
                         || honk_reason == Some("upstream_restart")
                     {
                         effects.push(Effect::Notice(Notice::returned(
-                            format!("[honk] your message did not run: {}", prompt.text),
+                            format!("your message did not run: {}", prompt.text),
                             prompt.text.clone(),
                         )));
                     } else {
                         effects.push(Effect::Notice(Notice::info(
-                            "[honk] turn ended (stopReason: cancelled)",
+                            "turn ended (stopReason: cancelled)",
                         )));
                     }
-                } else {
+                } else if stop_reason != "end_turn" {
                     effects.push(Effect::Notice(Notice::info(format!(
-                        "[honk] turn ended (stopReason: {stop_reason})"
+                        "turn ended (stopReason: {stop_reason})"
                     ))));
                 }
             }
@@ -498,9 +498,7 @@ impl ChatCore {
             if !self.held_steers.is_empty() {
                 let held = std::mem::take(&mut self.held_steers);
                 unstarted_to_queue.extend(held);
-                effects.push(Effect::Notice(Notice::info(
-                    "[honk] held lines moved to queue",
-                )));
+                effects.push(Effect::Notice(Notice::info("held lines moved to queue")));
             }
 
             for (t, c) in unstarted_to_queue.into_iter().rev() {
@@ -516,13 +514,13 @@ impl ChatCore {
                 if is_no_active_run(err) {
                     if inflight.conversion_count < 1 {
                         effects.push(Effect::Notice(Notice::info(
-                            "[honk] no active run to steer; converting to prompt",
+                            "no active run to steer; converting to prompt",
                         )));
                         self.send_prompt(inflight.text, inflight.conversion_count + 1, effects);
                     } else {
                         effects.push(Effect::Notice(Notice::returned(
                             format!(
-                                "[honk] steer error: no active run; your message did not run: {}",
+                                "steer error: no active run; your message did not run: {}",
                                 inflight.text
                             ),
                             inflight.text,
@@ -531,7 +529,7 @@ impl ChatCore {
                 } else if is_run_mismatch(err) {
                     effects.push(Effect::Notice(Notice::returned(
                         format!(
-                            "[honk] the turn you were steering ended; re-send to send it to the current one: {}",
+                            "the turn you were steering ended; re-send to send it to the current one: {}",
                             inflight.text
                         ),
                         inflight.text,
@@ -543,7 +541,7 @@ impl ChatCore {
                         .unwrap_or("unknown error");
                     effects.push(Effect::Notice(Notice::returned(
                         format!(
-                            "[honk] steer error: {msg}; your message did not run: {}",
+                            "steer error: {msg}; your message did not run: {}",
                             inflight.text
                         ),
                         inflight.text,
@@ -552,12 +550,12 @@ impl ChatCore {
             } else if let Some(msg_id) = frame.pointer("/result/messageId").and_then(Value::as_str)
             {
                 if self.consumed_steer_ids.contains(msg_id) {
-                    effects.push(Effect::Notice(Notice::info("[honk] steer accepted")));
+                    // steer accepted dropped
                 } else if self.unconsumed_steer_ids.remove(msg_id)
                     || self.run_state != RunState::Running(inflight.expected_run_id.clone())
                 {
                     effects.push(Effect::Notice(Notice::warning(format!(
-                        "[honk] steer not consumed: {}",
+                        "steer not consumed: {}",
                         inflight.text
                     ))));
                 } else {
@@ -565,10 +563,8 @@ impl ChatCore {
                         msg_id.to_string(),
                         (inflight.text, inflight.expected_run_id),
                     );
-                    effects.push(Effect::Notice(Notice::info("[honk] steer accepted")));
+                    // steer accepted dropped
                 }
-            } else {
-                effects.push(Effect::Notice(Notice::info("[honk] steer accepted")));
             }
         }
     }
@@ -703,7 +699,7 @@ impl ChatCore {
                                             self.local_queue.push_front((t, c));
                                         }
                                         effects.push(Effect::Notice(Notice::info(
-                                            "[honk] held lines moved to queue",
+                                            "held lines moved to queue",
                                         )));
                                     }
 
@@ -719,7 +715,7 @@ impl ChatCore {
                                     unconsumed.sort();
                                     for steer_text in unconsumed {
                                         effects.push(Effect::Notice(Notice::warning(format!(
-                                            "[honk] steer not consumed: {steer_text}"
+                                            "steer not consumed: {steer_text}"
                                         ))));
                                     }
                                     self.check_queued_prompts(effects);
@@ -739,7 +735,7 @@ impl ChatCore {
                         .and_then(Value::as_str)
                         .unwrap_or("resolved");
                     effects.push(Effect::Notice(Notice::info(format!(
-                        "[honk] permission request resolved: {reason}"
+                        "permission request resolved: {reason}"
                     ))));
                 }
             }
@@ -749,7 +745,7 @@ impl ChatCore {
                 {
                     if let Some((text, _)) = self.pending_steers.remove(mid) {
                         effects.push(Effect::Notice(Notice::warning(format!(
-                            "[honk] steer not consumed: {text}"
+                            "steer not consumed: {text}"
                         ))));
                     } else {
                         self.unconsumed_steer_ids.insert(mid.to_string());
@@ -759,7 +755,7 @@ impl ChatCore {
             honk_wire::method::GAP => {
                 if !self.is_replaying {
                     effects.push(Effect::Notice(Notice::warning(
-                        "[honk] frame gap detected; transcript will reset at turn end",
+                        "frame gap detected; transcript will reset at turn end",
                     )));
                 }
             }
@@ -767,7 +763,7 @@ impl ChatCore {
                 self.handle_disconnected(effects);
                 effects.push(Effect::Reattach);
                 effects.push(Effect::Notice(Notice::info(
-                    "[honk] session evicted; re-attaching...",
+                    "session evicted; re-attaching...",
                 )));
             }
             _ => {}
@@ -775,7 +771,7 @@ impl ChatCore {
     }
 
     fn handle_connected(&mut self, effects: &mut Vec<Effect>) {
-        effects.push(Effect::Notice(Notice::info("[honk] connected")));
+        self.disconnected = false;
         if self.prompt_sent.is_some() {
             let req_id = self.allocate_id();
             let p = self.prompt_sent.as_mut().unwrap();
@@ -796,16 +792,19 @@ impl ChatCore {
                 params,
             });
             effects.push(Effect::Notice(Notice::info(format!(
-                "[honk] re-sent prompt (crid: {})",
+                "re-sent prompt (crid: {})",
                 p.crid
             ))));
         }
     }
 
     fn handle_disconnected(&mut self, effects: &mut Vec<Effect>) {
-        effects.push(Effect::Notice(Notice::info(
-            "[honk] disconnected; reconnecting...",
-        )));
+        if !self.disconnected {
+            self.disconnected = true;
+            effects.push(Effect::Notice(Notice::info(
+                "disconnected; reconnecting...",
+            )));
+        }
         self.run_state = RunState::Unknown;
         self.run_ownership = Ownership::Unknown;
         self.last_echo_crid = None;
@@ -813,7 +812,7 @@ impl ChatCore {
         self.pending_permissions.clear();
         for (_req_id, inflight) in self.pending_steer_reqs.drain() {
             effects.push(Effect::Notice(Notice::warning(format!(
-                "[honk] steer may not have been delivered: {}",
+                "steer may not have been delivered: {}",
                 inflight.text
             ))));
         }

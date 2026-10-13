@@ -1289,12 +1289,22 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
         "id": 1,
         "result": { "stopReason": "end_turn" }
     })));
-    assert!(has_notice(&effs, "stopReason: end_turn"));
+    // end_turn is quiet (no notice)
+    assert!(!has_notice(&effs, "stopReason: end_turn"));
+
+    // other stopReason (e.g. max_tokens) emits notice
+    core.handle(Input::Line("hello max".into()));
+    let effs_max = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": { "stopReason": "max_tokens" }
+    })));
+    assert!(has_notice(&effs_max, "stopReason: max_tokens"));
 
     core.handle(Input::Line("hello 2".into()));
     let effs2 = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
-        "id": 2,
+        "id": 3,
         "result": { "stopReason": "cancelled" }
     })));
     assert!(has_notice(&effs2, "stopReason: cancelled"));
@@ -1302,7 +1312,7 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
     core.handle(Input::Line("hello 3".into()));
     let effs3 = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
-        "id": 3,
+        "id": 4,
         "result": {
             "stopReason": "cancelled",
             "_meta": { "honk": { "reason": "not_delivered" } }
@@ -1315,7 +1325,7 @@ fn test_prompt_reply_success_and_cancellation_reasons() {
     core.handle(Input::Line("hello 4".into()));
     let effs4 = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
-        "id": 4,
+        "id": 5,
         "result": {
             "stopReason": "cancelled",
             "_meta": { "honk": { "reason": "upstream_restart" } }
@@ -1919,7 +1929,8 @@ fn test_steer_race_chunk_before_reply() {
         "id": steer_id,
         "result": { "runId": "run_1", "messageId": "steer_early_123" }
     })));
-    assert!(has_notice(&reply_effs, "steer accepted"));
+    // steer accepted notice is dropped (consumed steer appears as user block)
+    assert!(!has_notice(&reply_effs, "steer accepted"));
 
     let end_effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
@@ -2091,9 +2102,13 @@ fn test_reconnect_resends_prompt_with_same_crid() {
 
     let disc_effs = core.handle(Input::Disconnected);
     assert!(has_notice(&disc_effs, "disconnected; reconnecting..."));
+    // Subsequent disconnect during same outage does not duplicate notice
+    let disc_effs2 = core.handle(Input::Disconnected);
+    assert!(!has_notice(&disc_effs2, "disconnected; reconnecting..."));
 
     let conn_effs = core.handle(Input::Connected);
-    assert!(has_notice(&conn_effs, "connected"));
+    // connected notice dropped
+    assert!(!has_notice(&conn_effs, "connected"));
 
     let resend_req = conn_effs
         .iter()
@@ -2176,7 +2191,8 @@ fn test_run_end_before_prompt_reply() {
         "id": 1,
         "result": { "stopReason": "end_turn" }
     })));
-    assert!(has_notice(&reply_effs, "stopReason: end_turn"));
+    // end_turn is quiet
+    assert!(!has_notice(&reply_effs, "stopReason: end_turn"));
     assert_eq!(*core.run_state(), RunState::Idle);
 }
 
