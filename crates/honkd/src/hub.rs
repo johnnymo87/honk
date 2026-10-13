@@ -418,6 +418,7 @@ impl Hub {
                 serde_json::json!({
                     "protocol": honk_wire::PROTOCOL,
                     "version": env!("CARGO_PKG_VERSION"),
+                    "features": [honk_wire::FEATURE_RESUME_ONLY],
                 }),
             );
         } else {
@@ -425,6 +426,7 @@ impl Hub {
                 "honk": {
                     "protocol": honk_wire::PROTOCOL,
                     "version": env!("CARGO_PKG_VERSION"),
+                    "features": [honk_wire::FEATURE_RESUME_ONLY],
                 }
             });
         }

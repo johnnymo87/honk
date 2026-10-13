@@ -2186,7 +2186,27 @@ impl Session {
                     );
                     return;
                 }
-                let client_req_id = honk_wire::honk_meta(&params).client_req_id;
+                let resume_only = honk_wire::resume_only_requested(&params);
+                let client_req_id = honk_wire::client_req_id(&params).map(String::from);
+
+                let owner = OwnerRef {
+                    viewer: Some(viewer_id),
+                    downstream_id: id.clone(),
+                    client_req_id: client_req_id.clone(),
+                };
+
+                if let Some(crid) = &client_req_id
+                    && let Some(waiters) = self.finalizing_waiters.get_mut(crid)
+                {
+                    waiters.push(owner);
+                    return;
+                }
+
+                if let Some(crid) = &client_req_id
+                    && self.turn.attach_waiter(crid, owner.clone())
+                {
+                    return;
+                }
 
                 if let Some(crid) = &client_req_id {
                     let cached = {
@@ -2222,25 +2242,6 @@ impl Session {
                     }
                 }
 
-                let owner = OwnerRef {
-                    viewer: Some(viewer_id),
-                    downstream_id: id.clone(),
-                    client_req_id: client_req_id.clone(),
-                };
-
-                if let Some(crid) = &client_req_id
-                    && self.turn.attach_waiter(crid, owner.clone())
-                {
-                    return;
-                }
-
-                if let Some(crid) = &client_req_id
-                    && let Some(waiters) = self.finalizing_waiters.get_mut(crid)
-                {
-                    waiters.push(owner);
-                    return;
-                }
-
                 if let Some(crid) = &client_req_id {
                     let is_inconsistent_inflight = {
                         let s = self.state_store.lock().await;
@@ -2259,6 +2260,17 @@ impl Session {
                         self.send_to_viewer(viewer_id, err_resp);
                         return;
                     }
+                }
+
+                if resume_only {
+                    let err_resp = crate::rpc::error(
+                        id,
+                        honk_wire::ERR_UNKNOWN_CLIENT_REQ_ID,
+                        "unknown client_req_id; resume_only prompt not started",
+                        None,
+                    );
+                    self.send_to_viewer(viewer_id, err_resp);
+                    return;
                 }
 
                 let actions = self.turn.on_prompt(owner, params, &mut self.ids);

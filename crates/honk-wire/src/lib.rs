@@ -5,6 +5,9 @@ use std::collections::HashMap;
 pub mod export;
 
 pub const PROTOCOL: u32 = 1;
+pub const FEATURE_RESUME_ONLY: &str = "resume_only";
+pub const ERR_UNKNOWN_CLIENT_REQ_ID: i64 = -32004;
+
 pub mod method {
     pub const RESET: &str = "_honk/reset";
     pub const REPLAY_DONE: &str = "_honk/replay_done";
@@ -77,12 +80,28 @@ pub struct HonkMeta {
     pub client_req_id: Option<String>,
     #[serde(default)]
     pub after: Option<Cursor>,
+    #[serde(default)]
+    pub resume_only: bool,
 }
 pub fn honk_meta(params: &Value) -> HonkMeta {
     params
         .pointer("/_meta/honk")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default()
+}
+/// Returns true if `/_meta/honk/resume_only` is present and not JSON `false`.
+pub fn resume_only_requested(params: &Value) -> bool {
+    match params.pointer("/_meta/honk/resume_only") {
+        None => false,
+        Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
+}
+/// Returns the client request id if `/_meta/honk/client_req_id` is a string.
+pub fn client_req_id(params: &Value) -> Option<&str> {
+    params
+        .pointer("/_meta/honk/client_req_id")
+        .and_then(Value::as_str)
 }
 pub fn frame_cursor(frame: &Value) -> Option<Cursor> {
     frame
