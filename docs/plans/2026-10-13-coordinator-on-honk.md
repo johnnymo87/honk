@@ -20,10 +20,10 @@ cwd: a per-session working dir (also used to attribute spend)
 ```
 
 The CLI writes goose's `sessions.db` directly, so honkd never sees these turns.
-`honk list` shows the sessions, but nobody can watch a wake live or talk to a
-coordinator from honk. The goal is that every wake goes through honkd, so the
-author can watch, and then chat with, a coordinator from a honk client while the
-timer keeps running.
+`honk list` shows only the most recent page of sessions (the CLI reads page 1),
+but nobody can watch a wake live or talk to a coordinator from honk. The goal is
+that every wake goes through honkd, so the author can watch, and then chat with,
+a coordinator from a honk client while the timer keeps running.
 
 Non-goals: the chat client itself (separate work), and changing what the
 coordinator decides.
@@ -143,9 +143,9 @@ prompts the existing id, and honkd activates it with `session/load`.
 - **Dry run before switching.** Run a throwaway patched `goose serve` on a copy
   of the sessions DB with a stub provider, behind a throwaway honkd. Activate
   every adopted session and re-pin it. Check the tools, the system prompt, the
-  persisted TTL, and **time** the activation against honkd's 30 s load timeout,
-  using real ~400K histories (the load replay is the full history). No model
-  calls; no production process touched.
+  persisted TTL, and **time** the activation lookup and load against honkd's 30 s
+  load timeout, using real ~400K histories (the load replay is the full history).
+  No model calls; no production process touched.
 - **Environment parity.** Diff the serve's `GOOSE_*` environment and config
   against the runner's: compaction threshold, context limit, effort.
 
@@ -200,7 +200,9 @@ Alternatives considered:
 5. **Chat:** the chat client's queue-when-not-mine rule must be in place before
    the author chats into coordinator sessions. Until then, watch only.
 
-honk needs no code change for this.
+Two honkd changes support this:
+- Activation looks sessions up by id (`_goose/unstable/session/info`) instead of the first `session/list` page, allowing older sessions to activate directly.
+- `session/list`'s `_meta.honk.running` now reports in-flight and active runs, advisory only — a check-then-act race remains and is harmless because goose's `settings/set` is idempotent and keeps a collected final output.
 
 ## 6. Open questions
 
