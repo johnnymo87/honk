@@ -1,12 +1,12 @@
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Input {
     Line(String),
     Interrupt,
     Eof,
-    Tick(Instant),
+    Tick(std::time::Instant),
     Frame(Value),
     Connected,
     Disconnected,
@@ -27,7 +27,7 @@ pub enum Effect {
         id: Value,
         result: Value,
     },
-    Print(String),
+    Transcript(Value),
     Status(String),
     Detach,
     Reattach,
@@ -56,19 +56,15 @@ pub enum Ownership {
 
 #[derive(Clone, Debug)]
 pub struct ChatOpts {
-    pub text_only: bool,
-    pub thoughts: bool,
+    pub crid_seed: u64,
     pub idle_timeout: Duration,
-    pub crid_prefix: Option<String>,
 }
 
 impl Default for ChatOpts {
     fn default() -> Self {
         Self {
-            text_only: false,
-            thoughts: false,
+            crid_seed: 0,
             idle_timeout: Duration::from_secs(30 * 60),
-            crid_prefix: None,
         }
     }
 }
@@ -90,17 +86,8 @@ pub struct PermissionOption {
 }
 
 #[derive(Clone, Debug)]
-pub struct PendingPermission {
-    pub tag: String,
-    pub goose_req_id: Value,
-    pub tool_title: String,
-    pub options: Vec<PermissionOption>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct InflightSteer {
     pub text: String,
-    #[allow(dead_code)]
     pub expected_run_id: String,
     pub conversion_count: u32,
 }

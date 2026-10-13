@@ -83,7 +83,7 @@ impl Conn {
 
         let conn = Self {
             write_tx,
-            next_req_id: Arc::new(AtomicU64::new(2)),
+            next_req_id: Arc::new(AtomicU64::new(1 << 32)),
             init_result: init_result.clone(),
             closed,
         };
@@ -91,6 +91,12 @@ impl Conn {
         Ok((conn, frame_rx, init_result))
     }
 
+    /// Sends a JSON-RPC request and returns the assigned ID.
+    ///
+    /// Note: in chat sessions, `ChatCore` acts as the single ID allocator for all
+    /// wire requests (including `session/load`, `session/list`, `session/new`). Do not
+    /// use `request` alongside `ChatCore`; use `Conn::send_request` with the ID allocated
+    /// by `ChatCore` instead.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<u64> {
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("failed to send {method} request: connection closed");

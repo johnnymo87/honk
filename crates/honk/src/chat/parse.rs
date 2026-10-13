@@ -65,9 +65,6 @@ pub fn is_run_mismatch(val: &Value) -> bool {
 }
 
 pub fn is_lost_track(val: &Value) -> bool {
-    if val.get("code").and_then(Value::as_i64) == Some(-32000) {
-        return true;
-    }
     let check = |s: &str| s.contains("lost track");
     val.pointer("/data")
         .and_then(Value::as_str)
@@ -80,4 +77,5 @@ pub fn is_lost_track(val: &Value) -> bool {
             .pointer("/data/message")
             .and_then(Value::as_str)
             .is_some_and(check)
+        || val.as_str().is_some_and(check)
 }
