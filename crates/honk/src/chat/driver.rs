@@ -1,11 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::chat::core::ChatCore;
 use crate::chat::types::{ChatOpts, Effect, IdAlloc, Input, Notice, Ownership, RunState};
@@ -92,11 +93,21 @@ pub enum UiCommand {
 #[derive(Clone, Debug)]
 pub struct DriverHandle {
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
+    join_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl DriverHandle {
     pub fn send(&self, cmd: UiCommand) -> Result<(), mpsc::error::SendError<UiCommand>> {
         self.cmd_tx.send(cmd)
+    }
+
+    pub async fn join(&self) -> Result<(), tokio::task::JoinError> {
+        let mut guard = self.join_handle.lock().await;
+        if let Some(h) = guard.take() {
+            h.await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -107,6 +118,33 @@ fn random_seed() -> u64 {
     std::process::id().hash(&mut hasher);
     COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
     hasher.finish()
+}
+
+fn is_auth_error(error: &Value) -> bool {
+    if let Some(code) = error.get("code").and_then(Value::as_i64)
+        && (code == 401 || code == 403)
+    {
+        return true;
+    }
+    if let Some(msg) = error.get("message").and_then(Value::as_str) {
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+            return true;
+        }
+    }
+    if let Some(data) = error.get("data").and_then(Value::as_str) {
+        let lower = data.to_ascii_lowercase();
+        if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+            return true;
+        }
+    }
+    if let Some(s) = error.as_str() {
+        let lower = s.to_ascii_lowercase();
+        if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+            return true;
+        }
+    }
+    false
 }
 
 fn maybe_emit_state(
@@ -135,28 +173,39 @@ enum EffectAction {
     Exit,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_effects(
     effects: Vec<Effect>,
     core: &mut ChatCore,
-    conn: &mut Conn,
+    conn_opt: &mut Option<Conn>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     is_first_attach: &mut bool,
     attach_failed_attempts: &mut u32,
+    attach_retry_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     connection_state: &mut ConnectionState,
 ) -> EffectAction {
     for effect in effects {
         match effect {
             Effect::Request { id, method, params } => {
+                let Some(conn) = conn_opt.as_mut() else {
+                    return EffectAction::Reattach;
+                };
                 if conn.send_request(id, &method, params).await.is_err() {
                     return EffectAction::Reattach;
                 }
             }
             Effect::Notify { method, params } => {
+                let Some(conn) = conn_opt.as_mut() else {
+                    return EffectAction::Reattach;
+                };
                 if conn.notify(&method, params).await.is_err() {
                     return EffectAction::Reattach;
                 }
             }
             Effect::Respond { id, result } => {
+                let Some(conn) = conn_opt.as_mut() else {
+                    return EffectAction::Reattach;
+                };
                 if conn.respond(id, result).await.is_err() {
                     return EffectAction::Reattach;
                 }
@@ -170,10 +219,11 @@ async fn process_effects(
             Effect::Attached { result } => {
                 *is_first_attach = false;
                 *attach_failed_attempts = 0;
+                *attach_retry_timer = None;
                 let _ = ui_tx.send(UiEvent::Attached { result });
             }
             Effect::AttachFailed { error } => {
-                if *is_first_attach {
+                if *is_first_attach || is_auth_error(&error) {
                     let msg = error
                         .get("message")
                         .and_then(Value::as_str)
@@ -182,42 +232,45 @@ async fn process_effects(
                     let _ = ui_tx.send(UiEvent::Fatal(format!("session/load failed: {msg}")));
                     let _ = ui_tx.send(UiEvent::Exit(1));
                     return EffectAction::Exit;
+                }
+                *attach_failed_attempts += 1;
+                if *attach_failed_attempts < 5 {
+                    let delay = Duration::from_millis(
+                        (250 * (1 << (*attach_failed_attempts - 1))).min(5000),
+                    );
+                    let _ = ui_tx.send(UiEvent::Notice(Notice::warning(format!(
+                        "[honk] attach failed ({error}); retrying in {delay:?}..."
+                    ))));
+                    *attach_retry_timer = Some(Box::pin(tokio::time::sleep(delay)));
                 } else {
-                    *attach_failed_attempts += 1;
-                    if *attach_failed_attempts < 5 {
-                        let delay = Duration::from_millis(
-                            (250 * (1 << (*attach_failed_attempts - 1))).min(5000),
-                        );
-                        let _ = ui_tx.send(UiEvent::Notice(Notice::warning(format!(
-                            "[honk] attach failed ({error}); retrying in {delay:?}..."
-                        ))));
-                        tokio::time::sleep(delay).await;
-                        let (load_id, method, params) = core.attach_request();
-                        if conn.send_request(load_id, &method, params).await.is_err() {
-                            return EffectAction::Reattach;
-                        }
-                    } else {
-                        *connection_state = ConnectionState::Stopped {
-                            reason: format!("attach failed after 5 attempts: {error}"),
-                        };
-                        let _ = ui_tx.send(UiEvent::Notice(Notice::warning(
-                            "[honk] attach failed 5 times; press any key to retry",
-                        )));
-                    }
+                    *attach_retry_timer = None;
+                    *connection_state = ConnectionState::Stopped {
+                        reason: format!("attach failed after 5 attempts: {error}"),
+                    };
+                    let _ = ui_tx.send(UiEvent::Notice(Notice::warning(
+                        "[honk] attach failed 5 times; press any key to retry",
+                    )));
                 }
             }
             Effect::Detach => {
-                let _ = conn
-                    .notify("session/close", json!({"sessionId": core.session_id}))
-                    .await;
-                let _ = conn.close().await;
+                if let Some(conn) = conn_opt.as_mut() {
+                    let _ = conn
+                        .notify("session/close", json!({"sessionId": core.session_id}))
+                        .await;
+                    let _ = conn.close().await;
+                }
+                *conn_opt = None;
+                *attach_retry_timer = None;
                 *connection_state = ConnectionState::Detached;
             }
             Effect::Reattach => {
                 return EffectAction::Reattach;
             }
             Effect::Exit(code) => {
-                let _ = conn.close().await;
+                if let Some(conn) = conn_opt.as_mut() {
+                    let _ = conn.close().await;
+                }
+                *conn_opt = None;
                 let _ = ui_tx.send(UiEvent::Exit(code));
                 return EffectAction::Exit;
             }
@@ -227,89 +280,38 @@ async fn process_effects(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn perform_reconnect(
-    opts: &DriverOpts,
+fn trigger_disconnect(
     core: &mut ChatCore,
-    cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    conn_opt: &mut Option<Conn>,
+    frame_rx_opt: &mut Option<mpsc::UnboundedReceiver<Value>>,
+    attach_retry_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    reconnect_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    reconnect_attempt: &mut u32,
     connection_state: &mut ConnectionState,
     last_state: &mut Option<StateSnapshot>,
-    is_first_attach: &mut bool,
-    attach_failed_attempts: &mut u32,
-) -> Option<(Conn, mpsc::UnboundedReceiver<Value>)> {
-    let mut attempt = 1u32;
-    loop {
-        *connection_state = ConnectionState::Reconnecting { attempt };
-        maybe_emit_state(core, connection_state, last_state, ui_tx);
-
-        match Conn::connect(&opts.url, &opts.secret).await {
-            Ok((new_conn, new_frame_rx, _init_res)) => {
-                // Order matters: send session/load first, then feed Connected
-                let (load_id, method, params) = core.attach_request();
-                let _ = new_conn.send_request(load_id, &method, params).await;
-                let effects = core.handle(Input::Connected);
-                let mut temp_conn = new_conn.clone();
-                let action = process_effects(
-                    effects,
-                    core,
-                    &mut temp_conn,
-                    ui_tx,
-                    is_first_attach,
-                    attach_failed_attempts,
-                    connection_state,
-                )
-                .await;
-                if matches!(action, EffectAction::Exit) {
-                    return None;
-                }
-                *connection_state = ConnectionState::Live;
-                maybe_emit_state(core, connection_state, last_state, ui_tx);
-                return Some((new_conn, new_frame_rx));
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    let effects = core.handle(Input::Disconnected);
+    for effect in effects {
+        match effect {
+            Effect::Transcript(v) => {
+                let _ = ui_tx.send(UiEvent::Transcript(v));
             }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.starts_with("fatal: ") {
-                    let _ = ui_tx.send(UiEvent::Fatal(err_str));
-                    let _ = ui_tx.send(UiEvent::Exit(1));
-                    return None;
-                }
-                let backoff = Duration::from_millis(
-                    (250 * (1 << (attempt.saturating_sub(1)).min(5))).min(5000),
-                );
-                tokio::select! {
-                    cmd_opt = cmd_rx.recv() => {
-                        match cmd_opt {
-                            Some(UiCommand::Shutdown) | Some(UiCommand::Eof) | None => {
-                                let _ = ui_tx.send(UiEvent::Exit(0));
-                                return None;
-                            }
-                            Some(UiCommand::Line(l)) => {
-                                let effects = core.handle(Input::Line(l));
-                                for effect in effects {
-                                    if let Effect::Notice(n) = effect {
-                                        let _ = ui_tx.send(UiEvent::Notice(n));
-                                    }
-                                }
-                                maybe_emit_state(core, connection_state, last_state, ui_tx);
-                            }
-                            Some(UiCommand::Interrupt) => {
-                                let effects = core.handle(Input::Interrupt);
-                                for effect in effects {
-                                    if let Effect::Notice(n) = effect {
-                                        let _ = ui_tx.send(UiEvent::Notice(n));
-                                    }
-                                }
-                                maybe_emit_state(core, connection_state, last_state, ui_tx);
-                            }
-                            Some(UiCommand::RetryAttach) => {}
-                        }
-                    }
-                    _ = tokio::time::sleep(backoff) => {}
-                }
-                attempt = attempt.saturating_add(1);
+            Effect::Notice(n) => {
+                let _ = ui_tx.send(UiEvent::Notice(n));
             }
+            _ => {}
         }
     }
+    *conn_opt = None;
+    *frame_rx_opt = None;
+    *attach_retry_timer = None;
+    *reconnect_attempt = 1;
+    *connection_state = ConnectionState::Reconnecting {
+        attempt: *reconnect_attempt,
+    };
+    maybe_emit_state(core, connection_state, last_state, ui_tx);
+    *reconnect_timer = Some(Box::pin(tokio::time::sleep(Duration::ZERO)));
 }
 
 async fn run_driver(
@@ -328,7 +330,7 @@ async fn run_driver(
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
-    let (mut conn, mut frame_rx, _init_res) = match Conn::connect(&opts.url, &opts.secret).await {
+    let (conn, mut frame_rx, _init_res) = match Conn::connect(&opts.url, &opts.secret).await {
         Ok(c) => c,
         Err(e) => {
             let _ = ui_tx.send(UiEvent::Fatal(format!("connection failed: {e}")));
@@ -447,286 +449,325 @@ async fn run_driver(
     let mut tick_interval = tokio::time::interval(Duration::from_secs(1));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut conn_opt = Some(conn);
+    let mut frame_rx_opt = Some(frame_rx);
+    let mut attach_retry_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut reconnect_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut reconnect_attempt = 1u32;
+
     loop {
-        if matches!(connection_state, ConnectionState::Detached) {
-            tokio::select! {
-                cmd_opt = cmd_rx.recv() => {
-                    match cmd_opt {
-                        Some(UiCommand::Line(l)) => {
-                            let effects = core.handle(Input::Line(l));
-                            let action = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                            if matches!(action, EffectAction::Reattach) {
-                                let Some((nc, nfr)) = perform_reconnect(
-                                    &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                    &mut connection_state, &mut last_state,
-                                    &mut is_first_attach, &mut attach_failed_attempts,
-                                ).await else {
-                                    return;
-                                };
-                                conn = nc;
-                                frame_rx = nfr;
-                            } else if matches!(action, EffectAction::Exit) {
-                                return;
-                            }
-                        }
-                        Some(UiCommand::RetryAttach) => {
-                            let Some((nc, nfr)) = perform_reconnect(
-                                &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                &mut connection_state, &mut last_state,
-                                &mut is_first_attach, &mut attach_failed_attempts,
-                            ).await else {
-                                return;
-                            };
-                            conn = nc;
-                            frame_rx = nfr;
-                        }
-                        Some(UiCommand::Shutdown) | Some(UiCommand::Eof) | None => {
-                            let _ = ui_tx.send(UiEvent::Exit(0));
+        tokio::select! {
+            cmd_opt = cmd_rx.recv() => {
+                let Some(cmd) = cmd_opt else {
+                    if let Some(c) = conn_opt.as_mut() {
+                        let _ = c.notify("session/close", json!({"sessionId": core.session_id})).await;
+                        let _ = c.close().await;
+                    }
+                    let _ = ui_tx.send(UiEvent::Exit(0));
+                    return;
+                };
+
+                match cmd {
+                    UiCommand::Line(l) => {
+                        let effects = core.handle(Input::Line(l));
+                        let action = process_effects(
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
+                        ).await;
+                        if matches!(action, EffectAction::Exit) {
                             return;
                         }
-                        Some(UiCommand::Interrupt) => {
-                            let effects = core.handle(Input::Interrupt);
-                            let _ = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                        if matches!(action, EffectAction::Reattach) {
+                            trigger_disconnect(
+                                &mut core,
+                                &mut conn_opt,
+                                &mut frame_rx_opt,
+                                &mut attach_retry_timer,
+                                &mut reconnect_timer,
+                                &mut reconnect_attempt,
+                                &mut connection_state,
+                                &mut last_state,
+                                &ui_tx,
+                            );
                         }
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                     }
-                }
-                _ = tick_interval.tick() => {
-                    let effects = core.handle(Input::Tick(Instant::now()));
-                    let _ = process_effects(
-                        effects, &mut core, &mut conn, &ui_tx,
-                        &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                    ).await;
-                    maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                }
-            }
-            continue;
-        }
-
-        if matches!(connection_state, ConnectionState::Stopped { .. }) {
-            tokio::select! {
-                cmd_opt = cmd_rx.recv() => {
-                    match cmd_opt {
-                        Some(UiCommand::RetryAttach) => {
+                    UiCommand::Interrupt => {
+                        let effects = core.handle(Input::Interrupt);
+                        let action = process_effects(
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
+                        ).await;
+                        if matches!(action, EffectAction::Exit) {
+                            return;
+                        }
+                        if matches!(action, EffectAction::Reattach) {
+                            trigger_disconnect(
+                                &mut core,
+                                &mut conn_opt,
+                                &mut frame_rx_opt,
+                                &mut attach_retry_timer,
+                                &mut reconnect_timer,
+                                &mut reconnect_attempt,
+                                &mut connection_state,
+                                &mut last_state,
+                                &ui_tx,
+                            );
+                        }
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                    }
+                    UiCommand::Eof => {
+                        let effects = core.handle(Input::Eof);
+                        let action = process_effects(
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
+                        ).await;
+                        if matches!(action, EffectAction::Exit) {
+                            return;
+                        }
+                        return;
+                    }
+                    UiCommand::Shutdown => {
+                        if let Some(c) = conn_opt.as_mut() {
+                            let _ = c.notify("session/close", json!({"sessionId": core.session_id})).await;
+                            let _ = c.close().await;
+                        }
+                        let _ = ui_tx.send(UiEvent::Exit(0));
+                        return;
+                    }
+                    UiCommand::RetryAttach => {
+                        if matches!(connection_state, ConnectionState::Stopped { .. } | ConnectionState::Detached) {
                             attach_failed_attempts = 0;
-                            if conn.is_closed() {
-                                let Some((nc, nfr)) = perform_reconnect(
-                                    &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                    &mut connection_state, &mut last_state,
-                                    &mut is_first_attach, &mut attach_failed_attempts,
-                                ).await else {
-                                    return;
-                                };
-                                conn = nc;
-                                frame_rx = nfr;
-                            } else {
-                                connection_state = ConnectionState::Reconnecting { attempt: 1 };
-                                maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                            attach_retry_timer = None;
+                            if let Some(c) = conn_opt.as_mut() {
                                 let (load_id, method, params) = core.attach_request();
-                                if conn.send_request(load_id, &method, params).await.is_err() {
-                                    let Some((nc, nfr)) = perform_reconnect(
-                                        &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                        &mut connection_state, &mut last_state,
-                                        &mut is_first_attach, &mut attach_failed_attempts,
-                                    ).await else {
-                                        return;
-                                    };
-                                    conn = nc;
-                                    frame_rx = nfr;
+                                if c.send_request(load_id, &method, params).await.is_err() {
+                                    trigger_disconnect(
+                                        &mut core,
+                                        &mut conn_opt,
+                                        &mut frame_rx_opt,
+                                        &mut attach_retry_timer,
+                                        &mut reconnect_timer,
+                                        &mut reconnect_attempt,
+                                        &mut connection_state,
+                                        &mut last_state,
+                                        &ui_tx,
+                                    );
                                 } else {
                                     connection_state = ConnectionState::Live;
                                     maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                                 }
+                            } else {
+                                trigger_disconnect(
+                                    &mut core,
+                                    &mut conn_opt,
+                                    &mut frame_rx_opt,
+                                    &mut attach_retry_timer,
+                                    &mut reconnect_timer,
+                                    &mut reconnect_attempt,
+                                    &mut connection_state,
+                                    &mut last_state,
+                                    &ui_tx,
+                                );
                             }
                         }
-                        Some(UiCommand::Shutdown) | Some(UiCommand::Eof) | None => {
-                            let _ = conn.close().await;
-                            let _ = ui_tx.send(UiEvent::Exit(0));
-                            return;
-                        }
-                        Some(UiCommand::Line(l)) => {
-                            let effects = core.handle(Input::Line(l));
-                            let _ = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                        }
-                        Some(UiCommand::Interrupt) => {
-                            let effects = core.handle(Input::Interrupt);
-                            let _ = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                        }
                     }
-                }
-                frame_opt = frame_rx.recv() => {
-                    match frame_opt {
-                        Some(frame) => {
-                            let effects = core.handle(Input::Frame(frame));
-                            let action = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                            if matches!(action, EffectAction::Reattach) {
-                                let Some((nc, nfr)) = perform_reconnect(
-                                    &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                    &mut connection_state, &mut last_state,
-                                    &mut is_first_attach, &mut attach_failed_attempts,
-                                ).await else {
-                                    return;
-                                };
-                                conn = nc;
-                                frame_rx = nfr;
-                            } else if matches!(action, EffectAction::Exit) {
-                                return;
-                            }
-                        }
-                        None => {
-                            let effects = core.handle(Input::Disconnected);
-                            let _ = process_effects(
-                                effects, &mut core, &mut conn, &ui_tx,
-                                &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                            ).await;
-                            let Some((nc, nfr)) = perform_reconnect(
-                                &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                &mut connection_state, &mut last_state,
-                                &mut is_first_attach, &mut attach_failed_attempts,
-                            ).await else {
-                                return;
-                            };
-                            conn = nc;
-                            frame_rx = nfr;
-                        }
-                    }
-                }
-                _ = tick_interval.tick() => {
-                    let effects = core.handle(Input::Tick(Instant::now()));
-                    let _ = process_effects(
-                        effects, &mut core, &mut conn, &ui_tx,
-                        &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                    ).await;
-                    maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                 }
             }
-            continue;
-        }
-
-        tokio::select! {
-            frame_opt = frame_rx.recv() => {
+            frame_opt = async {
+                match frame_rx_opt.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match frame_opt {
                     Some(frame) => {
                         let effects = core.handle(Input::Frame(frame));
                         let action = process_effects(
-                            effects, &mut core, &mut conn, &ui_tx,
-                            &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
                         ).await;
-                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                        if matches!(action, EffectAction::Reattach) {
-                            let Some((nc, nfr)) = perform_reconnect(
-                                &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                &mut connection_state, &mut last_state,
-                                &mut is_first_attach, &mut attach_failed_attempts,
-                            ).await else {
-                                return;
-                            };
-                            conn = nc;
-                            frame_rx = nfr;
-                        } else if matches!(action, EffectAction::Exit) {
-                            return;
-                        }
-                    }
-                    None => {
-                        let effects = core.handle(Input::Disconnected);
-                        let _ = process_effects(
-                            effects, &mut core, &mut conn, &ui_tx,
-                            &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                        ).await;
-                        let Some((nc, nfr)) = perform_reconnect(
-                            &opts, &mut core, &mut cmd_rx, &ui_tx,
-                            &mut connection_state, &mut last_state,
-                            &mut is_first_attach, &mut attach_failed_attempts,
-                        ).await else {
-                            return;
-                        };
-                        conn = nc;
-                        frame_rx = nfr;
-                    }
-                }
-            }
-            cmd_opt = cmd_rx.recv() => {
-                match cmd_opt {
-                    Some(UiCommand::Line(l)) => {
-                        let effects = core.handle(Input::Line(l));
-                        let action = process_effects(
-                            effects, &mut core, &mut conn, &ui_tx,
-                            &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                        ).await;
-                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
-                        if matches!(action, EffectAction::Reattach) {
-                            let Some((nc, nfr)) = perform_reconnect(
-                                &opts, &mut core, &mut cmd_rx, &ui_tx,
-                                &mut connection_state, &mut last_state,
-                                &mut is_first_attach, &mut attach_failed_attempts,
-                            ).await else {
-                                return;
-                            };
-                            conn = nc;
-                            frame_rx = nfr;
-                        } else if matches!(action, EffectAction::Exit) {
-                            return;
-                        }
-                    }
-                    Some(UiCommand::Interrupt) => {
-                        let effects = core.handle(Input::Interrupt);
-                        let action = process_effects(
-                            effects, &mut core, &mut conn, &ui_tx,
-                            &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                        ).await;
-                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                         if matches!(action, EffectAction::Exit) {
                             return;
                         }
+                        if matches!(action, EffectAction::Reattach) {
+                            trigger_disconnect(
+                                &mut core,
+                                &mut conn_opt,
+                                &mut frame_rx_opt,
+                                &mut attach_retry_timer,
+                                &mut reconnect_timer,
+                                &mut reconnect_attempt,
+                                &mut connection_state,
+                                &mut last_state,
+                                &ui_tx,
+                            );
+                        }
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                     }
-                    Some(UiCommand::Eof) => {
-                        let effects = core.handle(Input::Eof);
-                        let _ = process_effects(
-                            effects, &mut core, &mut conn, &ui_tx,
-                            &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
-                        ).await;
-                        return;
+                    None => {
+                        trigger_disconnect(
+                            &mut core,
+                            &mut conn_opt,
+                            &mut frame_rx_opt,
+                            &mut attach_retry_timer,
+                            &mut reconnect_timer,
+                            &mut reconnect_attempt,
+                            &mut connection_state,
+                            &mut last_state,
+                            &ui_tx,
+                        );
                     }
-                    Some(UiCommand::Shutdown) | None => {
-                        let _ = conn
-                            .notify("session/close", json!({"sessionId": core.session_id}))
-                            .await;
-                        let _ = conn.close().await;
-                        let _ = ui_tx.send(UiEvent::Exit(0));
-                        return;
+                }
+            }
+            _ = async {
+                match attach_retry_timer.as_mut() {
+                    Some(timer) => timer.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                attach_retry_timer = None;
+                if let Some(c) = conn_opt.as_mut() {
+                    let (load_id, method, params) = core.attach_request();
+                    if c.send_request(load_id, &method, params).await.is_err() {
+                        trigger_disconnect(
+                            &mut core,
+                            &mut conn_opt,
+                            &mut frame_rx_opt,
+                            &mut attach_retry_timer,
+                            &mut reconnect_timer,
+                            &mut reconnect_attempt,
+                            &mut connection_state,
+                            &mut last_state,
+                            &ui_tx,
+                        );
                     }
-                    Some(UiCommand::RetryAttach) => {}
+                }
+            }
+            _ = async {
+                match reconnect_timer.as_mut() {
+                    Some(timer) => timer.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                reconnect_timer = None;
+                match Conn::connect(&opts.url, &opts.secret).await {
+                    Ok((new_conn, new_frame_rx, _init_res)) => {
+                        let (load_id, method, params) = core.attach_request();
+                        if new_conn.send_request(load_id, &method, params).await.is_err() {
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
+                            maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                            let backoff = Duration::from_millis(
+                                (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
+                            );
+                            reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
+                        } else {
+                            let effects = core.handle(Input::Connected);
+                            let mut temp_conn = Some(new_conn);
+                            let action = process_effects(
+                                effects,
+                                &mut core,
+                                &mut temp_conn,
+                                &ui_tx,
+                                &mut is_first_attach,
+                                &mut attach_failed_attempts,
+                                &mut attach_retry_timer,
+                                &mut connection_state,
+                            ).await;
+                            if matches!(action, EffectAction::Exit) {
+                                return;
+                            }
+                            if matches!(action, EffectAction::Reattach) {
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
+                                maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                                let backoff = Duration::from_millis(
+                                    (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
+                                );
+                                reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
+                            } else {
+                                conn_opt = temp_conn;
+                                frame_rx_opt = Some(new_frame_rx);
+                                connection_state = ConnectionState::Live;
+                                maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.starts_with("fatal: ")
+                            || err_str.contains("authentication failed")
+                            || err_str.contains("401")
+                            || err_str.contains("403")
+                        {
+                            let _ = ui_tx.send(UiEvent::Fatal(err_str));
+                            let _ = ui_tx.send(UiEvent::Exit(1));
+                            return;
+                        }
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        connection_state = ConnectionState::Reconnecting { attempt: reconnect_attempt };
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
+                        let backoff = Duration::from_millis(
+                            (250 * (1 << (reconnect_attempt.saturating_sub(2)).min(5))).min(5000),
+                        );
+                        reconnect_timer = Some(Box::pin(tokio::time::sleep(backoff)));
+                    }
                 }
             }
             _ = tick_interval.tick() => {
                 let effects = core.handle(Input::Tick(Instant::now()));
                 let action = process_effects(
-                    effects, &mut core, &mut conn, &ui_tx,
-                    &mut is_first_attach, &mut attach_failed_attempts, &mut connection_state,
+                    effects,
+                    &mut core,
+                    &mut conn_opt,
+                    &ui_tx,
+                    &mut is_first_attach,
+                    &mut attach_failed_attempts,
+                    &mut attach_retry_timer,
+                    &mut connection_state,
                 ).await;
-                maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                 if matches!(action, EffectAction::Exit) {
                     return;
                 }
+                if matches!(action, EffectAction::Reattach) {
+                    trigger_disconnect(
+                        &mut core,
+                        &mut conn_opt,
+                        &mut frame_rx_opt,
+                        &mut attach_retry_timer,
+                        &mut reconnect_timer,
+                        &mut reconnect_attempt,
+                        &mut connection_state,
+                        &mut last_state,
+                        &ui_tx,
+                    );
+                }
+                maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
             }
         }
     }
@@ -737,11 +778,16 @@ pub async fn start(
 ) -> anyhow::Result<(DriverHandle, mpsc::UnboundedReceiver<UiEvent>)> {
     let (ui_tx, ui_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let handle = DriverHandle { cmd_tx };
+    let join_handle = Arc::new(Mutex::new(None));
+    let handle = DriverHandle {
+        cmd_tx,
+        join_handle: join_handle.clone(),
+    };
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         run_driver(opts, cmd_rx, ui_tx).await;
     });
+    *join_handle.lock().await = Some(task);
 
     Ok((handle, ui_rx))
 }

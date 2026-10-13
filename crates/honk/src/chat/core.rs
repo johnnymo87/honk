@@ -188,6 +188,10 @@ impl ChatCore {
     }
 
     fn handle_line(&mut self, line: String, effects: &mut Vec<Effect>) {
+        if line.starts_with('/') && !line.starts_with("//") && self.handle_command(&line, effects) {
+            return;
+        }
+
         if self.is_detached {
             self.is_detached = false;
             self.is_reattaching = true;
@@ -211,10 +215,6 @@ impl ChatCore {
         if line.starts_with("//") {
             let text = line[1..].to_string();
             self.process_text_input(text, 0, effects);
-            return;
-        }
-
-        if line.starts_with('/') && self.handle_command(&line, effects) {
             return;
         }
 
@@ -381,6 +381,7 @@ impl ChatCore {
                 if Some(id) == self.pending_load_req_id {
                     self.pending_load_req_id = None;
                     if let Some(err) = frame.get("error") {
+                        self.is_replaying = false;
                         effects.push(Effect::AttachFailed { error: err.clone() });
                     } else {
                         let result = frame.get("result").cloned().unwrap_or(Value::Null);

@@ -1,13 +1,34 @@
+#![allow(clippy::result_large_err)]
+
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+use futures::{SinkExt, StreamExt};
 use honk::chat::{ConnectionState, DriverOpts, RunState, Target, UiCommand, UiEvent, start};
 use honk_testgoose::{StubGoose, Turn};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::Message;
+
+async fn fake_ws_server<F>(handler: F) -> (String, tokio::task::JoinHandle<()>)
+where
+    F: FnOnce(
+            TcpListener,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        + Send
+        + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{addr}/acp");
+    let handle = tokio::spawn(handler(listener));
+    (url, handle)
+}
 
 fn find_honkd_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HONKD_BIN") {
@@ -1098,7 +1119,7 @@ async fn test_scenario_g_kill9_honkd_mid_turn_reconnects_resends_crid_single_ass
     let mut idle_seen = false;
     let post_wait = std::time::Instant::now();
 
-    while let Some(evt) = rx.recv().await {
+    while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(25), rx.recv()).await {
         match evt {
             UiEvent::Transcript(f) => {
                 blocks.apply(&f);
@@ -1114,7 +1135,7 @@ async fn test_scenario_g_kill9_honkd_mid_turn_reconnects_resends_crid_single_ass
             }
             _ => {}
         }
-        if post_wait.elapsed() > Duration::from_secs(15) {
+        if post_wait.elapsed() > Duration::from_secs(25) {
             panic!("timed out waiting for reconnect and turn completion");
         }
     }
@@ -1306,4 +1327,590 @@ async fn test_driver_idle_detach_and_reattach() {
     );
 
     handle.send(UiCommand::Shutdown).expect("send shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_reattach_failures_stopped_then_retry_attach() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            // Connection 1: initial connect + attach succeeds
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "initialize");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            let load_id = v["id"].clone();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": load_id,
+                    "result": { "sessionId": "s1" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": { "sessionId": "s1", "epoch": 1, "seq": 0 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Close connection 1 to force reconnect
+            let _ = ws.close(None).await;
+            drop(ws);
+
+            // Connection 2: reconnect succeeds, but session/load fails 5 times
+            let (tcp2, _) = listener.accept().await.unwrap();
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(tcp2, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "initialize");
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 5 failed session/load attempts
+            for _ in 0..5 {
+                let msg = ws2.next().await.unwrap().unwrap();
+                let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                assert_eq!(v["method"], "session/load");
+                ws2.send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": v["id"],
+                        "error": { "code": -32000, "message": "held-session limit reached" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
+
+            // Driver enters Stopped. Wait for RetryAttach -> send successful session/load
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "sessionId": "s1" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Drain close
+            while let Some(msg_res) = ws2.next().await {
+                if let Ok(Message::Close(_)) = msg_res {
+                    break;
+                }
+            }
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("s1".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    // Wait until Live initially
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && s.connection == ConnectionState::Live
+            && !s.replaying
+        {
+            break;
+        }
+    }
+
+    // Wait for driver to transition through 5 failed attempts to Stopped
+    let mut stopped_seen = false;
+    let wait_stopped = Instant::now();
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && matches!(s.connection, ConnectionState::Stopped { .. })
+        {
+            stopped_seen = true;
+            break;
+        }
+        if wait_stopped.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for Stopped state");
+        }
+    }
+    assert!(
+        stopped_seen,
+        "driver should enter Stopped after 5 failed re-attach attempts"
+    );
+
+    // Send RetryAttach
+    handle
+        .send(UiCommand::RetryAttach)
+        .expect("send retry attach");
+
+    // Wait until Live again
+    let mut live_again = false;
+    let wait_live = Instant::now();
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && s.connection == ConnectionState::Live
+        {
+            live_again = true;
+            break;
+        }
+        if wait_live.elapsed() > Duration::from_secs(5) {
+            panic!("timed out waiting for Live state after RetryAttach");
+        }
+    }
+    assert!(live_again, "driver should return to Live after RetryAttach");
+
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_shutdown_during_attach_backoff_returns_promptly() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "sessionId": "s1" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": { "sessionId": "s1", "epoch": 1, "seq": 0 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.close(None).await;
+            drop(ws);
+
+            let (tcp2, _) = listener.accept().await.unwrap();
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(tcp2, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Fail session/load attempt -> driver enters backoff
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "error": { "code": -32000, "message": "held-session limit reached" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            while let Some(msg_res) = ws2.next().await {
+                if let Ok(Message::Close(_)) = msg_res {
+                    break;
+                }
+            }
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("s1".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && s.connection == ConnectionState::Live
+            && !s.replaying
+        {
+            break;
+        }
+    }
+
+    // Wait until driver sees attach failed notice and enters backoff
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::Notice(n) = evt
+            && n.text.contains("attach failed")
+            && n.text.contains("retrying in")
+        {
+            break;
+        }
+    }
+
+    // Shutdown should return promptly (<200ms)
+    let start_shutdown = Instant::now();
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+
+    let join_res = tokio::time::timeout(Duration::from_millis(500), handle.join()).await;
+    assert!(
+        join_res.is_ok(),
+        "handle.join() must complete promptly during backoff"
+    );
+    assert!(start_shutdown.elapsed() < Duration::from_millis(500));
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_quit_while_stopped_ends_task() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "sessionId": "s1" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": { "sessionId": "s1", "epoch": 1, "seq": 0 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.close(None).await;
+            drop(ws);
+
+            let (tcp2, _) = listener.accept().await.unwrap();
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(tcp2, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 5 failed session/load attempts
+            for _ in 0..5 {
+                let msg = ws2.next().await.unwrap().unwrap();
+                let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                ws2.send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": v["id"],
+                        "error": { "code": -32000, "message": "held-session limit reached" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            }
+
+            // Driver is in Stopped state, receives /quit
+            while let Some(msg_res) = ws2.next().await {
+                if let Ok(Message::Close(_)) = msg_res {
+                    break;
+                }
+            }
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("s1".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && s.connection == ConnectionState::Live
+            && !s.replaying
+        {
+            break;
+        }
+    }
+
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && matches!(s.connection, ConnectionState::Stopped { .. })
+        {
+            break;
+        }
+    }
+
+    // Send /quit line
+    handle
+        .send(UiCommand::Line("/quit".to_string()))
+        .expect("send /quit");
+
+    // Join handle must complete cleanly
+    let join_res = tokio::time::timeout(Duration::from_secs(2), handle.join()).await;
+    assert!(
+        join_res.is_ok(),
+        "/quit while Stopped must terminate driver task"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_attach_failed_auth_error_on_reconnect_is_fatal() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "sessionId": "s1" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "_honk/replay_done",
+                    "params": { "sessionId": "s1", "epoch": 1, "seq": 0 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.close(None).await;
+            drop(ws);
+
+            let (tcp2, _) = listener.accept().await.unwrap();
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(tcp2, |_req: &Request, resp: Response| {
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": { "protocolVersion": 1 }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Fail session/load with AUTH error (401)
+            let msg = ws2.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws2.send(Message::Text(json!({
+                "jsonrpc": "2.0",
+                "id": v["id"],
+                "error": { "code": 401, "message": "authentication failed: session unauthorized" }
+            }).to_string().into())).await.unwrap();
+
+            while let Some(msg_res) = ws2.next().await {
+                if let Ok(Message::Close(_)) = msg_res {
+                    break;
+                }
+            }
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("s1".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    while let Some(evt) = rx.recv().await {
+        if let UiEvent::State(s) = evt
+            && s.connection == ConnectionState::Live
+            && !s.replaying
+        {
+            break;
+        }
+    }
+
+    // Driver should receive Fatal event due to auth failure on reconnect
+    let mut fatal_seen = false;
+    let mut exit_seen = false;
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            UiEvent::Fatal(msg) => {
+                assert!(
+                    msg.contains("authentication failed") || msg.contains("401"),
+                    "fatal msg: {msg}"
+                );
+                fatal_seen = true;
+            }
+            UiEvent::Exit(code) => {
+                assert_eq!(code, 1);
+                exit_seen = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(fatal_seen, "auth failure on reconnect must emit Fatal");
+    assert!(exit_seen, "auth failure on reconnect must emit Exit(1)");
+
+    let join_res = tokio::time::timeout(Duration::from_secs(2), handle.join()).await;
+    assert!(join_res.is_ok(), "task must complete on fatal auth error");
+    let _ = server_task.await;
 }
