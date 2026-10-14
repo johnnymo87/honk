@@ -1056,57 +1056,92 @@ impl Hub {
         }
 
         // 3. Subscribe to the conn stream with takeover
-        session_upstream
-            .subscribe_with(
-                None,
-                SubscribeOpts {
-                    takeover: true,
-                    resume_after: None,
-                },
-            )
-            .await
-            .context("failed to subscribe session conn stream")?;
+        let creation_res: anyhow::Result<(Value, String, String, crate::log::SessionLog)> = async {
+            session_upstream
+                .subscribe_with(
+                    None,
+                    SubscribeOpts {
+                        takeover: true,
+                        resume_after: None,
+                    },
+                )
+                .await
+                .context("failed to subscribe session conn stream")?;
 
-        // 4. call("session/new", strip_honk_meta(params))
-        let mut clean_params = params.clone();
-        crate::rpc::strip_honk_meta(&mut clean_params);
-        let new_res = session_upstream
-            .call("session/new", clean_params, None, Duration::from_secs(30))
-            .await
-            .context("failed to call session/new")?;
+            // 4. call("session/new", strip_honk_meta(params))
+            let mut clean_params = params.clone();
+            crate::rpc::strip_honk_meta(&mut clean_params);
+            let timeout = self
+                .args
+                .session_new_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_secs(self.args.session_new_timeout_secs));
+            let new_res = session_upstream
+                .call("session/new", clean_params, None, timeout)
+                .await
+                .context("failed to call session/new")?;
 
-        let sid = new_res
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .context("session/new missing sessionId")?
-            .to_string();
-        let cwd = params
-            .get("cwd")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            let sid = new_res
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .context("session/new missing sessionId")?
+                .to_string();
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
 
-        // 5. Subscribe to session stream with takeover and resume_after: Some(0)
-        // Note: In patched goose (vendor/agent-client-protocol-http/src/http_mailbox.rs),
-        // sequence numbers start at 1 (next_seq = 1, trimmed_through = 0).
-        // Calling resume_after(0) acknowledges nothing and replays all retained frames
-        // from seq 1 onwards. For a brand-new session stream, this guarantees all initial
-        // frames are replayed without creating a gap.
-        session_upstream
-            .subscribe_with(
-                Some(&sid),
-                SubscribeOpts {
-                    takeover: true,
-                    resume_after: Some(0),
-                },
-            )
-            .await
-            .context("failed to subscribe session stream")?;
+            // 5. Subscribe to session stream with takeover and resume_after: Some(0)
+            // Note: In patched goose (vendor/agent-client-protocol-http/src/http_mailbox.rs),
+            // sequence numbers start at 1 (next_seq = 1, trimmed_through = 0).
+            // Calling resume_after(0) acknowledges nothing and replays all retained frames
+            // from seq 1 onwards. For a brand-new session stream, this guarantees all initial
+            // frames are replayed without creating a gap.
+            session_upstream
+                .subscribe_with(
+                    Some(&sid),
+                    SubscribeOpts {
+                        takeover: true,
+                        resume_after: Some(0),
+                    },
+                )
+                .await
+                .context("failed to subscribe session stream")?;
 
-        // 6. SessionLog::create(sessions/<sid>.jsonl, 1, None, []) BEFORE state mutate
-        let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
-        let session_log = crate::log::SessionLog::create(&log_path, 1, None, Vec::new())
-            .context("failed to create session log")?;
+            // 6. SessionLog::create(sessions/<sid>.jsonl, 1, None, []) BEFORE state mutate
+            let log_path = self.state_dir.join("sessions").join(format!("{sid}.jsonl"));
+            let session_log = crate::log::SessionLog::create(&log_path, 1, None, Vec::new())
+                .context("failed to create session log")?;
+
+            Ok((new_res, sid, cwd, session_log))
+        }
+        .await;
+
+        let (new_res, sid, cwd, session_log) = match creation_res {
+            Ok(tuple) => tuple,
+            Err(e) => {
+                drop(session_upstream);
+                let upstream_opts = UpstreamOpts {
+                    allow_production: self.args.allow_production_upstream,
+                    ..Default::default()
+                };
+                if let Ok(up) = Upstream::resume_with(
+                    &self.upstream_url,
+                    self.upstream_secret.clone(),
+                    conn_id.clone(),
+                    Recorder::disabled(),
+                    &upstream_opts,
+                ) && up.delete().await.is_ok()
+                {
+                    let mut s = self.state.lock().await;
+                    let _ = s.mutate(|st| {
+                        st.orphan_conns.retain(|id| id != &conn_id);
+                    });
+                }
+                return Err(e);
+            }
+        };
 
         // 7. In one state.mutate: remove orphan; insert HeldSession
         let now = std::time::SystemTime::now()

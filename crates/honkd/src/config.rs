@@ -25,7 +25,7 @@ pub struct Args {
     pub idle_ttl_secs: u64,
     #[arg(long, default_value_t = 4096, hide = true)]
     pub viewer_queue: usize,
-    #[arg(long, default_value_t = 16, hide = true)]
+    #[arg(long, default_value_t = 64, hide = true)]
     pub max_sessions: usize,
     #[arg(long, default_value_t = 20, hide = true)]
     pub stream_dead_secs: u64,
@@ -35,6 +35,10 @@ pub struct Args {
     pub probe_timeout_secs: u64,
     #[arg(long, default_value_t = 30, hide = true)]
     pub ambiguous_inflight_timeout_secs: u64,
+    #[arg(long, default_value_t = 30, hide = true)]
+    pub session_new_timeout_secs: u64,
+    #[arg(long, hide = true)]
+    pub session_new_timeout_ms: Option<u64>,
 }
 
 impl Args {
@@ -53,5 +57,25 @@ impl Args {
             return PathBuf::from(home.trim()).join(".local/state/honk");
         }
         PathBuf::from("./.honk-state")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_max_sessions_is_64() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.max_sessions, 64);
+    }
+
+    #[test]
+    fn default_session_new_timeout_secs_is_30() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.session_new_timeout_secs, 30);
+        assert_eq!(args.session_new_timeout_ms, None);
     }
 }

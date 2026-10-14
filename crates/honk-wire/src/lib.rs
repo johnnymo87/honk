@@ -24,6 +24,7 @@ pub enum BlockKey {
     Text(String),
     Thought(String),
     Tool(String),
+    Notice(String),
 }
 
 pub fn block_key(update: &Value) -> Option<BlockKey> {
