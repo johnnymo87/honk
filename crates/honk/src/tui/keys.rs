@@ -14,6 +14,7 @@ pub enum Action {
     ScrollBottom,
     ToggleTools,
     ToggleThoughts,
+    ToggleJson,
     OpenCommand,
     HistoryPrev,
     HistoryNext,
@@ -75,6 +76,7 @@ pub fn resolve(
                     match key_event.code {
                         KeyCode::Char('a') => return Action::ToggleTools,
                         KeyCode::Char('t') => return Action::ToggleThoughts,
+                        KeyCode::Char('j') => return Action::ToggleJson,
                         _ => return Action::Edtui(key_event),
                     }
                 }
@@ -434,6 +436,17 @@ mod tests {
                 false
             ),
             Action::ToggleThoughts
+        );
+        // 'j' with prefix 'z' -> ToggleJson
+        assert_eq!(
+            resolve(
+                EditorMode::Normal,
+                true,
+                key(KeyCode::Char('j')),
+                Some('z'),
+                false
+            ),
+            Action::ToggleJson
         );
         // any other key with prefix 'z' -> Edtui
         let x_event = key(KeyCode::Char('x'));

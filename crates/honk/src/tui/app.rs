@@ -202,6 +202,9 @@ impl App {
             Action::ToggleThoughts => {
                 self.transcript.toggle_thoughts();
             }
+            Action::ToggleJson => {
+                self.transcript.toggle_json();
+            }
             Action::OpenCommand => {
                 self.command_line = Some(String::new());
             }
@@ -303,6 +306,9 @@ impl App {
             }
             "help" => {
                 let _ = self.cmd_tx.send(UiCommand::Line("/help".into()));
+            }
+            "json" => {
+                self.transcript.toggle_json();
             }
             cmd if cmd.starts_with("turns ") || cmd == "turns" => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
@@ -1090,6 +1096,17 @@ mod tests {
         app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.pending_prefix, None);
         assert!(app.transcript.thoughts_expanded);
+
+        // 'z' then 'j' toggles json
+        assert!(!app.transcript.json_expanded);
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pending_prefix, None);
+        assert!(app.transcript.json_expanded);
+
+        // ':json' toggles json back off
+        app.execute_app_command(":json");
+        assert!(!app.transcript.json_expanded);
     }
 
     #[test]

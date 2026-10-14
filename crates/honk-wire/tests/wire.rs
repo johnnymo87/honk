@@ -583,3 +583,141 @@ fn test_turn_text_skips_tool_response_messages() {
         Some("all done".to_string())
     );
 }
+
+#[test]
+fn test_to_updates_tool_call_raw_input_and_content() {
+    let export = load_json(EXPORT_PATH);
+    let updates = to_updates(&export, "20261011_85");
+
+    let tool_calls: Vec<_> = updates
+        .iter()
+        .filter_map(|u| u.pointer("/params/update"))
+        .filter(|u| u.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call"))
+        .collect();
+
+    assert_eq!(tool_calls.len(), 3);
+    assert_eq!(
+        tool_calls[0].get("title").and_then(Value::as_str),
+        Some("shell · ls")
+    );
+    assert_eq!(
+        tool_calls[0]
+            .pointer("/rawInput/command")
+            .and_then(Value::as_str),
+        Some("ls")
+    );
+
+    assert_eq!(
+        tool_calls[1].get("title").and_then(Value::as_str),
+        Some("write · notes.md")
+    );
+    assert_eq!(
+        tool_calls[1]
+            .pointer("/rawInput/path")
+            .and_then(Value::as_str),
+        Some("notes.md")
+    );
+
+    assert_eq!(
+        tool_calls[2].get("title").and_then(Value::as_str),
+        Some("edit · notes.md")
+    );
+    assert_eq!(
+        tool_calls[2]
+            .pointer("/rawInput/path")
+            .and_then(Value::as_str),
+        Some("notes.md")
+    );
+
+    let tool_call_updates: Vec<_> = updates
+        .iter()
+        .filter_map(|u| u.pointer("/params/update"))
+        .filter(|u| u.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update"))
+        .collect();
+
+    assert_eq!(tool_call_updates.len(), 3);
+    // First tool result was (no output)
+    let first_content = tool_call_updates[0]
+        .pointer("/content/0/content/text")
+        .and_then(Value::as_str);
+    assert_eq!(first_content, Some("(no output)"));
+    assert_eq!(
+        tool_call_updates[0]
+            .pointer("/content/0/type")
+            .and_then(Value::as_str),
+        Some("content")
+    );
+
+    // Second tool result was "Created notes.md (2 lines)"
+    let second_content = tool_call_updates[1]
+        .pointer("/content/0/content/text")
+        .and_then(Value::as_str);
+    assert_eq!(second_content, Some("Created notes.md (2 lines)"));
+}
+
+#[test]
+fn test_to_updates_synthetic_truncation_and_text_editor_title() {
+    let huge_text = "x".repeat(100 * 1024);
+    let synthetic_export = serde_json::json!({
+        "conversation": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolRequest",
+                        "id": "call_1",
+                        "toolCall": {
+                            "name": "text_editor",
+                            "arguments": {
+                                "command": "view",
+                                "path": "src/main.rs"
+                            }
+                        }
+                    },
+                    {
+                        "type": "toolResponse",
+                        "id": "call_1",
+                        "toolResult": {
+                            "status": "success",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": huge_text
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    let updates = to_updates(&synthetic_export, "ses_test");
+    assert_eq!(updates.len(), 2);
+
+    let req = updates[0].pointer("/params/update").unwrap();
+    assert_eq!(
+        req.get("sessionUpdate").and_then(Value::as_str),
+        Some("tool_call")
+    );
+    assert_eq!(
+        req.get("title").and_then(Value::as_str),
+        Some("text_editor · src/main.rs view")
+    );
+    assert_eq!(
+        req.pointer("/rawInput/command").and_then(Value::as_str),
+        Some("view")
+    );
+
+    let resp = updates[1].pointer("/params/update").unwrap();
+    assert_eq!(
+        resp.get("sessionUpdate").and_then(Value::as_str),
+        Some("tool_call_update")
+    );
+    let text = resp
+        .pointer("/content/0/content/text")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(text.ends_with('…'));
+    assert_eq!(text.len(), 64 * 1024 + '…'.len_utf8());
+}
