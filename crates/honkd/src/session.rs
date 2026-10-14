@@ -266,8 +266,20 @@ pub async fn create_new_generation_from_export(
     Ok((new_log, next_epoch))
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.hub.set_session_running(&self.sid, false);
+    }
+}
+
 impl Session {
+    fn sync_running(&self) {
+        self.hub
+            .set_session_running(&self.sid, self.turn.is_running());
+    }
+
     pub async fn run(mut self) {
+        self.sync_running();
         let mut watchdog = tokio::time::interval(Duration::from_secs(5));
         let mut idle = tokio::time::interval(Duration::from_millis(200));
         let mut idle_since: Option<std::time::Instant> = None;
@@ -1616,11 +1628,13 @@ impl Session {
                             }
                         }
                         self.turn.run = Some(run_id.to_string());
+                        self.sync_running();
                         self.rebuild_at_turn_end = true;
                     } else if is_idle {
                         if self.gap_evidenced {
                             // Case (b): Turn ended inside the gap, or session is idle after evidenced delivery!
                             self.turn.run = None;
+                            self.sync_running();
                             self.start_rebuild().await;
                         } else if let Some(inf) = self.turn.inflight.as_ref()
                             && !inf.announced
@@ -2055,6 +2069,7 @@ impl Session {
         }
 
         self.sync_inflight().await;
+        self.sync_running();
     }
 
     fn queue_msg(&mut self, viewer_id: ViewerId, id: Value, msg: SessionMsg) {

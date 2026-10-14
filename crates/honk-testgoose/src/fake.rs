@@ -153,6 +153,7 @@ struct FakeGooseInner {
     active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     active_runs: Mutex<HashMap<String, String>>,
     all_sessions: Mutex<HashMap<String, String>>,
+    session_list_page_size: Mutex<Option<usize>>,
     keepalive_interval: Mutex<Duration>,
     drop_prompt_reply: AtomicBool,
     drop_prompt_announcement: AtomicBool,
@@ -167,6 +168,7 @@ struct FakeGooseInner {
     export_delay: Mutex<Option<Duration>>,
     run_announcement_delay: Mutex<Option<Duration>>,
     export_commit_delay: Mutex<Option<Duration>>,
+    session_info_error: Mutex<Option<(i64, String)>>,
 }
 
 pub struct FakeGoose {
@@ -206,6 +208,7 @@ impl FakeGoose {
             active_prompt_cancels: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(HashMap::new()),
             all_sessions: Mutex::new(HashMap::new()),
+            session_list_page_size: Mutex::new(None),
             keepalive_interval: Mutex::new(Duration::from_secs(15)),
             drop_prompt_reply: AtomicBool::new(false),
             drop_prompt_announcement: AtomicBool::new(false),
@@ -220,6 +223,7 @@ impl FakeGoose {
             export_delay: Mutex::new(None),
             run_announcement_delay: Mutex::new(None),
             export_commit_delay: Mutex::new(None),
+            session_info_error: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -275,6 +279,18 @@ impl FakeGoose {
 
     pub fn remove_session(&self, sid: &str) {
         self.state.all_sessions.lock().unwrap().remove(sid);
+    }
+
+    pub fn insert_session(&self, sid: &str, cwd: &str) {
+        self.state
+            .all_sessions
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), cwd.to_string());
+    }
+
+    pub fn set_session_list_page_size(&self, page_size: usize) {
+        *self.state.session_list_page_size.lock().unwrap() = Some(page_size);
     }
 
     pub fn gap_on_next_resume(&self, sid: &str) {
@@ -410,6 +426,10 @@ impl FakeGoose {
 
     pub fn set_export_commit_delay(&self, delay: Option<Duration>) {
         *self.state.export_commit_delay.lock().unwrap() = delay;
+    }
+
+    pub fn error_next_session_info(&self, code: i64, message: &str) {
+        *self.state.session_info_error.lock().unwrap() = Some((code, message.to_string()));
     }
 
     pub fn received_prompts(&self, sid: &str) -> Vec<Value> {
@@ -605,12 +625,14 @@ async fn handle_post(
                 .entry(sid.clone())
                 .or_insert_with(StreamState::new);
         }
-        state
-            .all_sessions
-            .lock()
-            .unwrap()
-            .entry(sid.clone())
-            .or_insert_with(|| "/tmp".to_string());
+        if method != Some("_goose/unstable/session/info") {
+            state
+                .all_sessions
+                .lock()
+                .unwrap()
+                .entry(sid.clone())
+                .or_insert_with(|| "/tmp".to_string());
+        }
     }
 
     let patched = state.advertise_patched.load(Ordering::SeqCst);
@@ -666,29 +688,80 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("session/list") => {
-            let sessions_guard = state.all_sessions.lock().unwrap();
-            let sessions_list: Vec<Value> = sessions_guard
-                .iter()
-                .map(|(s, cwd)| {
-                    json!({
-                        "sessionId": s,
-                        "cwd": cwd,
-                        "title": Value::Null,
-                        "updatedAt": Value::Null
-                    })
-                })
-                .collect();
+            let page_size = *state.session_list_page_size.lock().unwrap();
+            let (sessions_list, next_cursor) = match page_size {
+                Some(limit) => {
+                    let mut sessions: Vec<(String, String)> = state
+                        .all_sessions
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .into_iter()
+                        .collect();
+                    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    let req_cursor = frame.pointer("/params/cursor").and_then(|v| v.as_str());
+                    let start_idx = req_cursor
+                        .and_then(|c| {
+                            c.strip_prefix("cur_")
+                                .and_then(|idx| idx.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let end_idx = (start_idx + limit).min(sessions.len());
+                    let slice = if start_idx < sessions.len() {
+                        &sessions[start_idx..end_idx]
+                    } else {
+                        &[]
+                    };
+                    let list: Vec<Value> = slice
+                        .iter()
+                        .map(|(s, cwd)| {
+                            json!({
+                                "sessionId": s,
+                                "cwd": cwd,
+                                "title": Value::Null,
+                                "updatedAt": Value::Null
+                            })
+                        })
+                        .collect();
+                    let next = if end_idx < sessions.len() {
+                        Some(format!("cur_{end_idx}"))
+                    } else {
+                        None
+                    };
+                    (list, next)
+                }
+                None => {
+                    let sessions_guard = state.all_sessions.lock().unwrap();
+                    let list: Vec<Value> = sessions_guard
+                        .iter()
+                        .map(|(s, cwd)| {
+                            json!({
+                                "sessionId": s,
+                                "cwd": cwd,
+                                "title": Value::Null,
+                                "updatedAt": Value::Null
+                            })
+                        })
+                        .collect();
+                    (list, None)
+                }
+            };
 
             let mut conns = state.connections.lock().unwrap();
             if let Some(conn) = conns.get_mut(&conn_id)
                 && let Some(id) = req_id
             {
+                let mut result = json!({
+                    "sessions": sessions_list
+                });
+                if let Some(nc) = next_cursor {
+                    result["nextCursor"] = json!(nc);
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {
-                        "sessions": sessions_list
-                    }
+                    "result": result
                 });
                 conn.conn_stream.push_frame(resp, patched, false);
             }
@@ -708,6 +781,69 @@ async fn handle_post(
                     let stream = conn
                         .sessions
                         .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
+                } else {
+                    conn.conn_stream.push_frame(resp, patched, false);
+                }
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/info") => {
+            let injected_error = state.session_info_error.lock().unwrap().take();
+            let target_sid = target_session.clone().or_else(|| {
+                frame
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+
+            let sid = target_sid.unwrap_or_default();
+            let cwd_opt = state.all_sessions.lock().unwrap().get(&sid).cloned();
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = if let Some((code, msg)) = injected_error {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": code,
+                            "message": msg,
+                            "data": msg
+                        }
+                    })
+                } else {
+                    match cwd_opt {
+                        Some(cwd) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "session": {
+                                    "sessionId": sid,
+                                    "cwd": cwd,
+                                    "title": Value::Null,
+                                    "updatedAt": Value::Null
+                                }
+                            }
+                        }),
+                        None => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32002,
+                                "message": format!("Session not found: {sid}"),
+                                "data": format!("Session not found: {sid}")
+                            }
+                        }),
+                    }
+                };
+                if let Some(target) = &target_session {
+                    let stream = conn
+                        .sessions
+                        .entry(target.clone())
                         .or_insert_with(StreamState::new);
                     stream.push_frame(resp, patched, false);
                 } else {

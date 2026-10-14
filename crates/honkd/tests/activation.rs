@@ -885,3 +885,126 @@ async fn evict_reactivate_kill9_restart_uses_real_reply_not_stale_sidecar() {
         "must use real reply 2, not stale sidecar reply 1"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activation_finds_stored_cwd_via_session_info() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    // Old session stored upstream
+    fake.insert_session("ses_old", "/tmp/cwd_old");
+
+    let h = Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await);
+    let mut v = Viewer::connect(&h).await;
+
+    // Loading ses_old must activate successfully
+    let load_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_old",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    assert!(
+        load_res.get("error").is_none(),
+        "expected ses_old to activate successfully, got: {load_res}"
+    );
+
+    // Verify session/info was called in one call for ses_old
+    let info_calls = fake
+        .inbound()
+        .iter()
+        .filter(|f| {
+            f.get("method").and_then(Value::as_str) == Some("_goose/unstable/session/info")
+                && f.pointer("/params/sessionId").and_then(Value::as_str) == Some("ses_old")
+        })
+        .count();
+    assert_eq!(
+        info_calls, 1,
+        "session/info must be called in exactly one call"
+    );
+
+    // Side connection must be deleted and orphan_conns must be empty
+    assert!(
+        !fake.deletes().is_empty(),
+        "side connection id must appear in FakeGoose deletes"
+    );
+    let state_after_old = read_state(&h);
+    assert!(
+        state_after_old.orphan_conns.is_empty(),
+        "orphan_conns must be empty after successful activation"
+    );
+
+    // Loading a truly missing session must fail with -32602 "Session not found"
+    let deletes_before_missing = fake.deletes().len();
+    let missing_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_missing",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    let err = missing_res
+        .get("error")
+        .expect("expected error for missing session");
+    assert_eq!(
+        err.get("code").and_then(Value::as_i64),
+        Some(-32602),
+        "expected -32602 for missing session, got: {missing_res}"
+    );
+    assert!(
+        err.get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("Session not found: ses_missing"),
+        "expected 'Session not found: ses_missing', got: {missing_res}"
+    );
+    assert_eq!(
+        fake.deletes().len(),
+        deletes_before_missing + 1,
+        "missing session side connection must be deleted"
+    );
+    let state_after_missing = read_state(&h);
+    assert!(
+        state_after_missing.orphan_conns.is_empty(),
+        "orphan_conns must be empty after missing-session activation"
+    );
+
+    // Transient error from goose session/info (-32603) -> honkd answers -32603
+    fake.error_next_session_info(-32603, "transient error from goose");
+    let deletes_before_transient = fake.deletes().len();
+    let transient_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_transient",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    let transient_err = transient_res
+        .get("error")
+        .expect("expected error for transient session/info failure");
+    assert_eq!(
+        transient_err.get("code").and_then(Value::as_i64),
+        Some(-32603),
+        "expected -32603 for transient session/info failure, got: {transient_res}"
+    );
+    assert_eq!(
+        fake.deletes().len(),
+        deletes_before_transient + 1,
+        "transient error side connection must be deleted"
+    );
+    let state_after_transient = read_state(&h);
+    assert!(
+        state_after_transient.orphan_conns.is_empty(),
+        "orphan_conns must be empty after transient session/info failure"
+    );
+}

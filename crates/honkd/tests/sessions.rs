@@ -1,5 +1,6 @@
-use common::{Honkd, Viewer};
-use honk_testgoose::{FakeGoose, StubGoose};
+use common::{Honkd, Viewer, new_session, prompt_params};
+use honk_testgoose::{FakeGoose, StubGoose, Turn};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 mod common;
@@ -61,6 +62,7 @@ async fn session_new_passes_extension_results_verbatim_against_stub_goose() {
 #[tokio::test(flavor = "multi_thread")]
 async fn session_list_marks_held_true() {
     let fake = FakeGoose::start().await;
+    fake.insert_session("ses_unheld", "/tmp");
     let h = Honkd::spawn(
         &fake.url(),
         fake.secret_file(),
@@ -96,6 +98,291 @@ async fn session_list_marks_held_true() {
         .expect("created session found in session/list");
     assert_eq!(entry["_meta"]["honk"]["held"], true);
     assert_eq!(entry["_meta"]["honk"]["running"], false);
+
+    let unheld = sessions
+        .iter()
+        .find(|s| s["sessionId"] == "ses_unheld")
+        .expect("unheld session found in session/list");
+    assert_eq!(unheld["_meta"]["honk"]["held"], false);
+    assert_eq!(unheld["_meta"]["honk"]["running"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_list_reports_whether_session_is_running() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    // Prompt initial turn so goose commits session with messages
+    g.model().push([Turn::Text(vec!["init ok".into()])]);
+    let req0 = v
+        .request("session/prompt", prompt_params(&sid, "init", None))
+        .await;
+    let _ = v.response(&req0).await;
+
+    // Connect fresh viewer so its incoming frame buffer is empty
+    let mut v2 = Viewer::connect_pigeon(&h).await;
+
+    // 1. Before prompt 2: held is true, running is false
+    let list_res = v2.call("session/list", json!({})).await;
+    let sessions = list_res["result"]["sessions"].as_array().expect("sessions");
+    let entry = sessions
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .expect("session found");
+    assert_eq!(entry["_meta"]["honk"]["held"], true);
+    assert_eq!(entry["_meta"]["honk"]["running"], false);
+
+    // 2. Start prompt 2 (which triggers an active run parked at gate_running_test)
+    g.model().push([Turn::Gate(
+        "gate_running_test".into(),
+        Box::new(Turn::Text(vec!["done".into()])),
+    )]);
+    let p_req = v2
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test run", Some("crid_1")),
+        )
+        .await;
+
+    // Wait until run is active
+    v2.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // 3. While run is active: session/list must report running: true
+    let list_res_running = v2.call("session/list", json!({})).await;
+    let sessions_running = list_res_running["result"]["sessions"]
+        .as_array()
+        .expect("sessions");
+    let entry_running = sessions_running
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .expect("session found");
+    assert_eq!(entry_running["_meta"]["honk"]["held"], true);
+    assert_eq!(entry_running["_meta"]["honk"]["running"], true);
+
+    // 4. Release gate and wait for prompt completion
+    g.model().open("gate_running_test");
+    let _ = v2.response(&p_req).await;
+
+    // Wait until run ends (activeRunId is null)
+    v2.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .is_some_and(|v| v.is_null())
+    })
+    .await;
+
+    // 5. After run finishes: session/list must report running: false
+    let list_res_after = v2.call("session/list", json!({})).await;
+    let sessions_after = list_res_after["result"]["sessions"]
+        .as_array()
+        .expect("sessions");
+    let entry_after = sessions_after
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .expect("session found");
+    assert_eq!(entry_after["_meta"]["honk"]["held"], true);
+    assert_eq!(entry_after["_meta"]["honk"]["running"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_list_reports_running_during_inflight_window() {
+    let fake = FakeGoose::start().await;
+    // Delay activeRunId announcement so the in-flight window is prolonged
+    fake.set_run_announcement_delay(Some(std::time::Duration::from_millis(500)));
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    // Before prompt: running is false
+    let list_res = v.call("session/list", json!({})).await;
+    let entry = list_res["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry["_meta"]["honk"]["running"], false);
+
+    // Send prompt
+    let p_req = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "inflight test", Some("crid_inflight")),
+        )
+        .await;
+
+    // Immediately query session/list during the in-flight window (before run announcement)
+    let list_res_inflight = v.call("session/list", json!({})).await;
+    let entry_inflight = list_res_inflight["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(
+        entry_inflight["_meta"]["honk"]["running"], true,
+        "session must report running: true while prompt is in-flight before run announcement"
+    );
+
+    // Await prompt completion
+    let _ = v.response(&p_req).await;
+
+    // After completion: running is false
+    let list_res_done = v.call("session/list", json!({})).await;
+    let entry_done = list_res_done["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry_done["_meta"]["honk"]["running"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_list_running_clears_on_cancel() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Gate(
+        "gate_cancel_running".into(),
+        Box::new(Turn::Text(vec!["done".into()])),
+    )]);
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    let p_id = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test cancel gated", None),
+        )
+        .await;
+
+    // Wait until run is active
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // While run is active: session/list must report running: true
+    let list_res_active = v.call("session/list", json!({})).await;
+    let entry_active = list_res_active["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry_active["_meta"]["honk"]["running"], true);
+
+    // Cancel while turn is active
+    v.call("session/cancel", json!({ "sessionId": &sid })).await;
+    g.model().open("gate_cancel_running");
+
+    let p_resp = v.response(&p_id).await;
+    assert_eq!(p_resp["result"]["stopReason"], "cancelled");
+
+    // After cancel: session/list must report running: false
+    let list_res_after = v.call("session/list", json!({})).await;
+    let entry_after = list_res_after["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry_after["_meta"]["honk"]["running"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_list_running_clears_on_goose_restart() {
+    let Some(mut g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    g.model().push([Turn::Gate(
+        "gate_rst_running".into(),
+        Box::new(Turn::Text(vec!["never".into()])),
+    )]);
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    let id = v
+        .request("session/prompt", prompt_params(&sid, "first", Some("a")))
+        .await;
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId")
+                .and_then(Value::as_str)
+                .is_some()
+    })
+    .await;
+
+    // While run is active: session/list must report running: true
+    let list_res_active = v.call("session/list", json!({})).await;
+    let entry_active = list_res_active["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry_active["_meta"]["honk"]["running"], true);
+
+    // Wait until prompt reaches model
+    let wait_start = std::time::Instant::now();
+    while g.model().turn_requests().is_empty()
+        && wait_start.elapsed() < std::time::Duration::from_secs(2)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    g.restart().await;
+    let r = v
+        .response_timeout(&id, std::time::Duration::from_secs(15))
+        .await;
+    assert_eq!(r["result"]["stopReason"], "cancelled");
+
+    // After restart: session/list must report running: false
+    let list_res_after = v.call("session/list", json!({})).await;
+    let entry_after = list_res_after["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == sid)
+        .unwrap();
+    assert_eq!(entry_after["_meta"]["honk"]["running"], false);
 }
 
 #[tokio::test(flavor = "multi_thread")]

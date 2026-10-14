@@ -50,6 +50,7 @@ pub struct Hub {
     pub upstream_ids: Arc<Mutex<UpstreamIds>>,
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
+    pub running_sessions: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     pub self_weak: std::sync::RwLock<Option<std::sync::Weak<Hub>>>,
     pub activating: Arc<Mutex<HashMap<String, ActivatingReceiver>>>,
     pub evicting: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
@@ -206,6 +207,7 @@ impl Hub {
             upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            running_sessions: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             self_weak: std::sync::RwLock::new(None),
             activating: Arc::new(Mutex::new(HashMap::new())),
             evicting: Arc::new(Mutex::new(HashMap::new())),
@@ -627,26 +629,119 @@ impl Hub {
     }
 
     pub async fn get_stored_cwd(&self, sid: &str) -> Result<String, ActivationError> {
-        let list_res = self
-            .control_request("session/list", json!({}), json!(1))
-            .await
-            .map_err(|e| ActivationError {
+        let init_opts = UpstreamOpts {
+            allow_production: self.args.allow_production_upstream,
+            client_capabilities: serde_json::json!({
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            }),
+        };
+
+        let recorder = if let Some(rec_path) = &self.args.record {
+            let redactor = Redactor::from_env();
+            Recorder::file(rec_path, redactor).map_err(|e| ActivationError {
                 code: -32603,
-                message: format!("control session/list failed: {e:#}"),
-            })?;
+                message: format!("recorder init failed: {e:#}"),
+            })?
+        } else {
+            Recorder::disabled()
+        };
 
-        let sessions = list_res
-            .pointer("/result/sessions")
-            .and_then(Value::as_array);
-        let stored_cwd = sessions
-            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
-            .and_then(|s| s["cwd"].as_str())
-            .map(|s| s.to_string());
+        let mut side_up = Upstream::initialize_with(
+            &self.upstream_url,
+            self.upstream_secret.clone(),
+            recorder,
+            &init_opts,
+        )
+        .await
+        .map_err(|e| ActivationError {
+            code: -32603,
+            message: format!("failed to initialize session/info side connection: {e:#}"),
+        })?;
 
-        stored_cwd.ok_or_else(|| ActivationError {
-            code: -32602,
-            message: format!("Session not found: {sid}"),
-        })
+        let conn_id = side_up.conn_id().to_string();
+
+        let persist_res = {
+            let mut s = self.state.lock().await;
+            s.mutate(|st| {
+                st.orphan_conns.push(conn_id.clone());
+            })
+        };
+        if let Err(e) = persist_res {
+            let _ = side_up.delete().await;
+            return Err(ActivationError {
+                code: -32603,
+                message: format!("failed to record orphan conn: {e:#}"),
+            });
+        }
+
+        let info_result: Result<String, ActivationError> = async {
+            side_up
+                .subscribe_with(
+                    Some(sid),
+                    SubscribeOpts {
+                        takeover: false,
+                        resume_after: None,
+                    },
+                )
+                .await
+                .map_err(|e| ActivationError {
+                    code: -32603,
+                    message: format!("failed to subscribe session stream: {e:#}"),
+                })?;
+
+            let (_key, resp) = side_up
+                .call_full(
+                    "_goose/unstable/session/info",
+                    serde_json::json!({ "sessionId": sid }),
+                    Some(sid),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| ActivationError {
+                    code: -32603,
+                    message: format!("failed to call session/info: {e:#}"),
+                })?;
+
+            if let Some(err) = resp.get("error") {
+                let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                if code == -32002 {
+                    return Err(ActivationError {
+                        code: -32602,
+                        message: format!("Session not found: {sid}"),
+                    });
+                }
+                return Err(ActivationError {
+                    code: -32603,
+                    message: format!("session/info returned error: {err}"),
+                });
+            }
+
+            let cwd = resp
+                .pointer("/result/session/cwd")
+                .or_else(|| resp.pointer("/result/cwd"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| ActivationError {
+                    code: -32603,
+                    message: "session/info reply has no cwd".into(),
+                })?;
+
+            Ok(cwd)
+        }
+        .await;
+
+        if side_up.delete().await.is_ok() {
+            let mut s = self.state.lock().await;
+            let _ = s.mutate(|st| {
+                st.orphan_conns.retain(|c| c != &conn_id);
+            });
+        }
+
+        info_result
     }
 
     pub async fn control_request(
@@ -706,7 +801,7 @@ impl Hub {
                 for entry in sessions_arr {
                     let sid = entry.get("sessionId").and_then(Value::as_str).unwrap_or("");
                     let is_held = held_sids.contains(sid);
-                    let is_running = self.is_session_running(sid);
+                    let is_running = is_held && self.is_session_running(sid);
                     if let Some(meta_obj) = entry.get_mut("_meta").and_then(Value::as_object_mut) {
                         meta_obj.insert(
                             "honk".to_string(),
@@ -727,9 +822,21 @@ impl Hub {
         Ok(resp)
     }
 
-    pub fn is_session_running(&self, _sid: &str) -> bool {
-        // Wired for actor lookup in A9; returns false for now
-        false
+    pub fn set_session_running(&self, sid: &str, running: bool) {
+        if let Ok(mut set) = self.running_sessions.write() {
+            if running {
+                set.insert(sid.to_string());
+            } else {
+                set.remove(sid);
+            }
+        }
+    }
+
+    pub fn is_session_running(&self, sid: &str) -> bool {
+        self.running_sessions
+            .read()
+            .map(|set| set.contains(sid))
+            .unwrap_or(false)
     }
 
     pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
@@ -763,11 +870,15 @@ impl Hub {
         let conn_id = side_up.conn_id().to_string();
 
         // 1. Persist orphan first
-        {
+        let persist_res = {
             let mut s = self.state.lock().await;
             s.mutate(|st| {
                 st.orphan_conns.push(conn_id.clone());
-            })?;
+            })
+        };
+        if let Err(e) = persist_res {
+            let _ = side_up.delete().await;
+            return Err(e).context("failed to record orphan conn before first use");
         }
 
         // Guaranteed cleanup on every path after initialize
@@ -806,9 +917,8 @@ impl Hub {
         }
         .await;
 
-        // Guaranteed cleanup: DELETE + orphan removal
-        let _ = side_up.delete().await;
-        {
+        // Guaranteed cleanup: DELETE + orphan removal (only if delete succeeds)
+        if side_up.delete().await.is_ok() {
             let mut s = self.state.lock().await;
             let _ = s.mutate(|st| {
                 st.orphan_conns.retain(|id| id != &conn_id);
