@@ -767,6 +767,16 @@ async fn test_scenario_e_interrupt_own_vs_foreign() {
     handle.send(UiCommand::Shutdown).expect("send shutdown");
 
     // --- Part 2: Interrupt during foreign turn -> not cancelled ---
+    // Fresh goose + honkd: the cancelled part-1 turn can leave goose making
+    // further model calls that would consume part 2's gate, letting the
+    // "foreign" turn end before the interrupt arrives (seen as a CI flake).
+    drop(h);
+    drop(g);
+    let Some(g) = StubGoose::start_or_skip().await else {
+        eprintln!("skipping test: StubGoose unset");
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
     g.model().push([Turn::Gate(
         "gate_foreign_cancel".into(),
         Box::new(Turn::Text(vec!["foreign completed successfully".into()])),
@@ -839,19 +849,24 @@ async fn test_scenario_e_interrupt_own_vs_foreign() {
 
     // Expect notice saying "another client" / "/cancel!"
     let mut notice_received = false;
+    let mut seen_notices: Vec<String> = Vec::new();
     let n_wait = std::time::Instant::now();
     while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(5), rx2.recv()).await {
-        if let UiEvent::Notice(n) = evt
-            && (n.text.contains("another client") || n.text.contains("/cancel!"))
-        {
-            notice_received = true;
-            break;
+        if let UiEvent::Notice(n) = evt {
+            if n.text.contains("another client") || n.text.contains("/cancel!") {
+                notice_received = true;
+                break;
+            }
+            seen_notices.push(n.text.clone());
         }
         if n_wait.elapsed() > Duration::from_secs(5) {
             break;
         }
     }
-    assert!(notice_received, "should receive notice refusing cancel");
+    assert!(
+        notice_received,
+        "should receive notice refusing cancel; other notices: {seen_notices:?}"
+    );
 
     // Open gate on goose: foreign turn completes normally
     g.model().open("gate_foreign_cancel");
