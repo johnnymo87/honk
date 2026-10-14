@@ -83,6 +83,7 @@ connection's replay ring (honkd rule I1).
 | Outcome | Examples | Effect |
 |---|---|---|
 | `CoordinatorBusy` (exists) | Lock busy; honkd busy `-32602` (a human turn is running) | Skip; retried next tick; not a failure |
+| Activation "Session not found" | Activation `-32602 "Session not found: <sid>"` (same code as busy; client must match on message) | If session exists in goose DB, treat as `TransportUnavailable` and alert, not rotate |
 | **`TransportUnavailable`** (new) | honkd down or refusing; `held-session limit reached`; goose restarting (`-32004`, 404); activation or load timeout; deadline hit while honkd is unreachable | Skip; not counted toward rotation; separate alert after N consecutive |
 | `CoordinatorError` (exists) | Output parse failure; schema-invalid output; recipe render error; tool guard failed | Counted; rotation after 2 as today |
 
