@@ -114,6 +114,7 @@ pub enum Ownership {
 pub struct ChatOpts {
     pub crid_seed: u64,
     pub idle_timeout: Option<Duration>,
+    pub max_turns: Option<u32>,
 }
 
 impl Default for ChatOpts {
@@ -121,6 +122,7 @@ impl Default for ChatOpts {
         Self {
             crid_seed: 0,
             idle_timeout: Some(Duration::from_secs(30 * 60)),
+            max_turns: None,
         }
     }
 }

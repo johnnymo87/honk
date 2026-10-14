@@ -154,6 +154,10 @@ impl ChatCore {
         &self.local_queue
     }
 
+    pub fn max_turns(&self) -> Option<u32> {
+        self.opts.max_turns
+    }
+
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
         let mut effects = Vec::new();
         match input {
@@ -286,14 +290,19 @@ impl ChatCore {
         );
         let req_id = self.allocate_id();
 
+        let mut meta = json!({
+            "honk": {
+                "client_req_id": crid
+            }
+        });
+        if let Some(max_turns) = self.opts.max_turns {
+            meta["goose"] = json!({ "maxTurns": max_turns });
+        }
+
         let params = json!({
             "sessionId": self.session_id,
             "prompt": [{"type": "text", "text": text}],
-            "_meta": {
-                "honk": {
-                    "client_req_id": crid
-                }
-            }
+            "_meta": meta
         });
 
         self.prompt_sent = Some(PromptSent {
@@ -807,14 +816,19 @@ impl ChatCore {
             let p = self.prompt_sent.as_mut().unwrap();
             p.req_id = req_id;
 
+            let mut meta = json!({
+                "honk": {
+                    "client_req_id": p.crid
+                }
+            });
+            if let Some(max_turns) = self.opts.max_turns {
+                meta["goose"] = json!({ "maxTurns": max_turns });
+            }
+
             let params = json!({
                 "sessionId": self.session_id,
                 "prompt": [{"type": "text", "text": p.text}],
-                "_meta": {
-                    "honk": {
-                        "client_req_id": p.crid
-                    }
-                }
+                "_meta": meta
             });
             effects.push(Effect::Request {
                 id: req_id,

@@ -28,6 +28,7 @@ pub struct DriverOpts {
     pub target: Target,
     pub crid_seed: Option<u64>,
     pub idle_timeout: Option<Duration>,
+    pub max_turns: Option<u32>,
 }
 
 impl DriverOpts {
@@ -38,6 +39,7 @@ impl DriverOpts {
             target,
             crid_seed: None,
             idle_timeout: None,
+            max_turns: None,
         }
     }
 }
@@ -428,6 +430,7 @@ async fn run_driver(
     let chat_opts = ChatOpts {
         crid_seed,
         idle_timeout: opts.idle_timeout,
+        max_turns: opts.max_turns,
     };
 
     let mut core = match opts.target.clone() {
