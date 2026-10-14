@@ -664,15 +664,18 @@ impl Hub {
 
         let conn_id = side_up.conn_id().to_string();
 
-        {
+        let persist_res = {
             let mut s = self.state.lock().await;
             s.mutate(|st| {
                 st.orphan_conns.push(conn_id.clone());
             })
-            .map_err(|e| ActivationError {
+        };
+        if let Err(e) = persist_res {
+            let _ = side_up.delete().await;
+            return Err(ActivationError {
                 code: -32603,
                 message: format!("failed to record orphan conn: {e:#}"),
-            })?;
+            });
         }
 
         let info_result: Result<String, ActivationError> = async {
@@ -698,30 +701,14 @@ impl Hub {
                     Duration::from_secs(30),
                 )
                 .await
-                .map_err(|e| {
-                    let err_str = e.to_string();
-                    if err_str.contains("Session not found") || err_str.contains("-32002") {
-                        ActivationError {
-                            code: -32602,
-                            message: format!("Session not found: {sid}"),
-                        }
-                    } else {
-                        ActivationError {
-                            code: -32603,
-                            message: format!("failed to call session/info: {e:#}"),
-                        }
-                    }
+                .map_err(|e| ActivationError {
+                    code: -32603,
+                    message: format!("failed to call session/info: {e:#}"),
                 })?;
 
             if let Some(err) = resp.get("error") {
-                let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
-                let data = err.get("data").and_then(Value::as_str).unwrap_or("");
                 let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-                if code == -32602
-                    || code == -32002
-                    || msg.contains("Session not found")
-                    || data.contains("Session not found")
-                {
+                if code == -32002 {
                     return Err(ActivationError {
                         code: -32602,
                         message: format!("Session not found: {sid}"),
@@ -739,16 +726,15 @@ impl Hub {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| ActivationError {
-                    code: -32602,
-                    message: format!("Session not found: {sid}"),
+                    code: -32603,
+                    message: "session/info reply has no cwd".into(),
                 })?;
 
             Ok(cwd)
         }
         .await;
 
-        let _ = side_up.delete().await;
-        {
+        if side_up.delete().await.is_ok() {
             let mut s = self.state.lock().await;
             let _ = s.mutate(|st| {
                 st.orphan_conns.retain(|c| c != &conn_id);
@@ -884,11 +870,15 @@ impl Hub {
         let conn_id = side_up.conn_id().to_string();
 
         // 1. Persist orphan first
-        {
+        let persist_res = {
             let mut s = self.state.lock().await;
             s.mutate(|st| {
                 st.orphan_conns.push(conn_id.clone());
-            })?;
+            })
+        };
+        if let Err(e) = persist_res {
+            let _ = side_up.delete().await;
+            return Err(e).context("failed to record orphan conn before first use");
         }
 
         // Guaranteed cleanup on every path after initialize
@@ -927,9 +917,8 @@ impl Hub {
         }
         .await;
 
-        // Guaranteed cleanup: DELETE + orphan removal
-        let _ = side_up.delete().await;
-        {
+        // Guaranteed cleanup: DELETE + orphan removal (only if delete succeeds)
+        if side_up.delete().await.is_ok() {
             let mut s = self.state.lock().await;
             let _ = s.mutate(|st| {
                 st.orphan_conns.retain(|id| id != &conn_id);

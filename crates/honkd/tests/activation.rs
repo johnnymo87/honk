@@ -927,7 +927,19 @@ async fn activation_finds_stored_cwd_via_session_info() {
         "session/info must be called in exactly one call"
     );
 
+    // Side connection must be deleted and orphan_conns must be empty
+    assert!(
+        !fake.deletes().is_empty(),
+        "side connection id must appear in FakeGoose deletes"
+    );
+    let state_after_old = read_state(&h);
+    assert!(
+        state_after_old.orphan_conns.is_empty(),
+        "orphan_conns must be empty after successful activation"
+    );
+
     // Loading a truly missing session must fail with -32602 "Session not found"
+    let deletes_before_missing = fake.deletes().len();
     let missing_res = v
         .call(
             "session/load",
@@ -952,5 +964,47 @@ async fn activation_finds_stored_cwd_via_session_info() {
             .unwrap_or("")
             .contains("Session not found: ses_missing"),
         "expected 'Session not found: ses_missing', got: {missing_res}"
+    );
+    assert_eq!(
+        fake.deletes().len(),
+        deletes_before_missing + 1,
+        "missing session side connection must be deleted"
+    );
+    let state_after_missing = read_state(&h);
+    assert!(
+        state_after_missing.orphan_conns.is_empty(),
+        "orphan_conns must be empty after missing-session activation"
+    );
+
+    // Transient error from goose session/info (-32603) -> honkd answers -32603
+    fake.error_next_session_info(-32603, "transient error from goose");
+    let deletes_before_transient = fake.deletes().len();
+    let transient_res = v
+        .call(
+            "session/load",
+            json!({
+                "sessionId": "ses_transient",
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+    let transient_err = transient_res
+        .get("error")
+        .expect("expected error for transient session/info failure");
+    assert_eq!(
+        transient_err.get("code").and_then(Value::as_i64),
+        Some(-32603),
+        "expected -32603 for transient session/info failure, got: {transient_res}"
+    );
+    assert_eq!(
+        fake.deletes().len(),
+        deletes_before_transient + 1,
+        "transient error side connection must be deleted"
+    );
+    let state_after_transient = read_state(&h);
+    assert!(
+        state_after_transient.orphan_conns.is_empty(),
+        "orphan_conns must be empty after transient session/info failure"
     );
 }

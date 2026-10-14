@@ -165,6 +165,7 @@ struct FakeGooseInner {
     export_delay: Mutex<Option<Duration>>,
     run_announcement_delay: Mutex<Option<Duration>>,
     export_commit_delay: Mutex<Option<Duration>>,
+    session_info_error: Mutex<Option<(i64, String)>>,
 }
 
 pub struct FakeGoose {
@@ -216,6 +217,7 @@ impl FakeGoose {
             export_delay: Mutex::new(None),
             run_announcement_delay: Mutex::new(None),
             export_commit_delay: Mutex::new(None),
+            session_info_error: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -406,6 +408,10 @@ impl FakeGoose {
 
     pub fn set_export_commit_delay(&self, delay: Option<Duration>) {
         *self.state.export_commit_delay.lock().unwrap() = delay;
+    }
+
+    pub fn error_next_session_info(&self, code: i64, message: &str) {
+        *self.state.session_info_error.lock().unwrap() = Some((code, message.to_string()));
     }
 
     pub fn received_prompts(&self, sid: &str) -> Vec<Value> {
@@ -723,6 +729,7 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("_goose/unstable/session/info") => {
+            let injected_error = state.session_info_error.lock().unwrap().take();
             let target_sid = target_session.clone().or_else(|| {
                 frame
                     .pointer("/params/sessionId")
@@ -737,28 +744,40 @@ async fn handle_post(
             if let Some(conn) = conns.get_mut(&conn_id)
                 && let Some(id) = req_id
             {
-                let resp = match cwd_opt {
-                    Some(cwd) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "session": {
-                                "sessionId": sid,
-                                "cwd": cwd,
-                                "title": Value::Null,
-                                "updatedAt": Value::Null
-                            }
-                        }
-                    }),
-                    None => json!({
+                let resp = if let Some((code, msg)) = injected_error {
+                    json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "error": {
-                            "code": -32002,
-                            "message": format!("Session not found: {sid}"),
-                            "data": format!("Session not found: {sid}")
+                            "code": code,
+                            "message": msg,
+                            "data": msg
                         }
-                    }),
+                    })
+                } else {
+                    match cwd_opt {
+                        Some(cwd) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "session": {
+                                    "sessionId": sid,
+                                    "cwd": cwd,
+                                    "title": Value::Null,
+                                    "updatedAt": Value::Null
+                                }
+                            }
+                        }),
+                        None => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32002,
+                                "message": format!("Session not found: {sid}"),
+                                "data": format!("Session not found: {sid}")
+                            }
+                        }),
+                    }
                 };
                 if let Some(target) = &target_session {
                     let stream = conn
