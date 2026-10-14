@@ -114,10 +114,11 @@ failures may lead to it.
 - **Usage deltas** per wake include any chat turns since the last wake. That is
   acceptable: it is still the coordinator's spend.
 - **Held-session cap.** honkd holds at most `--max-sessions` sessions (default
-  16, production 16, no LRU in M1a). Each wake holds a session for 15 minutes
-  idle TTL, and about 20 coordinators plus pigeon and chat share the cap. Raise it
-  in production to 48 before the switch. A goose session costs about 0.5–1.7 MB
-  and 9–12 threads. Hitting the cap is `TransportUnavailable`, not a failure.
+  64 since the chat-client release; it was 16 in M1a; no LRU yet). Each wake
+  holds a session for the 15-minute idle TTL, and about 20 coordinators plus
+  pigeon and chat share the cap, which the default covers. A goose session costs
+  about 0.5–1.7 MB and 9–12 threads. Hitting the cap is `TransportUnavailable`,
+  not a failure.
 
 ### 3.3 Migration: adopt, don't rotate
 
@@ -195,8 +196,8 @@ Alternatives considered:
    against a fake honkd. Live test against a throwaway honkd on the patched
    sandbox with a cheap model.
 3. **Adoption dry run** (§3.3).
-4. **Production:** honkd `--max-sessions 48` (restart author-gated), then the
-   goose deploy, then the switch. Watch two ticks: `honk tail` on one
+4. **Production:** deploy goose and the honkd with the lookup fix (restarts
+   author-gated), then the switch. Watch two ticks: `honk tail` on one
    coordinator, cache reads and cost in the spend report.
 5. **Chat:** the chat client's queue-when-not-mine rule must be in place before
    the author chats into coordinator sessions. Until then, watch only.
