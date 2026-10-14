@@ -72,10 +72,10 @@ The user interface consists of three distinct vertical areas:
 
 1. **Transcript Pane** (top):
    - Renders session turns chronologically.
-   - **User messages**: labeled user turns.
-   - **Assistant messages**: markdown rendered with syntax highlighting and newline-gated streaming (committed lines are rendered as markdown, while the trailing in-flight chunk is displayed cleanly).
+   - **User messages**: labeled user turns (`> text`). Consecutive identical user messages automatically collapse into a single line with a `×N` suffix. When a user message's full content parses as a JSON object or array (such as recipe or coordinator wake payloads), it renders collapsed by default to a single dim summary line (e.g. `▸ structured input · program=example-program · wake_reason=activity · 18 KB`); `zj` or `:json` toggles full structural expansion.
+   - **Assistant messages**: markdown rendered with syntax highlighting and newline-gated streaming. When the response parses as a JSON object or array, it renders structurally: top-level keys appear as bold/dim labels, string values are unescaped and rendered as markdown, string arrays appear as bullet lists, arrays of objects appear as indented sub-blocks, inline scalars appear beside keys, and empty strings/arrays/objects are omitted. In-progress streaming JSON displays `◌ receiving structured reply (N KB)…` until the full object arrives.
    - **Thinking blocks**: internal model reasoning, displayed dim and collapsed to a single line by default (`zt` toggles full visibility).
-   - **Tool calls**: compact status row displaying the glyph, title, and live tool notification output (`za` toggles full input/output view).
+   - **Tool calls**: compact status row displaying the glyph, title (formatted with recognizable command/path details such as `shell · ls` or `write · notes.md`), and live tool notification output (`za` toggles full input/output view). Tools ending in `final_output` (e.g. `recipe__final_output`) render as a dim one-liner `◆ final output` without dumping duplicate inputs.
    - **Honk notices**: informational and warning notices (e.g. queue state, extension warnings).
 
 2. **Status Bar** (single row):
@@ -121,6 +121,7 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `G` (Shift-G) | Scroll to bottom of transcript (when composer is empty). |
 | `z a` | Toggle tool call expansion (expand/collapse tool arguments and outputs). |
 | `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
+| `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
 | `Ctrl-C` | If idle and composer has text: clears composer. Otherwise: interrupts active turn (`Action::Interrupt`). |
@@ -151,6 +152,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
+| — | `:json` | Toggle JSON payload expansion (`zj`). |
 | `//text` | — | Escape sequence: sends literal `/text` as a user message instead of parsing as a command. |
 
 ---

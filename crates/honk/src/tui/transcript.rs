@@ -42,6 +42,7 @@ pub struct Block {
 pub struct ExpansionFlags {
     pub thoughts: bool,
     pub tools: bool,
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -71,6 +72,8 @@ pub struct Transcript {
     pub block_indices: HashMap<BlockKey, usize>,
     pub thoughts_expanded: bool,
     pub tools_expanded: bool,
+    pub json_expanded: bool,
+    pub active_run: Option<String>,
     pub layout_cache: HashMap<LayoutKey, CachedBlock>,
     pub render_count: usize,
     last_width: Option<u16>,
@@ -96,6 +99,8 @@ impl Transcript {
             block_indices: HashMap::new(),
             thoughts_expanded: false,
             tools_expanded: false,
+            json_expanded: false,
+            active_run: None,
             layout_cache: HashMap::new(),
             render_count: 0,
             last_width: None,
@@ -122,6 +127,8 @@ impl Transcript {
                 let mut fresh = Transcript::new();
                 fresh.thoughts_expanded = self.thoughts_expanded;
                 fresh.tools_expanded = self.tools_expanded;
+                fresh.json_expanded = self.json_expanded;
+                fresh.active_run = self.active_run.clone();
                 fresh.next_notice_id = self.next_notice_id;
                 self.pending_rebuild = Some(Box::new(fresh));
                 false
@@ -165,24 +172,37 @@ impl Transcript {
             return;
         };
 
-        if let Some(state) = honk_wire::run_state(u)
-            && state.is_none()
-        {
-            // Run ended (activeRunId null): mark any pending/in-progress tool blocks as interrupted
-            let mut first_modified = None;
-            for (idx, b) in self.blocks.iter_mut().enumerate() {
-                if b.kind == BlockKind::Tool
-                    && (b.status == "pending" || b.status == "in_progress" || b.status.is_empty())
-                {
-                    b.status = "interrupted".to_string();
-                    b.revision += 1;
-                    if first_modified.is_none() {
-                        first_modified = Some(idx);
+        if let Some(state) = honk_wire::run_state(u) {
+            self.active_run = state;
+            if self.active_run.is_none() {
+                // Run ended (activeRunId null): mark any pending/in-progress tool blocks as interrupted
+                let mut first_modified = None;
+                for (idx, b) in self.blocks.iter_mut().enumerate() {
+                    if b.kind == BlockKind::Tool
+                        && (b.status == "pending"
+                            || b.status == "in_progress"
+                            || b.status.is_empty())
+                    {
+                        b.status = "interrupted".to_string();
+                        b.revision += 1;
+                        if first_modified.is_none() {
+                            first_modified = Some(idx);
+                        }
                     }
                 }
-            }
-            if let Some(idx) = first_modified {
-                self.invalidate_prefix_sums_from(idx);
+                // Invalidate the last assistant block if any, so streaming placeholder flips to markdown
+                if let Some(last_ast_idx) = self
+                    .blocks
+                    .iter()
+                    .rposition(|b| b.kind == BlockKind::Assistant)
+                {
+                    self.blocks[last_ast_idx].revision += 1;
+                    first_modified =
+                        Some(first_modified.map_or(last_ast_idx, |m| m.min(last_ast_idx)));
+                }
+                if let Some(idx) = first_modified {
+                    self.invalidate_prefix_sums_from(idx);
+                }
             }
         }
 
@@ -219,12 +239,11 @@ impl Transcript {
         };
 
         self.invalidate_prefix_sums_from(idx);
-
-        let block = &mut self.blocks[idx];
-        block.revision += 1;
+        self.blocks[idx].revision += 1;
 
         match &key {
             BlockKey::Tool(_) => {
+                let block = &mut self.blocks[idx];
                 if let Some(t) = u.get("title").and_then(Value::as_str) {
                     block.title = t.to_string();
                 }
@@ -233,6 +252,10 @@ impl Transcript {
                 }
                 if let Some(raw_in) = u.get("rawInput") {
                     block.input_text = extract_input_text(raw_in);
+                    if !block.title.contains(" · ") && !block.title.is_empty() {
+                        block.title =
+                            honk_wire::export::format_tool_title(&block.title, Some(raw_in));
+                    }
                 }
                 if let Some(out) = extract_output_text(u) {
                     if !block.output_text.is_empty() && !out.is_empty() {
@@ -245,8 +268,47 @@ impl Transcript {
                 }
             }
             _ => {
+                let is_user = self.blocks[idx].kind == BlockKind::User;
+                let prev_run_start = if is_user
+                    && idx > 0
+                    && self.blocks[idx - 1].kind == BlockKind::User
+                    && self.blocks[idx - 1].text == self.blocks[idx].text
+                {
+                    let mut f = idx - 1;
+                    while f > 0
+                        && self.blocks[f - 1].kind == BlockKind::User
+                        && self.blocks[f - 1].text == self.blocks[idx].text
+                    {
+                        f -= 1;
+                    }
+                    Some(f)
+                } else {
+                    None
+                };
+
                 if let Some(t) = honk_wire::text_of(u) {
-                    block.text.push_str(t);
+                    self.blocks[idx].text.push_str(t);
+                }
+
+                if is_user {
+                    if let Some(prs) = prev_run_start
+                        && self.blocks[prs].text != self.blocks[idx].text
+                    {
+                        self.blocks[prs].revision += 1;
+                        self.invalidate_prefix_sums_from(prs);
+                    }
+
+                    let mut first_idx = idx;
+                    while first_idx > 0
+                        && self.blocks[first_idx - 1].kind == BlockKind::User
+                        && self.blocks[first_idx - 1].text == self.blocks[idx].text
+                    {
+                        first_idx -= 1;
+                    }
+                    if first_idx != idx {
+                        self.blocks[first_idx].revision += 1;
+                        self.invalidate_prefix_sums_from(first_idx);
+                    }
                 }
             }
         }
@@ -363,6 +425,11 @@ impl Transcript {
         self.cached_prefix_sums = None;
     }
 
+    pub fn toggle_json(&mut self) {
+        self.json_expanded = !self.json_expanded;
+        self.cached_prefix_sums = None;
+    }
+
     pub fn render_block(&mut self, block_idx: usize, width: u16) -> Arc<[Line<'static>]> {
         if block_idx >= self.blocks.len() {
             return Arc::new([]);
@@ -371,6 +438,7 @@ impl Transcript {
         let flags = ExpansionFlags {
             thoughts: self.thoughts_expanded,
             tools: self.tools_expanded,
+            json: self.json_expanded,
         };
         let key = LayoutKey {
             key: block.key.clone(),
@@ -393,15 +461,36 @@ impl Transcript {
 
         self.render_count += 1;
 
+        let is_streaming = self.active_run.is_some() && block_idx == self.blocks.len() - 1;
+
         let mut lines_vec = match block.kind {
-            BlockKind::User => render_user(&block.text, width),
-            BlockKind::Assistant => render_assistant(&block.text, width),
+            BlockKind::User => {
+                if block_idx > 0
+                    && self.blocks[block_idx - 1].kind == BlockKind::User
+                    && self.blocks[block_idx - 1].text == block.text
+                {
+                    Vec::new()
+                } else {
+                    let mut count = 1;
+                    while block_idx + count < self.blocks.len()
+                        && self.blocks[block_idx + count].kind == BlockKind::User
+                        && self.blocks[block_idx + count].text == block.text
+                    {
+                        count += 1;
+                    }
+                    render_user(&block.text, count, self.json_expanded, width)
+                }
+            }
+            BlockKind::Assistant => render_assistant(&block.text, is_streaming, width),
             BlockKind::Thought => render_thought(&block.text, self.thoughts_expanded, width),
             BlockKind::Tool => render_tool(block, self.tools_expanded, width),
             BlockKind::Notice => render_notice(block, width),
         };
 
-        if block_idx > 0 && needs_separator(self.blocks[block_idx - 1].kind, block.kind) {
+        if !lines_vec.is_empty()
+            && block_idx > 0
+            && needs_separator(self.blocks[block_idx - 1].kind, block.kind)
+        {
             lines_vec.insert(0, Line::raw(""));
         }
 
@@ -429,6 +518,7 @@ impl Transcript {
             flags: ExpansionFlags {
                 thoughts: self.thoughts_expanded,
                 tools: self.tools_expanded,
+                json: self.json_expanded,
             },
         };
 
@@ -447,6 +537,7 @@ impl Transcript {
         let flags = ExpansionFlags {
             thoughts: self.thoughts_expanded,
             tools: self.tools_expanded,
+            json: self.json_expanded,
         };
         let n_blocks = self.blocks.len();
         let (valid_up_to, start_sum) = match &self.cached_prefix_sums {
@@ -496,10 +587,27 @@ impl Transcript {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        for b in &self.blocks {
+        for (i, b) in self.blocks.iter().enumerate() {
             match b.kind {
                 BlockKind::User => {
-                    out.push_str("## User\n\n");
+                    let is_dup = i > 0
+                        && self.blocks[i - 1].kind == BlockKind::User
+                        && self.blocks[i - 1].text == b.text;
+                    if is_dup {
+                        continue;
+                    }
+                    let mut count = 1;
+                    while i + count < self.blocks.len()
+                        && self.blocks[i + count].kind == BlockKind::User
+                        && self.blocks[i + count].text == b.text
+                    {
+                        count += 1;
+                    }
+                    if count > 1 {
+                        out.push_str(&format!("## User (×{count})\n\n"));
+                    } else {
+                        out.push_str("## User\n\n");
+                    }
                     out.push_str(&b.text);
                     if !b.text.ends_with('\n') {
                         out.push('\n');
@@ -646,7 +754,77 @@ struct Token {
     width: usize,
 }
 
+fn detect_hanging_indent(line: &Line) -> usize {
+    if line.spans.is_empty() {
+        return 0;
+    }
+
+    let mut span_idx = 0;
+    let mut base = 0;
+
+    // Check for user prompt prefix ("> " or "  ")
+    if let Some(first) = line.spans.first()
+        && (first.content == "> "
+            || (first.content == "  "
+                && line.spans.len() > 1
+                && (line.spans[1].content.ends_with(": ")
+                    || line.spans[1].content.starts_with("• "))))
+    {
+        base = 2;
+        span_idx = 1;
+    }
+
+    if span_idx >= line.spans.len() {
+        return base;
+    }
+
+    let first_text = line.spans[span_idx].content.as_ref();
+
+    // Bullets
+    if first_text.starts_with("  • ") {
+        return base + 4;
+    }
+    if first_text.starts_with("    • ") {
+        return base + 6;
+    }
+    if first_text.starts_with("      • ") {
+        return base + 8;
+    }
+    if first_text.starts_with("• ") {
+        return base + 2;
+    }
+
+    // Key: value lines (e.g. "key: ")
+    if first_text.ends_with(": ") {
+        return base + unicode_width::UnicodeWidthStr::width(first_text);
+    }
+
+    // Indented sub-block markers
+    if first_text == "  - " || first_text == "    " || first_text == "  " || first_text == "      "
+    {
+        let lead_w = unicode_width::UnicodeWidthStr::width(first_text);
+        if span_idx + 1 < line.spans.len() {
+            let second_text = line.spans[span_idx + 1].content.as_ref();
+            if second_text.ends_with(": ") {
+                return base + lead_w + unicode_width::UnicodeWidthStr::width(second_text);
+            }
+        }
+        return base + lead_w;
+    }
+
+    base
+}
+
 pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let hanging_indent = detect_hanging_indent(&line);
+    wrap_line_with_indent(line, width, hanging_indent)
+}
+
+pub fn wrap_line_with_indent(
+    line: Line<'static>,
+    width: usize,
+    hanging_indent: usize,
+) -> Vec<Line<'static>> {
     let line_style = line.style;
     let max_width = width.max(1);
     let total_width: usize = line
@@ -658,6 +836,13 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     if total_width <= max_width && !line.spans.iter().any(|s| s.content.contains('\n')) {
         return vec![line];
     }
+
+    let hanging_indent = hanging_indent.min(max_width.saturating_sub(10));
+    let indent_span = if hanging_indent > 0 {
+        Some(Span::raw(" ".repeat(hanging_indent)))
+    } else {
+        None
+    };
 
     // Tokenize
     let mut tokens: Vec<Token> = Vec::new();
@@ -758,6 +943,8 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                     current_spans.push(Span::styled(token.text, token.style));
                     current_width += token.width;
                 }
+            } else if current_width == hanging_indent && !is_start_of_original_line {
+                // Ignore inter-word whitespace right at the wrap boundary of continuation line
             } else if current_width + token.width <= max_width {
                 current_spans.push(Span::styled(token.text, token.style));
                 current_width += token.width;
@@ -765,25 +952,48 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 let mut l = Line::from(std::mem::take(&mut current_spans));
                 l.style = line_style;
                 result.push(l);
-                current_width = 0;
+                if let Some(ref ind) = indent_span {
+                    current_spans.push(ind.clone());
+                    current_width = hanging_indent;
+                } else {
+                    current_width = 0;
+                }
             }
             continue;
         }
 
         // Non-whitespace
         is_start_of_original_line = false;
+        if current_width == 0
+            && hanging_indent > 0
+            && !result.is_empty()
+            && let Some(ref ind) = indent_span
+        {
+            current_spans.push(ind.clone());
+            current_width = hanging_indent;
+        }
+
         if current_width + token.width <= max_width {
             current_spans.push(Span::styled(token.text, token.style));
             current_width += token.width;
         } else {
-            if current_width > 0 {
+            if current_width > 0 && (current_width > hanging_indent || result.is_empty()) {
                 let mut l = Line::from(std::mem::take(&mut current_spans));
                 l.style = line_style;
                 result.push(l);
                 current_width = 0;
             }
 
-            if token.width <= max_width {
+            if current_width == 0
+                && hanging_indent > 0
+                && !result.is_empty()
+                && let Some(ref ind) = indent_span
+            {
+                current_spans.push(ind.clone());
+                current_width = hanging_indent;
+            }
+
+            if current_width + token.width <= max_width {
                 current_spans.push(Span::styled(token.text, token.style));
                 current_width += token.width;
             } else {
@@ -797,7 +1007,12 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                         let mut l = Line::from(std::mem::take(&mut current_spans));
                         l.style = line_style;
                         result.push(l);
-                        current_width = 0;
+                        if let Some(ref ind) = indent_span {
+                            current_spans.push(ind.clone());
+                            current_width = hanging_indent;
+                        } else {
+                            current_width = 0;
+                        }
                         continue;
                     }
                     let mut chunk = String::new();
@@ -825,17 +1040,26 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
                         let mut l = Line::from(std::mem::take(&mut current_spans));
                         l.style = line_style;
                         result.push(l);
-                        current_width = 0;
+                        if let Some(ref ind) = indent_span {
+                            current_spans.push(ind.clone());
+                            current_width = hanging_indent;
+                        } else {
+                            current_width = 0;
+                        }
                     }
                 }
             }
         }
     }
 
-    if !current_spans.is_empty() || result.is_empty() {
-        let mut l = Line::from(current_spans);
-        l.style = line_style;
-        result.push(l);
+    if !current_spans.is_empty() {
+        let is_only_hanging_indent =
+            hanging_indent > 0 && current_width == hanging_indent && current_spans.len() == 1;
+        if !is_only_hanging_indent || result.is_empty() {
+            let mut l = Line::from(current_spans);
+            l.style = line_style;
+            result.push(l);
+        }
     }
 
     result
@@ -853,23 +1077,654 @@ fn needs_separator(prev_kind: BlockKind, curr_kind: BlockKind) -> bool {
     true
 }
 
-fn render_user(raw: &str, width: u16) -> Vec<Line<'static>> {
+#[derive(Clone, Debug, PartialEq)]
+pub enum OrderedValue {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<OrderedValue>),
+    Object(indexmap::IndexMap<String, OrderedValue>),
+}
+
+impl OrderedValue {
+    pub fn is_object(&self) -> bool {
+        matches!(self, OrderedValue::Object(_))
+    }
+    pub fn is_array(&self) -> bool {
+        matches!(self, OrderedValue::Array(_))
+    }
+    pub fn as_object(&self) -> Option<&indexmap::IndexMap<String, OrderedValue>> {
+        match self {
+            OrderedValue::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+    pub fn as_array(&self) -> Option<&[OrderedValue]> {
+        match self {
+            OrderedValue::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            OrderedValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OrderedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderedValue::Null => write!(f, "null"),
+            OrderedValue::Bool(b) => write!(f, "{b}"),
+            OrderedValue::Number(n) => write!(f, "{n}"),
+            OrderedValue::String(s) => write!(f, "{s}"),
+            OrderedValue::Array(a) => {
+                if a.is_empty() {
+                    write!(f, "[]")
+                } else {
+                    write!(f, "[...]")
+                }
+            }
+            OrderedValue::Object(o) => {
+                if o.is_empty() {
+                    write!(f, "{{}}")
+                } else {
+                    write!(f, "{{...}}")
+                }
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OrderedValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OrderedVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for OrderedVisitor {
+            type Value = OrderedValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Bool(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Number(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Number(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Number(
+                    serde_json::Number::from_f64(v).unwrap_or_else(|| 0.into()),
+                ))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OrderedValue::String(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OrderedValue::String(v))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Null)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                serde::Deserialize::deserialize(deserializer)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedValue::Null)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut vec = Vec::new();
+                while let Some(elem) = seq.next_element()? {
+                    vec.push(elem);
+                }
+                Ok(OrderedValue::Array(vec))
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut map = indexmap::IndexMap::new();
+                while let Some((key, val)) = access.next_entry()? {
+                    map.insert(key, val);
+                }
+                Ok(OrderedValue::Object(map))
+            }
+        }
+
+        deserializer.deserialize_any(OrderedVisitor)
+    }
+}
+
+fn is_empty_value(v: &OrderedValue) -> bool {
+    match v {
+        OrderedValue::String(s) => s.trim().is_empty(),
+        OrderedValue::Array(a) => a.is_empty(),
+        OrderedValue::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+fn to_owned_spans(spans: Vec<Span<'_>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), s.style))
+        .collect()
+}
+
+fn extract_wake_summary(val: &OrderedValue, max_len: usize) -> String {
+    let mut fields = Vec::new();
+    let mut current_len = 0;
+
+    let Some(map) = val.as_object() else {
+        return String::new();
+    };
+
+    let preferred_keys = [
+        "program",
+        "wake_reason",
+        "session",
+        "action",
+        "task",
+        "status",
+        "source",
+        "type",
+    ];
+
+    let mut candidate_keys: Vec<&str> = Vec::new();
+    for &pk in &preferred_keys {
+        if map.contains_key(pk) {
+            candidate_keys.push(pk);
+        }
+    }
+    for k in map.keys() {
+        if !candidate_keys.contains(&k.as_str()) {
+            candidate_keys.push(k.as_str());
+        }
+    }
+
+    for k in candidate_keys {
+        if let Some(v) = map.get(k)
+            && let Some(s) = v.as_str()
+        {
+            let s_trim = s.trim();
+            if !s_trim.is_empty() && s_trim.len() <= 40 && !s_trim.contains('\n') && k.len() <= 20 {
+                let field = format!("{k}={s_trim}");
+                let added_len = field.len() + 3; // " · "
+                if current_len + added_len <= max_len {
+                    current_len += added_len;
+                    fields.push(field);
+                    if fields.len() == 3 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", fields.join(" · "))
+    }
+}
+
+fn render_structured_json(
+    val: &OrderedValue,
+    width: u16,
+    is_user: bool,
+    count: usize,
+) -> Vec<Line<'static>> {
+    let mut raw_lines: Vec<(Line<'static>, usize)> = Vec::new();
+
+    if let Some(map) = val.as_object() {
+        if map.is_empty() {
+            // Empty {} reply: render raw text rather than zero lines
+            let line = Line::from(val.to_string());
+            return if is_user {
+                let mut l = Line::from(vec![
+                    Span::styled(
+                        "> ".to_string(),
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow),
+                    ),
+                    Span::raw(val.to_string()),
+                ]);
+                if count > 1 {
+                    l.spans.push(Span::styled(
+                        format!(" ×{count}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                wrap_line_with_indent(l, width as usize, 2)
+            } else {
+                wrap_line(line, width as usize)
+            };
+        }
+        for (key, v) in map {
+            if is_empty_value(v) {
+                continue;
+            }
+            render_value_lines(&mut raw_lines, Some(key), v, 0, 0);
+        }
+    } else if let Some(arr) = val.as_array() {
+        if arr.is_empty() {
+            // Empty [] reply: render raw text rather than zero lines
+            let line = Line::from(val.to_string());
+            return if is_user {
+                let mut l = Line::from(vec![
+                    Span::styled(
+                        "> ".to_string(),
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow),
+                    ),
+                    Span::raw(val.to_string()),
+                ]);
+                if count > 1 {
+                    l.spans.push(Span::styled(
+                        format!(" ×{count}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                wrap_line_with_indent(l, width as usize, 2)
+            } else {
+                wrap_line(line, width as usize)
+            };
+        }
+        for item in arr {
+            if is_empty_value(item) {
+                continue;
+            }
+            render_array_item(&mut raw_lines, item, 0, 0);
+        }
+    }
+
+    let prefix_style = Style::default()
+        .add_modifier(Modifier::BOLD)
+        .fg(Color::Yellow);
+
+    let mut out = Vec::new();
+    for (i, (mut line, hanging_indent)) in raw_lines.into_iter().enumerate() {
+        let total_indent = if is_user {
+            let pfx = if i == 0 { "> " } else { "  " };
+            line.spans
+                .insert(0, Span::styled(pfx.to_string(), prefix_style));
+            if i == 0 && count > 1 {
+                line.spans.push(Span::styled(
+                    format!(" ×{count}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            hanging_indent + 2
+        } else {
+            hanging_indent
+        };
+        out.extend(wrap_line_with_indent(line, width as usize, total_indent));
+    }
+    out
+}
+
+fn render_value_lines(
+    raw_lines: &mut Vec<(Line<'static>, usize)>,
+    key: Option<&str>,
+    v: &OrderedValue,
+    depth: usize,
+    indent: usize,
+) {
+    let label_style = if depth == 0 {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+
+    if depth >= 6 {
+        let s = v.to_string();
+        let truncated = if s.chars().count() > 200 {
+            let t: String = s.chars().take(200).collect();
+            format!("{t}…")
+        } else {
+            s
+        };
+        let prefix = " ".repeat(indent);
+        let line = if let Some(k) = key {
+            let h_indent = indent + k.len() + 2;
+            (
+                Line::from(vec![
+                    Span::raw(prefix),
+                    Span::styled(format!("{k}: "), label_style),
+                    Span::raw(truncated),
+                ]),
+                h_indent,
+            )
+        } else {
+            (Line::from(format!("{prefix}{truncated}")), indent)
+        };
+        raw_lines.push(line);
+        return;
+    }
+
+    match v {
+        OrderedValue::Null | OrderedValue::Bool(_) | OrderedValue::Number(_) => {
+            let prefix = " ".repeat(indent);
+            if let Some(k) = key {
+                let h_indent = indent + k.len() + 2;
+                raw_lines.push((
+                    Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(format!("{k}: "), label_style),
+                        Span::raw(v.to_string()),
+                    ]),
+                    h_indent,
+                ));
+            } else {
+                raw_lines.push((
+                    Line::from(vec![Span::raw(prefix), Span::raw(v.to_string())]),
+                    indent,
+                ));
+            }
+        }
+        OrderedValue::String(s) => {
+            let prefix = " ".repeat(indent);
+            let s_str = s.as_str();
+            if !s_str.contains('\n') {
+                let md = tui_markdown::from_str(s_str);
+                if let Some(k) = key {
+                    let h_indent = indent + k.len() + 2;
+                    let mut spans = vec![
+                        Span::raw(prefix),
+                        Span::styled(format!("{k}: "), label_style),
+                    ];
+                    if let Some(first) = md.lines.into_iter().next() {
+                        spans.extend(to_owned_spans(first.spans));
+                    }
+                    raw_lines.push((Line::from(spans), h_indent));
+                } else {
+                    let mut spans = vec![Span::raw(prefix)];
+                    if let Some(first) = md.lines.into_iter().next() {
+                        spans.extend(to_owned_spans(first.spans));
+                    }
+                    raw_lines.push((Line::from(spans), indent));
+                }
+            } else {
+                if let Some(k) = key {
+                    raw_lines.push((
+                        Line::from(vec![
+                            Span::raw(prefix),
+                            Span::styled(format!("{k}:"), label_style),
+                        ]),
+                        indent,
+                    ));
+                }
+                let md = tui_markdown::from_str(s_str);
+                let sub_prefix = " ".repeat(indent + 2);
+                let sub_indent = indent + 2;
+                for line in md.lines {
+                    let mut spans = vec![Span::raw(sub_prefix.clone())];
+                    spans.extend(to_owned_spans(line.spans));
+                    raw_lines.push((Line::from(spans), sub_indent));
+                }
+            }
+        }
+        OrderedValue::Array(arr) => {
+            let prefix = " ".repeat(indent);
+            if let Some(k) = key {
+                raw_lines.push((
+                    Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(format!("{k}:"), label_style),
+                    ]),
+                    indent,
+                ));
+            }
+            for item in arr {
+                if is_empty_value(item) {
+                    continue;
+                }
+                render_array_item(raw_lines, item, depth + 1, indent + 2);
+            }
+        }
+        OrderedValue::Object(sub_map) => {
+            let prefix = " ".repeat(indent);
+            if let Some(k) = key {
+                raw_lines.push((
+                    Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(format!("{k}:"), label_style),
+                    ]),
+                    indent,
+                ));
+            }
+            let sub_indent = if key.is_some() { indent + 2 } else { indent };
+            for (sub_k, sub_v) in sub_map {
+                if is_empty_value(sub_v) {
+                    continue;
+                }
+                render_value_lines(raw_lines, Some(sub_k), sub_v, depth + 1, sub_indent);
+            }
+        }
+    }
+}
+
+fn render_array_item(
+    raw_lines: &mut Vec<(Line<'static>, usize)>,
+    item: &OrderedValue,
+    depth: usize,
+    indent: usize,
+) {
+    let sub_label_style = Style::default().add_modifier(Modifier::BOLD);
+    let prefix = " ".repeat(indent);
+
+    if let Some(s) = item.as_str() {
+        let md = tui_markdown::from_str(s);
+        let h_indent = indent + 2;
+        for (idx, line) in md.lines.into_iter().enumerate() {
+            let (bullet_prefix, cur_h_indent) = if idx == 0 {
+                (format!("{prefix}• "), h_indent)
+            } else {
+                (format!("{prefix}  "), h_indent)
+            };
+            let mut spans = vec![Span::raw(bullet_prefix)];
+            spans.extend(to_owned_spans(line.spans));
+            raw_lines.push((Line::from(spans), cur_h_indent));
+        }
+    } else if let Some(obj) = item.as_object() {
+        let mut is_first = true;
+        for (sub_k, sub_v) in obj {
+            if is_empty_value(sub_v) {
+                continue;
+            }
+            let item_prefix = if is_first {
+                format!("{prefix}- ")
+            } else {
+                format!("{prefix}  ")
+            };
+            is_first = false;
+            let h_indent = indent + 2 + sub_k.len() + 2;
+
+            match sub_v {
+                OrderedValue::Null | OrderedValue::Bool(_) | OrderedValue::Number(_) => {
+                    raw_lines.push((
+                        Line::from(vec![
+                            Span::raw(item_prefix),
+                            Span::styled(format!("{sub_k}: "), sub_label_style),
+                            Span::raw(sub_v.to_string()),
+                        ]),
+                        h_indent,
+                    ));
+                }
+                OrderedValue::String(s_sub) => {
+                    if !s_sub.contains('\n') {
+                        let md = tui_markdown::from_str(s_sub);
+                        let mut spans = vec![
+                            Span::raw(item_prefix),
+                            Span::styled(format!("{sub_k}: "), sub_label_style),
+                        ];
+                        if let Some(first) = md.lines.into_iter().next() {
+                            spans.extend(to_owned_spans(first.spans));
+                        }
+                        raw_lines.push((Line::from(spans), h_indent));
+                    } else {
+                        raw_lines.push((
+                            Line::from(vec![
+                                Span::raw(item_prefix),
+                                Span::styled(format!("{sub_k}:"), sub_label_style),
+                            ]),
+                            indent + 2,
+                        ));
+                        let md = tui_markdown::from_str(s_sub);
+                        let deep_prefix = format!("{prefix}    ");
+                        let deep_indent = indent + 4;
+                        for line in md.lines {
+                            let mut spans = vec![Span::raw(deep_prefix.clone())];
+                            spans.extend(to_owned_spans(line.spans));
+                            raw_lines.push((Line::from(spans), deep_indent));
+                        }
+                    }
+                }
+                OrderedValue::Array(sub_arr) => {
+                    raw_lines.push((
+                        Line::from(vec![
+                            Span::raw(item_prefix),
+                            Span::styled(format!("{sub_k}:"), sub_label_style),
+                        ]),
+                        indent + 2,
+                    ));
+                    for el in sub_arr {
+                        if is_empty_value(el) {
+                            continue;
+                        }
+                        render_array_item(raw_lines, el, depth + 1, indent + 4);
+                    }
+                }
+                OrderedValue::Object(deep_obj) => {
+                    raw_lines.push((
+                        Line::from(vec![
+                            Span::raw(item_prefix),
+                            Span::styled(format!("{sub_k}:"), sub_label_style),
+                        ]),
+                        indent + 2,
+                    ));
+                    for (dk, dv) in deep_obj {
+                        if is_empty_value(dv) {
+                            continue;
+                        }
+                        render_value_lines(raw_lines, Some(dk), dv, depth + 1, indent + 4);
+                    }
+                }
+            }
+        }
+    } else {
+        let h_indent = indent + 2;
+        raw_lines.push((
+            Line::from(vec![
+                Span::raw(format!("{prefix}• ")),
+                Span::raw(item.to_string()),
+            ]),
+            h_indent,
+        ));
+    }
+}
+
+fn render_user(raw: &str, count: usize, json_expanded: bool, width: u16) -> Vec<Line<'static>> {
+    let trimmed = raw.trim();
+    if ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && let Ok(val) = serde_json::from_str::<OrderedValue>(trimmed)
+        && (val.is_object() || val.is_array())
+    {
+        if json_expanded {
+            return render_structured_json(&val, width, true, count);
+        } else {
+            let kb = raw.len().div_ceil(1024);
+            let suffix = if count > 1 {
+                format!(" ×{count}")
+            } else {
+                String::new()
+            };
+            let base_str = format!("▸ structured input · {kb} KB{suffix}");
+            let avail = (width as usize).saturating_sub(base_str.len() + 3);
+            let summary = extract_wake_summary(&val, avail);
+            let mut text = format!("▸ structured input{summary} · {kb} KB{suffix}");
+            if width > 4 && text.chars().count() > width as usize {
+                let take_c = (width as usize).saturating_sub(1);
+                let s: String = text.chars().take(take_c).collect();
+                text = format!("{s}…");
+            }
+            let line = Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            return wrap_line(line, width as usize);
+        }
+    }
+
     let prefix_style = Style::default()
         .add_modifier(Modifier::BOLD)
         .fg(Color::Yellow);
     let mut out = Vec::new();
     let lines: Vec<&str> = raw.lines().collect();
     if lines.is_empty() {
-        out.push(Line::from(Span::styled("> ", prefix_style)));
+        let mut spans = vec![Span::styled("> ", prefix_style)];
+        if count > 1 {
+            spans.push(Span::styled(
+                format!("×{count}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        out.push(Line::from(spans));
         return out;
     }
+
+    if count > 1 {
+        let first_line = lines[0];
+        let spans = vec![
+            Span::styled("> ", prefix_style),
+            Span::raw(first_line.to_string()),
+            Span::styled(
+                format!(" ×{count}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ];
+        out.extend(wrap_line_with_indent(Line::from(spans), width as usize, 2));
+        return out;
+    }
+
     for (i, l) in lines.iter().enumerate() {
         let prefix = if i == 0 { "> " } else { "  " };
         let spans = vec![
             Span::styled(prefix.to_string(), prefix_style),
             Span::raw(l.to_string()),
         ];
-        out.extend(wrap_line(Line::from(spans), width as usize));
+        out.extend(wrap_line_with_indent(Line::from(spans), width as usize, 2));
     }
     out
 }
@@ -915,7 +1770,48 @@ fn to_owned_line(line: Line<'_>) -> Line<'static> {
     Line::from(spans).style(line.style)
 }
 
-fn render_assistant(raw: &str, width: u16) -> Vec<Line<'static>> {
+fn looks_like_json_opening(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("{\"") || trimmed.starts_with("[{") || trimmed.starts_with("[\"") {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let r = rest.trim_start();
+        if r.starts_with('{') || r.starts_with('"') {
+            return true;
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix('{') {
+        let r = rest.trim_start();
+        if r.starts_with('"') {
+            return true;
+        }
+    }
+    false
+}
+
+fn render_assistant(raw: &str, is_streaming: bool, width: u16) -> Vec<Line<'static>> {
+    let trimmed = raw.trim();
+    if ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && let Ok(val) = serde_json::from_str::<OrderedValue>(trimmed)
+        && (val.is_object() || val.is_array())
+    {
+        return render_structured_json(&val, width, false, 1);
+    }
+
+    if is_streaming && looks_like_json_opening(raw) {
+        let kb = raw.len().div_ceil(1024);
+        let line = Line::from(vec![
+            Span::styled("◌ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("receiving structured reply ({kb} KB)…"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]);
+        return wrap_line(line, width as usize);
+    }
+
     let last_nl = raw.rfind('\n');
     let mut out_lines = Vec::new();
     let (committed, tail) = match last_nl {
@@ -997,16 +1893,28 @@ fn truncate_tool_text(text: &str) -> (Vec<String>, usize) {
 }
 
 fn render_tool(block: &Block, expanded: bool, width: u16) -> Vec<Line<'static>> {
+    let is_final_output = block.title.ends_with("final_output");
+
     let (glyph, glyph_style) = match block.status.as_str() {
         "completed" | "success" => ("✓ ", Style::default().fg(Color::Green)),
         "failed" | "error" => ("✗ ", Style::default().fg(Color::Red)),
         "interrupted" | "cancelled" => ("⊘ ", Style::default().add_modifier(Modifier::DIM)),
         _ => ("◌ ", Style::default().fg(Color::Yellow)),
     };
-    let title_style = Style::default().add_modifier(Modifier::BOLD);
+    let title_style = if is_final_output {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let title_text = if is_final_output {
+        "final output".to_string()
+    } else {
+        block.title.clone()
+    };
+
     let mut header_spans = vec![
         Span::styled(glyph.to_string(), glyph_style),
-        Span::styled(block.title.clone(), title_style),
+        Span::styled(title_text, title_style),
     ];
     if let Some(notif) = &block.notification_line {
         header_spans.push(Span::styled(
@@ -1557,6 +2465,618 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("… 20 more lines"));
+    }
+
+    #[test]
+    fn test_final_output_glyph_and_expanded() {
+        let mut transcript = Transcript::new();
+        let call = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t_out",
+                    "title": "recipe__final_output",
+                    "status": "completed",
+                    "rawInput": {"response": "All tasks done"},
+                    "content": [{"type": "content", "content": {"type": "text", "text": "All tasks done"}}],
+                }
+            }
+        });
+        transcript.apply_frame(&call);
+
+        // Collapsed: "✓ final output"
+        let lines = transcript.render_block(0, 80);
+        assert_eq!(lines.len(), 1);
+        let plain: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(plain, "✓ final output");
+
+        // Expanded: shows header with "✓ final output" and Input/Output blocks
+        transcript.toggle_tools();
+        let lines_exp = transcript.render_block(0, 80);
+        assert!(lines_exp.len() > 1);
+        let plain_exp: String = lines_exp[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(plain_exp, "✓ final output");
+        let joined: String = lines_exp
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Input:"));
+        assert!(joined.contains("Output:"));
+
+        // Failed final_output shows ✗
+        let fail_call = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t_fail",
+                    "title": "final_output",
+                    "status": "failed",
+                }
+            }
+        });
+        transcript.apply_frame(&fail_call);
+        let fail_lines = transcript.render_block(1, 80);
+        let fail_plain: String = fail_lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(fail_plain, "✗ final output");
+    }
+
+    #[test]
+    fn test_prose_containing_colon_does_not_get_hanging_indent() {
+        let mut transcript = Transcript::new();
+        let prose = "This is a paragraph of markdown prose ending at: `code` and continuing with more text that will wrap onto the next line";
+        let frame = make_chunk_frame("agent_message_chunk", "msg_prose", prose);
+        transcript.apply_frame(&frame);
+
+        // Wrap at 40 cols
+        let lines = transcript.render_block(0, 40);
+        assert!(lines.len() > 1);
+        for (i, l) in lines.iter().enumerate() {
+            let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            if i > 0 {
+                // Continuation line must NOT have a hanging indent (must not start with space)
+                assert!(
+                    !plain.starts_with(' '),
+                    "line {i} should not have a hanging indent, got: {plain:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_vs_ended_structured_reply() {
+        let mut transcript = Transcript::new();
+
+        // 1. Text starting with '[' but not JSON opening: "[PR #42](https://...) is merged"
+        let pr_text = "[PR #42](https://example.com) is merged";
+        let frame_pr = make_chunk_frame("agent_message_chunk", "msg_pr", pr_text);
+        transcript.apply_frame(&frame_pr);
+
+        let lines_pr = transcript.render_block(0, 80);
+        let plain_pr: String = lines_pr
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!plain_pr.contains("receiving structured reply"));
+        assert!(plain_pr.contains("PR #42"));
+
+        // 2. Text that has JSON opening but does not parse completely: `{"a":1}\n\nThat is the config.`
+        let mut transcript2 = Transcript::new();
+        // Start an active run
+        let run_start = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": "run_123"
+                        }
+                    }
+                }
+            }
+        });
+        transcript2.apply_frame(&run_start);
+
+        // Chunk while streaming
+        let chunk_stream = "{\"a\": 1}\n\nThat is the config.";
+        let frame_stream = make_chunk_frame("agent_message_chunk", "msg_stream", chunk_stream);
+        transcript2.apply_frame(&frame_stream);
+
+        // Now end the run
+        let run_end = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": null
+                        }
+                    }
+                }
+            }
+        });
+        transcript2.apply_frame(&run_end);
+
+        // Once turn ended, it must fall through to normal markdown, NOT the streaming placeholder!
+        let lines_ended = transcript2.render_block(0, 80);
+        let plain_ended: String = lines_ended
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!plain_ended.contains("receiving structured reply"));
+        assert!(plain_ended.contains("That is the config."));
+    }
+
+    #[test]
+    fn test_nested_json_deep_recursion_and_empty_collections() {
+        let mut transcript = Transcript::new();
+        let deep_json = json!({
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "level4": "deep_value"
+                    }
+                }
+            }
+        });
+        let frame_deep =
+            make_chunk_frame("agent_message_chunk", "msg_deep", &deep_json.to_string());
+        transcript.apply_frame(&frame_deep);
+
+        let lines = transcript.render_block(0, 80);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("level1:"));
+        assert!(joined.contains("level2:"));
+        assert!(joined.contains("level3:"));
+        assert!(joined.contains("level4: deep_value"));
+
+        // Empty {} assistant message renders raw text "{}" rather than zero lines
+        let mut transcript_empty_obj = Transcript::new();
+        let frame_empty_obj = make_chunk_frame("agent_message_chunk", "msg_empty_o", "{}");
+        transcript_empty_obj.apply_frame(&frame_empty_obj);
+        let lines_empty_obj = transcript_empty_obj.render_block(0, 80);
+        assert_eq!(lines_empty_obj.len(), 1);
+        let plain_empty_obj: String = lines_empty_obj[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(plain_empty_obj, "{}");
+
+        // Empty [] assistant message renders raw text "[]" rather than zero lines
+        let mut transcript_empty_arr = Transcript::new();
+        let frame_empty_arr = make_chunk_frame("agent_message_chunk", "msg_empty_a", "[]");
+        transcript_empty_arr.apply_frame(&frame_empty_arr);
+        let lines_empty_arr = transcript_empty_arr.render_block(0, 80);
+        assert_eq!(lines_empty_arr.len(), 1);
+        let plain_empty_arr: String = lines_empty_arr[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(plain_empty_arr, "[]");
+    }
+
+    #[test]
+    fn test_consecutive_user_message_stops_being_equal_updates_earlier_block() {
+        let mut transcript = Transcript::new();
+        let frame1 = make_chunk_frame("user_message_chunk", "msg_1", "nag");
+        let frame2 = make_chunk_frame("user_message_chunk", "msg_2", "nag");
+        transcript.apply_frame(&frame1);
+        transcript.apply_frame(&frame2);
+
+        // Before append: collapsed with ×2, total height 1
+        assert_eq!(transcript.total_height(80), 1);
+        let lines0 = transcript.render_block(0, 80);
+        let plain0: String = lines0[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(plain0.ends_with("×2"));
+
+        // Message 2 receives a chunk making it "nag different"
+        let frame2_chunk2 = make_chunk_frame("user_message_chunk", "msg_2", " different");
+        transcript.apply_frame(&frame2_chunk2);
+
+        // Now block 0 must no longer have ×2, and block 1 renders "nag different", total height 2
+        let lines0_after = transcript.render_block(0, 80);
+        let plain0_after: String = lines0_after[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!plain0_after.contains("×"));
+
+        let lines1_after = transcript.render_block(1, 80);
+        assert!(!lines1_after.is_empty());
+        let plain1_after: String = lines1_after[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(plain1_after.contains("nag different"));
+
+        assert_eq!(transcript.total_height(80), 2);
+    }
+
+    #[test]
+    fn test_tool_title_formats_from_raw_input() {
+        let mut transcript = Transcript::new();
+        let call = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t_sh",
+                    "title": "shell",
+                    "status": "completed",
+                    "rawInput": {"command": "cargo test --workspace\necho done"},
+                }
+            }
+        });
+        transcript.apply_frame(&call);
+
+        assert_eq!(transcript.blocks[0].title, "shell · cargo test --workspace");
+        let lines = transcript.render_block(0, 80);
+        let plain: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(plain.contains("shell · cargo test --workspace"));
+    }
+
+    #[test]
+    fn test_structured_json_rendering_in_assistant() {
+        let mut transcript = Transcript::new();
+        let json_body = json!({
+            "episode_status": "complete",
+            "notes": "**Summary**\n\n- task completed",
+            "count": 42,
+            "active": true,
+            "empty_str": "",
+            "empty_arr": [],
+            "empty_obj": {},
+            "actions": ["checked logs", "verified fix"],
+            "sessions": [
+                {"id": "ses_1", "status": "running"},
+                {"id": "ses_2", "status": "idle"}
+            ]
+        });
+        let frame = make_chunk_frame("agent_message_chunk", "msg_ast", &json_body.to_string());
+        transcript.apply_frame(&frame);
+
+        let lines = transcript.render_block(0, 80);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Top level labels and scalars inline
+        assert!(joined.contains("episode_status: complete"));
+        assert!(joined.contains("count: 42"));
+        assert!(joined.contains("active: true"));
+
+        // Markdown rendered and unescaped
+        assert!(joined.contains("Summary"));
+        assert!(joined.contains("task completed"));
+
+        // Empty values omitted
+        assert!(!joined.contains("empty_str"));
+        assert!(!joined.contains("empty_arr"));
+        assert!(!joined.contains("empty_obj"));
+
+        // Array of strings as bullet list
+        assert!(joined.contains("actions:"));
+        assert!(joined.contains("• checked logs"));
+        assert!(joined.contains("• verified fix"));
+
+        // Array of objects as indented sub-blocks
+        assert!(joined.contains("sessions:"));
+        assert!(joined.contains("- id: ses_1"));
+        assert!(joined.contains("status: running"));
+        assert!(joined.contains("- id: ses_2"));
+        assert!(joined.contains("status: idle"));
+    }
+
+    #[test]
+    fn test_structured_json_preserves_key_order() {
+        let mut transcript = Transcript::new();
+        // b_key before a_key, and z before a in sub_obj
+        let json_str = r#"{
+            "b_key": "first",
+            "a_key": "second",
+            "sub_obj": {
+                "z_field": 10,
+                "a_field": 20
+            }
+        }"#;
+        let frame = make_chunk_frame("agent_message_chunk", "msg_order", json_str);
+        transcript.apply_frame(&frame);
+
+        let lines = transcript.render_block(0, 80);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let b_pos = joined.find("b_key").expect("b_key present");
+        let a_pos = joined.find("a_key").expect("a_key present");
+        assert!(
+            b_pos < a_pos,
+            "b_key should appear before a_key in rendered output (order preserved)"
+        );
+
+        let z_pos = joined.find("z_field").expect("z_field present");
+        let sub_a_pos = joined.find("a_field").expect("a_field present");
+        assert!(
+            z_pos < sub_a_pos,
+            "z_field should appear before a_field in sub_obj (order preserved)"
+        );
+    }
+
+    #[test]
+    fn test_hanging_indent_on_wrapped_lines() {
+        let mut transcript = Transcript::new();
+        let json_str = r#"{
+            "bullet_list": [
+                "This is a long bullet item that will wrap onto multiple continuation lines in a narrow viewport"
+            ],
+            "notes": "A very long note that wraps onto multiple continuation lines in a narrow viewport",
+            "sub_block": [
+                {
+                    "text": "A long text property in a sub block that wraps onto multiple lines"
+                }
+            ]
+        }"#;
+        let frame = make_chunk_frame("agent_message_chunk", "msg_hang", json_str);
+        transcript.apply_frame(&frame);
+
+        // Render at width 35 to force multiple wrapped lines
+        let lines = transcript.render_block(0, 35);
+        let plain_lines: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // 1. Bullet list continuation line starts with 4 spaces ("    ")
+        let bullet_start = plain_lines
+            .iter()
+            .position(|l| l.starts_with("  • "))
+            .expect("bullet start line");
+        let bullet_cont = &plain_lines[bullet_start + 1];
+        assert!(
+            bullet_cont.starts_with("    ") && !bullet_cont.starts_with("     "),
+            "bullet continuation line should have hanging indent of 4 spaces, got: {bullet_cont:?}"
+        );
+
+        // 2. "notes: " continuation line starts with 7 spaces ("notes: ".len() == 7)
+        let notes_start = plain_lines
+            .iter()
+            .position(|l| l.starts_with("notes: "))
+            .expect("notes start line");
+        let notes_cont = &plain_lines[notes_start + 1];
+        assert!(
+            notes_cont.starts_with("       ") && !notes_cont.starts_with("        "),
+            "notes continuation line should have hanging indent of 7 spaces, got: {notes_cont:?}"
+        );
+
+        // 3. Sub-block "  - text: " continuation line starts with 10 spaces ("  - text: ".len() == 10)
+        let sub_start = plain_lines
+            .iter()
+            .position(|l| l.starts_with("  - text: "))
+            .expect("sub-block start line");
+        let sub_cont = &plain_lines[sub_start + 1];
+        assert!(
+            sub_cont.starts_with("          ") && !sub_cont.starts_with("           "),
+            "sub-block continuation line should have hanging indent of 10 spaces, got: {sub_cont:?}"
+        );
+    }
+
+    #[test]
+    fn test_user_wake_payload_collapsed_by_default_and_expanded_with_toggle() {
+        let mut transcript = Transcript::new();
+        let payload = json!({
+            "program": "example-program",
+            "wake_reason": "activity",
+            "open_items": [{"id": "item_1"}],
+            "field_notes": "very long notes..."
+        });
+        let frame = make_chunk_frame("user_message_chunk", "msg_user_json", &payload.to_string());
+        transcript.apply_frame(&frame);
+
+        // Collapsed by default: exactly 1 dim line
+        let lines_collapsed = transcript.render_block(0, 80);
+        assert_eq!(lines_collapsed.len(), 1);
+        let plain_collapsed: String = lines_collapsed[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(plain_collapsed.starts_with("▸ structured input"));
+        assert!(plain_collapsed.contains("program=example-program"));
+        assert!(plain_collapsed.contains("wake_reason=activity"));
+        assert!(plain_collapsed.contains("KB"));
+        assert!(
+            lines_collapsed[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+
+        // Toggle JSON expanded
+        transcript.toggle_json();
+        let lines_expanded = transcript.render_block(0, 80);
+        assert!(lines_expanded.len() > 1);
+        let joined_expanded: String = lines_expanded
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined_expanded.contains("> "));
+        assert!(joined_expanded.contains("program: example-program"));
+        assert!(joined_expanded.contains("wake_reason: activity"));
+    }
+
+    #[test]
+    fn test_streaming_incomplete_json_assistant() {
+        let mut transcript = Transcript::new();
+        // Set active run
+        let run_start = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goose": {
+                            "activeRunId": "run_999"
+                        }
+                    }
+                }
+            }
+        });
+        transcript.apply_frame(&run_start);
+
+        let incomplete = "{\"program\": \"example-program\", \"items\": [";
+        let frame = make_chunk_frame("agent_message_chunk", "msg_stream", incomplete);
+        transcript.apply_frame(&frame);
+
+        let lines = transcript.render_block(0, 80);
+        assert_eq!(lines.len(), 1);
+        let plain: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(plain.contains("◌ receiving structured reply"));
+        assert!(plain.contains("KB)…"));
+    }
+
+    #[test]
+    #[ignore]
+    fn render_dump_file_visual_check() {
+        let dump_path = std::env::var("HONK_DUMP_FILE").unwrap_or_default();
+        if dump_path.is_empty() {
+            return;
+        }
+        let content = std::fs::read_to_string(&dump_path).expect("read dump");
+        let mut transcript = Transcript::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(frame) = serde_json::from_str::<Value>(line) {
+                transcript.apply_frame(&frame);
+            }
+        }
+
+        let mut viewport = Viewport::new();
+        let height = transcript.total_height(140);
+        let visible = viewport.visible_lines(&mut transcript, 140, height);
+        for l in visible {
+            let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!("{plain}");
+        }
+    }
+
+    #[test]
+    fn test_consecutive_identical_user_messages_collapse_with_count() {
+        let mut transcript = Transcript::new();
+        let nag = "You MUST call the `final_output` tool NOW";
+        let frame1 = make_chunk_frame("user_message_chunk", "msg_1", nag);
+        let frame2 = make_chunk_frame("user_message_chunk", "msg_2", nag);
+        let frame3 = make_chunk_frame("user_message_chunk", "msg_3", nag);
+
+        transcript.apply_frame(&frame1);
+        transcript.apply_frame(&frame2);
+        transcript.apply_frame(&frame3);
+
+        assert_eq!(transcript.blocks.len(), 3);
+
+        // Block 0 renders with ×3 suffix
+        let lines0 = transcript.render_block(0, 80);
+        assert_eq!(lines0.len(), 1);
+        let plain0: String = lines0[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(plain0.contains(nag));
+        assert!(plain0.ends_with("×3"), "expected ×3 suffix, got: {plain0}");
+
+        // Blocks 1 and 2 render 0 lines
+        let lines1 = transcript.render_block(1, 80);
+        assert_eq!(lines1.len(), 0);
+        let lines2 = transcript.render_block(2, 80);
+        assert_eq!(lines2.len(), 0);
+
+        assert_eq!(transcript.total_height(80), 1);
+
+        // Applying a 4th identical message updates block 0 to ×4
+        let frame4 = make_chunk_frame("user_message_chunk", "msg_4", nag);
+        transcript.apply_frame(&frame4);
+        let lines0_updated = transcript.render_block(0, 80);
+        assert_eq!(lines0_updated.len(), 1);
+        let plain0_updated: String = lines0_updated[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            plain0_updated.ends_with("×4"),
+            "expected ×4 suffix, got: {plain0_updated}"
+        );
+        assert_eq!(transcript.total_height(80), 1);
+
+        // Markdown export contains ## User (×4) once
+        let md = transcript.to_markdown();
+        assert!(md.contains("## User (×4)"));
+        assert_eq!(md.matches(nag).count(), 1);
     }
 
     #[test]

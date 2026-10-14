@@ -942,6 +942,7 @@ dependencies = [
  "futures",
  "honk-testgoose",
  "honk-wire",
+ "indexmap",
  "ratatui",
  "serde",
  "serde_json",

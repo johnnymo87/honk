@@ -41,6 +41,98 @@ fn get_user_visible_text(msg: &Value) -> String {
     text
 }
 
+pub fn format_tool_title(tool_name: &str, raw_input: Option<&Value>) -> String {
+    let Some(raw_input) = raw_input else {
+        return tool_name.to_string();
+    };
+
+    if tool_name.contains(" · ") {
+        return tool_name.to_string();
+    }
+
+    let detail = match tool_name {
+        "shell" => raw_input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|cmd| cmd.lines().next().unwrap_or("").trim().to_string()),
+        "text_editor" | "edit" | "write" => {
+            let path = raw_input.get("path").and_then(Value::as_str);
+            let cmd = raw_input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| c.lines().next().unwrap_or("").trim());
+            match (path, cmd) {
+                (Some(p), Some(c)) if !c.is_empty() => Some(format!("{p} {c}")),
+                (Some(p), _) => Some(p.to_string()),
+                (None, Some(c)) if !c.is_empty() => Some(c.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(detail_str) = detail {
+        let trimmed = detail_str.trim();
+        if !trimmed.is_empty() {
+            let truncated = if trimmed.chars().count() > 100 {
+                let s: String = trimmed.chars().take(100).collect();
+                format!("{s}…")
+            } else {
+                trimmed.to_string()
+            };
+            return format!("{tool_name} · {truncated}");
+        }
+    }
+
+    tool_name.to_string()
+}
+
+fn extract_tool_result_text(block: &Value) -> Option<String> {
+    if let Some(content) = block
+        .pointer("/toolResult/value/content")
+        .or_else(|| block.pointer("/toolResult/content"))
+    {
+        if let Some(arr) = content.as_array() {
+            let mut parts = Vec::new();
+            for item in arr {
+                if let Some(t) = item.get("text").and_then(Value::as_str) {
+                    parts.push(t);
+                }
+            }
+            if !parts.is_empty() {
+                return Some(parts.join("\n"));
+            }
+        } else if let Some(s) = content.as_str() {
+            return Some(s.to_string());
+        }
+    }
+
+    if let Some(stdout) = block
+        .pointer("/toolResult/value/structuredContent/stdout")
+        .or_else(|| block.pointer("/toolResult/structuredContent/stdout"))
+        .and_then(Value::as_str)
+    {
+        let stderr = block
+            .pointer("/toolResult/value/structuredContent/stderr")
+            .or_else(|| block.pointer("/toolResult/structuredContent/stderr"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut s = stdout.to_string();
+        if !stderr.is_empty() {
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("stderr: ");
+            s.push_str(stderr);
+        }
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+
+    None
+}
+
 pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
     let conversation = match export.get("conversation").and_then(Value::as_array) {
         Some(c) => c,
@@ -133,13 +225,19 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
                 }
                 "toolRequest" => {
                     let tool_call_id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                    let title = block
+                    let tool_name = block
                         .pointer("/toolCall/value/name")
                         .or_else(|| block.pointer("/toolCall/name"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
 
-                    let update = serde_json::json!({
+                    let raw_input = block
+                        .pointer("/toolCall/value/arguments")
+                        .or_else(|| block.pointer("/toolCall/arguments"));
+
+                    let title = format_tool_title(tool_name, raw_input);
+
+                    let mut update = serde_json::json!({
                         "sessionUpdate": "tool_call",
                         "toolCallId": tool_call_id,
                         "title": title,
@@ -147,6 +245,10 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
                             "goose": goose_meta.clone(),
                         }
                     });
+
+                    if let Some(args) = raw_input {
+                        update["rawInput"] = args.clone();
+                    }
 
                     updates.push(serde_json::json!({
                         "jsonrpc": "2.0",
@@ -175,7 +277,7 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
                         "completed"
                     };
 
-                    let update = serde_json::json!({
+                    let mut update = serde_json::json!({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": tool_call_id,
                         "status": status,
@@ -183,6 +285,28 @@ pub fn to_updates(export: &Value, sid: &str) -> Vec<Value> {
                             "goose": goose_meta.clone(),
                         }
                     });
+
+                    if let Some(text) = extract_tool_result_text(block) {
+                        let truncated = if text.len() > 64 * 1024 {
+                            let mut end = 64 * 1024;
+                            while !text.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            format!("{}…", &text[..end])
+                        } else {
+                            text
+                        };
+
+                        update["content"] = serde_json::json!([
+                            {
+                                "type": "content",
+                                "content": {
+                                    "type": "text",
+                                    "text": truncated,
+                                }
+                            }
+                        ]);
+                    }
 
                     updates.push(serde_json::json!({
                         "jsonrpc": "2.0",
