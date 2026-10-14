@@ -10,6 +10,7 @@ fn new_test_core() -> (ChatCore, Instant) {
     let opts = ChatOpts {
         crid_seed: 0x1234,
         idle_timeout: Some(Duration::from_secs(30 * 60)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     // Complete initial replay phase
@@ -296,6 +297,7 @@ fn test_replay_done_flush_reoffered_permission_unknown_not_answered() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
 
@@ -537,6 +539,7 @@ fn test_attach_success_emits_attached_effect() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
 
@@ -568,6 +571,7 @@ fn test_attach_failure_emits_attach_failed_effect() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
 
@@ -613,6 +617,7 @@ fn test_idle_timeout_none_disables_detach() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: None,
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
@@ -633,6 +638,7 @@ fn test_id_alloc_pre_session_constructor() {
     let opts = ChatOpts {
         crid_seed: 42,
         idle_timeout: None,
+        max_turns: None,
     };
     // Pass pre-session allocator to ChatCore::with_ids
     let mut core = ChatCore::with_ids("new-session-id".into(), opts, now, ids);
@@ -1497,6 +1503,7 @@ fn test_transcript_effects_and_cursor() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     assert_eq!(core.cursor(), None);
@@ -1547,6 +1554,7 @@ fn test_replay_phase_suppresses_live_actions() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     assert!(core.is_replaying());
@@ -1645,6 +1653,7 @@ fn test_attach_request_and_id_allocation() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
 
@@ -1665,10 +1674,12 @@ fn test_crid_uniqueness_with_seeds() {
     let opts_a = ChatOpts {
         crid_seed: 0xaaaa_bbbb,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let opts_b = ChatOpts {
         crid_seed: 0xcccc_dddd,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
 
     let mut core_a = ChatCore::new("session-a".into(), opts_a, now);
@@ -1791,6 +1802,7 @@ fn test_clock_purity_and_deterministic_idle_detach() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
@@ -1810,6 +1822,7 @@ fn test_detached_lines_buffered_and_processed_in_order_after_replay_done() {
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
@@ -2218,6 +2231,7 @@ fn test_multiple_lines_while_detached() {
     let opts = ChatOpts {
         crid_seed: 0x9999,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     core.handle(Input::Frame(json!({"jsonrpc": "2.0", "method": "_honk/replay_done", "params": {"sessionId": "test-session", "epoch": 1, "seq": 0}})));
@@ -2359,6 +2373,7 @@ fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behavi
     let opts = ChatOpts {
         crid_seed: 1,
         idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: None,
     };
     let mut core = ChatCore::new("test-session".into(), opts, now);
     assert!(core.is_replaying());
@@ -2997,4 +3012,203 @@ fn test_reconnect_foreign_run_with_old_crid_stays_non_own() {
             .any(|e| matches!(e, Effect::Notify { method, .. } if method == "session/cancel"))
     );
     assert!(has_notice(&cancel_effs, "/cancel!"));
+}
+
+#[test]
+fn test_prompt_params_carry_max_turns_when_set() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 0x1234,
+        idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: Some(5),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+
+    let effs = core.handle(Input::Line("hello".into()));
+    let prompt = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .unwrap();
+    let Effect::Request { params, .. } = prompt else {
+        panic!()
+    };
+    assert_eq!(params["_meta"]["goose"]["maxTurns"], 5);
+    assert!(params["_meta"]["honk"]["client_req_id"].is_string());
+}
+
+#[test]
+fn test_prompt_params_omit_max_turns_when_unset() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("hello".into()));
+    let prompt = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .unwrap();
+    let Effect::Request { params, .. } = prompt else {
+        panic!()
+    };
+    assert!(params["_meta"]["goose"].is_null());
+    assert!(params["_meta"]["honk"]["client_req_id"].is_string());
+}
+
+#[test]
+fn test_prompt_re_send_keeps_max_turns() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 0x1234,
+        idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: Some(3),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+
+    core.handle(Input::Line("hello".into()));
+    core.handle(Input::Disconnected);
+    let reconnected_effs = core.handle(Input::Connected);
+
+    let resend = reconnected_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .unwrap();
+    let Effect::Request { params, .. } = resend else {
+        panic!()
+    };
+    assert_eq!(params["_meta"]["goose"]["maxTurns"], 3);
+}
+
+#[test]
+fn test_turns_slash_command_updates_subsequent_prompts() {
+    let (mut core, _) = new_test_core();
+
+    // /turns 7 updates max_turns
+    let effs1 = core.handle(Input::Line("/turns 7".into()));
+    assert!(has_notice(&effs1, "max_turns set to 7"));
+
+    let effs_p1 = core.handle(Input::Line("prompt 1".into()));
+    let p1 = effs_p1
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .unwrap();
+    let Effect::Request {
+        params: params1, ..
+    } = p1
+    else {
+        panic!()
+    };
+    assert_eq!(params1["_meta"]["goose"]["maxTurns"], 7);
+
+    // Turn finishes
+    let req_id1 = core.prompt_sent().unwrap().req_id;
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id1,
+        "result": { "stopReason": "end_turn" }
+    })));
+    let crid1 = "honk-chat-0000000000001234-1";
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u1",
+                "content": { "type": "text", "text": "prompt 1" },
+                "_meta": { "honk": { "source": { "client_req_id": crid1 } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": { "sessionUpdate": "session_info_update", "_meta": { "goose": { "activeRunId": null } } } }
+    })));
+
+    // /turns off clears it
+    let effs2 = core.handle(Input::Line("/turns off".into()));
+    assert!(has_notice(&effs2, "max_turns disabled"));
+
+    let effs_p2 = core.handle(Input::Line("prompt 2".into()));
+    let p2 = effs_p2
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .unwrap();
+    let Effect::Request {
+        params: params2, ..
+    } = p2
+    else {
+        panic!()
+    };
+    assert!(params2["_meta"]["goose"].is_null());
+}
+
+#[test]
+fn test_turns_slash_command_invalid_argument() {
+    let (mut core, _) = new_test_core();
+
+    let effs0 = core.handle(Input::Line("/turns 0".into()));
+    assert!(has_notice(&effs0, "invalid /turns argument"));
+    assert_eq!(core.max_turns(), None);
+
+    let effs_abc = core.handle(Input::Line("/turns abc".into()));
+    assert!(has_notice(&effs_abc, "invalid /turns argument"));
+    assert_eq!(core.max_turns(), None);
+}
+
+#[test]
+fn test_steer_does_not_carry_max_turns() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 0x1234,
+        idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: Some(10),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+
+    // Prompt 1
+    core.handle(Input::Line("prompt 1".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    // Echo confirms own turn
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u1",
+                "content": { "type": "text", "text": "prompt 1" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": { "sessionUpdate": "session_info_update", "_meta": { "goose": { "activeRunId": "run_1" } } } }
+    })));
+
+    // While own turn is running, line becomes a steer
+    let steer_effs = core.handle(Input::Line("steer text".into()));
+    let steer = steer_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_goose/unstable/session/steer"))
+        .unwrap();
+    let Effect::Request { params, .. } = steer else {
+        panic!()
+    };
+    assert!(params.get("_meta").is_none());
 }

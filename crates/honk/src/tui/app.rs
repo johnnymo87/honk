@@ -304,6 +304,9 @@ impl App {
             "help" => {
                 let _ = self.cmd_tx.send(UiCommand::Line("/help".into()));
             }
+            cmd if cmd.starts_with("turns ") || cmd == "turns" => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             other => {
                 self.transcript
                     .apply_notice(Notice::warning(format!("unknown command: :{other}")));
@@ -943,6 +946,8 @@ mod tests {
             ("drop", "/drop"),
             ("approve", "/approve"),
             ("help", "/help"),
+            ("turns 5", "/turns 5"),
+            ("turns off", "/turns off"),
         ];
 
         for (typed, expected_cmd) in commands {

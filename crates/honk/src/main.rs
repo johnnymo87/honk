@@ -41,6 +41,10 @@ struct ChatArgs {
     #[arg(long = "ext", requires = "new")]
     ext: Vec<String>,
 
+    /// Cap model calls per turn (positive integer)
+    #[arg(long = "max-turns", env = "HONK_MAX_TURNS", value_parser = parse_max_turns)]
+    max_turns: Option<u32>,
+
     /// honkd WebSocket or HTTP endpoint
     #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
     url: String,
@@ -76,12 +80,34 @@ struct TailArgs {
 
 #[derive(Args, Debug)]
 struct ListArgs {
+    /// Filter sessions by working directory
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
     /// honkd WebSocket or HTTP endpoint
     #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
     url: String,
     /// Secret auth token (defaults to $HONK_SECRET or state file)
     #[arg(long)]
     secret: Option<String>,
+}
+
+fn parse_max_turns(s: &str) -> Result<u32, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("invalid --max-turns `{s}`: must be an integer >= 1"))?;
+    if n < 1 {
+        return Err(format!("invalid --max-turns `{s}`: must be >= 1"));
+    }
+    Ok(n)
+}
+
+fn resolve_list_cwd(p: &std::path::Path) -> String {
+    if let Ok(canon) = p.canonicalize() {
+        canon.to_string_lossy().to_string()
+    } else {
+        p.to_string_lossy().to_string()
+    }
 }
 
 fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Target> {
@@ -131,7 +157,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::List(args) => {
             let secret = resolve_secret(args.secret.as_deref())?;
             let mut client = Client::connect(&args.url, &secret).await?;
-            let sessions = client.list_sessions().await?;
+            let cwd = args.cwd.as_deref().map(resolve_list_cwd);
+            let opts = honk::ListOpts {
+                cwd,
+                ..Default::default()
+            };
+            let sessions = client.list_sessions_with(opts).await?;
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             use std::io::Write;
@@ -153,7 +184,8 @@ async fn main() -> anyhow::Result<()> {
                 honk::chat::driver::Target::New { .. } => String::new(),
             };
 
-            let opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
+            let mut opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
+            opts.max_turns = args.max_turns;
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
@@ -173,6 +205,7 @@ mod tests {
             new: true,
             cwd: Some(PathBuf::from("/nonexistent_path_xyz_123")),
             ext: vec![],
+            max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
         };
@@ -188,6 +221,7 @@ mod tests {
             new: true,
             cwd: Some(temp.path().to_path_buf()),
             ext: vec!["dev".into()],
+            max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
         };
@@ -199,5 +233,42 @@ mod tests {
             }
             _ => panic!("expected Target::New"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_max_turns_valid() {
+        let cli = Cli::try_parse_from(["honk", "chat", "ses_1", "--max-turns", "5"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert_eq!(args.max_turns, Some(5)),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_max_turns_default_unset() {
+        let cli = Cli::try_parse_from(["honk", "chat", "ses_1"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert_eq!(args.max_turns, None),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_max_turns_zero_fails() {
+        let err = Cli::try_parse_from(["honk", "chat", "ses_1", "--max-turns", "0"]).unwrap_err();
+        assert!(err.to_string().contains(">= 1"));
+    }
+
+    #[test]
+    fn test_resolve_list_cwd_existing_canonicalizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let canon = temp.path().canonicalize().unwrap();
+        assert_eq!(resolve_list_cwd(temp.path()), canon.to_string_lossy());
+    }
+
+    #[test]
+    fn test_resolve_list_cwd_nonexistent_verbatim() {
+        let non_existent = PathBuf::from("/nonexistent/path/xyz/123");
+        assert_eq!(resolve_list_cwd(&non_existent), "/nonexistent/path/xyz/123");
     }
 }

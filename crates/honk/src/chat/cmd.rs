@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -45,6 +45,39 @@ impl ChatCore {
 
         if trimmed == "/approve" {
             self.handle_approve_command(effects);
+            return true;
+        }
+
+        if trimmed == "/turns" || trimmed.starts_with("/turns ") {
+            let arg = trimmed.strip_prefix("/turns").unwrap().trim();
+            if arg.is_empty() {
+                let status = match self.opts.max_turns {
+                    Some(n) => format!(
+                        "max_turns is currently {n} (use /turns N to change, /turns off to clear)"
+                    ),
+                    None => "max_turns is currently disabled (use /turns N to set)".to_string(),
+                };
+                effects.push(Effect::Notice(Notice::info(status)));
+                return true;
+            }
+            if arg == "off" {
+                self.opts.max_turns = None;
+                effects.push(Effect::Notice(Notice::info("max_turns disabled")));
+                return true;
+            }
+            match arg.parse::<u32>() {
+                Ok(n) if n >= 1 => {
+                    self.opts.max_turns = Some(n);
+                    effects.push(Effect::Notice(Notice::info(format!(
+                        "max_turns set to {n}"
+                    ))));
+                }
+                _ => {
+                    effects.push(Effect::Notice(Notice::warning(
+                        "invalid /turns argument: must be a positive integer (>= 1) or 'off'",
+                    )));
+                }
+            }
             return true;
         }
 

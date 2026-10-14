@@ -1,5 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use honk::{Client, Conn, is_response};
+use honk::{Client, Conn, ListOpts, is_response};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -690,6 +690,287 @@ async fn test_send_request_with_explicit_id() {
     let frame = frame_rx.recv().await.unwrap();
     assert_eq!(frame["id"], 42);
     assert_eq!(frame["result"]["status"], "ok");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_list_sessions_returns_all_pages_in_order() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Page 1: 50 sessions (0..50) with nextCursor
+            let msg1 = ws.next().await.unwrap().unwrap();
+            let v1: Value = serde_json::from_str(msg1.to_text().unwrap()).unwrap();
+            assert_eq!(v1["method"], "session/list");
+            let mut s1 = Vec::new();
+            for i in 0..50 {
+                s1.push(json!({
+                    "sessionId": format!("ses_{i}"),
+                    "title": format!("Session {i}"),
+                    "cwd": format!("/work/{i}"),
+                }));
+            }
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v1["id"],
+                    "result": {
+                        "sessions": s1,
+                        "nextCursor": "cursor_1"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Page 2: 50 sessions (50..100) with nextCursor
+            let msg2 = ws.next().await.unwrap().unwrap();
+            let v2: Value = serde_json::from_str(msg2.to_text().unwrap()).unwrap();
+            assert_eq!(v2["method"], "session/list");
+            assert_eq!(v2["params"]["cursor"], "cursor_1");
+            let mut s2 = Vec::new();
+            for i in 50..100 {
+                s2.push(json!({
+                    "sessionId": format!("ses_{i}"),
+                    "title": format!("Session {i}"),
+                    "cwd": format!("/work/{i}"),
+                }));
+            }
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v2["id"],
+                    "result": {
+                        "sessions": s2,
+                        "nextCursor": "cursor_2"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Page 3: 20 sessions (100..120) with no nextCursor
+            let msg3 = ws.next().await.unwrap().unwrap();
+            let v3: Value = serde_json::from_str(msg3.to_text().unwrap()).unwrap();
+            assert_eq!(v3["method"], "session/list");
+            assert_eq!(v3["params"]["cursor"], "cursor_2");
+            let mut s3 = Vec::new();
+            for i in 100..120 {
+                s3.push(json!({
+                    "sessionId": format!("ses_{i}"),
+                    "title": format!("Session {i}"),
+                    "cwd": format!("/work/{i}"),
+                }));
+            }
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v3["id"],
+                    "result": {
+                        "sessions": s3
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let mut client = Client::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    let sessions = client.list_sessions().await.unwrap();
+    assert_eq!(sessions.len(), 120);
+    for (i, s) in sessions.iter().enumerate() {
+        assert_eq!(s.session_id, format!("ses_{i}"));
+        assert_eq!(s.title, format!("Session {i}"));
+        assert_eq!(s.cwd, format!("/work/{i}"));
+    }
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_list_sessions_forwards_cwd_param() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/list");
+            assert_eq!(v["params"]["cwd"], "/test/filtered/dir");
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessions": [{
+                            "sessionId": "ses_filtered",
+                            "title": "Filtered Session",
+                            "cwd": "/test/filtered/dir"
+                        }]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let mut client = Client::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    let sessions = client
+        .list_sessions_with(ListOpts {
+            cwd: Some("/test/filtered/dir".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "ses_filtered");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_list_sessions_terminates_on_repeated_cursor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Page 1 returns nextCursor: "loop_cursor"
+            let msg1 = ws.next().await.unwrap().unwrap();
+            let v1: Value = serde_json::from_str(msg1.to_text().unwrap()).unwrap();
+            assert_eq!(v1["method"], "session/list");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v1["id"],
+                    "result": {
+                        "sessions": [{"sessionId": "ses_1", "title": "S1", "cwd": "/c1"}],
+                        "nextCursor": "loop_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Page 2 also returns nextCursor: "loop_cursor" (repeated cursor!)
+            let msg2 = ws.next().await.unwrap().unwrap();
+            let v2: Value = serde_json::from_str(msg2.to_text().unwrap()).unwrap();
+            assert_eq!(v2["method"], "session/list");
+            assert_eq!(v2["params"]["cursor"], "loop_cursor");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v2["id"],
+                    "result": {
+                        "sessions": [{"sessionId": "ses_2", "title": "S2", "cwd": "/c2"}],
+                        "nextCursor": "loop_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let mut client = Client::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    // Must terminate after page 2 without hanging or looping infinitely
+    let sessions = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.list_sessions_with(ListOpts::default()),
+    )
+    .await
+    .expect("must terminate on repeated cursor")
+    .unwrap();
+
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].session_id, "ses_1");
+    assert_eq!(sessions[1].session_id, "ses_2");
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_list_sessions_respects_max_pages() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = accept_test_ws(listener, |mut ws| {
+        Box::pin(async move {
+            handle_initialize(&mut ws).await;
+
+            // Server offers page 1 with nextCursor
+            let msg1 = ws.next().await.unwrap().unwrap();
+            let v1: Value = serde_json::from_str(msg1.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v1["id"],
+                    "result": {
+                        "sessions": [{"sessionId": "ses_p1", "title": "P1", "cwd": "/c"}],
+                        "nextCursor": "cur_2"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let mut client = Client::connect(&addr.to_string(), "test-secret-123")
+        .await
+        .unwrap();
+
+    let sessions = client
+        .list_sessions_with(ListOpts {
+            cwd: None,
+            max_pages: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "ses_p1");
 
     server_handle.await.unwrap();
 }
