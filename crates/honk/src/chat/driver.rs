@@ -136,6 +136,27 @@ fn id_matches(frame_id: Option<&Value>, expected: u64) -> bool {
     }
 }
 
+#[derive(Default, Debug)]
+struct ListPagingState {
+    pending_id: Option<u64>,
+    page_count: usize,
+    seen_cursors: std::collections::HashSet<String>,
+}
+
+impl ListPagingState {
+    fn start(&mut self, id: u64) {
+        self.pending_id = Some(id);
+        self.page_count = 1;
+        self.seen_cursors.clear();
+    }
+
+    fn reset(&mut self) {
+        self.pending_id = None;
+        self.page_count = 0;
+        self.seen_cursors.clear();
+    }
+}
+
 fn random_seed() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let mut hasher = DefaultHasher::new();
@@ -208,7 +229,7 @@ async fn process_effects(
     attach_failed_attempts: &mut u32,
     attach_retry_timer: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     connection_state: &mut ConnectionState,
-    pending_list_id: &mut Option<u64>,
+    list_paging: &mut ListPagingState,
     known_cwd: &mut Option<String>,
 ) -> EffectAction {
     for effect in effects {
@@ -257,8 +278,14 @@ async fn process_effects(
                 let _ = ui_tx.send(UiEvent::Attached { result });
                 if let Some(conn) = conn_opt.as_mut() {
                     let list_id = core.allocate_id();
-                    *pending_list_id = Some(list_id);
-                    let _ = conn.send_request(list_id, "session/list", json!({})).await;
+                    list_paging.start(list_id);
+                    let mut params = serde_json::Map::new();
+                    if let Some(cwd) = known_cwd.as_deref() {
+                        params.insert("cwd".to_string(), json!(cwd));
+                    }
+                    let _ = conn
+                        .send_request(list_id, "session/list", Value::Object(params))
+                        .await;
                 }
             }
             Effect::AttachFailed { error } => {
@@ -338,7 +365,9 @@ fn trigger_disconnect(
     last_state: &mut Option<StateSnapshot>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     live_since: &mut Option<Instant>,
+    list_paging: &mut ListPagingState,
 ) {
+    list_paging.reset();
     let effects = core.handle(Input::Disconnected);
     for effect in effects {
         match effect {
@@ -510,7 +539,7 @@ async fn run_driver(
     let mut attach_retry_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reconnect_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut reconnect_attempt = 1u32;
-    let mut pending_list_id: Option<u64> = None;
+    let mut list_paging = ListPagingState::default();
     let mut known_cwd = match &opts.target {
         Target::New { cwd, .. } => Some(cwd.to_string_lossy().to_string()),
         Target::Attach(_) => None,
@@ -541,7 +570,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
-                            &mut pending_list_id,
+                            &mut list_paging,
                             &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
@@ -559,6 +588,7 @@ async fn run_driver(
                                 &mut last_state,
                                 &ui_tx,
                                 &mut live_since,
+                                &mut list_paging,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -574,7 +604,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
-                            &mut pending_list_id,
+                            &mut list_paging,
                             &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
@@ -592,6 +622,7 @@ async fn run_driver(
                                 &mut last_state,
                                 &ui_tx,
                                 &mut live_since,
+                                &mut list_paging,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -607,7 +638,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
-                            &mut pending_list_id,
+                            &mut list_paging,
                             &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
@@ -641,6 +672,7 @@ async fn run_driver(
                                         &mut last_state,
                                         &ui_tx,
                                         &mut live_since,
+                                        &mut list_paging,
                                     );
                                 } else {
                                     connection_state = ConnectionState::Live;
@@ -658,6 +690,7 @@ async fn run_driver(
                                     &mut last_state,
                                     &ui_tx,
                                     &mut live_since,
+                                    &mut list_paging,
                                 );
                             }
                         }
@@ -672,11 +705,11 @@ async fn run_driver(
             } => {
                 match frame_opt {
                     Some(frame) => {
-                        if let Some(list_id) = pending_list_id
+                        if let Some(list_id) = list_paging.pending_id
                             && id_matches(frame.get("id"), list_id)
                             && frame.get("method").is_none()
                         {
-                            pending_list_id = None;
+                            let mut found = false;
                             let mut title = None;
                             let mut cwd = None;
                             let sessions = frame
@@ -692,6 +725,7 @@ async fn run_driver(
                                         .and_then(Value::as_str)
                                         == Some(&core.session_id);
                                     if sid_matches {
+                                        found = true;
                                         title = s
                                             .get("title")
                                             .or_else(|| s.get("name"))
@@ -706,10 +740,59 @@ async fn run_driver(
                                     }
                                 }
                             }
+
+                            if found {
+                                if let Some(ref c) = cwd {
+                                    known_cwd = Some(c.clone());
+                                } else if cwd.is_none() {
+                                    cwd = known_cwd.clone();
+                                }
+                                let _ = ui_tx.send(UiEvent::SessionInfo { title, cwd });
+                                list_paging.reset();
+                                continue;
+                            }
+
+                            // Session not found on this page: check nextCursor to follow pages
+                            let next_cursor = frame
+                                .pointer("/result/nextCursor")
+                                .or_else(|| frame.get("nextCursor"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
+
+                            const MAX_PAGES: usize = 100;
+                            if let Some(cursor) = next_cursor
+                                && list_paging.page_count < MAX_PAGES
+                                && list_paging.seen_cursors.insert(cursor.clone())
+                                && let Some(conn) = conn_opt.as_mut()
+                            {
+                                list_paging.page_count += 1;
+                                let next_list_id = core.allocate_id();
+                                list_paging.pending_id = Some(next_list_id);
+                                let mut params = serde_json::Map::new();
+                                params.insert("cursor".to_string(), json!(cursor));
+                                if let Some(k_cwd) = known_cwd.as_deref() {
+                                    params.insert("cwd".to_string(), json!(k_cwd));
+                                }
+                                if conn
+                                    .send_request(
+                                        next_list_id,
+                                        "session/list",
+                                        Value::Object(params),
+                                    )
+                                    .await
+                                    .is_ok()
+                                {
+                                    continue;
+                                }
+                            }
+
+                            // Pages exhausted, cap reached, repeated cursor, or send failed
                             if cwd.is_none() {
                                 cwd = known_cwd.clone();
                             }
                             let _ = ui_tx.send(UiEvent::SessionInfo { title, cwd });
+                            list_paging.reset();
                             continue;
                         }
 
@@ -722,8 +805,14 @@ async fn run_driver(
                             && let Some(conn) = conn_opt.as_mut()
                         {
                             let list_id = core.allocate_id();
-                            pending_list_id = Some(list_id);
-                            let _ = conn.send_request(list_id, "session/list", json!({})).await;
+                            list_paging.start(list_id);
+                            let mut params = serde_json::Map::new();
+                            if let Some(cwd) = known_cwd.as_deref() {
+                                params.insert("cwd".to_string(), json!(cwd));
+                            }
+                            let _ = conn
+                                .send_request(list_id, "session/list", Value::Object(params))
+                                .await;
                         }
 
                         if frame.get("method").and_then(Value::as_str)
@@ -748,7 +837,7 @@ async fn run_driver(
                             &mut attach_failed_attempts,
                             &mut attach_retry_timer,
                             &mut connection_state,
-                            &mut pending_list_id,
+                            &mut list_paging,
                             &mut known_cwd,
                         ).await;
                         if matches!(action, EffectAction::Exit) {
@@ -766,6 +855,7 @@ async fn run_driver(
                                 &mut last_state,
                                 &ui_tx,
                                 &mut live_since,
+                                &mut list_paging,
                             );
                         }
                         maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
@@ -782,6 +872,7 @@ async fn run_driver(
                             &mut last_state,
                             &ui_tx,
                             &mut live_since,
+                            &mut list_paging,
                         );
                     }
                 }
@@ -807,6 +898,7 @@ async fn run_driver(
                             &mut last_state,
                             &ui_tx,
                             &mut live_since,
+                            &mut list_paging,
                         );
                     }
                 }
@@ -840,7 +932,7 @@ async fn run_driver(
                                 &mut attach_failed_attempts,
                                 &mut attach_retry_timer,
                                 &mut connection_state,
-                                &mut pending_list_id,
+                                &mut list_paging,
                                 &mut known_cwd,
                             ).await;
                             if matches!(action, EffectAction::Exit) {
@@ -892,7 +984,7 @@ async fn run_driver(
                     &mut attach_failed_attempts,
                     &mut attach_retry_timer,
                     &mut connection_state,
-                    &mut pending_list_id,
+                    &mut list_paging,
                     &mut known_cwd,
                 ).await;
                 if matches!(action, EffectAction::Exit) {
@@ -910,6 +1002,7 @@ async fn run_driver(
                         &mut last_state,
                         &ui_tx,
                         &mut live_since,
+                        &mut list_paging,
                     );
                 }
                 maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);

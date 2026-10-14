@@ -8,6 +8,39 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListOpts {
+    pub cwd: Option<String>,
+    pub max_pages: usize,
+}
+
+impl Default for ListOpts {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            max_pages: Self::DEFAULT_MAX_PAGES,
+        }
+    }
+}
+
+impl ListOpts {
+    pub const DEFAULT_MAX_PAGES: usize = 100;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_max_pages(mut self, max_pages: usize) -> Self {
+        self.max_pages = max_pages;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionEntry {
     pub session_id: String,
     pub held: bool,
@@ -259,50 +292,105 @@ impl Client {
     }
 
     pub async fn list_sessions(&mut self) -> anyhow::Result<Vec<SessionEntry>> {
-        let res = self.call("session/list", json!({})).await?;
-        if let Some(err) = res.get("error") {
-            anyhow::bail!("session/list returned error: {err}");
-        }
+        self.list_sessions_with(ListOpts::default()).await
+    }
 
-        let sessions_val = res
-            .pointer("/result/sessions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("missing sessions array in response: {res}"))?;
+    pub async fn list_sessions_with(
+        &mut self,
+        opts: ListOpts,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        let max_pages = if opts.max_pages == 0 {
+            ListOpts::DEFAULT_MAX_PAGES
+        } else {
+            opts.max_pages
+        };
 
         let mut entries = Vec::new();
-        for s in sessions_val {
-            let session_id = s
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let title = s
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let cwd = s
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let held = s
-                .pointer("/_meta/honk/held")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let running = s
-                .pointer("/_meta/honk/running")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        let mut current_cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut pages_fetched = 0;
 
-            entries.push(SessionEntry {
-                session_id,
-                held,
-                running,
-                title,
-                cwd,
-            });
+        loop {
+            if pages_fetched >= max_pages {
+                break;
+            }
+
+            let mut params = serde_json::Map::new();
+            if let Some(ref cwd) = opts.cwd {
+                params.insert("cwd".to_string(), json!(cwd));
+            }
+            if let Some(ref cursor) = current_cursor {
+                params.insert("cursor".to_string(), json!(cursor));
+            }
+
+            let res = self.call("session/list", Value::Object(params)).await?;
+            if let Some(err) = res.get("error") {
+                anyhow::bail!("session/list returned error: {err}");
+            }
+
+            let sessions_val = res
+                .pointer("/result/sessions")
+                .or_else(|| res.get("sessions"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("missing sessions array in response: {res}"))?;
+
+            for s in sessions_val {
+                let session_id = s
+                    .get("sessionId")
+                    .or_else(|| s.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let title = s
+                    .get("title")
+                    .or_else(|| s.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let cwd = s
+                    .get("cwd")
+                    .or_else(|| s.pointer("/_meta/workingDir"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let held = s
+                    .pointer("/_meta/honk/held")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let running = s
+                    .pointer("/_meta/honk/running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                entries.push(SessionEntry {
+                    session_id,
+                    held,
+                    running,
+                    title,
+                    cwd,
+                });
+            }
+
+            pages_fetched += 1;
+
+            let next_cursor = res
+                .pointer("/result/nextCursor")
+                .or_else(|| res.get("nextCursor"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+
+            match next_cursor {
+                Some(cursor) => {
+                    if !seen_cursors.insert(cursor.clone()) {
+                        break;
+                    }
+                    current_cursor = Some(cursor);
+                }
+                None => break,
+            }
         }
+
         Ok(entries)
     }
 }

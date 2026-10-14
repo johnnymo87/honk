@@ -2155,3 +2155,372 @@ async fn test_reconnect_backoff_successive_delays_grow() {
 
     let _ = handle.send(UiCommand::Shutdown);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_session_info_finds_target_on_page_3() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "initialize");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            let load_id = v["id"].clone();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": load_id, "result": { "sessionId": "target-ses" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/list page 1 (50 dummy sessions)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v1: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v1["method"], "session/list");
+            let mut p1_sessions = Vec::new();
+            for i in 0..50 {
+                p1_sessions.push(json!({
+                    "sessionId": format!("dummy_p1_{i}"),
+                    "title": format!("Dummy {i}"),
+                    "cwd": "/dummy",
+                }));
+            }
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v1["id"],
+                    "result": {
+                        "sessions": p1_sessions,
+                        "nextCursor": "page2_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/list page 2 (50 dummy sessions)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v2: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v2["method"], "session/list");
+            assert_eq!(v2["params"]["cursor"], "page2_cursor");
+            let mut p2_sessions = Vec::new();
+            for i in 0..50 {
+                p2_sessions.push(json!({
+                    "sessionId": format!("dummy_p2_{i}"),
+                    "title": format!("Dummy {i}"),
+                    "cwd": "/dummy",
+                }));
+            }
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v2["id"],
+                    "result": {
+                        "sessions": p2_sessions,
+                        "nextCursor": "page3_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 5. session/list page 3 (contains target-ses)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v3: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v3["method"], "session/list");
+            assert_eq!(v3["params"]["cursor"], "page3_cursor");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v3["id"],
+                    "result": {
+                        "sessions": [
+                            {
+                                "sessionId": "target-ses",
+                                "title": "Deep Session Title",
+                                "cwd": "/deep/work/dir"
+                            }
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("target-ses".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut found_session_info = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(UiEvent::SessionInfo { title, cwd })) => {
+                if title.as_deref() == Some("Deep Session Title")
+                    && cwd.as_deref() == Some("/deep/work/dir")
+                {
+                    found_session_info = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        found_session_info,
+        "driver must follow nextCursor to page 3 and find session title and cwd"
+    );
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_forwards_known_cwd_to_session_list() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "initialize");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            let new_id = v["id"].clone();
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": new_id,
+                    "result": {
+                        "sessionId": "s_new",
+                        "cwd": "/test/known/driver/cwd"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            let load_id = v["id"].clone();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": load_id, "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/list must have cwd forwarded
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/list");
+            assert_eq!(v["params"]["cwd"], "/test/known/driver/cwd");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessions": [
+                            {
+                                "sessionId": "s_new",
+                                "title": "New Session",
+                                "cwd": "/test/known/driver/cwd"
+                            }
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(
+        url,
+        "secret",
+        Target::New {
+            cwd: PathBuf::from("/test/known/driver/cwd"),
+            extensions: None,
+        },
+    );
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut found_session_info = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(UiEvent::SessionInfo { title, cwd })) => {
+                if title.as_deref() == Some("New Session")
+                    && cwd.as_deref() == Some("/test/known/driver/cwd")
+                {
+                    found_session_info = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        found_session_info,
+        "driver must forward known cwd to session/list and emit SessionInfo"
+    );
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_session_info_terminates_on_repeated_cursor() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let load_id = v["id"].clone();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": load_id, "result": { "sessionId": "target-ses" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/list page 1 returns loop_cursor
+            let msg = ws.next().await.unwrap().unwrap();
+            let v1: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v1["method"], "session/list");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v1["id"],
+                    "result": {
+                        "sessions": [],
+                        "nextCursor": "loop_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/list page 2 returns loop_cursor again
+            let msg = ws.next().await.unwrap().unwrap();
+            let v2: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v2["method"], "session/list");
+            assert_eq!(v2["params"]["cursor"], "loop_cursor");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v2["id"],
+                    "result": {
+                        "sessions": [],
+                        "nextCursor": "loop_cursor"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        })
+    })
+    .await;
+
+    let opts = DriverOpts::new(url, "secret", Target::Attach("target-ses".to_string()));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut session_info_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(UiEvent::SessionInfo { .. })) => {
+                session_info_seen = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        session_info_seen,
+        "driver must terminate paging loop on repeated cursor and emit SessionInfo"
+    );
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}

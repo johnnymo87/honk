@@ -76,12 +76,24 @@ struct TailArgs {
 
 #[derive(Args, Debug)]
 struct ListArgs {
+    /// Filter sessions by working directory
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
     /// honkd WebSocket or HTTP endpoint
     #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
     url: String,
     /// Secret auth token (defaults to $HONK_SECRET or state file)
     #[arg(long)]
     secret: Option<String>,
+}
+
+fn resolve_list_cwd(p: &std::path::Path) -> String {
+    if let Ok(canon) = p.canonicalize() {
+        canon.to_string_lossy().to_string()
+    } else {
+        p.to_string_lossy().to_string()
+    }
 }
 
 fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Target> {
@@ -131,7 +143,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::List(args) => {
             let secret = resolve_secret(args.secret.as_deref())?;
             let mut client = Client::connect(&args.url, &secret).await?;
-            let sessions = client.list_sessions().await?;
+            let cwd = args.cwd.as_deref().map(resolve_list_cwd);
+            let opts = honk::ListOpts {
+                cwd,
+                ..Default::default()
+            };
+            let sessions = client.list_sessions_with(opts).await?;
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             use std::io::Write;
@@ -199,5 +216,18 @@ mod tests {
             }
             _ => panic!("expected Target::New"),
         }
+    }
+
+    #[test]
+    fn test_resolve_list_cwd_existing_canonicalizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let canon = temp.path().canonicalize().unwrap();
+        assert_eq!(resolve_list_cwd(temp.path()), canon.to_string_lossy());
+    }
+
+    #[test]
+    fn test_resolve_list_cwd_nonexistent_verbatim() {
+        let non_existent = PathBuf::from("/nonexistent/path/xyz/123");
+        assert_eq!(resolve_list_cwd(&non_existent), "/nonexistent/path/xyz/123");
     }
 }
