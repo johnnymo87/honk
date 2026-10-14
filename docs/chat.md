@@ -54,6 +54,10 @@ export HONK_MAX_TURNS=10
 
 When set, `honk chat` includes `_meta.goose.maxTurns` on each prompt. You can dynamically adjust or clear this during a session using `/turns <N>` or `/turns off`.
 
+The per-prompt value *replaces* goose's own `GOOSE_MAX_TURNS` limit for that prompt, in both directions: a large value raises the cap above the server's setting. It requires goose patched-1.54.0.4 or later; older goose ignores it. Recipe sessions that end every turn with `final_output` (such as stall-watch coordinators) can loop on chat-style prompts, so a small cap (around 10) is a good idea when chatting with them.
+
+`honk list` walks every page of goose's `session/list` (50 per page, most recently updated first). A session updated while the walk is in progress can move to an already-fetched page and be missed; run it again if a busy session is absent. `honk list --cwd DIR` filters by exact working directory (no symlink or trailing-slash normalization).
+
 Authentication secret is resolved in the following priority order:
 1. `--secret <token>` CLI argument
 2. `$HONK_SECRET` environment variable
