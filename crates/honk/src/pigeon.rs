@@ -242,8 +242,12 @@ pub async fn find_registered(
         .into_iter()
         .flatten()
         .find(|s| {
-            s.get("backend_kind").and_then(Value::as_str) == Some("goose-acp")
-                && s.get("backend_session_id").and_then(Value::as_str) == Some(goose_session_id)
+            let id = |k: &str| s.get(k).and_then(Value::as_str);
+            // Rows from before pigeon minted its own ids carry goose's id as
+            // `session_id` and no `backend_session_id`.
+            id("backend_kind") == Some("goose-acp")
+                && (id("backend_session_id") == Some(goose_session_id)
+                    || id("session_id") == Some(goose_session_id))
         })
         .and_then(|s| s.get("session_id").and_then(Value::as_str))
         .map(str::to_string);

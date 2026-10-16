@@ -133,6 +133,7 @@ async fn find_registered_matches_goose_acp_rows_by_goose_id() {
             {"session_id": "ses_x", "backend_kind": "opencode-plugin-direct", "backend_session_id": "20261016_7"},
             {"session_id": "gse_a", "backend_kind": "goose-acp", "backend_session_id": "20261016_6"},
             {"session_id": "gse_b", "backend_kind": "goose-acp", "backend_session_id": "20261016_7"},
+            {"session_id": "20261001_3", "backend_kind": "goose-acp", "backend_session_id": null},
         ]}),
         ..Behaviour::default()
     })
@@ -147,6 +148,14 @@ async fn find_registered_matches_goose_acp_rows_by_goose_id() {
             .unwrap()
             .as_deref(),
         Some("gse_b")
+    );
+    assert_eq!(
+        find_registered(&cfg, "20261001_3")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("20261001_3"),
+        "legacy rows keyed by goose's id"
     );
     assert_eq!(find_registered(&cfg, "20261016_9").await.unwrap(), None);
     assert!(
