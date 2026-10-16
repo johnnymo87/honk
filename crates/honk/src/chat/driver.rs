@@ -29,6 +29,10 @@ pub struct DriverOpts {
     pub crid_seed: Option<u64>,
     pub idle_timeout: Option<Duration>,
     pub max_turns: Option<u32>,
+    /// When set, a session created by `Target::New` is registered with this
+    /// pigeon daemon (so it gets a Telegram topic). Runs in the background;
+    /// its outcome arrives as a `UiEvent::Notice` and never blocks the chat.
+    pub pigeon: Option<crate::pigeon::PigeonSettings>,
 }
 
 impl DriverOpts {
@@ -40,9 +44,54 @@ impl DriverOpts {
             crid_seed: None,
             idle_timeout: None,
             max_turns: None,
+            pigeon: None,
         }
     }
 }
+
+/// Registers a just-created session with pigeon in the background and reports
+/// the outcome as a notice. A failure is a warning, never fatal: the chat works
+/// the same without a Telegram topic.
+fn spawn_pigeon_registration(
+    settings: crate::pigeon::PigeonSettings,
+    honk_url: &str,
+    honk_secret: &str,
+    goose_session_id: String,
+    cwd: String,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let endpoint = crate::pigeon::acp_endpoint(honk_url);
+    let auth_token = honk_secret.to_string();
+    tokio::spawn(async move {
+        let notice = match endpoint.and_then(|ep| Ok((ep, settings.load()?))) {
+            Err(e) => Notice::warning(format!("Telegram: not registered with pigeon: {e:#}")),
+            Ok((endpoint, cfg)) => {
+                let reg = crate::pigeon::Registration {
+                    goose_session_id,
+                    endpoint,
+                    auth_token,
+                    cwd,
+                    title: None,
+                    reason: crate::pigeon::Reason::NewChat,
+                };
+                match crate::pigeon::register(&cfg, &reg).await {
+                    Ok(r) if r.announced => Notice::info(r.summary()),
+                    Ok(r) => Notice::warning(r.summary()),
+                    Err(e) => {
+                        Notice::warning(format!("Telegram: not registered with pigeon: {e:#}"))
+                    }
+                }
+            }
+        };
+        let _ = ui_tx.send(UiEvent::Notice(notice));
+    })
+}
+
+/// How long quitting waits for a registration still in flight, so that a quick
+/// `:q` after `--new` does not leave pigeon with a session but no topic.
+const PIGEON_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+type PigeonSlot = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -405,6 +454,7 @@ async fn run_driver(
     opts: DriverOpts,
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
+    pigeon_slot: PigeonSlot,
 ) {
     let mut connection_state = ConnectionState::Connecting;
     let mut last_state = Some(StateSnapshot {
@@ -435,6 +485,7 @@ async fn run_driver(
 
     let mut core = match opts.target.clone() {
         Target::New { cwd, extensions } => {
+            let cwd_for_pigeon = cwd.to_string_lossy().to_string();
             let mut ids = IdAlloc::new();
             let new_req_id = ids.allocate();
             let mut params = json!({
@@ -516,6 +567,18 @@ async fn run_driver(
             let _ = ui_tx.send(UiEvent::SessionNew {
                 result: result.clone(),
             });
+
+            if let Some(settings) = opts.pigeon.clone() {
+                let task = spawn_pigeon_registration(
+                    settings,
+                    &opts.url,
+                    &opts.secret,
+                    session_id.to_string(),
+                    cwd_for_pigeon.clone(),
+                    ui_tx.clone(),
+                );
+                *pigeon_slot.lock().unwrap() = Some(task);
+            }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
         }
@@ -1026,7 +1089,12 @@ pub async fn start(
     };
 
     let task = tokio::spawn(async move {
-        run_driver(opts, cmd_rx, ui_tx).await;
+        let pigeon_slot = PigeonSlot::default();
+        run_driver(opts, cmd_rx, ui_tx, pigeon_slot.clone()).await;
+        let pending = pigeon_slot.lock().unwrap().take();
+        if let Some(h) = pending {
+            let _ = tokio::time::timeout(PIGEON_EXIT_GRACE, h).await;
+        }
     });
     *join_handle.lock().await = Some(task);
 

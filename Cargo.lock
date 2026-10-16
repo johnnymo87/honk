@@ -935,6 +935,7 @@ name = "honk"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "clap",
  "crossterm",
@@ -944,6 +945,7 @@ dependencies = [
  "honk-wire",
  "indexmap",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

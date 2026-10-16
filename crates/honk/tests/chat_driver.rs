@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err)]
 
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2538,4 +2540,110 @@ async fn test_driver_session_info_terminates_on_repeated_cursor() {
 
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
+}
+
+/// Drives `Target::New` with a pigeon configured and returns the session id
+/// and the first pigeon-related notice, failing on any fatal event.
+async fn new_session_pigeon_notice(
+    h: &HonkdHarness,
+    cwd: &Path,
+    pigeon: honk::pigeon::PigeonSettings,
+) -> (String, honk::chat::Notice) {
+    let mut opts = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: cwd.to_path_buf(),
+            extensions: None,
+        },
+    );
+    opts.pigeon = Some(pigeon);
+    let (_handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut session_id = None;
+    let mut attached = false;
+    let mut notice = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while notice.is_none() || !attached {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for session + pigeon notice")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { result } => {
+                session_id = result
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            UiEvent::Attached { .. } => attached = true,
+            UiEvent::Notice(n) if n.text.starts_with("Telegram:") => notice = Some(n),
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    }
+    (
+        session_id.expect("SessionNew carried a sessionId"),
+        notice.unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_is_registered_with_pigeon() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let p = support::pigeon_stub::StubPigeon::start(Default::default()).await;
+
+    let (sid, notice) = new_session_pigeon_notice(
+        &h,
+        tmp.path(),
+        honk::pigeon::PigeonSettings {
+            url: p.url.clone(),
+            token_file: None,
+        },
+    )
+    .await;
+
+    assert_eq!(notice.kind, honk::chat::NoticeKind::Info, "{notice:?}");
+    let seen = p.seen();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0].path, "/goose/sessions");
+    assert_eq!(seen[0].body["session_id"], sid.as_str());
+    assert_eq!(seen[0].body["endpoint"], h.ws_url().as_str());
+    assert_eq!(seen[0].body["auth_token"], h.secret().as_str());
+    assert_eq!(seen[0].body["cwd"], tmp.path().to_string_lossy().as_ref());
+    assert_eq!(seen[1].path, "/stop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_pigeon_failure_is_a_warning_not_fatal() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+
+    let (_sid, notice) = new_session_pigeon_notice(
+        &h,
+        tmp.path(),
+        honk::pigeon::PigeonSettings {
+            url: dead,
+            token_file: None,
+        },
+    )
+    .await;
+    assert_eq!(notice.kind, honk::chat::NoticeKind::Warning, "{notice:?}");
+    assert!(notice.text.contains("not registered"), "{notice:?}");
 }

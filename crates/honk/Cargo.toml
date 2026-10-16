@@ -20,6 +20,7 @@ futures.workspace = true
 honk-wire = { path = "../honk-wire" }
 indexmap = "2"
 ratatui = "0.30"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -30,4 +31,5 @@ unicode-width = "0.2.2"
 url = "2.5.4"
 
 [dev-dependencies]
+axum = "0.8.9"
 honk-testgoose = { path = "../honk-testgoose" }

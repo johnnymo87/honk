@@ -21,6 +21,62 @@ enum Commands {
         long_about = "Interactive ratatui TUI client for a goose session.\n\nSee docs/chat.md for key map, commands, shared session rules, and tmux configuration."
     )]
     Chat(ChatArgs),
+    /// Register an existing session with pigeon so it gets a Telegram topic
+    #[command(
+        long_about = "Register an existing session with a pigeon daemon so it gets a Telegram topic.\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Telegram replies prompt the session; turns typed in honk chat are not mirrored to Telegram. pigeon is given the honkd secret so it can reach the session."
+    )]
+    Telegram(TelegramArgs),
+}
+
+/// Where the pigeon daemon is. Registration is off unless a URL is given.
+#[derive(Args, Debug, Clone)]
+struct PigeonArgs {
+    /// pigeon daemon URL; when set, `chat --new` registers the session with it
+    #[arg(long = "pigeon-url", env = "HONK_PIGEON_URL")]
+    pigeon_url: Option<String>,
+
+    /// File holding pigeon's bearer token, if the daemon requires one
+    #[arg(long = "pigeon-token-file", env = "HONK_PIGEON_TOKEN_FILE")]
+    pigeon_token_file: Option<PathBuf>,
+}
+
+impl PigeonArgs {
+    fn settings(&self) -> Option<honk::pigeon::PigeonSettings> {
+        let url = self.pigeon_url.as_deref()?.trim();
+        if url.is_empty() {
+            return None;
+        }
+        Some(honk::pigeon::PigeonSettings {
+            url: url.to_string(),
+            token_file: self.pigeon_token_file.clone(),
+        })
+    }
+}
+
+#[derive(Args, Debug)]
+struct TelegramArgs {
+    /// Session ID to register
+    session: String,
+
+    /// Working directory to report, if honkd's session list does not include the session
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+
+    /// Register even if pigeon already has the session (overwrites pigeon's row,
+    /// including the token of a session pigeon launched itself)
+    #[arg(long)]
+    force: bool,
+
+    #[command(flatten)]
+    pigeon: PigeonArgs,
+
+    /// honkd WebSocket or HTTP endpoint
+    #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
+    url: String,
+
+    /// Secret auth token (defaults to $HONK_SECRET or state file)
+    #[arg(long)]
+    secret: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -52,6 +108,13 @@ struct ChatArgs {
     /// Secret auth token (defaults to $HONK_SECRET or state file)
     #[arg(long)]
     secret: Option<String>,
+
+    /// Do not register a new session with pigeon, even if HONK_PIGEON_URL is set
+    #[arg(long = "no-telegram")]
+    no_telegram: bool,
+
+    #[command(flatten)]
+    pigeon: PigeonArgs,
 }
 
 #[derive(Args, Debug)]
@@ -131,6 +194,17 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
     }
 }
 
+/// Only a session this invocation creates is registered: attaching to an
+/// existing one would re-announce it on every attach (`honk telegram` exists
+/// for that).
+fn chat_pigeon_settings(args: &ChatArgs) -> Option<honk::pigeon::PigeonSettings> {
+    if args.new && !args.no_telegram {
+        args.pigeon.settings()
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -184,11 +258,59 @@ async fn main() -> anyhow::Result<()> {
                 honk::chat::driver::Target::New { .. } => String::new(),
             };
 
+            let pigeon = chat_pigeon_settings(&args);
             let mut opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
             opts.max_turns = args.max_turns;
+            opts.pigeon = pigeon;
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
+        }
+        Commands::Telegram(args) => {
+            let Some(settings) = args.pigeon.settings() else {
+                anyhow::bail!(
+                    "no pigeon daemon configured: set HONK_PIGEON_URL or pass --pigeon-url"
+                );
+            };
+            let cfg = settings.load()?;
+            if !args.force
+                && let Some(existing) = honk::pigeon::find_registered(&cfg, &args.session).await?
+            {
+                anyhow::bail!(
+                    "pigeon already has session {} (as {existing}); pass --force to re-register it",
+                    args.session
+                );
+            }
+            let secret = resolve_secret(args.secret.as_deref())?;
+            let endpoint = honk::pigeon::acp_endpoint(&args.url)?;
+            let mut client = Client::connect(&args.url, &secret).await?;
+            let listed = client
+                .list_sessions()
+                .await?
+                .into_iter()
+                .find(|s| s.session_id == args.session);
+            let title = listed
+                .as_ref()
+                .map(|s| s.title.clone())
+                .filter(|t| !t.is_empty());
+            let cwd = match (&args.cwd, listed) {
+                (Some(c), _) => resolve_list_cwd(c),
+                (None, Some(s)) => s.cwd,
+                (None, None) => anyhow::bail!(
+                    "session {} is not in honkd's session list; pass --cwd to register it anyway",
+                    args.session
+                ),
+            };
+            let reg = honk::pigeon::Registration {
+                goose_session_id: args.session,
+                endpoint,
+                auth_token: secret,
+                cwd,
+                title,
+                reason: honk::pigeon::Reason::Existing,
+            };
+            let out = honk::pigeon::register(&cfg, &reg).await?;
+            println!("{} (pigeon id {})", out.summary(), out.pigeon_session_id);
         }
     }
     Ok(())
@@ -208,6 +330,11 @@ mod tests {
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
+            no_telegram: false,
+            pigeon: PigeonArgs {
+                pigeon_url: None,
+                pigeon_token_file: None,
+            },
         };
         let err = resolve_chat_target(&args).unwrap_err();
         assert!(err.to_string().contains("invalid --cwd:"));
@@ -224,6 +351,11 @@ mod tests {
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
+            no_telegram: false,
+            pigeon: PigeonArgs {
+                pigeon_url: None,
+                pigeon_token_file: None,
+            },
         };
         let target = resolve_chat_target(&args).unwrap();
         match target {
@@ -257,6 +389,78 @@ mod tests {
     fn test_cli_parse_max_turns_zero_fails() {
         let err = Cli::try_parse_from(["honk", "chat", "ses_1", "--max-turns", "0"]).unwrap_err();
         assert!(err.to_string().contains(">= 1"));
+    }
+
+    fn chat(argv: &[&str]) -> ChatArgs {
+        let mut full = vec!["honk", "chat"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).unwrap().command {
+            Commands::Chat(a) => a,
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_new_registers_with_pigeon_when_url_given() {
+        let a = chat(&[
+            "--new",
+            "--pigeon-url",
+            "http://127.0.0.1:4731",
+            "--pigeon-token-file",
+            "/t",
+        ]);
+        assert_eq!(
+            chat_pigeon_settings(&a),
+            Some(honk::pigeon::PigeonSettings {
+                url: "http://127.0.0.1:4731".into(),
+                token_file: Some(PathBuf::from("/t")),
+            })
+        );
+    }
+
+    #[test]
+    fn test_chat_pigeon_off_without_url_with_opt_out_or_on_attach() {
+        // No URL given (and none in the environment of a test run that sets it
+        // would be a misconfigured test run, so pass an empty one explicitly).
+        assert_eq!(
+            chat_pigeon_settings(&chat(&["--new", "--pigeon-url", ""])),
+            None
+        );
+        assert_eq!(
+            chat_pigeon_settings(&chat(&[
+                "--new",
+                "--no-telegram",
+                "--pigeon-url",
+                "http://p"
+            ])),
+            None
+        );
+        assert_eq!(
+            chat_pigeon_settings(&chat(&["ses_1", "--pigeon-url", "http://p"])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_telegram_subcommand() {
+        let cli = Cli::try_parse_from([
+            "honk",
+            "telegram",
+            "20261016_1",
+            "--pigeon-url",
+            "http://p",
+            "--cwd",
+            "/w",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Telegram(a) => {
+                assert_eq!(a.session, "20261016_1");
+                assert_eq!(a.cwd, Some(PathBuf::from("/w")));
+                assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
+            }
+            _ => panic!("expected telegram command"),
+        }
     }
 
     #[test]

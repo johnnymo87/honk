@@ -192,6 +192,29 @@ When creating a new session with `honk chat --new`:
 
 ---
 
+## Telegram via pigeon
+
+If you run a [pigeon](https://github.com/johnnymo87/pigeon) daemon, `honk chat --new` can register the new session with it so the session gets a Telegram topic:
+
+```bash
+export HONK_PIGEON_URL=http://127.0.0.1:4731          # or --pigeon-url
+export HONK_PIGEON_TOKEN_FILE=/path/to/pigeon-token   # or --pigeon-token-file; only if the daemon requires auth
+honk chat --new                  # registers in the background
+honk chat --new --no-telegram    # skip it for this session
+
+# Register a session that already exists (cwd and title come from honkd's session list)
+honk telegram 20261016_7
+```
+
+- Registration is off unless a pigeon URL is configured. It runs in the background; the outcome is shown as a notice, and a failure is only a warning, never a reason the chat stops.
+- honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), the working directory, and the honkd secret honk connected with (pigeon stores it and presents it to honkd; it refuses Telegram messages for a session stored without one). pigeon creates a topic only when it sends a notification, so honk then posts one short announcement (`POST /stop`), which creates the topic.
+- Replies in the topic prompt the session, and pigeon posts those turns' results there. **Turns typed in honk chat are not mirrored to Telegram**: pigeon reports only the turns it starts.
+- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk telegram <id>`. `honk telegram` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides.
+- The bearer token and the honkd secret travel in the request, so keep the pigeon URL on loopback or use `https://`.
+- The honkd URL is sent as honk sees it, so pigeon must be able to reach honkd at the same address (normally both on localhost).
+
+---
+
 ## Copying Text
 
 - **Terminal Selection**: Mouse capture is intentionally disabled. Native terminal mouse selection (click and drag, Shift-drag in certain terminals) and standard copy shortcuts (`Ctrl-Shift-C`, `Cmd-C`) work out of the box.

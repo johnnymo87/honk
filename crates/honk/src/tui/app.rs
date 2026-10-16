@@ -784,6 +784,11 @@ pub async fn run_app(
 
     drop(_guard);
 
+    // Join before any process::exit below, so the driver's own shutdown (which
+    // waits briefly for a pigeon registration in flight) runs on every exit path.
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = handle.join().await;
+
     if let Some(err) = app.fatal_error {
         eprintln!("{err}");
         std::process::exit(1);
@@ -791,9 +796,6 @@ pub async fn run_app(
     if let Some(code) = app.exit_code {
         std::process::exit(code);
     }
-
-    let _ = handle.send(UiCommand::Shutdown);
-    let _ = handle.join().await;
 
     Ok(0)
 }
