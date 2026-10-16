@@ -57,10 +57,12 @@ async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
         json!({"sessionId": sid, "cwd": ".", "mcpServers": [], "_meta": {"honk": {"after": cur}}}),
     )
     .await;
-    // After a restart honkd re-subscribes with resume_after and goose replays
-    // what it missed, but nothing marks the end of that replay, so a load can be
-    // answered before the catch-up lands. The missed frames then follow as live
-    // frames: still a delta, still exactly once.
+    // After a restart the session actor serves attaches from its log while it
+    // is still Reattaching (M1 plan: "attaches are served from the log"), so
+    // the load reply can predate the catch-up; the missed frames then follow
+    // live: still a delta, still exactly once. (Even once Live, nothing marks
+    // the end of goose's resume replay, so the reply is never guaranteed to
+    // contain it.)
     let start = Instant::now();
     while w.blocks.agent_text() != "one two three" {
         assert!(
@@ -76,6 +78,9 @@ async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
         .await; // retry
     assert_eq!(r["result"]["stopReason"], "end_turn");
     assert_eq!(r["result"]["_meta"]["honk"]["text"], "one two three");
+    // Weak until honk-9qf.8 is fixed: the turn currently ends in a _honk/reset
+    // and rebuild, which would erase any duplicated live text before this
+    // check. The fix should add `assert_eq!(w.blocks.resets, 0)` here.
     assert_eq!(
         w.blocks.agent_text(),
         "one two three",
