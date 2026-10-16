@@ -22,6 +22,8 @@ pub struct Seen {
 pub struct Behaviour {
     pub register: (StatusCode, Value),
     pub stop: (StatusCode, Value),
+    /// Body for `GET /sessions`.
+    pub sessions: Value,
 }
 
 impl Default for Behaviour {
@@ -35,6 +37,7 @@ impl Default for Behaviour {
                 StatusCode::ACCEPTED,
                 json!({"ok": true, "deliveryState": "queued", "notificationId": "s:gse_test:1"}),
             ),
+            sessions: json!({"ok": true, "sessions": []}),
         }
     }
 }
@@ -60,6 +63,7 @@ impl StubPigeon {
         let app = Router::new()
             .route("/goose/sessions", post(register))
             .route("/stop", post(stop))
+            .route("/sessions", axum::routing::get(sessions))
             .with_state(st);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -106,4 +110,9 @@ async fn stop(
     record(&st, "/stop", &headers, body);
     let (s, v) = st.behaviour.stop.clone();
     (s, axum::Json(v))
+}
+
+async fn sessions(State(st): State<St>, headers: HeaderMap) -> impl IntoResponse {
+    record(&st, "/sessions", &headers, Value::Null);
+    axum::Json(st.behaviour.sessions.clone())
 }

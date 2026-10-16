@@ -207,9 +207,9 @@ honk telegram 20261016_7
 ```
 
 - Registration is off unless a pigeon URL is configured. It runs in the background; the outcome is shown as a notice, and a failure is only a warning, never a reason the chat stops.
-- honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), and the working directory. pigeon creates a topic only when it sends a notification, so honk then posts one announcement (`POST /stop`), which creates the topic. honk's honkd secret is never sent to pigeon; pigeon reaches honkd with its own credentials.
+- honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), the working directory, and the honkd secret honk connected with (pigeon stores it and presents it to honkd; it refuses Telegram messages for a session stored without one). pigeon creates a topic only when it sends a notification, so honk then posts one short announcement (`POST /stop`), which creates the topic.
 - Replies in the topic prompt the session, and pigeon posts those turns' results there. **Turns typed in honk chat are not mirrored to Telegram**: pigeon reports only the turns it starts.
-- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk telegram <id>`.
+- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk telegram <id>`. `honk telegram` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides.
 - The honkd URL is sent as honk sees it, so pigeon must be able to reach honkd at the same address (normally both on localhost).
 
 ---

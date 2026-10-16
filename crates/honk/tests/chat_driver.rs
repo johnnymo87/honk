@@ -2616,6 +2616,7 @@ async fn test_new_session_is_registered_with_pigeon() {
     assert_eq!(seen[0].path, "/goose/sessions");
     assert_eq!(seen[0].body["session_id"], sid.as_str());
     assert_eq!(seen[0].body["endpoint"], h.ws_url().as_str());
+    assert_eq!(seen[0].body["auth_token"], h.secret().as_str());
     assert_eq!(seen[0].body["cwd"], tmp.path().to_string_lossy().as_ref());
     assert_eq!(seen[1].path, "/stop");
 }

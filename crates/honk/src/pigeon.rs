@@ -8,7 +8,14 @@
 //! notification (`POST /stop`) announcing it, which is what creates the topic.
 //!
 //! Turns typed in honk chat are not mirrored to Telegram; pigeon only reports the
-//! turns it starts. The announcement says so.
+//! turns it starts. honk's own notice says so.
+//!
+//! honk hands pigeon the honkd secret it connected with, as the session's
+//! `auth_token`. pigeon checks that honkd is reachable with the session's stored
+//! token before it delivers each Telegram message, and refuses the message if no
+//! token is stored, so a session registered without one gets a topic that
+//! cannot be used. It is the same credential pigeon stores for the sessions it
+//! launches through honkd itself.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -55,17 +62,32 @@ impl PigeonSettings {
 }
 
 /// What to tell pigeon about the session.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Registration {
     /// goose's id for the session, e.g. `20261016_1`.
     pub goose_session_id: String,
     /// The honkd ACP endpoint pigeon should drive the session through (ws/wss).
     pub endpoint: String,
+    /// The honkd secret pigeon must present at `endpoint`.
+    pub auth_token: String,
     pub cwd: String,
     /// Session title, when known. pigeon names the topic after it.
     pub title: Option<String>,
     /// Why the announcement is being sent; shapes its wording.
     pub reason: Reason,
+}
+
+impl std::fmt::Debug for Registration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registration")
+            .field("goose_session_id", &self.goose_session_id)
+            .field("endpoint", &self.endpoint)
+            .field("auth_token", &"<redacted>")
+            .field("cwd", &self.cwd)
+            .field("title", &self.title)
+            .field("reason", &self.reason)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +115,7 @@ impl Registered {
     /// A one-line summary for the TUI or stdout.
     pub fn summary(&self) -> String {
         if self.announced {
-            "Telegram: registered with pigeon; its topic appears shortly. Turns typed here are not mirrored there.".to_string()
+            "Telegram: registered with pigeon; its topic appears shortly. Replies there prompt this session, but turns typed here are not mirrored there.".to_string()
         } else {
             format!(
                 "Telegram: registered with pigeon, but it did not announce the session ({}); no topic yet.",
@@ -123,26 +145,23 @@ pub fn acp_endpoint(honk_url: &str) -> anyhow::Result<String> {
     Ok(u.to_string())
 }
 
+/// Kept short on purpose: a swipe-reply to it is quoted into the prompt.
 fn announcement(reg: &Registration) -> String {
-    let lead = match reg.reason {
-        Reason::NewChat => format!(
-            "New session {} started in honk chat ({}).",
-            reg.goose_session_id, reg.cwd
-        ),
-        Reason::Existing => format!(
-            "Session {} ({}) is now reachable from Telegram.",
-            reg.goose_session_id, reg.cwd
-        ),
+    let what = match reg.reason {
+        Reason::NewChat => "New honk chat session",
+        Reason::Existing => "honk session",
     };
     format!(
-        "{lead} Reply in this topic to prompt it. Turns typed in honk chat are not mirrored here; only replies to prompts sent from Telegram are."
+        "{what} {} in {}. Reply here to prompt it.",
+        reg.goose_session_id, reg.cwd
     )
 }
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registers the session with pigeon and posts the announcement that creates
-/// its topic. Safe to repeat: pigeon reuses its row for the same goose id.
+/// its topic. pigeon reuses its row for the same goose id but overwrites it
+/// wholesale; see [`find_registered`].
 pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<Registered> {
     let http = reqwest::Client::builder()
         .timeout(TIMEOUT)
@@ -154,6 +173,7 @@ pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<
         "endpoint": reg.endpoint,
         "cwd": reg.cwd,
         "label": reg.goose_session_id,
+        "auth_token": reg.auth_token,
     });
     let res = post(&http, cfg, "/goose/sessions", &body).await?;
     let Some(pigeon_id) = res.get("session_id").and_then(Value::as_str) else {
@@ -185,6 +205,49 @@ pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<
         announced,
         not_announced_reason,
     })
+}
+
+/// pigeon's id for the goose session, if pigeon already has it registered.
+///
+/// Registering again overwrites pigeon's row wholesale (token, label, cwd,
+/// title), which can break a session pigeon launched itself, so `honk telegram`
+/// checks first.
+pub async fn find_registered(
+    cfg: &PigeonConfig,
+    goose_session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let http = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .context("building HTTP client")?;
+    let mut req = http.get(format!("{}/sessions", cfg.url));
+    if let Some(t) = &cfg.token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("pigeon unreachable at {}", cfg.url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("pigeon /sessions returned HTTP {}", status.as_u16());
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .context("pigeon /sessions returned non-JSON")?;
+    let found = v
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| {
+            s.get("backend_kind").and_then(Value::as_str) == Some("goose-acp")
+                && s.get("backend_session_id").and_then(Value::as_str) == Some(goose_session_id)
+        })
+        .and_then(|s| s.get("session_id").and_then(Value::as_str))
+        .map(str::to_string);
+    Ok(found)
 }
 
 async fn post(
@@ -283,16 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn announcement_mentions_session_and_mirroring_caveat() {
+    fn announcement_names_session_and_never_the_token() {
         let reg = Registration {
             goose_session_id: "20261016_1".into(),
             endpoint: "ws://h/acp".into(),
+            auth_token: "sekrit".into(),
             cwd: "/w".into(),
             title: None,
             reason: Reason::NewChat,
         };
         let a = announcement(&reg);
         assert!(a.contains("20261016_1") && a.contains("/w"), "{a}");
-        assert!(a.contains("not mirrored"), "{a}");
+        assert!(!a.contains("sekrit"), "{a}");
+        assert!(!format!("{reg:?}").contains("sekrit"));
     }
 }

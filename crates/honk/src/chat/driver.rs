@@ -55,11 +55,13 @@ impl DriverOpts {
 fn spawn_pigeon_registration(
     settings: crate::pigeon::PigeonSettings,
     honk_url: &str,
+    honk_secret: &str,
     goose_session_id: String,
     cwd: String,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let endpoint = crate::pigeon::acp_endpoint(honk_url);
+    let auth_token = honk_secret.to_string();
     tokio::spawn(async move {
         let notice = match endpoint.and_then(|ep| Ok((ep, settings.load()?))) {
             Err(e) => Notice::warning(format!("Telegram: not registered with pigeon: {e:#}")),
@@ -67,6 +69,7 @@ fn spawn_pigeon_registration(
                 let reg = crate::pigeon::Registration {
                     goose_session_id,
                     endpoint,
+                    auth_token,
                     cwd,
                     title: None,
                     reason: crate::pigeon::Reason::NewChat,
@@ -81,8 +84,14 @@ fn spawn_pigeon_registration(
             }
         };
         let _ = ui_tx.send(UiEvent::Notice(notice));
-    });
+    })
 }
+
+/// How long quitting waits for a registration still in flight, so that a quick
+/// `:q` after `--new` does not leave pigeon with a session but no topic.
+const PIGEON_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+type PigeonSlot = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -445,6 +454,7 @@ async fn run_driver(
     opts: DriverOpts,
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
+    pigeon_slot: PigeonSlot,
 ) {
     let mut connection_state = ConnectionState::Connecting;
     let mut last_state = Some(StateSnapshot {
@@ -559,13 +569,15 @@ async fn run_driver(
             });
 
             if let Some(settings) = opts.pigeon.clone() {
-                spawn_pigeon_registration(
+                let task = spawn_pigeon_registration(
                     settings,
                     &opts.url,
+                    &opts.secret,
                     session_id.to_string(),
                     cwd_for_pigeon.clone(),
                     ui_tx.clone(),
                 );
+                *pigeon_slot.lock().unwrap() = Some(task);
             }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
@@ -1077,7 +1089,12 @@ pub async fn start(
     };
 
     let task = tokio::spawn(async move {
-        run_driver(opts, cmd_rx, ui_tx).await;
+        let pigeon_slot = PigeonSlot::default();
+        run_driver(opts, cmd_rx, ui_tx, pigeon_slot.clone()).await;
+        let pending = pigeon_slot.lock().unwrap().take();
+        if let Some(h) = pending {
+            let _ = tokio::time::timeout(PIGEON_EXIT_GRACE, h).await;
+        }
     });
     *join_handle.lock().await = Some(task);
 

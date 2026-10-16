@@ -23,7 +23,7 @@ enum Commands {
     Chat(ChatArgs),
     /// Register an existing session with pigeon so it gets a Telegram topic
     #[command(
-        long_about = "Register an existing session with a pigeon daemon so it gets a Telegram topic.\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Telegram replies prompt the session; turns typed in honk chat are not mirrored to Telegram."
+        long_about = "Register an existing session with a pigeon daemon so it gets a Telegram topic.\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Telegram replies prompt the session; turns typed in honk chat are not mirrored to Telegram. pigeon is given the honkd secret so it can reach the session."
     )]
     Telegram(TelegramArgs),
 }
@@ -61,6 +61,11 @@ struct TelegramArgs {
     /// Working directory to report, if honkd's session list does not include the session
     #[arg(long)]
     cwd: Option<PathBuf>,
+
+    /// Register even if pigeon already has the session (overwrites pigeon's row,
+    /// including the token of a session pigeon launched itself)
+    #[arg(long)]
+    force: bool,
 
     #[command(flatten)]
     pigeon: PigeonArgs,
@@ -268,6 +273,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             };
             let cfg = settings.load()?;
+            if !args.force
+                && let Some(existing) = honk::pigeon::find_registered(&cfg, &args.session).await?
+            {
+                anyhow::bail!(
+                    "pigeon already has session {} (as {existing}); pass --force to re-register it",
+                    args.session
+                );
+            }
             let secret = resolve_secret(args.secret.as_deref())?;
             let endpoint = honk::pigeon::acp_endpoint(&args.url)?;
             let mut client = Client::connect(&args.url, &secret).await?;
@@ -291,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
             let reg = honk::pigeon::Registration {
                 goose_session_id: args.session,
                 endpoint,
+                auth_token: secret,
                 cwd,
                 title,
                 reason: honk::pigeon::Reason::Existing,
