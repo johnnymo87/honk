@@ -83,7 +83,10 @@ The user interface consists of three distinct vertical areas:
 
 3. **Composer / Command Bar** (bottom):
    - Multiline editor with modal vim navigation.
-   - Grows dynamically to accommodate multiline input (up to ~8 lines or 30% of screen height).
+   - Long lines wrap at the screen edge. The composer grows with the number of wrapped rows,
+     up to 8; taller input scrolls to keep the cursor visible.
+   - Pasted text keeps its line breaks (the CR or CRLF that terminals and tmux send become
+     newlines). In insert mode it goes in at the cursor, as if typed.
    - Pressing `:` in normal mode switches to a single-line command bar for executing commands.
 
 ---

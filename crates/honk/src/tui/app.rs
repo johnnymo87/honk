@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::chat::driver::{ConnectionState, StateSnapshot, UiCommand, UiEvent};
 use crate::chat::types::Notice;
+use crate::tui::composer;
 use crate::tui::keys::{Action, configure_key_handler, resolve};
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
@@ -36,6 +37,8 @@ pub struct App {
     pub cmd_tx: mpsc::UnboundedSender<UiCommand>,
     pub last_transcript_area: Rect,
     pub pending_dump: bool,
+    /// First visible visual row of the composer (see `tui::composer`).
+    pub composer_scroll: usize,
 }
 
 impl App {
@@ -68,6 +71,7 @@ impl App {
             cmd_tx,
             last_transcript_area: Rect::new(0, 0, 80, 24),
             pending_dump: false,
+            composer_scroll: 0,
         }
     }
 
@@ -93,10 +97,6 @@ impl App {
         } else {
             self.composer.cursor = edtui::Index2::new(0, 0);
         }
-    }
-
-    pub fn composer_line_count(&self) -> usize {
-        self.composer.lines.len().max(1)
     }
 
     pub fn connection_state(&self) -> &ConnectionState {
@@ -405,7 +405,7 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: String) {
-        self.event_handler.on_paste_event(text, &mut self.composer);
+        composer::paste(&mut self.composer, &self.event_handler, &text);
     }
 
     pub fn handle_ui_event(&mut self, event: UiEvent) {
@@ -504,8 +504,9 @@ impl App {
             return;
         }
 
-        let composer_lines = self.composer_line_count();
-        let composer_height = (composer_lines as u16).clamp(1, 8);
+        // The composer spans the full width; render it first to learn its wrapped height.
+        let rendered_composer = composer::Rendered::new(&mut self.composer, area.width);
+        let composer_height = rendered_composer.height();
 
         let chunks = if self.command_line.is_some() {
             Layout::vertical([
@@ -550,11 +551,8 @@ impl App {
         frame.render_widget(status_bar, status_area);
 
         // 3. Composer
-        let theme = edtui::EditorTheme::default().hide_status_line();
-        let editor_view = edtui::EditorView::new(&mut self.composer)
-            .wrap(true)
-            .theme(theme);
-        frame.render_widget(editor_view, composer_area);
+        let composer_cursor =
+            rendered_composer.blit(composer_area, frame.buffer_mut(), &mut self.composer_scroll);
 
         // 4. Command line if active
         if let Some(cmd_area) = chunks.get(3)
@@ -571,10 +569,7 @@ impl App {
             return;
         }
 
-        // Set cursor from composer
-        if let Some(pos) = self.composer.cursor_screen_position() {
-            frame.set_cursor_position(pos);
-        }
+        frame.set_cursor_position(composer_cursor);
     }
 }
 
@@ -1287,5 +1282,130 @@ mod tests {
         assert!(buffer_str.contains("queued: 2"));
         assert!(buffer_str.contains("live"));
         assert!(buffer_str.contains("INSERT"));
+    }
+
+    // ---- composer wrapping and paste ----
+
+    /// Draws `app` on a `w`x`h` test terminal and returns each screen row as a string,
+    /// plus the cursor position.
+    fn render_rows(app: &mut App, w: u16, h: u16) -> (Vec<String>, Position) {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        (rows, cursor)
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    /// The composer is the bottom block of rows below the status bar; returns (top row, rows).
+    fn composer_rows(rows: &[String], status_marker: &str) -> (usize, Vec<String>) {
+        let status = rows
+            .iter()
+            .rposition(|r| r.contains(status_marker))
+            .expect("status bar row");
+        (status + 1, rows[status + 1..].to_vec())
+    }
+
+    #[test]
+    fn test_typing_past_width_wraps_and_stays_visible() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_wrap", cmd_tx);
+        // 45 chars at width 20 = 3 visual rows.
+        let text = "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeee";
+        type_str(&mut app, text);
+        assert_eq!(app.get_composer_text(), text);
+
+        let (rows, cursor) = render_rows(&mut app, 20, 12);
+        let (top, composer) = composer_rows(&rows, "INSERT");
+        assert_eq!(
+            composer.len(),
+            3,
+            "composer grows to 3 visual rows: {rows:#?}"
+        );
+        assert_eq!(composer[0], "aaaaaaaaaabbbbbbbbbb");
+        assert_eq!(composer[1], "ccccccccccdddddddddd");
+        assert_eq!(composer[2].trim_end(), "eeeee");
+        // Cursor sits right after the last typed char, inside the composer.
+        assert_eq!(cursor, Position::new(5, (top + 2) as u16));
+    }
+
+    #[test]
+    fn test_long_line_taller_than_composer_follows_cursor() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_wrap", cmd_tx);
+        // One logical line of 12 visual rows at width 10; composer caps at 8.
+        let text: String = (0..12)
+            .map(|i| char::from(b'a' + i as u8).to_string().repeat(10))
+            .collect::<String>()
+            + "Z";
+        type_str(&mut app, &text);
+
+        let (rows, cursor) = render_rows(&mut app, 10, 20);
+        let (top, composer) = composer_rows(&rows, "INSERT");
+        assert_eq!(composer.len(), 8, "{rows:#?}");
+        // The cursor's visual row (the 13th, holding "Z") is the bottom row.
+        assert_eq!(composer[7].trim_end(), "Z", "{rows:#?}");
+        assert_eq!(composer[6], "llllllllll");
+        assert_eq!(cursor, Position::new(1, (top + 7) as u16));
+
+        // Jumping to the start of the line scrolls back to the first visual row.
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('0')));
+        let (rows, cursor) = render_rows(&mut app, 10, 20);
+        let (top, composer) = composer_rows(&rows, "NORMAL");
+        assert_eq!(composer[0], "aaaaaaaaaa", "{rows:#?}");
+        assert_eq!(cursor, Position::new(0, top as u16));
+    }
+
+    #[test]
+    fn test_paste_with_carriage_returns_becomes_lines() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_paste", cmd_tx);
+        // tmux and many terminals send CR (or CRLF) between pasted lines.
+        app.handle_paste("one\rtwo\r\nthree".to_string());
+        assert_eq!(app.get_composer_text(), "one\ntwo\nthree");
+
+        let (rows, _) = render_rows(&mut app, 30, 12);
+        let (_, composer) = composer_rows(&rows, "INSERT");
+        let composer: Vec<&str> = composer.iter().map(|r| r.trim_end()).collect();
+        assert_eq!(composer, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_paste_long_text_wraps() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_paste", cmd_tx);
+        app.handle_paste("x".repeat(25));
+        let (rows, _) = render_rows(&mut app, 10, 12);
+        let (_, composer) = composer_rows(&rows, "INSERT");
+        let composer: Vec<&str> = composer.iter().map(|r| r.trim_end()).collect();
+        assert_eq!(composer, vec!["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
+    }
+
+    #[test]
+    fn test_paste_in_insert_mode_goes_at_cursor() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_paste", cmd_tx);
+        type_str(&mut app, "abc");
+        app.handle_paste("XYZ".to_string());
+        assert_eq!(app.get_composer_text(), "abcXYZ");
+        type_str(&mut app, "!");
+        assert_eq!(app.get_composer_text(), "abcXYZ!");
+
+        // Mid-line: cursor between 'a' and 'b'.
+        let mut app2 = App::new("ses_paste2", mpsc::unbounded_channel().0);
+        type_str(&mut app2, "ab");
+        app2.handle_key(key(KeyCode::Left));
+        app2.handle_paste("1\n2".to_string());
+        assert_eq!(app2.get_composer_text(), "a1\n2b");
     }
 }
