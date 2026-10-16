@@ -324,10 +324,18 @@ async fn session_list_running_clears_on_goose_restart() {
     let Some(mut g) = StubGoose::start_or_skip().await else {
         return;
     };
-    g.model().push([Turn::Gate(
-        "gate_rst_running".into(),
-        Box::new(Turn::Text(vec!["never".into()])),
-    )]);
+    // goose's ACP session/list only returns sessions that have persisted
+    // messages, and whether an in-flight user message is persisted yet (when we
+    // list, or when goose is killed) is a goose race. A completed first turn
+    // makes the session listed regardless, so this test only observes honkd's
+    // `_meta.honk.running` annotation.
+    g.model().push([
+        Turn::Text(vec!["ok".into()]),
+        Turn::Gate(
+            "gate_rst_running".into(),
+            Box::new(Turn::Text(vec!["never".into()])),
+        ),
+    ]);
     let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
     let mut v = Viewer::connect(&h).await;
     let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
@@ -336,19 +344,25 @@ async fn session_list_running_clears_on_goose_restart() {
         json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
     )
     .await;
+    let r0 = v
+        .call("session/prompt", prompt_params(&sid, "zeroth", Some("z")))
+        .await;
+    assert_eq!(r0["result"]["stopReason"], "end_turn");
 
     let id = v
         .request("session/prompt", prompt_params(&sid, "first", Some("a")))
         .await;
-    v.wait_for(|f| {
-        f.pointer("/params/update/sessionUpdate")
-            .and_then(Value::as_str)
-            == Some("session_info_update")
-            && f.pointer("/params/update/_meta/goose/activeRunId")
-                .and_then(Value::as_str)
-                .is_some()
-    })
-    .await;
+    // Wait until the gated prompt reaches the model: honkd has dispatched it
+    // and goose's run is active. (Not a session_info_update match: the first
+    // turn's frames can still be in flight and would match too early.)
+    let wait_start = std::time::Instant::now();
+    while g.model().turn_requests().len() < 2 {
+        assert!(
+            wait_start.elapsed() < std::time::Duration::from_secs(10),
+            "gated prompt never reached the model"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     // While run is active: session/list must report running: true
     let list_res_active = v.call("session/list", json!({})).await;
@@ -360,22 +374,28 @@ async fn session_list_running_clears_on_goose_restart() {
         .unwrap();
     assert_eq!(entry_active["_meta"]["honk"]["running"], true);
 
-    // Wait until prompt reaches model
-    let wait_start = std::time::Instant::now();
-    while g.model().turn_requests().is_empty()
-        && wait_start.elapsed() < std::time::Duration::from_secs(2)
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
     g.restart().await;
     let r = v
         .response_timeout(&id, std::time::Duration::from_secs(15))
         .await;
     assert_eq!(r["result"]["stopReason"], "cancelled");
 
-    // After restart: session/list must report running: false
-    let list_res_after = v.call("session/list", json!({})).await;
+    // After restart: session/list must report running: false. honkd answers
+    // control requests with an error while its control connection reconnects
+    // (by design: control_reconnect_drains_pending_control_oneshots), so retry
+    // until it answers; the first real answer must already say false.
+    let start = std::time::Instant::now();
+    let list_res_after = loop {
+        let res = v.call("session/list", json!({})).await;
+        if res.get("error").is_none() {
+            break res;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "session/list never answered after goose restart: {res}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     let entry_after = list_res_after["result"]["sessions"]
         .as_array()
         .unwrap()
