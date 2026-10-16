@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod client;
 pub mod conn;
+pub mod pigeon;
 pub mod render;
 pub mod tail;
 pub mod tui;

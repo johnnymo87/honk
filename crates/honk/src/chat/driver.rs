@@ -29,6 +29,10 @@ pub struct DriverOpts {
     pub crid_seed: Option<u64>,
     pub idle_timeout: Option<Duration>,
     pub max_turns: Option<u32>,
+    /// When set, a session created by `Target::New` is registered with this
+    /// pigeon daemon (so it gets a Telegram topic). Runs in the background;
+    /// its outcome arrives as a `UiEvent::Notice` and never blocks the chat.
+    pub pigeon: Option<crate::pigeon::PigeonSettings>,
 }
 
 impl DriverOpts {
@@ -40,8 +44,44 @@ impl DriverOpts {
             crid_seed: None,
             idle_timeout: None,
             max_turns: None,
+            pigeon: None,
         }
     }
+}
+
+/// Registers a just-created session with pigeon in the background and reports
+/// the outcome as a notice. A failure is a warning, never fatal: the chat works
+/// the same without a Telegram topic.
+fn spawn_pigeon_registration(
+    settings: crate::pigeon::PigeonSettings,
+    honk_url: &str,
+    goose_session_id: String,
+    cwd: String,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let endpoint = crate::pigeon::acp_endpoint(honk_url);
+    tokio::spawn(async move {
+        let notice = match endpoint.and_then(|ep| Ok((ep, settings.load()?))) {
+            Err(e) => Notice::warning(format!("Telegram: not registered with pigeon: {e:#}")),
+            Ok((endpoint, cfg)) => {
+                let reg = crate::pigeon::Registration {
+                    goose_session_id,
+                    endpoint,
+                    cwd,
+                    title: None,
+                    reason: crate::pigeon::Reason::NewChat,
+                };
+                match crate::pigeon::register(&cfg, &reg).await {
+                    Ok(r) if r.announced => Notice::info(r.summary()),
+                    Ok(r) => Notice::warning(r.summary()),
+                    Err(e) => {
+                        Notice::warning(format!("Telegram: not registered with pigeon: {e:#}"))
+                    }
+                }
+            }
+        };
+        let _ = ui_tx.send(UiEvent::Notice(notice));
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -435,6 +475,7 @@ async fn run_driver(
 
     let mut core = match opts.target.clone() {
         Target::New { cwd, extensions } => {
+            let cwd_for_pigeon = cwd.to_string_lossy().to_string();
             let mut ids = IdAlloc::new();
             let new_req_id = ids.allocate();
             let mut params = json!({
@@ -516,6 +557,16 @@ async fn run_driver(
             let _ = ui_tx.send(UiEvent::SessionNew {
                 result: result.clone(),
             });
+
+            if let Some(settings) = opts.pigeon.clone() {
+                spawn_pigeon_registration(
+                    settings,
+                    &opts.url,
+                    session_id.to_string(),
+                    cwd_for_pigeon.clone(),
+                    ui_tx.clone(),
+                );
+            }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
         }
