@@ -36,7 +36,18 @@ async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
     .await;
     let cur = v.blocks.cursor.clone().unwrap();
     h.kill9();
-    g.model().open("g"); // the turn finishes while honkd is down
+    g.model().open("g");
+    // The turn finishes while honkd is down. Wait for goose to have the whole
+    // turn before restarting honkd: otherwise the reload can land mid-stream
+    // (the mid-run path, covered by ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end).
+    let start = Instant::now();
+    while g.turn_text(&sid).await != "one two three" {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "goose never finished the turn"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     h.restart().await;
     let mut w = Viewer::connect(&h).await;
     w.blocks = v.blocks.clone(); // same client state, resuming
@@ -46,13 +57,35 @@ async fn kill9_honkd_mid_turn_resumes_with_delta_and_no_duplicate_text() {
         json!({"sessionId": sid, "cwd": ".", "mcpServers": [], "_meta": {"honk": {"after": cur}}}),
     )
     .await;
+    // After a restart the session actor serves attaches from its log while it
+    // is still Reattaching (M1 plan: "attaches are served from the log"), so
+    // the load reply can predate the catch-up; the missed frames then follow
+    // live: still a delta, still exactly once. (Even once Live, nothing marks
+    // the end of goose's resume replay, so the reply is never guaranteed to
+    // contain it.)
+    let start = Instant::now();
+    while w.blocks.agent_text() != "one two three" {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "resumed viewer never got the turn's text (has {:?})",
+            w.blocks.agent_text()
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(200), w.recv_frame()).await;
+    }
     assert_eq!(w.blocks.resets, 0, "patched resume keeps the epoch → delta");
-    assert_eq!(w.blocks.agent_text(), g.turn_text(&sid).await);
     let r = w
         .call("session/prompt", prompt_params(&sid, "go", Some("r1")))
         .await; // retry
     assert_eq!(r["result"]["stopReason"], "end_turn");
     assert_eq!(r["result"]["_meta"]["honk"]["text"], "one two three");
+    // Weak until honk-9qf.8 is fixed: the turn currently ends in a _honk/reset
+    // and rebuild, which would erase any duplicated live text before this
+    // check. The fix should add `assert_eq!(w.blocks.resets, 0)` here.
+    assert_eq!(
+        w.blocks.agent_text(),
+        "one two three",
+        "the retry does not duplicate the turn's text"
+    );
     assert_eq!(
         g.model().turn_requests().len(),
         1,
