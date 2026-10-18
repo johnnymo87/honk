@@ -1,4 +1,5 @@
 use crate::turn::TurnMeta;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
@@ -132,9 +133,14 @@ pub struct TurnHook {
 }
 
 impl TurnHook {
-    pub fn spawn(url: String, token: Option<String>, opts: HookOpts) -> Self {
+    pub fn spawn(
+        url: String,
+        token: Option<String>,
+        token_file: Option<PathBuf>,
+        opts: HookOpts,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(opts.queue);
-        tokio::spawn(sender_loop(url, token, opts, rx));
+        tokio::spawn(sender_loop(url, token, token_file, opts, rx));
         Self { tx }
     }
 
@@ -160,7 +166,8 @@ impl TurnHook {
 
 async fn sender_loop(
     url: String,
-    token: Option<String>,
+    mut token: Option<String>,
+    token_file: Option<PathBuf>,
     opts: HookOpts,
     mut rx: tokio::sync::mpsc::Receiver<(TurnEvent, tokio::time::Instant)>,
 ) {
@@ -177,14 +184,24 @@ async fn sender_loop(
     };
 
     while let Some((ev, enqueued)) = rx.recv().await {
-        send_one_event(&client, &url, token.as_deref(), &opts, &ev, enqueued).await;
+        send_one_event(
+            &client,
+            &url,
+            &mut token,
+            token_file.as_deref(),
+            &opts,
+            &ev,
+            enqueued,
+        )
+        .await;
     }
 }
 
 async fn send_one_event(
     client: &reqwest::Client,
     url: &str,
-    token: Option<&str>,
+    current_token: &mut Option<String>,
+    token_file: Option<&Path>,
     opts: &HookOpts,
     ev: &TurnEvent,
     enqueued: tokio::time::Instant,
@@ -193,7 +210,7 @@ async fn send_one_event(
 
     loop {
         let mut req = client.post(url).json(ev);
-        if let Some(t) = token {
+        if let Some(t) = current_token.as_deref() {
             req = req.bearer_auth(t);
         }
 
@@ -202,6 +219,62 @@ async fn send_one_event(
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
+                    return;
+                } else if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    tracing::error!(
+                        event_id = %ev.event_id,
+                        status = %status.as_u16(),
+                        "turn hook receiver returned auth error"
+                    );
+                    if let Some(path) = token_file {
+                        let new_token = match std::fs::read_to_string(path) {
+                            Ok(s) => {
+                                let trimmed = s.trim().to_string();
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed)
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    event_id = %ev.event_id,
+                                    error = %e,
+                                    "failed to re-read turn hook token file"
+                                );
+                                None
+                            }
+                        };
+                        if new_token.is_some() && new_token != *current_token {
+                            *current_token = new_token;
+                            // Retry once immediately with the new token
+                            let mut retry_req = client.post(url).json(ev);
+                            if let Some(t) = current_token.as_deref() {
+                                retry_req = retry_req.bearer_auth(t);
+                            }
+                            match retry_req.send().await {
+                                Ok(r) if r.status().is_success() => return,
+                                Ok(r) => {
+                                    tracing::error!(
+                                        event_id = %ev.event_id,
+                                        status = %r.status().as_u16(),
+                                        "turn hook receiver returned error on retry with updated token; dropping event"
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        event_id = %ev.event_id,
+                                        error = %e,
+                                        "turn hook retry with updated token failed; dropping event"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     return;
                 } else if status.is_client_error() {
                     tracing::warn!(
@@ -462,6 +535,7 @@ mod tests {
         let hook = TurnHook::spawn(
             format!("http://{addr}/hook"),
             Some("my-secret-token".to_string()),
+            None,
             opts,
         );
 
@@ -530,7 +604,7 @@ mod tests {
             backoff_initial: Duration::from_millis(10),
             backoff_max: Duration::from_millis(50),
         };
-        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, opts);
+        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, None, opts);
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
@@ -585,7 +659,7 @@ mod tests {
             backoff_initial: Duration::from_millis(10),
             backoff_max: Duration::from_millis(50),
         };
-        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, opts);
+        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, None, opts);
 
         let meta = sample_meta();
         let ev = TurnEvent::started("sid-1", &meta, 1);
@@ -636,7 +710,7 @@ mod tests {
             backoff_initial: Duration::from_millis(20),
             backoff_max: Duration::from_millis(100),
         };
-        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, opts);
+        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, None, opts);
 
         let meta = sample_meta();
         hook.emit(TurnEvent::started("sid-1", &meta, 1));
@@ -696,7 +770,7 @@ mod tests {
             backoff_initial: Duration::from_millis(10),
             backoff_max: Duration::from_millis(30),
         };
-        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, opts);
+        let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, None, opts);
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
@@ -779,7 +853,13 @@ mod tests {
         hook.emit(ev2);
 
         // Now start the sender loop AFTER ev1 is already stale
-        tokio::spawn(sender_loop(format!("http://{addr}/hook"), None, opts, rx));
+        tokio::spawn(sender_loop(
+            format!("http://{addr}/hook"),
+            None,
+            None,
+            opts,
+            rx,
+        ));
 
         // Wait until ev2 is delivered
         for _ in 0..50 {
@@ -792,6 +872,69 @@ mod tests {
         // Stale ev1 must have been attempted at least once, but dropped on that first failure (not retried)
         assert_eq!(state.ev1_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(state.ev2_delivered.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_hook_re_reads_token_on_401_and_retries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let token_path = temp_dir.path().join("hook_token");
+        std::fs::write(&token_path, "token-A").unwrap();
+
+        let token_path_clone = token_path.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let app = Router::new().route(
+            "/hook",
+            post(move |headers: HeaderMap| {
+                let attempts = attempts_clone.clone();
+                let token_path = token_path_clone.clone();
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    let auth = headers.get("authorization").and_then(|h| h.to_str().ok());
+                    if auth == Some("Bearer token-B") {
+                        StatusCode::OK
+                    } else {
+                        if n == 0 {
+                            std::fs::write(&token_path, "token-B").unwrap();
+                        }
+                        StatusCode::UNAUTHORIZED
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let opts = HookOpts {
+            queue: 16,
+            request_timeout: Duration::from_secs(2),
+            retry_window: Duration::from_secs(5),
+            backoff_initial: Duration::from_millis(20),
+            backoff_max: Duration::from_millis(50),
+        };
+        let hook = TurnHook::spawn(
+            format!("http://{addr}/hook"),
+            Some("token-A".to_string()),
+            Some(token_path),
+            opts,
+        );
+
+        let meta = sample_meta();
+        hook.emit(TurnEvent::started("sid-1", &meta, 1));
+
+        for _ in 0..50 {
+            if attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

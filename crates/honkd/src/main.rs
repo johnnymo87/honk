@@ -218,6 +218,7 @@ async fn main() {
         Some(honkd::turn_hook::TurnHook::spawn(
             url_str.clone(),
             turn_hook_token,
+            args.turn_hook_token_file.clone(),
             opts,
         ))
     } else {
