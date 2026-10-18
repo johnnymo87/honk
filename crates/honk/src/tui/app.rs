@@ -956,6 +956,7 @@ mod tests {
             ("turns 5", "/turns 5"),
             ("turns off", "/turns off"),
             ("compact", "/compact"),
+            ("compact now", "/compact now"),
         ];
 
         for (typed, expected_cmd) in commands {

@@ -154,6 +154,10 @@ impl ChatCore {
         &self.local_queue
     }
 
+    pub fn held_steers(&self) -> &[(String, u32)] {
+        &self.held_steers
+    }
+
     pub fn max_turns(&self) -> Option<u32> {
         self.opts.max_turns
     }
@@ -193,11 +197,11 @@ impl ChatCore {
         effects
     }
 
-    fn handle_line(&mut self, line: String, effects: &mut Vec<Effect>) {
-        if line.starts_with('/') && !line.starts_with("//") && self.handle_command(&line, effects) {
-            return;
-        }
-
+    pub(crate) fn buffer_if_detached_or_replaying(
+        &mut self,
+        line: String,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
         if self.is_detached {
             self.is_detached = false;
             self.is_reattaching = true;
@@ -207,7 +211,7 @@ impl ChatCore {
             if !trimmed.is_empty() {
                 self.detached_buffered_lines.push(line);
             }
-            return;
+            return true;
         }
 
         if self.is_reattaching || self.is_replaying {
@@ -215,6 +219,18 @@ impl ChatCore {
             if !trimmed.is_empty() {
                 self.detached_buffered_lines.push(line);
             }
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_line(&mut self, line: String, effects: &mut Vec<Effect>) {
+        if line.starts_with('/') && !line.starts_with("//") && self.handle_command(&line, effects) {
+            return;
+        }
+
+        if self.buffer_if_detached_or_replaying(line.clone(), effects) {
             return;
         }
 

@@ -90,17 +90,7 @@ impl ChatCore {
                 return true;
             }
 
-            if self.is_detached {
-                self.is_detached = false;
-                self.is_reattaching = true;
-                effects.push(Effect::Reattach);
-                effects.push(Effect::Notice(Notice::info("re-attaching...")));
-                self.detached_buffered_lines.push("/compact".to_string());
-                return true;
-            }
-
-            if self.is_reattaching || self.is_replaying {
-                self.detached_buffered_lines.push("/compact".to_string());
+            if self.buffer_if_detached_or_replaying("/compact".to_string(), effects) {
                 return true;
             }
 

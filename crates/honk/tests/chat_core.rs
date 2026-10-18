@@ -3317,6 +3317,9 @@ fn test_compact_queued_during_own_run_no_steer() {
         "compaction queued; it runs after the current turn ends"
     ));
     assert_eq!(core.queued_len(), 1);
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/compact");
+    assert!(core.held_steers().is_empty());
 
     // Run ends upstream and prompt response returns
     core.handle(Input::Frame(json!({
@@ -3346,6 +3349,106 @@ fn test_compact_queued_during_own_run_no_steer() {
     };
     assert_eq!(params["prompt"][0]["text"], "/compact");
     assert_eq!(core.queued_len(), 0);
+    assert!(core.local_queue().is_empty());
+    assert!(core.held_steers().is_empty());
+}
+
+#[test]
+fn test_compact_queued_while_prompt_sent_before_run_starts() {
+    let (mut core, _) = new_test_core();
+    // 1. Send normal prompt "initial prompt"
+    core.handle(Input::Line("initial prompt".into()));
+    assert!(core.prompt_sent().is_some());
+    assert!(!core.run_state().is_running());
+    let crid = core.prompt_sent().unwrap().crid.clone();
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+
+    // 2. Type /compact while prompt is sent but run has not started
+    let effs = core.handle(Input::Line("/compact".into()));
+    assert!(has_notice(
+        &effs,
+        "compaction queued; it runs after the current turn ends"
+    ));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "should not emit steer request for /compact"
+    );
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "should not emit prompt request immediately"
+    );
+    // Exact placement: goes to local_queue, never held_steers
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/compact");
+    assert!(core.held_steers().is_empty());
+
+    // 3. Now the initial prompt's turn starts (echo + activeRunId)
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u_init",
+                "content": { "type": "text", "text": "initial prompt" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    let run_start_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_initial" } }
+            }
+        }
+    })));
+    assert_eq!(core.ownership(), Ownership::Own);
+    // Crucial check: /compact was NOT held for steer and was NOT steered on run start
+    assert!(
+        !run_start_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "/compact must never be steered into run"
+    );
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/compact");
+    assert!(core.held_steers().is_empty());
+
+    // 4. Initial turn finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    // 5. /compact goes out as a prompt only after that run ends
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send /compact prompt after initial run ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
+    assert!(core.local_queue().is_empty());
+    assert!(core.held_steers().is_empty());
 }
 
 #[test]
