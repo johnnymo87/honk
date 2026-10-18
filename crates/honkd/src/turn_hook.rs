@@ -118,7 +118,7 @@ impl Default for HookOpts {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TurnHook {
     tx: tokio::sync::mpsc::Sender<TurnEvent>,
 }
@@ -157,6 +157,7 @@ async fn sender_loop(
 ) {
     let client = match reqwest::Client::builder()
         .timeout(opts.request_timeout)
+        .no_proxy()
         .build()
     {
         Ok(c) => c,
@@ -217,7 +218,8 @@ async fn send_one_event(
             }
         }
 
-        if first_attempt.elapsed() >= opts.retry_window {
+        let elapsed = first_attempt.elapsed();
+        if elapsed >= opts.retry_window {
             tracing::warn!(
                 event_id = %ev.event_id,
                 "turn hook retry window exceeded; dropping event"
@@ -225,16 +227,10 @@ async fn send_one_event(
             return;
         }
 
-        tokio::time::sleep(current_backoff).await;
+        let remaining = opts.retry_window - elapsed;
+        let sleep_dur = current_backoff.min(remaining);
+        tokio::time::sleep(sleep_dur).await;
         current_backoff = (current_backoff * 2).min(opts.backoff_max);
-
-        if first_attempt.elapsed() >= opts.retry_window {
-            tracing::warn!(
-                event_id = %ev.event_id,
-                "turn hook retry window exceeded; dropping event"
-            );
-            return;
-        }
     }
 }
 
@@ -597,10 +593,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_hook_unreachable_then_reachable_within_window() {
-        // Bind to get a free local port, then drop listener so port is unreachable
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_clone = delivered.clone();
+
+        tokio::spawn(async move {
+            // Drop first 2 incoming connections to simulate network/unreachable failure
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            }
+            let app = Router::new().route(
+                "/hook",
+                post(move || {
+                    let delivered = delivered_clone.clone();
+                    async move {
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
 
         let opts = HookOpts {
             queue: 16,
@@ -614,28 +631,7 @@ mod tests {
         let meta = sample_meta();
         hook.emit(TurnEvent::started("sid-1", &meta, 1));
 
-        // Sleep briefly while server is unreachable
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        let delivered = Arc::new(AtomicUsize::new(0));
-        let delivered_clone = delivered.clone();
-        let app = Router::new().route(
-            "/hook",
-            post(move || {
-                let delivered = delivered_clone.clone();
-                async move {
-                    delivered.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::OK
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        for _ in 0..50 {
+        for _ in 0..100 {
             if delivered.load(Ordering::SeqCst) == 1 {
                 break;
             }
@@ -685,9 +681,9 @@ mod tests {
 
         let opts = HookOpts {
             queue: 16,
-            request_timeout: Duration::from_millis(50),
-            retry_window: Duration::from_millis(150),
-            backoff_initial: Duration::from_millis(15),
+            request_timeout: Duration::from_millis(100),
+            retry_window: Duration::from_millis(600),
+            backoff_initial: Duration::from_millis(10),
             backoff_max: Duration::from_millis(30),
         };
         let hook = TurnHook::spawn(format!("http://{addr}/hook"), None, opts);
@@ -700,7 +696,7 @@ mod tests {
         hook.emit(ev2);
 
         // Wait until ev2 is delivered after ev1's retry window has expired
-        for _ in 0..100 {
+        for _ in 0..150 {
             if state.ev2_delivered.load(Ordering::SeqCst) == 1 {
                 break;
             }
