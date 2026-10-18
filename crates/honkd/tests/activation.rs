@@ -1008,3 +1008,167 @@ async fn activation_finds_stored_cwd_via_session_info() {
         "orphan_conns must be empty after transient session/info failure"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activation_carries_post_load_usage_update() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let sid = "ses_usage_act";
+    fake.insert_session(sid, "/tmp");
+    fake.set_export_data(
+        sid,
+        json!({
+            "messages": []
+        }),
+    );
+
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 42000,
+                "size": 128000,
+                "cost": {
+                    "amount": 0.05,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+    fake.set_load_frames_before(sid, vec![usage_frame]);
+
+    let h = Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await);
+    let mut v = Viewer::connect(&h).await;
+
+    let load_id = v
+        .request(
+            "session/load",
+            json!({
+                "sessionId": sid,
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+
+    let mut frames_before_done = Vec::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), v.recv_frame())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream open");
+        if f.get("method").and_then(Value::as_str) == Some("_honk/replay_done") {
+            break;
+        }
+        frames_before_done.push(f);
+    }
+
+    let load_resp = frames_before_done
+        .iter()
+        .find(|f| honk_upstream::rpc_id_matches(&load_id, f.get("id").unwrap_or(&Value::Null)))
+        .expect("must receive session/load response");
+    assert!(load_resp.get("error").is_none());
+
+    let usage_f = frames_before_done
+        .iter()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("usage_update")
+        })
+        .expect("must receive usage_update in replay before _honk/replay_done");
+
+    let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
+    assert_eq!(usage.used, 42000);
+    assert_eq!(usage.size, 128000);
+    let cost = usage.cost.expect("cost present");
+    assert_eq!(cost.amount, 0.05);
+    assert_eq!(cost.currency, "USD");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activation_carries_post_load_usage_update_after_reply() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let sid = "ses_usage_act_after";
+    fake.insert_session(sid, "/tmp");
+    fake.set_export_data(
+        sid,
+        json!({
+            "messages": []
+        }),
+    );
+
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 45000,
+                "size": 130000,
+                "cost": {
+                    "amount": 0.06,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+    fake.set_load_frames(sid, vec![usage_frame]);
+
+    let h = Arc::new(Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await);
+    let mut v = Viewer::connect(&h).await;
+
+    let load_id = v
+        .request(
+            "session/load",
+            json!({
+                "sessionId": sid,
+                "cwd": "/ignored",
+                "mcpServers": []
+            }),
+        )
+        .await;
+
+    let mut frames_before_done = Vec::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), v.recv_frame())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream open");
+        if f.get("method").and_then(Value::as_str) == Some("_honk/replay_done") {
+            break;
+        }
+        frames_before_done.push(f);
+    }
+
+    let load_resp = frames_before_done
+        .iter()
+        .find(|f| honk_upstream::rpc_id_matches(&load_id, f.get("id").unwrap_or(&Value::Null)))
+        .expect("must receive session/load response");
+    assert!(load_resp.get("error").is_none());
+
+    let usage_f = frames_before_done
+        .iter()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("usage_update")
+        })
+        .expect("must receive usage_update in replay before _honk/replay_done");
+
+    let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
+    assert_eq!(usage.used, 45000);
+    assert_eq!(usage.size, 130000);
+    let cost = usage.cost.expect("cost present");
+    assert_eq!(cost.amount, 0.06);
+    assert_eq!(cost.currency, "USD");
+}

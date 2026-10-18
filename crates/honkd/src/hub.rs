@@ -1468,14 +1468,25 @@ impl Hub {
             let (up_handle, mut event_rx) = session_upstream.split();
 
             // C1: Drain frames arrived before load reply.
-            // Discard session stream notifications (load replay).
+            // Discard session stream notifications (load replay), remembering the last usage_update.
+            // Retain server requests (Kind::Request) and conn stream events in initial_events.
+            // C1: Drain frames arrived before load reply.
+            // Discard session stream notifications (load replay), remembering the last usage_update.
             // Retain server requests (Kind::Request) and conn stream events in initial_events.
             let mut initial_events = Vec::new();
+            let mut carried_usage = None;
             while let Ok(ev) = event_rx.try_recv() {
                 if let honk_upstream::Event::Frame(key, frame, _) = &ev
                     && key == &honk_upstream::StreamKey::Session(sid_str.clone())
                     && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                 {
+                    if frame
+                        .pointer("/params/update")
+                        .and_then(honk_wire::usage)
+                        .is_some()
+                    {
+                        carried_usage = Some(frame.clone());
+                    }
                     continue;
                 }
                 initial_events.push(ev);
@@ -1502,6 +1513,7 @@ impl Hub {
                 frames,
                 keys.clone(),
                 Vec::new(),
+                carried_usage,
                 None,
                 None,
             )

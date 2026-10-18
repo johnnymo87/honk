@@ -428,3 +428,160 @@ async fn stub_goose_normal_prompt_reports_to_hook() {
         r["result"]["_meta"]["honk"]["text"]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_hook_reports_usage_in_turn_ended() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let hook = HookStub::start().await;
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--turn-hook-url",
+            &hook.url(),
+            "--turn-hook-retry-secs",
+            "5",
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Phase 1: Turn with no usage_update anywhere
+    fake.script_prompt(vec!["p0".into()]);
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": &sid,
+            "conversation": [
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "prompt no usage" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "reply no usage" }]
+                }
+            ]
+        }),
+    );
+
+    let r0 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt no usage", Some("c0")),
+        )
+        .await;
+    assert_eq!(r0["result"]["stopReason"], "end_turn");
+
+    let events0 = hook.wait_for_events(2, Duration::from_secs(5)).await;
+    assert_eq!(events0.len(), 2);
+    assert_eq!(events0[0].1["type"], "turn.started");
+    assert!(
+        events0[0].1.get("usage").is_none(),
+        "turn.started must never have usage"
+    );
+    assert_eq!(events0[1].1["type"], "turn.ended");
+    assert!(
+        events0[1].1.get("usage").is_none(),
+        "turn.ended with no usage_update must omit usage field"
+    );
+
+    // Phase 2: Turn with a usage_update emitted during the turn
+    let chunk_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "chunk text"
+                }
+            }
+        }
+    });
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 60000,
+                "size": 180000,
+                "cost": {
+                    "amount": 0.12,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+
+    fake.script_frames(vec![chunk_frame, usage_frame]);
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": &sid,
+            "conversation": [
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "prompt no usage" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "reply no usage" }]
+                },
+                {
+                    "role": "user",
+                    "metadata": { "userVisible": true },
+                    "content": [{ "type": "text", "text": "prompt with usage" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "chunk text" }]
+                }
+            ]
+        }),
+    );
+
+    let r1 = v
+        .call(
+            "session/prompt",
+            prompt_params(&sid, "prompt with usage", Some("c1")),
+        )
+        .await;
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+
+    let events1 = hook.wait_for_events(4, Duration::from_secs(5)).await;
+    assert_eq!(events1.len(), 4);
+
+    let ev_started = &events1[2].1;
+    assert_eq!(ev_started["type"], "turn.started");
+    assert!(
+        ev_started.get("usage").is_none(),
+        "turn.started must never have usage"
+    );
+
+    let ev_ended = &events1[3].1;
+    assert_eq!(ev_ended["type"], "turn.ended");
+    assert_eq!(
+        ev_ended["usage"],
+        json!({
+            "used": 60000,
+            "size": 180000,
+            "cost": {
+                "amount": 0.12,
+                "currency": "USD"
+            }
+        }),
+        "turn.ended must carry usage equal to last usage_update emitted"
+    );
+}

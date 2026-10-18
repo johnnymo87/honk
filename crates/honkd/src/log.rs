@@ -374,6 +374,14 @@ impl SessionLog {
     }
 }
 
+pub fn last_usage_frame(entries: &[Entry]) -> Option<&Value> {
+    entries.iter().rev().find_map(|entry| {
+        let update = entry.frame.pointer("/params/update")?;
+        honk_wire::usage(update)?;
+        Some(&entry.frame)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +402,69 @@ mod tests {
                 }
             }),
         )
+    }
+
+    fn usage_frame(used: u64, size: u64) -> Value {
+        crate::rpc::notification(
+            "session/update",
+            json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": used,
+                    "size": size,
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn test_last_usage_frame() {
+        let entries = vec![
+            Entry {
+                seq: 1,
+                upstream_id: Some(1),
+                frame: chunk("m1", "hello"),
+            },
+            Entry {
+                seq: 2,
+                upstream_id: Some(2),
+                frame: usage_frame(100, 200),
+            },
+            Entry {
+                seq: 3,
+                upstream_id: Some(3),
+                frame: chunk("m2", "world"),
+            },
+            Entry {
+                seq: 4,
+                upstream_id: Some(4),
+                frame: usage_frame(150, 200),
+            },
+            Entry {
+                seq: 5,
+                upstream_id: Some(5),
+                frame: chunk("m3", "!"),
+            },
+        ];
+
+        let found = last_usage_frame(&entries);
+        assert!(found.is_some());
+        let val = found.unwrap();
+        assert_eq!(
+            val.pointer("/params/update/used").and_then(Value::as_u64),
+            Some(150)
+        );
+
+        let empty: Vec<Entry> = vec![];
+        assert_eq!(last_usage_frame(&empty), None);
+
+        let chunks_only = vec![Entry {
+            seq: 1,
+            upstream_id: Some(1),
+            frame: chunk("m1", "hello"),
+        }];
+        assert_eq!(last_usage_frame(&chunks_only), None);
     }
 
     #[test]

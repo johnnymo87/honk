@@ -44,6 +44,8 @@ pub struct TurnEvent {
     pub final_text_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<honk_wire::Usage>,
 }
 
 impl TurnEvent {
@@ -66,6 +68,7 @@ impl TurnEvent {
             final_text: None,
             final_text_truncated: None,
             error: None,
+            usage: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl TurnEvent {
         stop_reason: Option<String>,
         final_text: Option<String>,
         error: Option<String>,
+        usage: Option<honk_wire::Usage>,
         at_ms: u64,
     ) -> Self {
         let session_id = sid.into();
@@ -102,6 +106,7 @@ impl TurnEvent {
             final_text,
             final_text_truncated,
             error,
+            usage,
         }
     }
 }
@@ -426,6 +431,7 @@ mod tests {
             Some("cancelled".to_string()),
             Some("answer text".to_string()),
             Some("something went wrong".to_string()),
+            None,
             987654321,
         );
         assert_eq!(ev.v, 1);
@@ -457,7 +463,7 @@ mod tests {
     #[test]
     fn test_turn_event_ended_none_final_text() {
         let meta = sample_meta();
-        let ev = TurnEvent::ended("sid-1", &meta, None, None, None, 100);
+        let ev = TurnEvent::ended("sid-1", &meta, None, None, None, None, 100);
         assert_eq!(ev.final_text, None);
         assert_eq!(ev.final_text_truncated, Some(false));
         let json = serde_json::to_value(&ev).expect("serialize");
@@ -466,6 +472,59 @@ mod tests {
         assert!(json.get("stop_reason").is_none());
         assert!(json.get("honk_reason").is_none());
         assert!(json.get("error").is_none());
+    }
+
+    #[test]
+    fn test_turn_event_usage_fields_and_json() {
+        let meta = sample_meta();
+        let usage = honk_wire::Usage {
+            used: 53000,
+            size: 200000,
+            cost: Some(honk_wire::Cost {
+                amount: 0.045,
+                currency: "USD".to_string(),
+            }),
+        };
+        let ev = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            Some("answer".to_string()),
+            None,
+            Some(usage.clone()),
+            123456,
+        );
+        assert_eq!(ev.usage, Some(usage));
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(
+            json["usage"],
+            serde_json::json!({
+                "used": 53000,
+                "size": 200000,
+                "cost": {
+                    "amount": 0.045,
+                    "currency": "USD"
+                }
+            })
+        );
+
+        let ev_no_usage = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            Some("answer".to_string()),
+            None,
+            None,
+            123456,
+        );
+        assert_eq!(ev_no_usage.usage, None);
+        let json_no_usage = serde_json::to_value(&ev_no_usage).expect("serialize");
+        assert!(json_no_usage.get("usage").is_none());
+
+        let ev_started = TurnEvent::started("sid-1", &meta, 123456);
+        assert_eq!(ev_started.usage, None);
+        let json_started = serde_json::to_value(&ev_started).expect("serialize");
+        assert!(json_started.get("usage").is_none());
     }
 
     #[test]
@@ -483,7 +542,7 @@ mod tests {
         let ev_start = TurnEvent::started("sid-1", &meta, 1);
         assert_eq!(ev_start.prompt_text.len(), MAX_TEXT_BYTES);
 
-        let ev_end = TurnEvent::ended("sid-1", &meta, None, Some(large_final), None, 2);
+        let ev_end = TurnEvent::ended("sid-1", &meta, None, Some(large_final), None, None, 2);
         assert_eq!(ev_end.prompt_text.len(), MAX_TEXT_BYTES);
         assert_eq!(ev_end.final_text.as_ref().unwrap().len(), MAX_TEXT_BYTES);
         assert_eq!(ev_end.final_text_truncated, Some(true));
@@ -541,7 +600,15 @@ mod tests {
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
-        let ev2 = TurnEvent::ended("sid-1", &meta, Some("end_turn".to_string()), None, None, 2);
+        let ev2 = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            None,
+            None,
+            None,
+            2,
+        );
 
         hook.emit(ev1);
         hook.emit(ev2);
@@ -608,7 +675,15 @@ mod tests {
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
-        let ev2 = TurnEvent::ended("sid-1", &meta, Some("end_turn".to_string()), None, None, 2);
+        let ev2 = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            None,
+            None,
+            None,
+            2,
+        );
 
         hook.emit(ev1);
         hook.emit(ev2);
@@ -774,7 +849,15 @@ mod tests {
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
-        let ev2 = TurnEvent::ended("sid-1", &meta, Some("end_turn".to_string()), None, None, 2);
+        let ev2 = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            None,
+            None,
+            None,
+            2,
+        );
 
         hook.emit(ev1);
         hook.emit(ev2);
@@ -841,7 +924,15 @@ mod tests {
 
         let meta = sample_meta();
         let ev1 = TurnEvent::started("sid-1", &meta, 1);
-        let ev2 = TurnEvent::ended("sid-1", &meta, Some("end_turn".to_string()), None, None, 2);
+        let ev2 = TurnEvent::ended(
+            "sid-1",
+            &meta,
+            Some("end_turn".to_string()),
+            None,
+            None,
+            None,
+            2,
+        );
 
         // Emit ev1
         hook.emit(ev1);

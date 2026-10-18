@@ -149,6 +149,9 @@ struct FakeGooseInner {
     next_session_num: AtomicU64,
     prompt_chunks: Mutex<Vec<String>>,
     scripted_frames: Mutex<Vec<Value>>,
+    load_frames: Mutex<HashMap<String, Vec<Value>>>,
+    load_frames_before: Mutex<HashMap<String, Vec<Value>>>,
+    scripted_load_frames: Mutex<Vec<Value>>,
     export_data: Mutex<HashMap<String, Value>>,
     active_prompt_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     active_runs: Mutex<HashMap<String, String>>,
@@ -204,6 +207,9 @@ impl FakeGoose {
             next_session_num: AtomicU64::new(1),
             prompt_chunks: Mutex::new(vec!["fake chunk".to_string()]),
             scripted_frames: Mutex::new(Vec::new()),
+            load_frames: Mutex::new(HashMap::new()),
+            load_frames_before: Mutex::new(HashMap::new()),
+            scripted_load_frames: Mutex::new(Vec::new()),
             export_data: Mutex::new(HashMap::new()),
             active_prompt_cancels: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(HashMap::new()),
@@ -333,6 +339,26 @@ impl FakeGoose {
 
     pub fn script_frames(&self, frames: Vec<Value>) {
         *self.state.scripted_frames.lock().unwrap() = frames;
+    }
+
+    pub fn set_load_frames(&self, sid: &str, frames: Vec<Value>) {
+        self.state
+            .load_frames
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), frames);
+    }
+
+    pub fn set_load_frames_before(&self, sid: &str, frames: Vec<Value>) {
+        self.state
+            .load_frames_before
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), frames);
+    }
+
+    pub fn script_load_frames(&self, frames: Vec<Value>) {
+        *self.state.scripted_load_frames.lock().unwrap() = frames;
     }
 
     pub fn set_export_data(&self, sid: &str, data: Value) {
@@ -782,7 +808,21 @@ async fn handle_post(
                         .sessions
                         .entry(sid.clone())
                         .or_insert_with(StreamState::new);
+                    if let Some(before_frames) = state.load_frames_before.lock().unwrap().get(sid) {
+                        for f in before_frames {
+                            stream.push_frame(f.clone(), patched, false);
+                        }
+                    }
                     stream.push_frame(resp, patched, false);
+                    if let Some(after_frames) = state.load_frames.lock().unwrap().get(sid) {
+                        for f in after_frames {
+                            stream.push_frame(f.clone(), patched, false);
+                        }
+                    }
+                    let scripted = state.scripted_load_frames.lock().unwrap().clone();
+                    for f in scripted {
+                        stream.push_frame(f, patched, false);
+                    }
                 } else {
                     conn.conn_stream.push_frame(resp, patched, false);
                 }

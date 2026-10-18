@@ -217,6 +217,7 @@ pub async fn create_new_generation_from_export(
     frames: Vec<Value>,
     keys: HashSet<honk_wire::BlockKey>,
     buffered_frames: Vec<(Option<u64>, Value)>,
+    carried_usage: Option<Value>,
     resume_from: Option<u64>,
     last_processed_session_id: Option<u64>,
 ) -> anyhow::Result<(SessionLog, u64)> {
@@ -244,10 +245,19 @@ pub async fn create_new_generation_from_export(
         })?;
     }
 
-    let mut combined: Vec<(Option<u64>, Value)> =
-        Vec::with_capacity(frames.len() + buffered_frames.len());
+    let mut combined: Vec<(Option<u64>, Value)> = Vec::with_capacity(
+        frames.len() + buffered_frames.len() + if carried_usage.is_some() { 1 } else { 0 },
+    );
     for f in frames {
         combined.push((None, f));
+    }
+    if let Some(mut u) = carried_usage {
+        if let Some(params) = u.get_mut("params").and_then(Value::as_object_mut)
+            && let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut)
+        {
+            meta.remove("honk");
+        }
+        combined.push((None, u));
     }
     for (id_opt, f) in buffered_frames {
         let key = f.pointer("/params/update").and_then(honk_wire::block_key);
@@ -956,11 +966,19 @@ impl Session {
                 let (up_handle, mut event_rx) = session_upstream.split();
 
                 let mut initial_events = Vec::new();
+                let mut carried_usage = None;
                 while let Ok(ev) = event_rx.try_recv() {
                     if let honk_upstream::Event::Frame(key, frame, _) = &ev
                         && key == &honk_upstream::StreamKey::Session(sid.clone())
                         && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                     {
+                        if frame
+                            .pointer("/params/update")
+                            .and_then(honk_wire::usage)
+                            .is_some()
+                        {
+                            carried_usage = Some(frame.clone());
+                        }
                         continue;
                     }
                     initial_events.push(ev);
@@ -983,6 +1001,7 @@ impl Session {
                     frames,
                     keys.clone(),
                     Vec::new(),
+                    carried_usage,
                     None,
                     None,
                 )
@@ -1186,6 +1205,7 @@ impl Session {
         resume_from: Option<u64>,
         client_prompts: usize,
     ) {
+        let carried_usage = crate::log::last_usage_frame(self.log.entries()).cloned();
         let buffered = std::mem::take(&mut self.rebuilding_buffered_frames);
         let (new_log, _next_epoch) = match create_new_generation_from_export(
             &self.sid,
@@ -1194,6 +1214,7 @@ impl Session {
             frames,
             keys.clone(),
             buffered,
+            carried_usage,
             resume_from,
             self.last_processed_session_id,
         )
@@ -3124,7 +3145,9 @@ impl Session {
                 hook.emit(TurnEvent::started(&self.sid, meta, started_ms));
             }
             let now_ms = now_ms();
-            let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, now_ms);
+            let usage = crate::log::last_usage_frame(self.log.entries())
+                .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
+            let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, usage, now_ms);
             hook.emit(ev);
         }
 
@@ -3501,4 +3524,116 @@ pub(crate) fn load_reply_sidecar(path: &Path) -> HashMap<String, Value> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text_frame(sid: &str, text: &str) -> Value {
+        crate::rpc::notification(
+            "session/update",
+            json!({
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": text,
+                    }
+                }
+            }),
+        )
+    }
+
+    fn usage_frame(sid: &str, used: u64, size: u64) -> Value {
+        crate::rpc::notification(
+            "session/update",
+            json!({
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": used,
+                    "size": size,
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_carried_usage_ordering() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "session-1";
+
+        let export_frames = vec![text_frame(sid, "export text")];
+        let carried = Some(usage_frame(sid, 100, 200));
+        let buffered_frames = vec![
+            (Some(10), text_frame(sid, "buffered text")),
+            (Some(11), usage_frame(sid, 300, 400)),
+        ];
+
+        let (log, epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            buffered_frames,
+            carried,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(epoch, 1);
+        let entries = log.entries();
+        assert_eq!(entries.len(), 4);
+
+        // 1. Export frame
+        assert_eq!(entries[0].upstream_id, None);
+        assert_eq!(
+            entries[0]
+                .frame
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str),
+            Some("export text")
+        );
+
+        // 2. Carried usage frame (id None)
+        assert_eq!(entries[1].upstream_id, None);
+        assert_eq!(
+            entries[1]
+                .frame
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(100)
+        );
+
+        // 3. Buffered text frame
+        assert_eq!(entries[2].upstream_id, Some(10));
+
+        // 4. Buffered newer usage frame
+        assert_eq!(entries[3].upstream_id, Some(11));
+        assert_eq!(
+            entries[3]
+                .frame
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(300)
+        );
+
+        // Verify last_usage_frame on this log returns the newer buffered usage
+        let last_u = crate::log::last_usage_frame(log.entries()).unwrap();
+        assert_eq!(
+            last_u
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(300)
+        );
+    }
 }
