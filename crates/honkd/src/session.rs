@@ -1598,6 +1598,9 @@ impl Session {
 
                     if let Some(run_id) = actual_run_id {
                         // Case (a): Turn is still running live on goose!
+                        if let Some(inf) = self.turn.inflight.as_mut() {
+                            inf.run_id = Some(run_id.to_string());
+                        }
                         // If we were checking an ambiguous inflight prompt: DELIVERED!
                         let delivered_info = if let Some(inf) = self.turn.inflight.as_mut()
                             && !inf.announced
@@ -1608,7 +1611,6 @@ impl Session {
                                 inf.upstream_id
                             );
                             inf.announced = true;
-                            inf.run_id = Some(run_id.to_string());
                             Some((
                                 inf.prompt_index,
                                 inf.params.clone(),
@@ -1622,7 +1624,6 @@ impl Session {
                             self.ambiguous_check_token += 1;
                             if self.turn.client_prompts <= n {
                                 self.turn.client_prompts = n + 1;
-                                self.sync_inflight().await;
                             }
                             if let Some(owner) = owner_opt {
                                 let synth_action = Action::SynthUser {
@@ -1633,6 +1634,7 @@ impl Session {
                                 self.execute_actions(vec![synth_action]).await;
                             }
                         }
+                        self.sync_inflight().await;
                         self.turn.run = Some(run_id.to_string());
                         self.sync_running();
                         self.rebuild_at_turn_end = true;

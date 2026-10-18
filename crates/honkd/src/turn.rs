@@ -34,7 +34,7 @@ impl Inflight {
         let mut client_req_ids = Vec::new();
         for o in &self.owners {
             if let Some(id) = &o.client_req_id
-                && seen.insert(id.clone())
+                && seen.insert(id.as_str())
             {
                 client_req_ids.push(id.clone());
             }
