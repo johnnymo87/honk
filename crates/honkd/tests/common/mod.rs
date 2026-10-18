@@ -312,6 +312,7 @@ pub struct Viewer {
     accumulated_agent_text: String,
     last_prompt_id: Option<Value>,
     prompt_reply_text: Option<String>,
+    pub all_frames: Vec<Value>,
 }
 
 impl Viewer {
@@ -326,6 +327,7 @@ impl Viewer {
             accumulated_agent_text: String::new(),
             last_prompt_id: None,
             prompt_reply_text: None,
+            all_frames: Vec::new(),
         }
     }
 
@@ -402,6 +404,7 @@ impl Viewer {
             match msg_res {
                 Ok(Message::Text(text)) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        self.all_frames.push(v.clone());
                         if let Some(m) = v.get("method").and_then(Value::as_str) {
                             self.raw_methods.push(m.to_string());
                         }
@@ -531,6 +534,10 @@ impl Viewer {
 
     pub fn prompt_reply_text(&self) -> Option<&str> {
         self.prompt_reply_text.as_deref()
+    }
+
+    pub fn incoming(&self) -> &[Value] {
+        &self.incoming
     }
 
     pub fn receipt_text(&self) -> String {
