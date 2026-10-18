@@ -1,4 +1,4 @@
-use honk_wire::export::{client_prompts, to_updates, turn_text};
+use honk_wire::export::{client_prompts, export_used_tokens, to_updates, turn_text};
 use honk_wire::{BlockKey, Blocks, block_key, run_state};
 use serde_json::Value;
 use std::fs::read_to_string;
@@ -881,4 +881,32 @@ fn test_usage_parsing_and_serialization() {
         "used": -50
     });
     assert_eq!(usage(&neg_used), None);
+}
+
+#[test]
+fn test_export_used_tokens_canonical_fixture() {
+    let fixture = load_json(EXPORT_PATH);
+    assert_eq!(export_used_tokens(&fixture), Some(5905));
+
+    // Missing usage object
+    let no_usage = serde_json::json!({
+        "conversation": []
+    });
+    assert_eq!(export_used_tokens(&no_usage), None);
+
+    // Negative total_tokens (not u64)
+    let neg_tokens = serde_json::json!({
+        "usage": {
+            "total_tokens": -10
+        }
+    });
+    assert_eq!(export_used_tokens(&neg_tokens), None);
+
+    // String total_tokens (not u64)
+    let str_tokens = serde_json::json!({
+        "usage": {
+            "total_tokens": "5905"
+        }
+    });
+    assert_eq!(export_used_tokens(&str_tokens), None);
 }

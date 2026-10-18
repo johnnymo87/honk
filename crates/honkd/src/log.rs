@@ -376,6 +376,9 @@ impl SessionLog {
 
 pub fn last_usage_frame(entries: &[Entry]) -> Option<&Value> {
     entries.iter().rev().find_map(|entry| {
+        if entry.frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            return None;
+        }
         let update = entry.frame.pointer("/params/update")?;
         honk_wire::usage(update)?;
         Some(&entry.frame)
@@ -465,6 +468,50 @@ mod tests {
             frame: chunk("m1", "hello"),
         }];
         assert_eq!(last_usage_frame(&chunks_only), None);
+
+        // Frame with method != "session/update" must be ignored
+        let mut entries_with_custom = entries.clone();
+        entries_with_custom.push(Entry {
+            seq: 6,
+            upstream_id: Some(6),
+            frame: crate::rpc::notification(
+                "_goose/unstable/session/update",
+                json!({
+                    "sessionId": "s",
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 250,
+                        "size": 200,
+                    }
+                }),
+            ),
+        });
+        let found_custom = last_usage_frame(&entries_with_custom);
+        assert_eq!(
+            found_custom
+                .unwrap()
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(150),
+            "custom method must be ignored, returning previous session/update frame"
+        );
+
+        let custom_only = vec![Entry {
+            seq: 1,
+            upstream_id: Some(1),
+            frame: crate::rpc::notification(
+                "_goose/unstable/session/update",
+                json!({
+                    "sessionId": "s",
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 250,
+                        "size": 200,
+                    }
+                }),
+            ),
+        }];
+        assert_eq!(last_usage_frame(&custom_only), None);
     }
 
     #[test]

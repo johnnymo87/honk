@@ -457,3 +457,11 @@ pub fn client_prompts(export: &Value) -> Vec<String> {
         .map(|(_, text)| text)
         .collect()
 }
+
+/// Extracts the non-negative integer `usage.total_tokens` from the top level of an export JSON, if present.
+pub fn export_used_tokens(export: &Value) -> Option<u64> {
+    export
+        .get("usage")
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(Value::as_u64)
+}

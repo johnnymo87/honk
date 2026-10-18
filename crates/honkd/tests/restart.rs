@@ -1386,6 +1386,18 @@ async fn gap_rebuild_carries_usage_update_to_new_epoch() {
         Some(1)
     );
 
+    // Set export data with usage.total_tokens different from last logged used
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": &sid,
+            "conversation": [],
+            "usage": {
+                "total_tokens": 52000
+            }
+        }),
+    );
+
     // Induce gap rebuild while idle
     fake.gap_on_next_resume(&sid);
     fake.kick_stream(&sid);
@@ -1447,7 +1459,10 @@ async fn gap_rebuild_carries_usage_update_to_new_epoch() {
     );
 
     let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
-    assert_eq!(usage.used, 50000);
+    assert_eq!(
+        usage.used, 52000,
+        "export usage.total_tokens must override carried used"
+    );
     assert_eq!(usage.size, 150000);
     let cost = usage.cost.expect("cost present");
     assert_eq!(cost.amount, 0.08);

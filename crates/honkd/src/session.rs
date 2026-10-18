@@ -99,6 +99,7 @@ pub enum SessionMsg {
         token: u64,
         frames: Vec<Value>,
         keys: std::collections::HashSet<honk_wire::BlockKey>,
+        export_used: Option<u64>,
         resume_from: Option<u64>,
         client_prompts: usize,
     },
@@ -207,6 +208,7 @@ pub struct Session {
     pub ambiguous_window_expired: bool,
     pub ambiguous_export_in_flight: bool,
     pub last_started_upstream: Option<String>,
+    pub last_usage: Option<honk_wire::Usage>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,6 +220,7 @@ pub async fn create_new_generation_from_export(
     keys: HashSet<honk_wire::BlockKey>,
     buffered_frames: Vec<(Option<u64>, Value)>,
     carried_usage: Option<Value>,
+    export_used: Option<u64>,
     resume_from: Option<u64>,
     last_processed_session_id: Option<u64>,
 ) -> anyhow::Result<(SessionLog, u64)> {
@@ -252,6 +255,11 @@ pub async fn create_new_generation_from_export(
         combined.push((None, f));
     }
     if let Some(mut u) = carried_usage {
+        if let Some(used) = export_used
+            && let Some(update) = u.pointer_mut("/params/update")
+        {
+            update["used"] = serde_json::json!(used);
+        }
         if let Some(params) = u.get_mut("params").and_then(Value::as_object_mut)
             && let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut)
         {
@@ -292,6 +300,10 @@ impl Session {
     }
 
     pub async fn run(mut self) {
+        if self.last_usage.is_none() {
+            self.last_usage = crate::log::last_usage_frame(self.log.entries())
+                .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
+        }
         self.sync_running();
         let mut watchdog = tokio::time::interval(Duration::from_secs(5));
         let mut idle = tokio::time::interval(Duration::from_millis(200));
@@ -966,16 +978,18 @@ impl Session {
                 let (up_handle, mut event_rx) = session_upstream.split();
 
                 let mut initial_events = Vec::new();
+                // Safety net: real goose sends usage_update after the load reply after an await, so in production it arrives later via the normal path.
                 let mut carried_usage = None;
                 while let Ok(ev) = event_rx.try_recv() {
                     if let honk_upstream::Event::Frame(key, frame, _) = &ev
                         && key == &honk_upstream::StreamKey::Session(sid.clone())
                         && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                     {
-                        if frame
-                            .pointer("/params/update")
-                            .and_then(honk_wire::usage)
-                            .is_some()
+                        if frame.get("method").and_then(Value::as_str) == Some("session/update")
+                            && frame
+                                .pointer("/params/update")
+                                .and_then(honk_wire::usage)
+                                .is_some()
                         {
                             carried_usage = Some(frame.clone());
                         }
@@ -985,6 +999,7 @@ impl Session {
                 }
 
                 let export_val = hub.export(&sid).await?;
+                let export_used = honk_wire::export::export_used_tokens(&export_val);
                 let client_prompts = honk_wire::export::client_prompts(&export_val).len();
                 let frames = honk_wire::export::to_updates(&export_val, &sid);
                 let mut keys = HashSet::new();
@@ -1002,6 +1017,7 @@ impl Session {
                     keys.clone(),
                     Vec::new(),
                     carried_usage,
+                    export_used,
                     None,
                     None,
                 )
@@ -1165,6 +1181,7 @@ impl Session {
         tokio::spawn(async move {
             match hub.export(&sid).await {
                 Ok(export_val) => {
+                    let export_used = honk_wire::export::export_used_tokens(&export_val);
                     let client_prompts = honk_wire::export::client_prompts(&export_val).len();
                     let frames = honk_wire::export::to_updates(&export_val, &sid);
                     let mut keys = HashSet::new();
@@ -1179,6 +1196,7 @@ impl Session {
                             token,
                             frames,
                             keys,
+                            export_used,
                             resume_from,
                             client_prompts,
                         })
@@ -1202,6 +1220,7 @@ impl Session {
         &mut self,
         frames: Vec<Value>,
         keys: HashSet<honk_wire::BlockKey>,
+        export_used: Option<u64>,
         resume_from: Option<u64>,
         client_prompts: usize,
     ) {
@@ -1215,6 +1234,7 @@ impl Session {
             keys.clone(),
             buffered,
             carried_usage,
+            export_used,
             resume_from,
             self.last_processed_session_id,
         )
@@ -1228,6 +1248,11 @@ impl Session {
         };
 
         self.log = new_log;
+        if let Some(u) = crate::log::last_usage_frame(self.log.entries())
+            .and_then(|f| honk_wire::usage(f.pointer("/params/update")?))
+        {
+            self.last_usage = Some(u);
+        }
         let head = self.log.head();
         let _ = std::fs::remove_file(
             self.state_dir
@@ -1527,6 +1552,13 @@ impl Session {
         // 2. Process
         let is_session_stream = matches!(&key, StreamKey::Session(_));
         let kind = crate::rpc::kind(&frame);
+
+        if is_session_stream
+            && frame.get("method").and_then(Value::as_str) == Some("session/update")
+            && let Some(u) = frame.pointer("/params/update").and_then(honk_wire::usage)
+        {
+            self.last_usage = Some(u);
+        }
 
         let block_k = if is_session_stream {
             frame
@@ -2582,6 +2614,7 @@ impl Session {
                 token,
                 frames,
                 keys,
+                export_used,
                 resume_from,
                 client_prompts,
             } => {
@@ -2596,7 +2629,7 @@ impl Session {
                     );
                     return;
                 }
-                self.on_rebuilt(frames, keys, resume_from, client_prompts)
+                self.on_rebuilt(frames, keys, export_used, resume_from, client_prompts)
                     .await;
             }
             SessionMsg::ReplyText {
@@ -2799,6 +2832,11 @@ impl Session {
                 self.up = up_handle;
                 self.events = event_rx;
                 self.log = new_log;
+                if let Some(u) = crate::log::last_usage_frame(self.log.entries())
+                    .and_then(|f| honk_wire::usage(f.pointer("/params/update")?))
+                {
+                    self.last_usage = Some(u);
+                }
                 self.last_processed_session_id = self.log.last_upstream_id();
                 self.last_processed_conn_id = None;
                 self.init_result = load_reply;
@@ -3145,8 +3183,7 @@ impl Session {
                 hook.emit(TurnEvent::started(&self.sid, meta, started_ms));
             }
             let now_ms = now_ms();
-            let usage = crate::log::last_usage_frame(self.log.entries())
-                .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
+            let usage = self.last_usage.clone();
             let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, usage, now_ms);
             hook.emit(ev);
         }
@@ -3586,6 +3623,7 @@ mod tests {
             carried,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3634,6 +3672,305 @@ mod tests {
                 .pointer("/params/update/used")
                 .and_then(Value::as_u64),
             Some(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_export_used_override() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "session-override";
+
+        let export_frames = vec![text_frame(sid, "export text")];
+        let carried_with_cost = crate::rpc::notification(
+            "session/update",
+            json!({
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 100,
+                    "size": 200,
+                    "cost": {
+                        "amount": 0.05,
+                        "currency": "USD"
+                    }
+                }
+            }),
+        );
+
+        // Case 1: Carried usage exists, export_used is Some(175) -> overrides used, keeps size and cost
+        let (log1, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames.clone(),
+            HashSet::new(),
+            Vec::new(),
+            Some(carried_with_cost.clone()),
+            Some(175),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let entries1 = log1.entries();
+        assert_eq!(entries1.len(), 2);
+        let u1 = entries1[1].frame.pointer("/params/update").unwrap();
+        assert_eq!(u1.get("used").and_then(Value::as_u64), Some(175));
+        assert_eq!(u1.get("size").and_then(Value::as_u64), Some(200));
+        assert_eq!(
+            u1.pointer("/cost/amount").and_then(Value::as_f64),
+            Some(0.05)
+        );
+
+        // Case 2: No carried usage, export_used is Some(175) -> does NOT synthesize a frame
+        let (log2, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            Vec::new(),
+            None,
+            Some(175),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let entries2 = log2.entries();
+        assert_eq!(
+            entries2.len(),
+            1,
+            "must not synthesize usage frame when carried is None"
+        );
+    }
+
+    async fn hook_test_handler(
+        axum::extract::State(tx): axum::extract::State<
+            tokio::sync::mpsc::Sender<serde_json::Value>,
+        >,
+        axum::extract::Json(event): axum::extract::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let _ = tx.send(event).await;
+        axum::http::StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn test_usage_update_while_rebuilding_updates_last_usage_and_reports_to_hook() {
+        let fake = honk_testgoose::FakeGoose::start().await;
+        fake.advertise_patched(true);
+
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_rebuilding_hook";
+
+        // Setup a test hook receiver
+        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::channel(10);
+        let app = axum::Router::new()
+            .route("/hook", axum::routing::post(hook_test_handler))
+            .with_state(hook_tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let hook_opts = crate::turn_hook::HookOpts {
+            queue: 16,
+            request_timeout: Duration::from_secs(2),
+            retry_window: Duration::from_secs(5),
+            backoff_initial: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(50),
+        };
+        let turn_hook =
+            crate::turn_hook::TurnHook::spawn(format!("http://{addr}/hook"), None, None, hook_opts);
+
+        let up_stream = honk_upstream::Upstream::initialize_with(
+            &fake.url(),
+            fake.secret().to_string(),
+            honk_upstream::Recorder::disabled(),
+            &honk_upstream::UpstreamOpts::default(),
+        )
+        .await
+        .unwrap();
+        let (up_handle, event_rx) = up_stream.split();
+        let (self_tx, rx) = tokio::sync::mpsc::channel(32);
+
+        // Pre-populate log with turn 1 usage (used: 100, size: 200)
+        let log_path = d.path().join("sessions").join(format!("{sid}.jsonl"));
+        let initial_entries = vec![(None, usage_frame(sid, 100, 200))];
+        let log = crate::log::SessionLog::create(&log_path, 1, None, initial_entries).unwrap();
+
+        use clap::Parser;
+        let args = Arc::new(crate::config::Args::parse_from([
+            "honkd",
+            "--upstream",
+            &fake.url(),
+            "--upstream-secret-file",
+            fake.secret_file().to_str().unwrap(),
+            "--turn-hook-url",
+            &format!("http://{addr}/hook"),
+        ]));
+
+        let hub = Arc::new(crate::hub::Hub {
+            args,
+            state: state_store.clone(),
+            state_dir: d.path().to_path_buf(),
+            upstream_url: fake.url(),
+            upstream_secret: fake.secret().to_string(),
+            turn_hook: Some(turn_hook),
+            control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
+            control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
+            is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_connected_notify: Arc::new(tokio::sync::Notify::new()),
+            control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
+            pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            self_weak: std::sync::RwLock::new(None),
+            activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        });
+
+        // Seeded from log::last_usage_frame
+        let seeded_usage = crate::log::last_usage_frame(log.entries())
+            .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
+        assert_eq!(seeded_usage.as_ref().map(|u| u.used), Some(100));
+
+        let mut session = Session {
+            sid: sid.to_string(),
+            state_dir: d.path().to_path_buf(),
+            state_store,
+            hub,
+            up: up_handle,
+            events: event_rx,
+            rx,
+            self_tx,
+            log,
+            turn: TurnCore::default(),
+            state: ActorState::Rebuilding, // Simulating turn-end rebuild in progress
+            ids: crate::rpc::UpstreamIds::new(1),
+            last_processed_session_id: None,
+            last_processed_conn_id: None,
+            viewers: HashMap::new(),
+            pending_requests: HashMap::new(),
+            pending_server_requests: Vec::new(),
+            recently_resolved: HashSet::new(),
+            init_result: json!({}),
+            queued_msgs: VecDeque::new(),
+            rebuilding_buffered_frames: Vec::new(),
+            rebuild_at_turn_end: false,
+            suppressed_keys: HashSet::new(),
+            gap_evidenced: false,
+            start_reattach: false,
+            needs_rebuild: false,
+            inflight_needs_delivery_check: false,
+            finalizing_waiters: HashMap::new(),
+            active_probe_id: None,
+            gap_synthesis_grace: Duration::from_millis(500),
+            synthesized_replies: HashSet::new(),
+            initial_events: Vec::new(),
+            gap_synthesis_pending: false,
+            reactivating: false,
+            reactivation_token: 0,
+            rebuild_token: 0,
+            ambiguous_check_token: 0,
+            ambiguous_window_expired: false,
+            ambiguous_export_in_flight: false,
+            last_started_upstream: None,
+            last_usage: seeded_usage,
+        };
+
+        // 1. Upstream frame with method != "session/update" must NOT update last_usage
+        let custom_method_frame = crate::rpc::notification(
+            "_goose/unstable/session/update",
+            json!({
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 999,
+                    "size": 999,
+                }
+            }),
+        );
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(sid.to_string()),
+                custom_method_frame,
+                Some(1),
+            ))
+            .await;
+        assert_eq!(session.last_usage.as_ref().map(|u| u.used), Some(100));
+
+        // 2. Upstream usage_update (used: 40) arrives while Rebuilding
+        let new_usage = usage_frame(sid, 40, 200);
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(sid.to_string()),
+                new_usage,
+                Some(2),
+            ))
+            .await;
+
+        // Verify it was buffered into rebuilding_buffered_frames, NOT appended to log
+        assert_eq!(session.rebuilding_buffered_frames.len(), 2);
+        assert_eq!(
+            crate::log::last_usage_frame(session.log.entries())
+                .unwrap()
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(100),
+            "log must still have old value (100) while rebuilding"
+        );
+
+        // Verify session.last_usage WAS updated to the new value (40)
+        assert_eq!(
+            session.last_usage.as_ref().map(|u| u.used),
+            Some(40),
+            "last_usage must reflect the buffered frame (40)"
+        );
+
+        // 3. Prompt reply arrives -> handle_reply_text fires turn hook
+        let turn_meta = crate::turn::TurnMeta {
+            upstream_id: "up_1".to_string(),
+            run_id: Some("run_1".to_string()),
+            client_req_ids: vec!["c1".to_string()],
+            prompt_text: "test prompt".to_string(),
+            honk_reason: None,
+        };
+        session
+            .handle_reply_text(
+                vec![],
+                crate::session::Reply::Result(json!({
+                    "stopReason": "end_turn",
+                })),
+                Some("assistant response".to_string()),
+                Some(turn_meta),
+            )
+            .await;
+
+        // Verify hook receives turn.started then turn.ended with usage = 40
+        let ev1 = hook_rx.recv().await.unwrap();
+        assert_eq!(ev1["type"], "turn.started");
+
+        let ev2 = hook_rx.recv().await.unwrap();
+        assert_eq!(ev2["type"], "turn.ended");
+        assert_eq!(
+            ev2.pointer("/usage/used").and_then(Value::as_u64),
+            Some(40),
+            "hook must report the fresh usage (40), not the stale log value (100)"
         );
     }
 }

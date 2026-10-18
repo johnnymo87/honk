@@ -222,6 +222,17 @@ impl<'a> StatusBar<'a> {
 
         let mut chosen = None;
         if let Some(u) = self.usage {
+            let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
+            let spacer_w = 1;
+            let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
+            let queued_w = self
+                .queued_text()
+                .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
+                .unwrap_or(0);
+            let conn_text = self.connection_text();
+            let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
+            let non_title_left = badge_w + spacer_w + run_state_w + queued_w + conn_w;
+
             let levels = [UsageLevel::Full, UsageLevel::NoCost, UsageLevel::TokensOnly];
             let mut candidates = Vec::new();
             for lvl in levels {
@@ -234,7 +245,9 @@ impl<'a> StatusBar<'a> {
 
             for cand in candidates {
                 let cand_w = unicode_width::UnicodeWidthStr::width(cand.as_str());
-                let max_title_w = (width as usize).saturating_sub(45 + cand_w).max(10);
+                let max_title_w = (width as usize)
+                    .saturating_sub(non_title_left + 2 + cand_w)
+                    .max(10);
                 let left_spans = build_left_spans(max_title_w);
                 let left_w: usize = left_spans
                     .iter()
@@ -742,5 +755,41 @@ mod tests {
             usage: Some(&u_zero_used),
         };
         assert_eq!(bar_none.to_line(140), bar_zero.to_line(140));
+    }
+
+    #[test]
+    fn test_status_line_title_budget_width_80() {
+        use honk_wire::{Cost, Usage};
+
+        let u_full = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+
+        let title_30 = "A very long session title 1234";
+        assert_eq!(title_30.len(), 30);
+
+        let bar = StatusBar {
+            session_id: "ses_1",
+            session_title: Some(title_30),
+            cwd: None,
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: Some(&u_full),
+        };
+
+        let line = bar.to_line(80);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line.width(), 80);
+        assert!(rendered.ends_with("45.2K (23%) · $1.84"));
+        assert!(
+            rendered.contains(title_30),
+            "title of length 30 must not be truncated, got: {rendered}"
+        );
+        assert!(!rendered.contains('…'), "must not contain ellipsis");
     }
 }

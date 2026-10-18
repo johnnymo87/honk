@@ -336,6 +336,8 @@ impl Hub {
             let actor_id = hub
                 .next_actor_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let last_usage = crate::log::last_usage_frame(session_log.entries())
+                .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
             let session = crate::session::Session {
                 sid: sid.clone(),
                 state_dir: hub.state_dir.clone(),
@@ -380,6 +382,7 @@ impl Hub {
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
                 last_started_upstream: None,
+                last_usage,
             };
 
             tokio::spawn(session.run());
@@ -1236,6 +1239,7 @@ impl Hub {
             ambiguous_window_expired: false,
             ambiguous_export_in_flight: false,
             last_started_upstream: None,
+            last_usage: None,
         };
 
         tokio::spawn(session.run());
@@ -1470,20 +1474,19 @@ impl Hub {
             // C1: Drain frames arrived before load reply.
             // Discard session stream notifications (load replay), remembering the last usage_update.
             // Retain server requests (Kind::Request) and conn stream events in initial_events.
-            // C1: Drain frames arrived before load reply.
-            // Discard session stream notifications (load replay), remembering the last usage_update.
-            // Retain server requests (Kind::Request) and conn stream events in initial_events.
             let mut initial_events = Vec::new();
+            // Safety net: real goose sends usage_update after the load reply after an await, so in production it arrives later via the normal path.
             let mut carried_usage = None;
             while let Ok(ev) = event_rx.try_recv() {
                 if let honk_upstream::Event::Frame(key, frame, _) = &ev
                     && key == &honk_upstream::StreamKey::Session(sid_str.clone())
                     && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                 {
-                    if frame
-                        .pointer("/params/update")
-                        .and_then(honk_wire::usage)
-                        .is_some()
+                    if frame.get("method").and_then(Value::as_str) == Some("session/update")
+                        && frame
+                            .pointer("/params/update")
+                            .and_then(honk_wire::usage)
+                            .is_some()
                     {
                         carried_usage = Some(frame.clone());
                     }
@@ -1497,6 +1500,7 @@ impl Hub {
                 code: -32603,
                 message: format!("export failed during activation: {e:#}"),
             })?;
+            let export_used = honk_wire::export::export_used_tokens(&export_val);
 
             let frames = honk_wire::export::to_updates(&export_val, &sid_str);
             let mut keys = std::collections::HashSet::new();
@@ -1514,6 +1518,7 @@ impl Hub {
                 keys.clone(),
                 Vec::new(),
                 carried_usage,
+                export_used,
                 None,
                 None,
             )
@@ -1570,6 +1575,8 @@ impl Hub {
                 .next_actor_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let last_processed_session = new_log.last_upstream_id();
+            let last_usage = crate::log::last_usage_frame(new_log.entries())
+                .and_then(|f| honk_wire::usage(f.pointer("/params/update")?));
 
             let session = crate::session::Session {
                 sid: sid_str.clone(),
@@ -1615,6 +1622,7 @@ impl Hub {
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
                 last_started_upstream: None,
+                last_usage,
             };
 
             tokio::spawn(session.run());
