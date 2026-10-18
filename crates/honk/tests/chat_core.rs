@@ -1465,6 +1465,7 @@ fn test_commands_help_quit_slash_slash() {
     let notice = find_notice(&help_effs, "/quit").unwrap();
     assert!(!notice.text.contains("/rK"));
     assert!(notice.text.contains("/approve"));
+    assert!(notice.text.contains("/compact"));
 
     let unk_effs = core.handle(Input::Line("/foobar".into()));
     assert!(has_notice(&unk_effs, "unknown command: '/foobar'"));
@@ -3211,4 +3212,312 @@ fn test_steer_does_not_carry_max_turns() {
         panic!()
     };
     assert!(params.get("_meta").is_none());
+}
+
+#[test]
+fn test_compact_idle_sends_prompt() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/compact".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send session/prompt request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
+    assert!(core.prompt_sent().is_some());
+    assert_eq!(core.prompt_sent().unwrap().text, "/compact");
+}
+
+#[test]
+fn test_compact_idle_preserves_max_turns() {
+    let now = Instant::now();
+    let opts = ChatOpts {
+        crid_seed: 0x1234,
+        idle_timeout: Some(Duration::from_secs(1800)),
+        max_turns: Some(5),
+    };
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+
+    let effs = core.handle(Input::Line("/compact".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send session/prompt request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
+    assert_eq!(params["_meta"]["goose"]["maxTurns"], 5);
+}
+
+#[test]
+fn test_compact_with_args_rejected() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/compact now".into()));
+    assert!(has_notice(&effs, "/compact takes no arguments"));
+    assert!(core.prompt_sent().is_none());
+    assert_eq!(core.queued_len(), 0);
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Request { .. })));
+}
+
+#[test]
+fn test_compact_queued_during_own_run_no_steer() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("run something".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+
+    // Confirm own run
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u1",
+                "content": { "type": "text", "text": "run something" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_own" } }
+            }
+        }
+    })));
+    assert_eq!(core.ownership(), Ownership::Own);
+
+    // Issue /compact while own run is active
+    let effs = core.handle(Input::Line("/compact".into()));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "should not emit steer request for /compact"
+    );
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "should not emit prompt request immediately"
+    );
+    assert!(has_notice(
+        &effs,
+        "compaction queued; it runs after the current turn ends"
+    ));
+    assert_eq!(core.queued_len(), 1);
+
+    // Run ends upstream and prompt response returns
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    // After turn ends, prompt for /compact is sent!
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send /compact prompt after own run ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
+    assert_eq!(core.queued_len(), 0);
+}
+
+#[test]
+fn test_compact_queued_behind_another_queued_line() {
+    let (mut core, _) = new_test_core();
+    // Foreign run starts
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "foreign_run_1" } }
+            }
+        }
+    })));
+
+    // Queue regular message "a"
+    core.handle(Input::Line("a".into()));
+    // Queue /compact
+    let effs = core.handle(Input::Line("/compact".into()));
+    assert!(has_notice(
+        &effs,
+        "compaction queued; it runs after the current turn ends"
+    ));
+    assert_eq!(core.queued_len(), 2);
+
+    // Foreign run ends
+    let drain_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+
+    // "a" should be sent as prompt, NOT /compact
+    let req = drain_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send prompt for 'a'");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "a");
+    assert_eq!(core.queued_len(), 1);
+
+    // "a" starts its own run
+    let crid_a = core.prompt_sent().unwrap().crid.clone();
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "ua",
+                "content": { "type": "text", "text": "a" },
+                "_meta": { "honk": { "source": { "client_req_id": crid_a } } }
+            }
+        }
+    })));
+    let run_start_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_a" } }
+            }
+        }
+    })));
+    // Assert no steer emitted for /compact
+    assert!(
+        !run_start_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "queued /compact must NOT be steered into run 'a'"
+    );
+
+    // "a" finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    // Now /compact is sent as prompt!
+    let req2 = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send /compact prompt after 'a' ends");
+    let Effect::Request { params: p2, .. } = req2 else {
+        panic!()
+    };
+    assert_eq!(p2["prompt"][0]["text"], "/compact");
+    assert_eq!(core.queued_len(), 0);
+}
+
+#[test]
+fn test_drop_command_clears_compact() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "foreign_run" } }
+            }
+        }
+    })));
+
+    core.handle(Input::Line("msg 1".into()));
+    core.handle(Input::Line("/compact".into()));
+    assert_eq!(core.queued_len(), 2);
+
+    let drop_effs = core.handle(Input::Line("/drop".into()));
+    assert_eq!(core.queued_len(), 0);
+    assert!(has_notice(&drop_effs, "dropped 2 queued message(s)"));
+
+    // When foreign run ends, nothing is sent
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    assert!(!end_effs.iter().any(|e| matches!(e, Effect::Request { .. })));
+}
+
+#[test]
+fn test_compact_buffered_while_detached() {
+    let (mut core, _) = new_test_core();
+    // Simulate idle detach
+    core.handle(Input::Tick(Instant::now() + Duration::from_secs(3600)));
+    assert!(core.is_detached());
+
+    let effs = core.handle(Input::Line("/compact".into()));
+    assert!(effs.iter().any(|e| matches!(e, Effect::Reattach)));
+    assert_eq!(core.queued_len(), 1);
+
+    // Replay finishes
+    let replay_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 2, "seq": 0 }
+    })));
+
+    let req = replay_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send /compact prompt after replay done");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
 }

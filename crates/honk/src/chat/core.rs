@@ -282,7 +282,12 @@ impl ChatCore {
         }
     }
 
-    fn send_prompt(&mut self, text: String, conversion_count: u32, effects: &mut Vec<Effect>) {
+    pub(crate) fn send_prompt(
+        &mut self,
+        text: String,
+        conversion_count: u32,
+        effects: &mut Vec<Effect>,
+    ) {
         self.crid_counter += 1;
         let crid = format!(
             "honk-chat-{:016x}-{}",
