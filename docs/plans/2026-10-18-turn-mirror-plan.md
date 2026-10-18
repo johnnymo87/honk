@@ -37,22 +37,24 @@ honkd → receiver, `POST <turn-hook-url>`, `Content-Type: application/json`, `A
   "event_id": "<goose_sid>:<upstream_id>:ended",
   "session_id": "...", "upstream_id": "...", "run_id": "run_abc or null",
   "client_req_ids": [], "prompt_text": "...", "at_ms": 0,
-  "stop_reason": "end_turn | cancelled | max_tokens | ... | null",
-  "honk_reason": "upstream_restart | delivery_unknown | cancelled | synthesized | null",
-  "final_text": "last assistant message text, or null",
+  "stop_reason": "end_turn | cancelled | max_tokens | ... (omitted if null)",
+  "honk_reason": "upstream_restart | delivery_unknown | cancelled | synthesized (omitted if null)",
+  "final_text": "last assistant message text (omitted if null)",
   "final_text_truncated": false,
-  "error": "JSON-RPC error message when goose answered the prompt with an error, else null"
+  "error": "JSON-RPC error message when goose answered the prompt with an error (omitted if null)"
 }
 ```
 
 Rules:
 - `upstream_id` is honkd's id for the upstream `session/prompt` (`hk{boot}_{actor}-{n}`, `crates/honkd/src/rpc.rs:193-204`); unique per prompt across restarts. It is the turn key on both sides.
-- `prompt_text` and `final_text` are capped at 256 KiB (UTF-8 bytes, cut on a char boundary); `final_text_truncated` says whether the final was cut. `prompt_text` is cut silently.
+- `prompt_text` and `final_text` are capped at 256 KiB (UTF-8 bytes, cut on a char boundary); `final_text_truncated` says whether the final was cut. `prompt_text` is cut silently. `final_text_truncated` is always present on `turn.ended` (boolean).
+- Ended-only fields (`stop_reason`, `honk_reason`, `final_text`, `error`) are omitted when empty/null; receivers must treat absent and `null` the same.
 - `client_req_ids` are the deduplicated `_meta.honk.client_req_id`s of the turn's owners (pigeon's goose runner sends its `commandId` there). May be empty.
-- honkd emits `turn.started` at most once per `upstream_id`, when goose announces the run (the point where honkd synthesizes the user-message echo). A prompt that is never announced produces no `turn.started`.
+- honkd emits `turn.started` at most once per `upstream_id`, when goose announces the run (the point where honkd synthesizes the user-message echo), or right before `turn.ended` if an unannounced turn is interrupted.
 - honkd emits `turn.ended` only for turns that ran or may have run: a reply from goose (result or error, except the busy rejection), the synthesized gap reply, or an interrupt of the in-flight prompt that was announced or whose reason is `upstream_restart` / `delivery_unknown`. It emits nothing for parked prompts that never ran, busy rejections, send failures, `not_delivered`, and `cancelled` on an unannounced prompt.
 - After a honkd restart a persisted reply can be replayed, so the same `turn.ended` (same `event_id`) may arrive twice. Receivers must be idempotent on `event_id`.
-- Receiver responses: any 2xx = accepted (including "ignored"); 4xx = permanent, honkd drops the event; 5xx / connection error / timeout = transient, honkd retries.
+- Receiver responses: any 2xx = accepted (including "ignored"); 401/403 re-reads `--turn-hook-token-file` and retries once if changed, else drops; other 4xx = permanent, honkd drops the event; 5xx / connection error / timeout = transient, honkd retries with backoff up to the retry window measured from enqueue time.
+- Accepted gaps: with parked prompts from two clients, `turn.started` for turn N+1 can precede `turn.ended` for turn N; an ended event can be lost before it is created (goose restart during the reply-text export with no viewers, crash between reply and export); `turn.ended` may lack `final_text` after a goose restart during export; steer messages not mirrored; direct-to-goose runs unseen.
 
 ---
 
@@ -137,7 +139,7 @@ Commit: `docs: document /goose/turn-event`. Redact check (see Ground rules) on e
 
 # Part B — honk PR (`~/projects/honk/.worktrees/turn-mirror`, branch `turn-mirror`)
 
-Ground rules: `~/.local/state/honk-m1a-ground-rules.md`, but the worktree is `/home/dev/projects/honk/.worktrees/turn-mirror` and the plan is this file. Commands:
+Ground rules: `~/.local/state/honk-m1a-ground-rules.md`, but the worktree is `$HOME/projects/honk/.worktrees/turn-mirror` and the plan is this file. Commands:
 - `nix develop -c cargo test -p honkd --lib turn::` / `--test <name>`
 - `HONK_GOOSE_BIN=$HOME/.local/state/honk-goose-bin/patched-1.54.0.3/pkg/bin/goose nix develop -c cargo test --workspace` (under systemd-run, MemoryMax=10G)
 - `nix develop -c cargo clippy --workspace --all-targets -- -D warnings`, `nix develop -c cargo fmt --all`.
