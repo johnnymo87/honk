@@ -28,6 +28,54 @@ pub struct StatusBar<'a> {
     pub cwd: Option<&'a str>,
     pub state_snapshot: Option<&'a StateSnapshot>,
     pub mode: EditorMode,
+    pub usage: Option<&'a honk_wire::Usage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageLevel {
+    Full,
+    NoCost,
+    TokensOnly,
+}
+
+pub fn usage_text(u: &honk_wire::Usage, level: UsageLevel) -> Option<String> {
+    if u.used == 0 {
+        return None;
+    }
+
+    let tokens = if u.used < 1000 {
+        format!("{}", u.used)
+    } else if u.used < 1_000_000 {
+        format!("{:.1}K", u.used as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", u.used as f64 / 1_000_000.0)
+    };
+
+    let token_part = if level != UsageLevel::TokensOnly && u.size > 0 {
+        let pct = ((u.used as f64 / u.size as f64) * 100.0).round() as u64;
+        format!("{tokens} ({pct}%)")
+    } else {
+        tokens
+    };
+
+    let cost_str = if level == UsageLevel::Full {
+        u.cost.as_ref().and_then(|c| {
+            if c.amount <= 0.0 {
+                None
+            } else if c.currency == "USD" {
+                Some(format!("${:.2}", c.amount))
+            } else {
+                Some(format!("{:.2} {}", c.amount, c.currency))
+            }
+        })
+    } else {
+        None
+    };
+
+    match cost_str {
+        Some(cost) => Some(format!("{token_part} · {cost}")),
+        None => Some(token_part),
+    }
 }
 
 impl<'a> StatusBar<'a> {
@@ -109,63 +157,119 @@ impl<'a> StatusBar<'a> {
         }
     }
 
-    pub fn to_line(&self, _width: u16) -> Line<'static> {
-        let mut spans = Vec::new();
-
-        // Mode badge
-        let mode_style = Style::default()
-            .fg(Color::Black)
-            .bg(match self.mode {
-                EditorMode::Insert => Color::Green,
-                EditorMode::Normal => Color::Blue,
-                EditorMode::Visual => Color::Magenta,
-                _ => Color::White,
-            })
-            .add_modifier(Modifier::BOLD);
-        spans.push(Span::styled(format!(" {} ", self.mode_text()), mode_style));
-
+    pub fn to_line(&self, width: u16) -> Line<'static> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
-        spans.push(Span::styled(" ", base_style));
 
-        // Title — CWD
         let title_style = Style::default()
             .bg(Color::DarkGray)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
-        let max_title_w = (_width as usize).saturating_sub(45).max(10);
-        let display_title = self.title_and_cwd(max_title_w);
-        spans.push(Span::styled(display_title, title_style));
 
-        // Run state
-        let run_state = self.run_state_text();
-        let run_style = Style::default().bg(Color::DarkGray).fg(match run_state {
-            "running" => Color::Green,
-            "running (other client)" => Color::Yellow,
-            "waiting" => Color::Cyan,
-            _ => Color::DarkGray,
-        });
-        spans.push(Span::styled(format!("  [{}]", run_state), run_style));
+        let build_left_spans = |max_title_w: usize| -> Vec<Span<'static>> {
+            let mut spans = Vec::new();
 
-        // Queued
-        if let Some(queued) = self.queued_text() {
-            spans.push(Span::styled(
-                format!("  [{}]", queued),
-                Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
-            ));
+            // Mode badge
+            let mode_style = Style::default()
+                .fg(Color::Black)
+                .bg(match self.mode {
+                    EditorMode::Insert => Color::Green,
+                    EditorMode::Normal => Color::Blue,
+                    EditorMode::Visual => Color::Magenta,
+                    _ => Color::White,
+                })
+                .add_modifier(Modifier::BOLD);
+            spans.push(Span::styled(format!(" {} ", self.mode_text()), mode_style));
+
+            spans.push(Span::styled(" ", base_style));
+
+            // Title — CWD
+            let display_title = self.title_and_cwd(max_title_w);
+            spans.push(Span::styled(display_title, title_style));
+
+            // Run state
+            let run_state = self.run_state_text();
+            let run_style = Style::default().bg(Color::DarkGray).fg(match run_state {
+                "running" => Color::Green,
+                "running (other client)" => Color::Yellow,
+                "waiting" => Color::Cyan,
+                _ => Color::DarkGray,
+            });
+            spans.push(Span::styled(format!("  [{}]", run_state), run_style));
+
+            // Queued
+            if let Some(queued) = self.queued_text() {
+                spans.push(Span::styled(
+                    format!("  [{}]", queued),
+                    Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                ));
+            }
+
+            // Connection
+            let conn = self.connection_text();
+            let conn_style = Style::default().bg(Color::DarkGray).fg(if conn == "live" {
+                Color::Green
+            } else if conn.starts_with("reconnecting") {
+                Color::Yellow
+            } else if conn.starts_with("stopped") {
+                Color::Red
+            } else {
+                Color::Gray
+            });
+            spans.push(Span::styled(format!("  {}", conn), conn_style));
+
+            spans
+        };
+
+        let mut chosen = None;
+        if let Some(u) = self.usage {
+            let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
+            let spacer_w = 1;
+            let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
+            let queued_w = self
+                .queued_text()
+                .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
+                .unwrap_or(0);
+            let conn_text = self.connection_text();
+            let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
+            let non_title_left = badge_w + spacer_w + run_state_w + queued_w + conn_w;
+
+            let levels = [UsageLevel::Full, UsageLevel::NoCost, UsageLevel::TokensOnly];
+            let mut candidates = Vec::new();
+            for lvl in levels {
+                if let Some(text) = usage_text(u, lvl)
+                    && !candidates.contains(&text)
+                {
+                    candidates.push(text);
+                }
+            }
+
+            for cand in candidates {
+                let cand_w = unicode_width::UnicodeWidthStr::width(cand.as_str());
+                let max_title_w = (width as usize)
+                    .saturating_sub(non_title_left + 2 + cand_w)
+                    .max(10);
+                let left_spans = build_left_spans(max_title_w);
+                let left_w: usize = left_spans
+                    .iter()
+                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                if left_w + 2 + cand_w <= width as usize {
+                    let padding = (width as usize) - left_w - cand_w;
+                    chosen = Some((left_spans, padding, cand));
+                    break;
+                }
+            }
         }
 
-        // Connection
-        let conn = self.connection_text();
-        let conn_style = Style::default().bg(Color::DarkGray).fg(if conn == "live" {
-            Color::Green
-        } else if conn.starts_with("reconnecting") {
-            Color::Yellow
-        } else if conn.starts_with("stopped") {
-            Color::Red
+        let spans = if let Some((mut left_spans, padding, cand)) = chosen {
+            left_spans.push(Span::styled(" ".repeat(padding), base_style));
+            let usage_style = Style::default().bg(Color::DarkGray).fg(Color::Gray);
+            left_spans.push(Span::styled(cand, usage_style));
+            left_spans
         } else {
-            Color::Gray
-        });
-        spans.push(Span::styled(format!("  {}", conn), conn_style));
+            let max_title_w = (width as usize).saturating_sub(45).max(10);
+            build_left_spans(max_title_w)
+        };
 
         Line::from(spans).style(base_style)
     }
@@ -211,6 +315,7 @@ mod tests {
             cwd: Some("/tmp/test-project"),
             state_snapshot: None,
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.title_text(), "My Special Session");
         assert_eq!(bar.cwd_text(), "/tmp/test-project");
@@ -225,6 +330,7 @@ mod tests {
             cwd: None,
             state_snapshot: None,
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar_fallback.title_text(), "ses_123");
         assert_eq!(bar_fallback.cwd_text(), "");
@@ -249,6 +355,7 @@ mod tests {
             cwd: Some("/tmp/opencode/chatcwd"),
             state_snapshot: None,
             mode: EditorMode::Normal,
+            usage: None,
         };
         let line = bar.to_line(140);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -273,6 +380,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_pending),
             mode: EditorMode::Insert,
+            usage: None,
         };
         assert_eq!(bar.run_state_text(), "waiting");
 
@@ -289,6 +397,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_own),
             mode: EditorMode::Insert,
+            usage: None,
         };
         assert_eq!(bar.run_state_text(), "running");
 
@@ -305,6 +414,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_foreign),
             mode: EditorMode::Insert,
+            usage: None,
         };
         assert_eq!(bar.run_state_text(), "running (other client)");
 
@@ -316,6 +426,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_idle),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.run_state_text(), "idle");
     }
@@ -330,6 +441,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_queued),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.queued_text(), Some("queued: 3".into()));
 
@@ -340,6 +452,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_zero),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.queued_text(), None);
     }
@@ -358,6 +471,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_reconnecting),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.connection_text(), "reconnecting (2)");
 
@@ -375,6 +489,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_stopped),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(
             bar.connection_text(),
@@ -393,6 +508,7 @@ mod tests {
             cwd: None,
             state_snapshot: Some(&snap_detached),
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar.connection_text(), "detached");
     }
@@ -405,6 +521,7 @@ mod tests {
             cwd: None,
             state_snapshot: None,
             mode: EditorMode::Insert,
+            usage: None,
         };
         assert_eq!(bar_insert.mode_text(), "INSERT");
 
@@ -414,6 +531,7 @@ mod tests {
             cwd: None,
             state_snapshot: None,
             mode: EditorMode::Normal,
+            usage: None,
         };
         assert_eq!(bar_normal.mode_text(), "NORMAL");
 
@@ -423,7 +541,255 @@ mod tests {
             cwd: None,
             state_snapshot: None,
             mode: EditorMode::Visual,
+            usage: None,
         };
         assert_eq!(bar_visual.mode_text(), "VISUAL");
+    }
+
+    #[test]
+    fn test_usage_formatter() {
+        use honk_wire::{Cost, Usage};
+
+        // 812 -> "812"
+        let u_812 = Usage {
+            used: 812,
+            size: 0,
+            cost: None,
+        };
+        assert_eq!(
+            usage_text(&u_812, UsageLevel::Full),
+            Some("812".to_string())
+        );
+
+        // 1000/0 size -> "1.0K"
+        let u_1000 = Usage {
+            used: 1000,
+            size: 0,
+            cost: None,
+        };
+        assert_eq!(
+            usage_text(&u_1000, UsageLevel::Full),
+            Some("1.0K".to_string())
+        );
+
+        // {45231, 200000, $1.84} -> "45.2K (23%) · $1.84"
+        let u_full = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+        assert_eq!(
+            usage_text(&u_full, UsageLevel::Full),
+            Some("45.2K (23%) · $1.84".to_string())
+        );
+        // Level degradation:
+        assert_eq!(
+            usage_text(&u_full, UsageLevel::NoCost),
+            Some("45.2K (23%)".to_string())
+        );
+        assert_eq!(
+            usage_text(&u_full, UsageLevel::TokensOnly),
+            Some("45.2K".to_string())
+        );
+
+        // size 0 -> no pct
+        let u_no_pct = Usage {
+            used: 45231,
+            size: 0,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+        assert_eq!(
+            usage_text(&u_no_pct, UsageLevel::Full),
+            Some("45.2K · $1.84".to_string())
+        );
+
+        // pct > 100 (used 210000/size 200000 -> "(105%)")
+        let u_over_100 = Usage {
+            used: 210000,
+            size: 200000,
+            cost: None,
+        };
+        assert_eq!(
+            usage_text(&u_over_100, UsageLevel::Full),
+            Some("210.0K (105%)".to_string())
+        );
+
+        // 1_500_000 -> "1.5M"
+        let u_mega = Usage {
+            used: 1_500_000,
+            size: 0,
+            cost: None,
+        };
+        assert_eq!(
+            usage_text(&u_mega, UsageLevel::Full),
+            Some("1.5M".to_string())
+        );
+
+        // EUR
+        let u_eur = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "EUR".to_string(),
+            }),
+        };
+        assert_eq!(
+            usage_text(&u_eur, UsageLevel::Full),
+            Some("45.2K (23%) · 1.84 EUR".to_string())
+        );
+
+        // cost 0 omitted
+        let u_zero_cost = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 0.0,
+                currency: "USD".to_string(),
+            }),
+        };
+        assert_eq!(
+            usage_text(&u_zero_cost, UsageLevel::Full),
+            Some("45.2K (23%)".to_string())
+        );
+
+        // cost negative omitted
+        let u_neg_cost = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: -0.5,
+                currency: "USD".to_string(),
+            }),
+        };
+        assert_eq!(
+            usage_text(&u_neg_cost, UsageLevel::Full),
+            Some("45.2K (23%)".to_string())
+        );
+
+        // used 0 -> hidden
+        let u_zero_used = Usage {
+            used: 0,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+        assert_eq!(usage_text(&u_zero_used, UsageLevel::Full), None);
+    }
+
+    #[test]
+    fn test_status_line_with_usage() {
+        use honk_wire::{Cost, Usage};
+
+        let u_full = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+
+        // at width 140 the line ends with the segment flush right (line width == 140)
+        let bar_140 = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: Some(&u_full),
+        };
+        let line_140 = bar_140.to_line(140);
+        let rendered_140: String = line_140.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line_140.width(), 140);
+        assert!(rendered_140.ends_with("45.2K (23%) · $1.84"));
+
+        // at a narrow width the cost is dropped first, then pct, then the segment
+        let line_50 = bar_140.to_line(50);
+        let rendered_50: String = line_50.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line_50.width(), 50);
+        assert!(rendered_50.ends_with("45.2K (23%)"));
+        assert!(!rendered_50.contains("$1.84"));
+
+        let line_43 = bar_140.to_line(43);
+        let rendered_43: String = line_43.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line_43.width(), 43);
+        assert!(rendered_43.ends_with("45.2K"));
+        assert!(!rendered_43.contains("(23%)"));
+
+        let line_35 = bar_140.to_line(35);
+        let rendered_35: String = line_35.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!rendered_35.contains("45.2K"));
+
+        // No usage and used == 0 produce identical line output
+        let u_zero_used = Usage {
+            used: 0,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+        let bar_none = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: None,
+        };
+        let bar_zero = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: Some(&u_zero_used),
+        };
+        assert_eq!(bar_none.to_line(140), bar_zero.to_line(140));
+    }
+
+    #[test]
+    fn test_status_line_title_budget_width_80() {
+        use honk_wire::{Cost, Usage};
+
+        let u_full = Usage {
+            used: 45231,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 1.84,
+                currency: "USD".to_string(),
+            }),
+        };
+
+        let title_30 = "A very long session title 1234";
+        assert_eq!(title_30.len(), 30);
+
+        let bar = StatusBar {
+            session_id: "ses_1",
+            session_title: Some(title_30),
+            cwd: None,
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: Some(&u_full),
+        };
+
+        let line = bar.to_line(80);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(line.width(), 80);
+        assert!(rendered.ends_with("45.2K (23%) · $1.84"));
+        assert!(
+            rendered.contains(title_30),
+            "title of length 30 must not be truncated, got: {rendered}"
+        );
+        assert!(!rendered.contains('…'), "must not contain ellipsis");
     }
 }

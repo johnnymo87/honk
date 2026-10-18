@@ -74,6 +74,7 @@ pub struct Transcript {
     pub tools_expanded: bool,
     pub json_expanded: bool,
     pub active_run: Option<String>,
+    pub usage: Option<honk_wire::Usage>,
     pub layout_cache: HashMap<LayoutKey, CachedBlock>,
     pub render_count: usize,
     last_width: Option<u16>,
@@ -101,6 +102,7 @@ impl Transcript {
             tools_expanded: false,
             json_expanded: false,
             active_run: None,
+            usage: None,
             layout_cache: HashMap::new(),
             render_count: 0,
             last_width: None,
@@ -144,6 +146,7 @@ impl Transcript {
                     }
                     self.blocks = fresh.blocks;
                     self.block_indices = fresh.block_indices;
+                    self.usage = fresh.usage.or(self.usage.take());
                     self.layout_cache.clear();
                     self.cached_prefix_sums = None;
                     self.is_rebuilding = false;
@@ -171,6 +174,10 @@ impl Transcript {
         let Some(u) = frame.pointer("/params/update") else {
             return;
         };
+
+        if let Some(usage) = honk_wire::usage(u) {
+            self.usage = Some(usage);
+        }
 
         if let Some(state) = honk_wire::run_state(u) {
             self.active_run = state;
@@ -344,6 +351,10 @@ impl Transcript {
             notice: Some(notice),
         });
         self.block_indices.insert(key, idx);
+    }
+
+    pub fn usage(&self) -> Option<&honk_wire::Usage> {
+        self.usage.as_ref()
     }
 
     pub fn abort_rebuild(&mut self) {
@@ -3726,5 +3737,140 @@ mod tests {
             total_cached_lines < 500_000,
             "cached lines exceeded bound: {total_cached_lines}"
         );
+    }
+
+    #[test]
+    fn test_transcript_usage_lifecycle() {
+        use honk_wire::{Cost, Usage};
+
+        let mut transcript = Transcript::new();
+        assert_eq!(transcript.usage(), None);
+
+        // 1. Live usage_update sets usage
+        let f1 = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 150_000,
+                    "size": 200_000,
+                    "cost": {
+                        "amount": 1.25,
+                        "currency": "USD"
+                    }
+                }
+            }
+        });
+        transcript.apply_frame(&f1);
+
+        assert_eq!(
+            transcript.usage(),
+            Some(&Usage {
+                used: 150_000,
+                size: 200_000,
+                cost: Some(Cost {
+                    amount: 1.25,
+                    currency: "USD".to_string()
+                }),
+            })
+        );
+        // Usage frames must create no blocks!
+        assert_eq!(transcript.blocks.len(), 0);
+
+        // 2. Later one replaces it (e.g. compaction drop 150000 -> 20000)
+        let f2 = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 20_000,
+                    "size": 200_000,
+                    "cost": {
+                        "amount": 1.30,
+                        "currency": "USD"
+                    }
+                }
+            }
+        });
+        transcript.apply_frame(&f2);
+
+        assert_eq!(
+            transcript.usage(),
+            Some(&Usage {
+                used: 20_000,
+                size: 200_000,
+                cost: Some(Cost {
+                    amount: 1.30,
+                    currency: "USD".to_string()
+                }),
+            })
+        );
+        assert_eq!(transcript.blocks.len(), 0);
+
+        // 3. Reset + replay containing a usage frame -> new value after replay_done
+        let reset_frame = json!({ "method": honk_wire::method::RESET });
+        transcript.apply_frame(&reset_frame);
+        // While rebuilding, usage is still accessible from transcript before replay finishes
+        assert_eq!(transcript.usage().map(|u| u.used), Some(20_000));
+
+        let replay_usage = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 50_000,
+                    "size": 200_000,
+                    "cost": {
+                        "amount": 1.50,
+                        "currency": "USD"
+                    }
+                }
+            }
+        });
+        transcript.apply_frame(&replay_usage);
+        // Still rebuilding, replay_done not received yet
+        assert_eq!(transcript.usage().map(|u| u.used), Some(20_000));
+
+        let replay_done = json!({ "method": honk_wire::method::REPLAY_DONE });
+        transcript.apply_frame(&replay_done);
+        // After replay_done, new generation's value wins
+        assert_eq!(
+            transcript.usage(),
+            Some(&Usage {
+                used: 50_000,
+                size: 200_000,
+                cost: Some(Cost {
+                    amount: 1.50,
+                    currency: "USD".to_string()
+                }),
+            })
+        );
+        assert_eq!(transcript.blocks.len(), 0);
+
+        // 4. Reset + replay without usage -> old value kept
+        transcript.apply_frame(&reset_frame);
+        // Only content chunks during replay, no usage frame
+        let chunk = make_chunk_frame("agent_message_chunk", "msg_1", "hello");
+        transcript.apply_frame(&chunk);
+        transcript.apply_frame(&replay_done);
+        // Old usage value preserved!
+        assert_eq!(transcript.usage().map(|u| u.used), Some(50_000));
+
+        // 5. Rebuild abort keeps current value
+        transcript.apply_frame(&reset_frame);
+        let replay_usage2 = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 99_000,
+                    "size": 200_000
+                }
+            }
+        });
+        transcript.apply_frame(&replay_usage2);
+        transcript.abort_rebuild();
+        // Aborted: kept the pre-reset value (50_000)
+        assert_eq!(transcript.usage().map(|u| u.used), Some(50_000));
     }
 }

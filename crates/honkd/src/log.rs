@@ -374,6 +374,17 @@ impl SessionLog {
     }
 }
 
+pub fn last_usage_frame(entries: &[Entry]) -> Option<&Value> {
+    entries.iter().rev().find_map(|entry| {
+        if entry.frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            return None;
+        }
+        let update = entry.frame.pointer("/params/update")?;
+        honk_wire::usage(update)?;
+        Some(&entry.frame)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +405,113 @@ mod tests {
                 }
             }),
         )
+    }
+
+    fn usage_frame(used: u64, size: u64) -> Value {
+        crate::rpc::notification(
+            "session/update",
+            json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": used,
+                    "size": size,
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn test_last_usage_frame() {
+        let entries = vec![
+            Entry {
+                seq: 1,
+                upstream_id: Some(1),
+                frame: chunk("m1", "hello"),
+            },
+            Entry {
+                seq: 2,
+                upstream_id: Some(2),
+                frame: usage_frame(100, 200),
+            },
+            Entry {
+                seq: 3,
+                upstream_id: Some(3),
+                frame: chunk("m2", "world"),
+            },
+            Entry {
+                seq: 4,
+                upstream_id: Some(4),
+                frame: usage_frame(150, 200),
+            },
+            Entry {
+                seq: 5,
+                upstream_id: Some(5),
+                frame: chunk("m3", "!"),
+            },
+        ];
+
+        let found = last_usage_frame(&entries);
+        assert!(found.is_some());
+        let val = found.unwrap();
+        assert_eq!(
+            val.pointer("/params/update/used").and_then(Value::as_u64),
+            Some(150)
+        );
+
+        let empty: Vec<Entry> = vec![];
+        assert_eq!(last_usage_frame(&empty), None);
+
+        let chunks_only = vec![Entry {
+            seq: 1,
+            upstream_id: Some(1),
+            frame: chunk("m1", "hello"),
+        }];
+        assert_eq!(last_usage_frame(&chunks_only), None);
+
+        // Frame with method != "session/update" must be ignored
+        let mut entries_with_custom = entries.clone();
+        entries_with_custom.push(Entry {
+            seq: 6,
+            upstream_id: Some(6),
+            frame: crate::rpc::notification(
+                "_goose/unstable/session/update",
+                json!({
+                    "sessionId": "s",
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 250,
+                        "size": 200,
+                    }
+                }),
+            ),
+        });
+        let found_custom = last_usage_frame(&entries_with_custom);
+        assert_eq!(
+            found_custom
+                .unwrap()
+                .pointer("/params/update/used")
+                .and_then(Value::as_u64),
+            Some(150),
+            "custom method must be ignored, returning previous session/update frame"
+        );
+
+        let custom_only = vec![Entry {
+            seq: 1,
+            upstream_id: Some(1),
+            frame: crate::rpc::notification(
+                "_goose/unstable/session/update",
+                json!({
+                    "sessionId": "s",
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 250,
+                        "size": 200,
+                    }
+                }),
+            ),
+        }];
+        assert_eq!(last_usage_frame(&custom_only), None);
     }
 
     #[test]

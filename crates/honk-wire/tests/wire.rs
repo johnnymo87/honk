@@ -1,4 +1,4 @@
-use honk_wire::export::{client_prompts, to_updates, turn_text};
+use honk_wire::export::{client_prompts, export_used_tokens, to_updates, turn_text};
 use honk_wire::{BlockKey, Blocks, block_key, run_state};
 use serde_json::Value;
 use std::fs::read_to_string;
@@ -720,4 +720,193 @@ fn test_to_updates_synthetic_truncation_and_text_editor_title() {
         .unwrap();
     assert!(text.ends_with('…'));
     assert_eq!(text.len(), 64 * 1024 + '…'.len_utf8());
+}
+
+#[test]
+fn test_usage_parsing_and_serialization() {
+    use honk_wire::{Cost, Usage, usage};
+
+    // 1. Full fixture frame shape
+    let full_update = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 53000,
+        "size": 200000,
+        "cost": {
+            "amount": 0.045,
+            "currency": "USD"
+        }
+    });
+    let parsed = usage(&full_update).expect("parses full usage");
+    assert_eq!(
+        parsed,
+        Usage {
+            used: 53000,
+            size: 200000,
+            cost: Some(Cost {
+                amount: 0.045,
+                currency: "USD".to_string(),
+            }),
+        }
+    );
+
+    // Round-trip serialization matches exact JSON field names
+    let serialized = serde_json::to_value(&parsed).expect("serialize usage");
+    assert_eq!(
+        serialized,
+        serde_json::json!({
+            "used": 53000,
+            "size": 200000,
+            "cost": {
+                "amount": 0.045,
+                "currency": "USD"
+            }
+        })
+    );
+
+    // 2. Missing cost
+    let no_cost = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 1500,
+        "size": 8000
+    });
+    let parsed_no_cost = usage(&no_cost).expect("parses without cost");
+    assert_eq!(
+        parsed_no_cost,
+        Usage {
+            used: 1500,
+            size: 8000,
+            cost: None,
+        }
+    );
+    // When cost is None, cost field is omitted in serialization
+    let serialized_no_cost = serde_json::to_value(&parsed_no_cost).expect("serialize");
+    assert_eq!(
+        serialized_no_cost,
+        serde_json::json!({
+            "used": 1500,
+            "size": 8000
+        })
+    );
+
+    // Deserialization with missing cost defaults to None
+    let deserialized: Usage = serde_json::from_str(r#"{"used": 100, "size": 200}"#).unwrap();
+    assert_eq!(deserialized.cost, None);
+
+    // 3. Missing size defaults to 0
+    let no_size = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 42
+    });
+    let parsed_no_size = usage(&no_size).expect("parses without size");
+    assert_eq!(parsed_no_size.size, 0);
+    assert_eq!(parsed_no_size.used, 42);
+
+    // 4. Invalid cost does not reject the whole update
+    // Empty currency -> cost None
+    let empty_curr = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 100,
+        "size": 500,
+        "cost": {
+            "amount": 1.23,
+            "currency": ""
+        }
+    });
+    assert_eq!(
+        usage(&empty_curr),
+        Some(Usage {
+            used: 100,
+            size: 500,
+            cost: None,
+        })
+    );
+
+    // Non-object cost -> cost None
+    let null_cost = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 100,
+        "size": 500,
+        "cost": null
+    });
+    assert_eq!(
+        usage(&null_cost),
+        Some(Usage {
+            used: 100,
+            size: 500,
+            cost: None,
+        })
+    );
+
+    // Non-numeric amount -> cost None
+    let str_amount = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": 100,
+        "size": 500,
+        "cost": {
+            "amount": "free",
+            "currency": "USD"
+        }
+    });
+    assert_eq!(
+        usage(&str_amount),
+        Some(Usage {
+            used: 100,
+            size: 500,
+            cost: None,
+        })
+    );
+
+    // 5. Non-usage update -> None
+    let user_chunk = serde_json::json!({
+        "sessionUpdate": "user_message_chunk",
+        "used": 100
+    });
+    assert_eq!(usage(&user_chunk), None);
+
+    let info_update = serde_json::json!({
+        "sessionUpdate": "session_info_update"
+    });
+    assert_eq!(usage(&info_update), None);
+
+    // Missing used -> None
+    let no_used = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "size": 1000
+    });
+    assert_eq!(usage(&no_used), None);
+
+    // Negative used (not u64) -> None
+    let neg_used = serde_json::json!({
+        "sessionUpdate": "usage_update",
+        "used": -50
+    });
+    assert_eq!(usage(&neg_used), None);
+}
+
+#[test]
+fn test_export_used_tokens_canonical_fixture() {
+    let fixture = load_json(EXPORT_PATH);
+    assert_eq!(export_used_tokens(&fixture), Some(5905));
+
+    // Missing usage object
+    let no_usage = serde_json::json!({
+        "conversation": []
+    });
+    assert_eq!(export_used_tokens(&no_usage), None);
+
+    // Negative total_tokens (not u64)
+    let neg_tokens = serde_json::json!({
+        "usage": {
+            "total_tokens": -10
+        }
+    });
+    assert_eq!(export_used_tokens(&neg_tokens), None);
+
+    // String total_tokens (not u64)
+    let str_tokens = serde_json::json!({
+        "usage": {
+            "total_tokens": "5905"
+        }
+    });
+    assert_eq!(export_used_tokens(&str_tokens), None);
 }

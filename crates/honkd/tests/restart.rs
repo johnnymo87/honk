@@ -1342,3 +1342,129 @@ async fn tool_turn_mid_run_gap_never_synthesizes_and_uses_real_reply() {
     assert_eq!(v.blocks.resets, 2, "exactly one reset at turn end");
     assert!(v.blocks.agent_text().contains("final_turn_response"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gap_rebuild_carries_usage_update_to_new_epoch() {
+    let fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    let sid = new_session(&mut v, "/tmp").await;
+
+    // Emit a usage_update on the session stream
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 50000,
+                "size": 150000,
+                "cost": {
+                    "amount": 0.08,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+    fake.emit_frame(&sid, usage_frame);
+
+    // Wait until viewer receives usage_update in epoch 1
+    let u1 = v
+        .wait_for(|f| {
+            f.pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("usage_update")
+        })
+        .await;
+    assert_eq!(
+        u1.pointer("/params/_meta/honk/epoch")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    // Set export data with usage.total_tokens different from last logged used
+    fake.set_export_data(
+        &sid,
+        json!({
+            "sessionId": &sid,
+            "conversation": [],
+            "usage": {
+                "total_tokens": 52000
+            }
+        }),
+    );
+
+    // Induce gap rebuild while idle
+    fake.gap_on_next_resume(&sid);
+    fake.kick_stream(&sid);
+
+    // Wait until epoch 2 replay_done arrives on v
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some("_honk/replay_done")
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+
+    // Attach fresh viewer v2
+    let mut v2 = Viewer::connect(&h).await;
+    let load_id = v2
+        .request(
+            "session/load",
+            json!({
+                "sessionId": &sid,
+                "cwd": "/tmp",
+                "mcpServers": []
+            }),
+        )
+        .await;
+
+    let mut frames_before_done = Vec::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), v2.recv_frame())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream open");
+        if f.get("method").and_then(Value::as_str) == Some("_honk/replay_done") {
+            break;
+        }
+        frames_before_done.push(f);
+    }
+
+    let load_resp = frames_before_done
+        .iter()
+        .find(|f| honk_upstream::rpc_id_matches(&load_id, f.get("id").unwrap_or(&Value::Null)))
+        .expect("must receive session/load response");
+    assert!(load_resp.get("error").is_none());
+
+    let usage_f = frames_before_done
+        .iter()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("usage_update")
+        })
+        .expect("fresh viewer must receive usage_update in epoch 2 replay");
+
+    assert_eq!(
+        usage_f
+            .pointer("/params/_meta/honk/epoch")
+            .and_then(Value::as_u64),
+        Some(2),
+        "usage_update in new generation must have epoch 2"
+    );
+
+    let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
+    assert_eq!(
+        usage.used, 52000,
+        "export usage.total_tokens must override carried used"
+    );
+    assert_eq!(usage.size, 150000);
+    let cost = usage.cost.expect("cost present");
+    assert_eq!(cost.amount, 0.08);
+    assert_eq!(cost.currency, "USD");
+}

@@ -63,11 +63,19 @@ Emitted once when the turn concludes (result received, error received, synthesiz
   "at_ms": 1792162677890,
   "stop_reason": "end_turn",
   "final_text": "assistant reply text",
-  "final_text_truncated": false
+  "final_text_truncated": false,
+  "usage": {
+    "used": 53000,
+    "size": 200000,
+    "cost": {
+      "amount": 0.045,
+      "currency": "USD"
+    }
+  }
 }
 ```
 
-Ended-only fields (`stop_reason`, `honk_reason`, `final_text`, `error`) are omitted when empty/null in serialized JSON (`#[serde(skip_serializing_if = "Option::is_none")]`). Receivers must treat absent and `null` fields identically.
+Ended-only fields (`stop_reason`, `honk_reason`, `final_text`, `error`, `usage`) are omitted when empty/null in serialized JSON (`#[serde(skip_serializing_if = "Option::is_none")]`). Receivers must treat absent and `null` fields identically.
 
 ### Event Fields
 
@@ -85,6 +93,7 @@ Ended-only fields (`stop_reason`, `honk_reason`, `final_text`, `error`) are omit
 - `final_text` (string, `turn.ended` only, omitted if empty): Final assistant response text from exported session history, capped at 256 KiB.
 - `final_text_truncated` (boolean, `turn.ended` only): Always present on `turn.ended`. Indicates whether `final_text` was truncated at the 256 KiB boundary (`false` if within limits or if `final_text` is absent).
 - `error` (string, `turn.ended` only, omitted if empty): Error message string when goose responded with a JSON-RPC error.
+- `usage` (object, `turn.ended` only, omitted if empty/unknown): Context window usage at turn end, with `used` (integer), `size` (integer), and optional `cost` (`amount` (float) and `currency` (string)).
 
 ## Idempotency and Accepted Gaps
 

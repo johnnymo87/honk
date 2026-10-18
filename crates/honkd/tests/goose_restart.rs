@@ -771,3 +771,212 @@ async fn lost_steer_probe_response_clears_active_probe_on_timeout_and_retries() 
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn goose_restart_reactivation_carries_post_load_usage_update() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 55000,
+                "size": 160000,
+                "cost": {
+                    "amount": 0.09,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+    fake.set_load_frames_before(&sid, vec![usage_frame]);
+
+    // Restart goose -> triggers reactivation
+    fake.restart().await;
+
+    // Wait for replay_done with epoch 2
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+
+    // Attach fresh viewer to verify the new generation log carries usage_update
+    let mut v2 = Viewer::connect(&h).await;
+    let load_id = v2
+        .request(
+            "session/load",
+            json!({
+                "sessionId": &sid,
+                "cwd": ".",
+                "mcpServers": []
+            }),
+        )
+        .await;
+
+    let mut frames_before_done = Vec::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), v2.recv_frame())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream open");
+        if is_method(&f, honk_wire::method::REPLAY_DONE) {
+            break;
+        }
+        frames_before_done.push(f);
+    }
+
+    let load_resp = frames_before_done
+        .iter()
+        .find(|f| honk_upstream::rpc_id_matches(&load_id, f.get("id").unwrap_or(&Value::Null)))
+        .expect("must receive session/load response");
+    assert!(load_resp.get("error").is_none());
+
+    let usage_f = frames_before_done
+        .iter()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("usage_update")
+        })
+        .expect("fresh viewer must receive usage_update in epoch 2 replay");
+
+    assert_eq!(
+        usage_f
+            .pointer("/params/_meta/honk/epoch")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
+    assert_eq!(usage.used, 55000);
+    assert_eq!(usage.size, 160000);
+    let cost = usage.cost.expect("cost present");
+    assert_eq!(cost.amount, 0.09);
+    assert_eq!(cost.currency, "USD");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn goose_restart_reactivation_carries_post_load_usage_update_after_reply() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 48000,
+                "size": 140000,
+                "cost": {
+                    "amount": 0.07,
+                    "currency": "USD"
+                }
+            }
+        }
+    });
+    // set_load_frames delivers AFTER the load reply (normal production goose behavior)
+    fake.set_load_frames(&sid, vec![usage_frame]);
+
+    // Restart goose -> triggers reactivation
+    fake.restart().await;
+
+    // Wait for replay_done with epoch 2
+    v.wait_for(|f| {
+        is_method(f, honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+
+    // The usage_update arrives after load reply on the live stream and is appended to log
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some("session/update")
+            && f.pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("usage_update")
+            && f.pointer("/params/update/used").and_then(Value::as_u64) == Some(48000)
+    })
+    .await;
+
+    // Attach fresh viewer to verify the new generation log holds the usage_update
+    let mut v2 = Viewer::connect(&h).await;
+    let load_id = v2
+        .request(
+            "session/load",
+            json!({
+                "sessionId": &sid,
+                "cwd": ".",
+                "mcpServers": []
+            }),
+        )
+        .await;
+
+    let mut frames_before_done = Vec::new();
+    loop {
+        let f = tokio::time::timeout(Duration::from_secs(5), v2.recv_frame())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream open");
+        if is_method(&f, honk_wire::method::REPLAY_DONE) {
+            break;
+        }
+        frames_before_done.push(f);
+    }
+
+    let load_resp = frames_before_done
+        .iter()
+        .find(|f| honk_upstream::rpc_id_matches(&load_id, f.get("id").unwrap_or(&Value::Null)))
+        .expect("must receive session/load response");
+    assert!(load_resp.get("error").is_none());
+
+    let usage_f = frames_before_done
+        .iter()
+        .find(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/update")
+                && f.pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("usage_update")
+        })
+        .expect("fresh viewer must receive usage_update in epoch 2 replay");
+
+    assert_eq!(
+        usage_f
+            .pointer("/params/_meta/honk/epoch")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+
+    let usage = honk_wire::usage(usage_f.pointer("/params/update").unwrap()).unwrap();
+    assert_eq!(usage.used, 48000);
+    assert_eq!(usage.size, 140000);
+    let cost = usage.cost.expect("cost present");
+    assert_eq!(cost.amount, 0.07);
+    assert_eq!(cost.currency, "USD");
+}

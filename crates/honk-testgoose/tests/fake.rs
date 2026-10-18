@@ -1018,3 +1018,77 @@ async fn test_stub_model_gate_queued_before_restart_consumed_after_waits() {
         .expect("res2 ok");
     assert!(res2.status().is_success());
 }
+
+#[tokio::test]
+async fn test_load_frames_delivered_after_load_reply() -> anyhow::Result<()> {
+    let fake = FakeGoose::start().await;
+
+    let mut up = Upstream::initialize(
+        &fake.url(),
+        fake.secret().to_string(),
+        honk_upstream::Recorder::disabled(),
+    )
+    .await?;
+    up.subscribe(None).await?;
+
+    let new_res = up
+        .call(
+            "session/new",
+            json!({"cwd": "/tmp", "mcpServers": []}),
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+    let sid = new_res
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .expect("sessionId in session/new")
+        .to_string();
+
+    up.subscribe(Some(&sid)).await?;
+
+    let usage_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 42000,
+                "size": 128000,
+            }
+        }
+    });
+
+    fake.set_load_frames(&sid, vec![usage_frame.clone()]);
+
+    let reply = up
+        .call(
+            "session/load",
+            json!({"sessionId": sid, "cwd": "/tmp", "mcpServers": []}),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert_eq!(reply, json!({}));
+
+    // Next event on session stream should be the usage frame
+    let ev = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = up.next(Duration::from_millis(50)).await? {
+                return Ok::<_, anyhow::Error>(event);
+            }
+        }
+    })
+    .await
+    .expect("event timeout")?;
+
+    if let Event::Frame(key, frame, _) = ev {
+        assert_eq!(key, StreamKey::Session(sid));
+        assert_eq!(frame, usage_frame);
+    } else {
+        panic!("expected Frame event, got {:?}", ev);
+    }
+
+    Ok(())
+}
