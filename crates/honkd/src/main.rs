@@ -142,8 +142,90 @@ async fn main() {
         }
     };
 
+    if args.turn_hook_token_file.is_some() && args.turn_hook_url.is_none() {
+        eprintln!("honkd: --turn-hook-token-file requires --turn-hook-url");
+        std::process::exit(1);
+    }
+
+    let turn_hook_token = match &args.turn_hook_token_file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    eprintln!(
+                        "honkd: turn hook token file {} is invalid (empty)",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Some(trimmed)
+            }
+            Err(e) => {
+                eprintln!(
+                    "honkd: failed to read turn hook token file {}: {e:#}",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    let turn_hook = if let Some(url_str) = &args.turn_hook_url {
+        let parsed_url = match reqwest::Url::parse(url_str) {
+            Ok(u) => {
+                if u.scheme() != "http" && u.scheme() != "https" {
+                    eprintln!("honkd: --turn-hook-url must be http or https: {url_str}");
+                    std::process::exit(1);
+                }
+                u
+            }
+            Err(e) => {
+                eprintln!("honkd: failed to parse --turn-hook-url '{url_str}': {e:#}");
+                std::process::exit(1);
+            }
+        };
+
+        let is_loopback = match parsed_url.host_str() {
+            Some(h) => {
+                if h.eq_ignore_ascii_case("localhost") {
+                    true
+                } else if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                    ip.is_loopback()
+                } else if let Ok(ip) = h
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                {
+                    ip.is_loopback()
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
+        if !is_loopback {
+            tracing::warn!("turn hook url host is not loopback: {url_str}");
+        }
+
+        tracing::info!("turn hook enabled url={url_str}");
+
+        let opts = honkd::turn_hook::HookOpts {
+            retry_window: std::time::Duration::from_secs(args.turn_hook_retry_secs),
+            ..Default::default()
+        };
+        Some(honkd::turn_hook::TurnHook::spawn(
+            url_str.clone(),
+            turn_hook_token,
+            opts,
+        ))
+    } else {
+        None
+    };
+
     let args_arc = Arc::new(args);
-    let hub = match Hub::start(args_arc, state_store, upstream_secret).await {
+    let hub = match Hub::start(args_arc, state_store, upstream_secret, turn_hook).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("honkd: {e:#}");
