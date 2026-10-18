@@ -68,6 +68,43 @@ pub fn text_of(update: &Value) -> Option<&str> {
     update.pointer("/content/text").and_then(Value::as_str)
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub used: u64,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost: Option<Cost>,
+}
+
+pub fn usage(update: &Value) -> Option<Usage> {
+    if update.get("sessionUpdate")?.as_str()? != "usage_update" {
+        return None;
+    }
+    let used = update.get("used")?.as_u64()?;
+    let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
+    let cost = update.get("cost").and_then(|c| {
+        let amount = c.get("amount")?.as_f64()?;
+        if !amount.is_finite() {
+            return None;
+        }
+        let currency = c.get("currency")?.as_str()?;
+        if currency.is_empty() {
+            return None;
+        }
+        Some(Cost {
+            amount,
+            currency: currency.to_string(),
+        })
+    });
+    Some(Usage { used, size, cost })
+}
+
 /// epoch = upstream connection generation for the session (not honkd boot).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {

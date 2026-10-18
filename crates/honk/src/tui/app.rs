@@ -547,6 +547,7 @@ impl App {
             cwd: self.cwd.as_deref(),
             state_snapshot: self.state_snapshot.as_ref(),
             mode: self.composer.mode,
+            usage: self.transcript.usage(),
         };
         frame.render_widget(status_bar, status_area);
 
@@ -1284,6 +1285,48 @@ mod tests {
         assert!(buffer_str.contains("queued: 2"));
         assert!(buffer_str.contains("live"));
         assert!(buffer_str.contains("INSERT"));
+    }
+
+    #[test]
+    fn test_status_bar_usage_in_app_draw() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("test_session_id", cmd_tx);
+        app.handle_ui_event(UiEvent::Attached {
+            result: json!({
+                "title": "My Session",
+                "cwd": "/tmp/work",
+                "sessionId": "test_session_id"
+            }),
+        });
+
+        let usage_frame = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 45231,
+                    "size": 200000,
+                    "cost": {
+                        "amount": 1.84,
+                        "currency": "USD"
+                    }
+                }
+            }
+        });
+        app.handle_ui_event(UiEvent::Transcript(usage_frame));
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let buffer_str: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+        assert!(
+            buffer_str.contains("45.2K (23%) · $1.84"),
+            "buffer did not contain usage readout: {buffer_str}"
+        );
     }
 
     // ---- composer wrapping and paste ----
