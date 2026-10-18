@@ -3624,3 +3624,259 @@ fn test_compact_buffered_while_detached() {
     };
     assert_eq!(params["prompt"][0]["text"], "/compact");
 }
+
+#[test]
+fn test_compact_inflight_own_running_queues_line_no_steer() {
+    let (mut core, _) = new_test_core();
+    // 1. Send /compact prompt
+    core.handle(Input::Line("/compact".into()));
+    assert!(core.prompt_sent().is_some());
+    let crid = core.prompt_sent().unwrap().crid.clone();
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+
+    // 2. /compact run starts (echo + activeRunId)
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u_compact",
+                "content": { "type": "text", "text": "/compact" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_compact" } }
+            }
+        }
+    })));
+    assert_eq!(*core.run_state(), RunState::Running("run_compact".into()));
+    assert_eq!(core.ownership(), Ownership::Own);
+
+    // 3. User types a line while /compact is running (Own+Running)
+    let effs = core.handle(Input::Line("message during compaction".into()));
+    // Must NOT steer!
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "lines typed during compaction must not steer"
+    );
+    assert!(has_notice(
+        &effs,
+        "compaction running; message queued for after it ends"
+    ));
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "message during compaction");
+    assert!(core.held_steers().is_empty());
+
+    // 4. Compaction finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    // 5. Queued message is sent as prompt
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send queued message prompt after compaction ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "message during compaction");
+    assert!(core.local_queue().is_empty());
+}
+
+#[test]
+fn test_compact_inflight_line_typed_before_run_announced_queues_no_held_steer() {
+    let (mut core, _) = new_test_core();
+    // 1. Send /compact prompt
+    core.handle(Input::Line("/compact".into()));
+    let crid = core.prompt_sent().unwrap().crid.clone();
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+
+    // 2. Before run is announced, type a line
+    let effs = core.handle(Input::Line("typed before compaction starts".into()));
+    assert!(has_notice(
+        &effs,
+        "compaction running; message queued for after it ends"
+    ));
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "typed before compaction starts");
+    assert!(core.held_steers().is_empty());
+
+    // 3. /compact run announced
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u_compact",
+                "content": { "type": "text", "text": "/compact" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    let run_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_compact" } }
+            }
+        }
+    })));
+    // Must NOT emit steer
+    assert!(
+        !run_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "no steer flushed into compaction run"
+    );
+    assert_eq!(core.local_queue().len(), 1);
+    assert!(core.held_steers().is_empty());
+
+    // 4. Compaction finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send prompt after compaction ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(
+        params["prompt"][0]["text"],
+        "typed before compaction starts"
+    );
+}
+
+#[test]
+fn test_compact_buffered_reattach_with_subsequent_line_queues_no_steer() {
+    let (mut core, _) = new_test_core();
+    // Detach via idle
+    core.handle(Input::Tick(Instant::now() + Duration::from_secs(3600)));
+    assert!(core.is_detached());
+
+    // Buffer /compact and then next line while detached
+    core.handle(Input::Line("/compact".into()));
+    core.handle(Input::Line("next line".into()));
+    assert_eq!(core.queued_len(), 2);
+
+    // Replay finishes
+    let replay_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 2, "seq": 0 }
+    })));
+
+    // /compact was sent as prompt
+    let req = replay_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send /compact prompt after replay done");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["prompt"][0]["text"], "/compact");
+    let crid = core.prompt_sent().unwrap().crid.clone();
+    let prompt_req_id = core.prompt_sent().unwrap().req_id;
+
+    // "next line" must be in local_queue, NOT held_steers
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "next line");
+    assert!(core.held_steers().is_empty());
+
+    // Compaction run starts
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u_c",
+                "content": { "type": "text", "text": "/compact" },
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    let run_start_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_c" } }
+            }
+        }
+    })));
+    // Must NOT steer "next line"
+    assert!(
+        !run_start_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method.contains("steer"))),
+        "buffered next line must NOT be steered into compaction run"
+    );
+
+    // Compaction finishes
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    let req2 = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+        .expect("should send next line prompt after compaction ends");
+    let Effect::Request { params: p2, .. } = req2 else {
+        panic!()
+    };
+    assert_eq!(p2["prompt"][0]["text"], "next line");
+}

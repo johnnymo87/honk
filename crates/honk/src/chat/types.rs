@@ -151,6 +151,7 @@ pub struct PromptSent {
     pub req_id: u64,
     pub run_seen: bool,
     pub conversion_count: u32,
+    pub is_command: bool,
 }
 
 #[derive(Clone, Debug)]
