@@ -72,28 +72,6 @@ async fn self_compact_and_resume_e2e() {
         "receipt text must contain 'after', got: {receipt1}"
     );
 
-    // Capture export fixture representing turn 1 for H2 unit test
-    let export_after_p1 = g.export(&sid).await;
-    let mut redactor = honk_upstream::Redactor::from_env();
-    let temp_cwd = g.cwd().to_string_lossy().to_string();
-    redactor.add(&temp_cwd, "/tmp/honk-self-compact");
-    let temp_root = g.root().to_string_lossy().to_string();
-    redactor.add(&temp_root, "/tmp/honk-self-compact");
-    if let Some(parent) = g.cwd().parent() {
-        redactor.add(
-            parent.to_string_lossy().to_string(),
-            "/tmp/honk-self-compact",
-        );
-    }
-    redactor.add("cloudbox", "host");
-    redactor.add("devbox", "host");
-    let redacted_export = redactor.apply(export_after_p1);
-    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/self_compact/export.json");
-    if let Ok(pretty) = serde_json::to_string_pretty(&redacted_export) {
-        let _ = std::fs::write(&fixture_path, format!("{pretty}\n"));
-    }
-
     // Assert: exactly one run (one activeRunId, no idle between)
     let run_ids: Vec<Option<String>> = v
         .all_frames
