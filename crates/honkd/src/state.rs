@@ -212,6 +212,8 @@ pub struct InflightPrompt {
     /// Set to `HeldSession.client_prompts` when the prompt is dispatched.
     #[serde(default)]
     pub prompt_index: usize,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// Boot-time ledger prune policy:
@@ -507,6 +509,20 @@ mod tests {
     }
 
     #[test]
+    fn test_inflight_prompt_serde_backward_compat() {
+        let old_json = serde_json::json!({
+            "upstream_id": "hk1-1",
+            "client_req_ids": ["c1"],
+            "params": {},
+            "announced": true,
+            "prompt_index": 2
+        });
+        let inflight: InflightPrompt = serde_json::from_value(old_json).unwrap();
+        assert_eq!(inflight.run_id, None);
+        assert_eq!(inflight.upstream_id, "hk1-1");
+    }
+
+    #[test]
     fn prune_keeps_inflight() {
         let mut st = State::default();
         let held = HeldSession {
@@ -516,6 +532,7 @@ mod tests {
                 params: json!({}),
                 announced: true,
                 prompt_index: 0,
+                run_id: None,
             }),
             ..Default::default()
         };

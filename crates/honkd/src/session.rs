@@ -1608,22 +1608,28 @@ impl Session {
                                 inf.upstream_id
                             );
                             inf.announced = true;
+                            inf.run_id = Some(run_id.to_string());
                             Some((
                                 inf.prompt_index,
                                 inf.params.clone(),
                                 inf.owners.first().cloned(),
+                                inf.upstream_id.clone(),
                             ))
                         } else {
                             None
                         };
-                        if let Some((n, params, owner_opt)) = delivered_info {
+                        if let Some((n, params, owner_opt, up_id)) = delivered_info {
                             self.ambiguous_check_token += 1;
                             if self.turn.client_prompts <= n {
                                 self.turn.client_prompts = n + 1;
                                 self.sync_inflight().await;
                             }
                             if let Some(owner) = owner_opt {
-                                let synth_action = Action::SynthUser { params, owner };
+                                let synth_action = Action::SynthUser {
+                                    params,
+                                    owner,
+                                    upstream_id: Some(up_id),
+                                };
                                 self.execute_actions(vec![synth_action]).await;
                             }
                         }
@@ -1941,7 +1947,7 @@ impl Session {
                         )
                         .await;
                 }
-                Action::SynthUser { params, owner } => {
+                Action::SynthUser { params, owner, .. } => {
                     let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
                     let msg_id = crid
@@ -1987,6 +1993,7 @@ impl Session {
                     body,
                     user_text,
                     prompt_index,
+                    ..
                 } => match body {
                     Reply::Error(err) => {
                         self.handle_reply_text(owners, Reply::Error(err), None)
@@ -2881,12 +2888,20 @@ impl Session {
             && !inf.announced
         {
             inf.announced = true;
-            Some((inf.params.clone(), inf.owners.first().cloned()))
+            Some((
+                inf.params.clone(),
+                inf.owners.first().cloned(),
+                inf.upstream_id.clone(),
+            ))
         } else {
             None
         };
-        if let Some((params, Some(owner))) = delivered_info {
-            let synth_action = Action::SynthUser { params, owner };
+        if let Some((params, Some(owner), up_id)) = delivered_info {
+            let synth_action = Action::SynthUser {
+                params,
+                owner,
+                upstream_id: Some(up_id),
+            };
             self.execute_actions(vec![synth_action]).await;
         }
         if self.turn.client_prompts <= n {
