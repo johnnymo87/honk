@@ -2647,3 +2647,133 @@ async fn test_new_session_pigeon_failure_is_a_warning_not_fatal() {
     assert_eq!(notice.kind, honk::chat::NoticeKind::Warning, "{notice:?}");
     assert!(notice.text.contains("not registered"), "{notice:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        eprintln!("skipping test: StubGoose unset");
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let opts = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut attached_sid = None;
+    let start_time = std::time::Instant::now();
+    while let Some(evt) = rx.recv().await {
+        match &evt {
+            UiEvent::SessionNew { result } => {
+                if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
+                    attached_sid = Some(s.to_string());
+                }
+            }
+            UiEvent::Attached { result } => {
+                if let Some(s) = result.get("sessionId").and_then(Value::as_str) {
+                    attached_sid = Some(s.to_string());
+                }
+            }
+            UiEvent::State(s) => {
+                if !s.replaying && attached_sid.is_some() {
+                    break;
+                }
+            }
+            UiEvent::Fatal(f) => panic!("fatal error during init: {f}"),
+            _ => {}
+        }
+        if start_time.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for session init");
+        }
+    }
+    let sid = attached_sid.expect("session_id must be known");
+
+    // Capability check: check if goose supports self-compact
+    let tools = g.tools_list(&sid).await;
+    let has_self_compact = tools.iter().any(|name| name == "self_compact_and_resume");
+
+    if !has_self_compact {
+        eprintln!("skipping test: self_compact_and_resume tool not offered by goose under test");
+        handle.send(UiCommand::Shutdown).expect("send shutdown");
+        return;
+    }
+
+    g.model().push([
+        Turn::ToolCall {
+            tool: "self_compact_and_resume".into(),
+            arguments: serde_json::json!({ "prompt": "Resume prompt" }),
+        },
+        Turn::Text(vec!["resumed response".into()]),
+    ]);
+
+    handle
+        .send(UiCommand::Line("trigger compact".to_string()))
+        .expect("send line");
+
+    let mut full_transcript = String::new();
+    let mut saw_running = false;
+    let mut became_idle = false;
+    let prompt_time = std::time::Instant::now();
+
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            UiEvent::Transcript(f) => {
+                if let Some(text) = f
+                    .pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+                {
+                    full_transcript.push_str(text);
+                }
+            }
+            UiEvent::Notice(notice) => {
+                assert!(
+                    !notice.text.to_lowercase().contains("steer")
+                        && !notice.text.to_lowercase().contains("unconsumed"),
+                    "unexpected steer warning: {:?}",
+                    notice
+                );
+            }
+            UiEvent::State(s) => {
+                if s.run_state.is_running() {
+                    saw_running = true;
+                    assert_eq!(
+                        s.ownership,
+                        honk::chat::Ownership::Own,
+                        "ownership must remain Own during self-compaction and resume"
+                    );
+                }
+                if s.run_state == RunState::Idle && full_transcript.contains("resumed response") {
+                    became_idle = true;
+                    break;
+                }
+            }
+            UiEvent::Fatal(f) => panic!("fatal error during prompt: {f}"),
+            _ => {}
+        }
+        if prompt_time.elapsed() > Duration::from_secs(15) {
+            panic!("timed out waiting for prompt response; text so far: {full_transcript}");
+        }
+    }
+
+    assert!(saw_running, "must have seen running state");
+    assert!(became_idle, "driver state should be Idle");
+    assert!(
+        full_transcript.contains("resumed response"),
+        "transcript must contain resumed response: {full_transcript}"
+    );
+
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+}
