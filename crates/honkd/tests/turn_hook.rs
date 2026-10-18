@@ -256,6 +256,59 @@ async fn goose_restart_mid_turn_reports_upstream_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn goose_restart_unannounced_prompt_emits_started_then_ended() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let hook = HookStub::start().await;
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--turn-hook-url",
+            &hook.url(),
+            "--turn-hook-retry-secs",
+            "5",
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, ".").await;
+
+    // Drop run announcement so prompt is never announced while in-flight
+    fake.set_drop_prompt_announcement(true);
+
+    let p_id = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "test unannounced restart", Some("c-unannounced")),
+        )
+        .await;
+
+    // Give honkd time to send prompt upstream to fake goose
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Restart goose while prompt is unannounced
+    fake.restart().await;
+
+    let resp = v.response_timeout(&p_id, Duration::from_secs(10)).await;
+    assert_eq!(resp["result"]["stopReason"], "cancelled");
+    assert_eq!(
+        resp["result"]["_meta"]["honk"]["reason"],
+        "upstream_restart"
+    );
+
+    let events = hook.wait_for_events(2, Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 2, "expected started then ended: {events:?}");
+    assert_eq!(events[0].1["type"], "turn.started");
+    assert_eq!(events[1].1["type"], "turn.ended");
+    assert_eq!(events[1].1["honk_reason"], "upstream_restart");
+    assert_eq!(events[0].1["upstream_id"], events[1].1["upstream_id"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn hook_receiver_down_prompts_answered_normally_and_promptly() {
     let fake = FakeGoose::start().await;
     fake.advertise_patched(true);

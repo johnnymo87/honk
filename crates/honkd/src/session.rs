@@ -3118,6 +3118,11 @@ impl Session {
         if let Some(hook) = &self.hub.turn_hook
             && let Some(meta) = &turn
         {
+            if self.last_started_upstream.as_deref() != Some(&meta.upstream_id) {
+                self.last_started_upstream = Some(meta.upstream_id.clone());
+                let started_ms = now_ms();
+                hook.emit(TurnEvent::started(&self.sid, meta, started_ms));
+            }
             let now_ms = now_ms();
             let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, now_ms);
             hook.emit(ev);
