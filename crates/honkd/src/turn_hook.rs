@@ -128,7 +128,7 @@ impl Default for HookOpts {
 
 #[derive(Clone, Debug)]
 pub struct TurnHook {
-    tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    tx: tokio::sync::mpsc::Sender<(TurnEvent, tokio::time::Instant)>,
 }
 
 impl TurnHook {
@@ -139,15 +139,16 @@ impl TurnHook {
     }
 
     pub fn emit(&self, ev: TurnEvent) {
-        match self.tx.try_send(ev) {
+        let enqueued = tokio::time::Instant::now();
+        match self.tx.try_send((ev, enqueued)) {
             Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full((ev, _))) => {
                 tracing::warn!(
                     event_id = %ev.event_id,
                     "turn hook queue full; dropping event"
                 );
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(ev)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed((ev, _))) => {
                 tracing::warn!(
                     event_id = %ev.event_id,
                     "turn hook channel closed; dropping event"
@@ -161,7 +162,7 @@ async fn sender_loop(
     url: String,
     token: Option<String>,
     opts: HookOpts,
-    mut rx: tokio::sync::mpsc::Receiver<TurnEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<(TurnEvent, tokio::time::Instant)>,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(opts.request_timeout)
@@ -175,8 +176,8 @@ async fn sender_loop(
         }
     };
 
-    while let Some(ev) = rx.recv().await {
-        send_one_event(&client, &url, token.as_deref(), &opts, &ev).await;
+    while let Some((ev, enqueued)) = rx.recv().await {
+        send_one_event(&client, &url, token.as_deref(), &opts, &ev, enqueued).await;
     }
 }
 
@@ -186,8 +187,8 @@ async fn send_one_event(
     token: Option<&str>,
     opts: &HookOpts,
     ev: &TurnEvent,
+    enqueued: tokio::time::Instant,
 ) {
-    let first_attempt = tokio::time::Instant::now();
     let mut current_backoff = opts.backoff_initial;
 
     loop {
@@ -226,8 +227,9 @@ async fn send_one_event(
             }
         }
 
-        let elapsed = first_attempt.elapsed();
-        if elapsed >= opts.retry_window {
+        let now = tokio::time::Instant::now();
+        let deadline = enqueued + opts.retry_window;
+        if now >= deadline {
             tracing::warn!(
                 event_id = %ev.event_id,
                 "turn hook retry window exceeded; dropping event"
@@ -235,7 +237,7 @@ async fn send_one_event(
             return;
         }
 
-        let remaining = opts.retry_window - elapsed;
+        let remaining = deadline - now;
         let sleep_dur = current_backoff.min(remaining);
         tokio::time::sleep(sleep_dur).await;
         current_backoff = (current_backoff * 2).min(opts.backoff_max);
@@ -712,6 +714,83 @@ mod tests {
         }
 
         assert!(state.ev1_attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(state.ev2_delivered.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_hook_stale_event_drops_on_first_failure() {
+        #[derive(Clone)]
+        struct ServerState {
+            ev1_attempts: Arc<AtomicUsize>,
+            ev2_delivered: Arc<AtomicUsize>,
+        }
+        let state = ServerState {
+            ev1_attempts: Arc::new(AtomicUsize::new(0)),
+            ev2_delivered: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let app =
+            Router::new()
+                .route(
+                    "/hook",
+                    post(
+                        |State(s): State<ServerState>,
+                         body: axum::extract::Json<serde_json::Value>| async move {
+                            let ev_id = body.0["event_id"].as_str().unwrap().to_string();
+                            if ev_id.ends_with(":started") {
+                                s.ev1_attempts.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            } else {
+                                s.ev2_delivered.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::OK
+                            }
+                        },
+                    ),
+                )
+                .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let opts = HookOpts {
+            queue: 16,
+            request_timeout: Duration::from_millis(100),
+            retry_window: Duration::from_millis(100),
+            backoff_initial: Duration::from_millis(20),
+            backoff_max: Duration::from_millis(50),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(opts.queue);
+        let hook = TurnHook { tx };
+
+        let meta = sample_meta();
+        let ev1 = TurnEvent::started("sid-1", &meta, 1);
+        let ev2 = TurnEvent::ended("sid-1", &meta, Some("end_turn".to_string()), None, None, 2);
+
+        // Emit ev1
+        hook.emit(ev1);
+
+        // Sleep until ev1's retry window (100ms) has expired while sitting in the queue
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Emit ev2
+        hook.emit(ev2);
+
+        // Now start the sender loop AFTER ev1 is already stale
+        tokio::spawn(sender_loop(format!("http://{addr}/hook"), None, opts, rx));
+
+        // Wait until ev2 is delivered
+        for _ in 0..50 {
+            if state.ev2_delivered.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Stale ev1 must have been attempted at least once, but dropped on that first failure (not retried)
+        assert_eq!(state.ev1_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(state.ev2_delivered.load(Ordering::SeqCst), 1);
     }
 
