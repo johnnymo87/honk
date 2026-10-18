@@ -7,8 +7,9 @@
 //! for turns it prompted. So honk registers the session and then posts one
 //! notification (`POST /stop`) announcing it, which is what creates the topic.
 //!
-//! Turns typed in honk chat are not mirrored to Telegram; pigeon only reports the
-//! turns it starts. honk's own notice says so.
+//! Prompts and replies from honk chat appear in the topic when honkd runs with
+//! its turn hook enabled (`--turn-hook-url`); without the hook, pigeon only
+//! reports the turns it starts.
 //!
 //! honk hands pigeon the honkd secret it connected with, as the session's
 //! `auth_token`. pigeon checks that honkd is reachable with the session's stored
@@ -115,7 +116,7 @@ impl Registered {
     /// A one-line summary for the TUI or stdout.
     pub fn summary(&self) -> String {
         if self.announced {
-            "Telegram: registered with pigeon; its topic appears shortly. Replies there prompt this session, but turns typed here are not mirrored there.".to_string()
+            "Telegram: registered with pigeon; its topic appears shortly. Replies there prompt this session; turns typed here appear in the topic when honkd's turn hook is enabled.".to_string()
         } else {
             format!(
                 "Telegram: registered with pigeon, but it did not announce the session ({}); no topic yet.",
