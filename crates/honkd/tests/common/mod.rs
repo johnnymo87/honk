@@ -1,6 +1,7 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
 
 pub mod hook_stub;
+#[allow(unused_imports)]
 pub use hook_stub::HookStub;
 
 use futures::{SinkExt, StreamExt};

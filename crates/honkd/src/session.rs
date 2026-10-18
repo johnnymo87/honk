@@ -15,7 +15,7 @@ use crate::hub::Hub;
 use crate::log::SessionLog;
 use crate::rpc::UpstreamIds;
 use crate::turn::{Action, OwnerRef, Reply, TurnCore, TurnMeta};
-use crate::turn_hook::TurnEvent;
+use crate::turn_hook::{TurnEvent, now_ms};
 use crate::viewer::{ViewerId, ViewerTx};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1979,10 +1979,7 @@ impl Session {
                                     run_id: self.turn.run.clone(),
                                     honk_reason: None,
                                 });
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
+                            let now_ms = now_ms();
                             hook.emit(TurnEvent::started(&self.sid, &meta, now_ms));
                         }
                     }
@@ -3121,10 +3118,7 @@ impl Session {
         if let Some(hook) = &self.hub.turn_hook
             && let Some(meta) = &turn
         {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_ms();
             let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, now_ms);
             hook.emit(ev);
         }
