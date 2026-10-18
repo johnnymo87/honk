@@ -264,6 +264,45 @@ impl StubGoose {
         extract_turn_text(&export)
     }
 
+    pub async fn tools_list(&self, sid: &str) -> Vec<String> {
+        let mut up =
+            Upstream::initialize(&self.url(), self.secret().to_string(), Recorder::disabled())
+                .await
+                .expect("initialize tools_list upstream");
+        up.subscribe(None).await.expect("subscribe tools_list conn");
+        up.subscribe(Some(sid))
+            .await
+            .expect("subscribe tools_list session");
+
+        let res = up
+            .call(
+                "_goose/unstable/tools/list",
+                serde_json::json!({
+                    "sessionId": sid,
+                }),
+                Some(sid),
+                Duration::from_secs(10),
+            )
+            .await;
+        let _ = up.delete().await;
+
+        res.ok()
+            .and_then(|r| {
+                r.pointer("/tools")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|t| {
+                                t.get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
     pub fn kill9(&mut self) {
         if let Some(mut child) = self.child.take() {
             kill_pgid(self.pid);
