@@ -45,14 +45,21 @@ No goose patch is needed.
    then the percent, then the whole segment.
 3. **honkd**:
    - Every new log generation (activation `hub.rs`, goose-restart reactivation and gap
-     rebuild in `session.rs`) is built from export, which has no usage. Carry one usage
-     frame into it, ordered export frames → carried usage → buffered live frames:
-     activation/reactivation keep the last `usage_update` that the post-`session/load`
-     drain would otherwise discard; gap rebuild carries the last `usage_update` in the
-     in-memory log. A viewer attaching to an idle session therefore sees the current value
-     immediately.
-   - Turn hook v1 gains an optional `usage: {used, size, cost?}` on `turn.ended` (latest
-     `usage_update` in the log at turn end). Additive; omitted when unknown.
+     rebuild in `session.rs`) is built from export, whose text/tool frames carry no
+     `usage_update`. Carry one usage frame into it, ordered export frames → carried usage →
+     buffered live frames: gap rebuild carries the last `usage_update` of the in-memory log;
+     activation/reactivation keep the last `usage_update` the post-`session/load` drain
+     would otherwise discard (a safety net: real goose sends it after the load reply, so it
+     normally arrives later and is logged the ordinary way). The carried frame's `used` is
+     replaced by the export's `usage.total_tokens` (the same value goose sends as `used`),
+     so a gap that swallowed a compaction or `/clear` does not resurrect the old figure;
+     `size` and `cost` stay from the frame (export cost excludes subagents). A viewer
+     attaching to an idle session therefore sees the current value immediately.
+   - The session actor keeps `last_usage`, updated from every session-stream
+     `usage_update` (including ones buffered during a rebuild). Turn hook v1 gains an
+     optional `usage: {used, size, cost?}` on `turn.ended` from it. Additive; omitted when
+     unknown. Only `session/update` frames count (goose's custom
+     `_goose/unstable/session/update` variant is ignored).
 4. **pigeon** (`packages/daemon`): one formatter, `📊 45.2K tokens · 23% · $1.84`
    (percent omitted when size is 0; cost omitted when absent or 0; nothing when used is 0),
    appended as `\n\n<footer>` to the turn message by `renderHookTurn` (honkd hook turns)
@@ -64,7 +71,16 @@ runner); see follow-up bead.
 
 ## Deploy (author-gated)
 
-honk: rebuild/redeploy `honkd` and `honk` from the merged rev (workstation pin bump);
-restarting honkd is safe for idle sessions and interrupts nothing that a reattach does not
-recover, but is still the author's call. pigeon: redeploy the daemon from the merged rev.
-Exact steps and verification live in the PRs and on the bead.
+Independent order: old pigeon ignores the new hook field; new pigeon renders nothing when
+it is absent.
+
+- **pigeon** runs from the `~/projects/pigeon` checkout (`tsx`): after the PR merges,
+  `git -C ~/projects/pigeon pull --ff-only` on `main`, then `sudo systemctl restart
+  pigeon-daemon`. Verify: `systemctl status pigeon-daemon`, then a turn in a registered
+  goose session's topic ends with `📊 … tokens · …%`.
+- **honk** (workstation PR bumping the `honk` flake input): `home-manager switch` updates
+  the `honk` CLI immediately; honkd is `X-SwitchMethod=keep-old`, so run `systemctl --user
+  restart honkd` in a quiet window (no goose turn running). Verify: `systemctl --user status
+  honkd`; open `honk chat <sid>` on an idle session and the status bar shows
+  `NN.NK (NN%) · $N.NN` on attach, before any new turn; after a honk-chat turn the topic's
+  mirrored reply ends with the footer.
