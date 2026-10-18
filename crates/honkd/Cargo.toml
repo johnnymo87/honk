@@ -14,6 +14,7 @@ fs4 = "1.1.0"
 futures.workspace = true
 honk-upstream = { version = "0.0.0", path = "../honk-upstream" }
 honk-wire = { path = "../honk-wire" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle = "2.6.1"

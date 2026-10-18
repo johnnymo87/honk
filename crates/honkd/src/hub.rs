@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use crate::config::Args;
 use crate::rpc::UpstreamIds;
 use crate::state::StateStore;
+use crate::turn_hook::TurnHook;
 
 #[derive(Debug, Clone)]
 pub struct ActivationError {
@@ -40,6 +41,7 @@ pub struct Hub {
     pub state_dir: PathBuf,
     pub upstream_url: String,
     pub upstream_secret: String,
+    pub turn_hook: Option<TurnHook>,
     pub control: Arc<RwLock<UpstreamHandle>>,
     pub control_init_result: Arc<std::sync::RwLock<Value>>,
     pub is_control_connected: Arc<std::sync::atomic::AtomicBool>,
@@ -63,6 +65,7 @@ impl Hub {
         args: Arc<Args>,
         state_store: StateStore,
         upstream_secret: String,
+        turn_hook: Option<TurnHook>,
     ) -> anyhow::Result<Arc<Self>> {
         let state_dir = state_store.dir().to_path_buf();
         let boot = state_store.boot;
@@ -197,6 +200,7 @@ impl Hub {
             state_dir,
             upstream_url,
             upstream_secret,
+            turn_hook,
             control,
             control_init_result,
             is_control_connected,
@@ -375,6 +379,7 @@ impl Hub {
                 ambiguous_check_token: 0,
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
+                last_started_upstream: None,
             };
 
             tokio::spawn(session.run());
@@ -1230,6 +1235,7 @@ impl Hub {
             ambiguous_check_token: 0,
             ambiguous_window_expired: false,
             ambiguous_export_in_flight: false,
+            last_started_upstream: None,
         };
 
         tokio::spawn(session.run());
@@ -1596,6 +1602,7 @@ impl Hub {
                 ambiguous_check_token: 0,
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
+                last_started_upstream: None,
             };
 
             tokio::spawn(session.run());

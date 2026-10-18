@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+pub mod hook_stub;
+#[allow(unused_imports)]
+pub use hook_stub::HookStub;
+
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};

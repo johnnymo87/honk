@@ -16,25 +16,50 @@ pub struct Inflight {
     pub params: Value,
     pub announced: bool,
     pub prompt_index: usize,
+    pub run_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnMeta {
+    pub upstream_id: String,
+    pub client_req_ids: Vec<String>,
+    pub prompt_text: String,
+    pub run_id: Option<String>,
+    pub honk_reason: Option<String>,
 }
 
 impl Inflight {
-    pub fn to_persisted(&self) -> crate::state::InflightPrompt {
+    pub fn client_req_ids(&self) -> Vec<String> {
         let mut seen = std::collections::BTreeSet::new();
         let mut client_req_ids = Vec::new();
         for o in &self.owners {
             if let Some(id) = &o.client_req_id
-                && seen.insert(id.clone())
+                && seen.insert(id.as_str())
             {
                 client_req_ids.push(id.clone());
             }
         }
+        client_req_ids
+    }
+
+    pub fn to_turn_meta(&self, honk_reason: Option<String>) -> TurnMeta {
+        TurnMeta {
+            upstream_id: self.upstream_id.clone(),
+            client_req_ids: self.client_req_ids(),
+            prompt_text: crate::rpc::extract_user_text(&self.params),
+            run_id: self.run_id.clone(),
+            honk_reason,
+        }
+    }
+
+    pub fn to_persisted(&self) -> crate::state::InflightPrompt {
         crate::state::InflightPrompt {
             upstream_id: self.upstream_id.clone(),
-            client_req_ids,
+            client_req_ids: self.client_req_ids(),
             params: self.params.clone(),
             announced: self.announced,
             prompt_index: self.prompt_index,
+            run_id: self.run_id.clone(),
         }
     }
 
@@ -68,6 +93,7 @@ impl Inflight {
             params: persisted.params,
             announced: persisted.announced,
             prompt_index: persisted.prompt_index,
+            run_id: persisted.run_id,
         }
     }
 }
@@ -88,12 +114,14 @@ pub enum Action {
     SynthUser {
         params: Value,
         owner: OwnerRef,
+        upstream_id: Option<String>,
     },
     Reply {
         owners: Vec<OwnerRef>,
         body: Reply,
         user_text: Option<String>,
         prompt_index: Option<usize>,
+        turn: Option<TurnMeta>,
     },
     NotifySteerUnconsumed {
         viewer: ViewerId,
@@ -129,6 +157,7 @@ impl TurnCore {
                 body: Reply::Error(crate::rpc::busy_error(run)),
                 user_text: None,
                 prompt_index: None,
+                turn: None,
             }];
         }
         if self.inflight.is_some() {
@@ -142,6 +171,7 @@ impl TurnCore {
             params: params.clone(),
             announced: false,
             prompt_index: self.client_prompts,
+            run_id: None,
         });
         vec![Action::SendPrompt {
             upstream_id,
@@ -159,16 +189,18 @@ impl TurnCore {
             Some(r) => {
                 self.run = Some(r.clone());
                 self.consumed_steers.clear();
-                if let Some(inf) = self.inflight.as_mut()
-                    && !inf.announced
-                {
-                    inf.announced = true;
-                    self.client_prompts += 1;
-                    if let Some(owner) = inf.owners.first().cloned() {
-                        out.push(Action::SynthUser {
-                            params: inf.params.clone(),
-                            owner,
-                        });
+                if let Some(inf) = self.inflight.as_mut() {
+                    inf.run_id = Some(r);
+                    if !inf.announced {
+                        inf.announced = true;
+                        self.client_prompts += 1;
+                        if let Some(owner) = inf.owners.first().cloned() {
+                            out.push(Action::SynthUser {
+                                params: inf.params.clone(),
+                                owner,
+                                upstream_id: Some(inf.upstream_id.clone()),
+                            });
+                        }
                     }
                 }
                 if std::mem::take(&mut self.cancel_pending) {
@@ -213,11 +245,29 @@ impl TurnCore {
         };
         let user_text = Some(crate::rpc::extract_user_text(&inf.params));
         let prompt_index = Some(inf.prompt_index);
+        let turn = if is_busy {
+            None
+        } else {
+            let honk_reason = if frame
+                .pointer("/result/_meta/honk/synthesized")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                Some("synthesized".to_string())
+            } else {
+                frame
+                    .pointer("/result/_meta/honk/reason")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            };
+            Some(inf.to_turn_meta(honk_reason))
+        };
         let mut out = vec![Action::Reply {
             owners: inf.owners,
             body,
             user_text,
             prompt_index,
+            turn,
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -240,6 +290,7 @@ impl TurnCore {
             body: Reply::Error(error),
             user_text: None,
             prompt_index: Some(inf.prompt_index),
+            turn: None,
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -268,6 +319,7 @@ impl TurnCore {
             })),
             user_text: None,
             prompt_index: Some(inf.prompt_index),
+            turn: None,
         }];
         if self.run.is_none() {
             out.extend(self.dispatch_parked(ids));
@@ -287,6 +339,7 @@ impl TurnCore {
             params: params.clone(),
             announced: false,
             prompt_index: self.client_prompts,
+            run_id: None,
         });
         vec![Action::SendPrompt {
             upstream_id,
@@ -322,31 +375,51 @@ impl TurnCore {
         self.cancel_pending = false;
         self.steers.clear();
         self.consumed_steers.clear();
-        let prompt_index = self.inflight.as_ref().map(|i| i.prompt_index);
-        let owners: Vec<OwnerRef> = self
-            .inflight
-            .take()
-            .map(|i| i.owners)
-            .unwrap_or_default()
-            .into_iter()
-            .chain(self.parked.drain(..).flat_map(|(owners, _)| owners))
-            .collect();
-        if owners.is_empty() {
-            return vec![];
-        }
-        vec![Action::Reply {
-            owners,
-            body: Reply::Result(serde_json::json!({
-                "stopReason": "cancelled",
-                "_meta": {
-                    "honk": {
-                        "reason": reason
-                    }
+
+        let mut out = Vec::new();
+        let body = Reply::Result(serde_json::json!({
+            "stopReason": "cancelled",
+            "_meta": {
+                "honk": {
+                    "reason": reason
                 }
-            })),
-            user_text: None,
-            prompt_index,
-        }]
+            }
+        }));
+
+        if let Some(inf) = self.inflight.take() {
+            let turn =
+                if inf.announced || reason == "upstream_restart" || reason == "delivery_unknown" {
+                    Some(inf.to_turn_meta(Some(reason.to_string())))
+                } else {
+                    None
+                };
+            if !inf.owners.is_empty() {
+                out.push(Action::Reply {
+                    owners: inf.owners,
+                    body: body.clone(),
+                    user_text: None,
+                    prompt_index: Some(inf.prompt_index),
+                    turn,
+                });
+            }
+        }
+
+        let parked_owners: Vec<OwnerRef> = self
+            .parked
+            .drain(..)
+            .flat_map(|(owners, _)| owners)
+            .collect();
+        if !parked_owners.is_empty() {
+            out.push(Action::Reply {
+                owners: parked_owners,
+                body,
+                user_text: None,
+                prompt_index: None,
+                turn: None,
+            });
+        }
+
+        out
     }
 
     pub fn attach_waiter(&mut self, client_req_id: &str, owner: OwnerRef) -> bool {
@@ -414,6 +487,7 @@ mod tests {
                 body: Reply::Error(busy_error("run_active")),
                 user_text: None,
                 prompt_index: None,
+                turn: None,
             }]
         );
         assert!(core.inflight.is_none());
@@ -446,6 +520,7 @@ mod tests {
             vec![Action::SynthUser {
                 params: json!({"prompt": "first"}),
                 owner: owner1.clone(),
+                upstream_id: Some("hk1-1".into()),
             }]
         );
         assert_eq!(core.parked.len(), 1);
@@ -468,6 +543,13 @@ mod tests {
                     body: Reply::Result(json!({"text": "done"})),
                     user_text: Some("first".to_string()),
                     prompt_index: Some(0),
+                    turn: Some(TurnMeta {
+                        upstream_id: "hk1-1".into(),
+                        client_req_ids: vec!["req_1".into()],
+                        prompt_text: "first".into(),
+                        run_id: Some("run_1".into()),
+                        honk_reason: None,
+                    }),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -507,6 +589,13 @@ mod tests {
                     body: Reply::Result(json!({"text": "done"})),
                     user_text: Some("first".into()),
                     prompt_index: Some(0),
+                    turn: Some(TurnMeta {
+                        upstream_id: "hk1-1".into(),
+                        client_req_ids: vec!["req_1".into()],
+                        prompt_text: "first".into(),
+                        run_id: None,
+                        honk_reason: None,
+                    }),
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -547,6 +636,13 @@ mod tests {
                 body: Reply::Result(json!({"status": "ok"})),
                 user_text: Some("hi".into()),
                 prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-1".into(),
+                    client_req_ids: vec!["req_1".into()],
+                    prompt_text: "hi".into(),
+                    run_id: Some("run_1".into()),
+                    honk_reason: None,
+                }),
             }]
         );
         assert!(core.inflight.is_none());
@@ -573,6 +669,7 @@ mod tests {
                 Action::SynthUser {
                     params: json!({"prompt": "hi"}),
                     owner,
+                    upstream_id: Some("hk1-1".into()),
                 },
                 Action::SendCancel,
             ]
@@ -623,19 +720,36 @@ mod tests {
         let actions = core.interrupt("goose restart");
         assert_eq!(
             actions,
-            vec![Action::Reply {
-                owners: vec![owner1, owner2],
-                body: Reply::Result(json!({
-                    "stopReason": "cancelled",
-                    "_meta": {
-                        "honk": {
-                            "reason": "goose restart"
+            vec![
+                Action::Reply {
+                    owners: vec![owner1],
+                    body: Reply::Result(json!({
+                        "stopReason": "cancelled",
+                        "_meta": {
+                            "honk": {
+                                "reason": "goose restart"
+                            }
                         }
-                    }
-                })),
-                user_text: None,
-                prompt_index: Some(0),
-            }]
+                    })),
+                    user_text: None,
+                    prompt_index: Some(0),
+                    turn: None,
+                },
+                Action::Reply {
+                    owners: vec![owner2],
+                    body: Reply::Result(json!({
+                        "stopReason": "cancelled",
+                        "_meta": {
+                            "honk": {
+                                "reason": "goose restart"
+                            }
+                        }
+                    })),
+                    user_text: None,
+                    prompt_index: None,
+                    turn: None,
+                },
+            ]
         );
         assert!(core.run.is_none());
         assert!(core.inflight.is_none());
@@ -774,6 +888,7 @@ mod tests {
             vec![Action::SynthUser {
                 params: json!({"prompt": "p2"}),
                 owner: owner2,
+                upstream_id: Some("hk1-2".into()),
             }]
         );
         assert!(!core.cancel_pending);
@@ -885,6 +1000,7 @@ mod tests {
                 body: Reply::Error(busy_err.clone()),
                 user_text: Some("p1".into()),
                 prompt_index: Some(0),
+                turn: None,
             }]
         );
         // 2. Run is recorded
@@ -902,6 +1018,7 @@ mod tests {
                 body: Reply::Error(busy_err),
                 user_text: None,
                 prompt_index: None,
+                turn: None,
             }]
         );
         assert_eq!(core.parked.len(), 1);
@@ -944,6 +1061,7 @@ mod tests {
                     body: Reply::Error(err),
                     user_text: None,
                     prompt_index: Some(0),
+                    turn: None,
                 },
                 Action::SendPrompt {
                     upstream_id: "hk1-2".into(),
@@ -1015,6 +1133,370 @@ mod tests {
                 body: Reply::Result(json!({"text": "done2"})),
                 user_text: Some("second".to_string()),
                 prompt_index: Some(1),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-2".into(),
+                    client_req_ids: vec!["req_2".into()],
+                    prompt_text: "second".into(),
+                    run_id: None,
+                    honk_reason: None,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_inflight_run_id_recorded_and_persisted() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let p_actions = core.on_prompt(owner, json!({"prompt": "hello"}), &mut ids);
+        assert_eq!(p_actions.len(), 1);
+        assert_eq!(core.inflight.as_ref().unwrap().run_id, None);
+
+        let run_actions = core.on_run_state(Some("run_123".into()), &mut ids);
+        assert_eq!(
+            core.inflight.as_ref().unwrap().run_id.as_deref(),
+            Some("run_123")
+        );
+        assert_eq!(
+            run_actions,
+            vec![Action::SynthUser {
+                params: json!({"prompt": "hello"}),
+                owner: make_owner(Some(1), 10, Some("req_1")),
+                upstream_id: Some("hk1-1".into()),
+            }]
+        );
+
+        // Later run state update while in-flight still exists
+        let _ = core.on_run_state(Some("run_456".into()), &mut ids);
+        assert_eq!(
+            core.inflight.as_ref().unwrap().run_id.as_deref(),
+            Some("run_456")
+        );
+
+        // Persist and restore
+        let persisted = core.to_persisted().unwrap();
+        assert_eq!(persisted.run_id.as_deref(), Some("run_456"));
+        let restored = TurnCore::from_persisted(persisted);
+        assert_eq!(
+            restored.inflight.as_ref().unwrap().run_id.as_deref(),
+            Some("run_456")
+        );
+    }
+
+    #[test]
+    fn test_reply_carries_turn_meta() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("crid_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "hello"}), &mut ids);
+        let owner2 = make_owner(Some(2), 20, Some("crid_2"));
+        assert!(core.attach_waiter("crid_1", owner2.clone()));
+        let owner3 = make_owner(Some(3), 30, Some("crid_1")); // duplicate crid
+        assert!(core.attach_waiter("crid_1", owner3.clone()));
+
+        let _ = core.on_run_state(Some("run_999".into()), &mut ids);
+
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {"stopReason": "end_turn"},
+        });
+        let reply_actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert_eq!(
+            reply_actions,
+            vec![Action::Reply {
+                owners: vec![owner1, owner2, owner3],
+                body: Reply::Result(json!({"stopReason": "end_turn"})),
+                user_text: Some("hello".into()),
+                prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-1".into(),
+                    client_req_ids: vec!["crid_1".into(), "crid_2".into()],
+                    prompt_text: "hello".into(),
+                    run_id: Some("run_999".into()),
+                    honk_reason: None,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_synthesized_gap_reply_honk_reason_synthesized() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("crid_1"));
+        let _ = core.on_prompt(owner.clone(), json!({"prompt": "hello"}), &mut ids);
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {
+                "stopReason": "end_turn",
+                "_meta": {
+                    "honk": {
+                        "synthesized": true
+                    }
+                }
+            },
+        });
+        let reply_actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        match &reply_actions[0] {
+            Action::Reply {
+                turn: Some(turn), ..
+            } => {
+                assert_eq!(turn.honk_reason.as_deref(), Some("synthesized"));
+            }
+            other => panic!("unexpected action: {:?}", other),
+        }
+
+        // Also test _meta.honk.reason as string
+        let mut core2 = TurnCore::default();
+        let _ = core2.on_prompt(owner, json!({"prompt": "hello"}), &mut ids);
+        let _ = core2.on_run_state(Some("run_2".into()), &mut ids);
+        let reply_frame2 = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-2",
+            "result": {
+                "stopReason": "cancelled",
+                "_meta": {
+                    "honk": {
+                        "reason": "custom_reason"
+                    }
+                }
+            },
+        });
+        let reply_actions2 = core2.on_prompt_reply("hk1-2", &reply_frame2, &mut ids);
+        match &reply_actions2[0] {
+            Action::Reply {
+                turn: Some(turn), ..
+            } => {
+                assert_eq!(turn.honk_reason.as_deref(), Some("custom_reason"));
+            }
+            other => panic!("unexpected action: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_busy_reply_no_turn_meta() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("crid_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "p1"}), &mut ids);
+
+        let busy_err = busy_error("run_active");
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "error": busy_err,
+        });
+        let reply_actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert_eq!(
+            reply_actions,
+            vec![Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Error(busy_err.clone()),
+                user_text: Some("p1".into()),
+                prompt_index: Some(0),
+                turn: None,
+            }]
+        );
+
+        // Also prompt while busy returns turn: None
+        let owner2 = make_owner(Some(2), 20, Some("crid_2"));
+        let prompt_actions = core.on_prompt(owner2.clone(), json!({"prompt": "p2"}), &mut ids);
+        assert_eq!(
+            prompt_actions,
+            vec![Action::Reply {
+                owners: vec![owner2],
+                body: Reply::Error(busy_err),
+                user_text: None,
+                prompt_index: None,
+                turn: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_prompt_send_failed_and_not_delivered_no_turn_meta() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("crid_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "p1"}), &mut ids);
+
+        let err = json!({"code": -32603, "message": "fail"});
+        let failed_actions = core.on_prompt_send_failed("hk1-1", err.clone(), &mut ids);
+        assert_eq!(
+            failed_actions,
+            vec![Action::Reply {
+                owners: vec![owner1.clone()],
+                body: Reply::Error(err),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: None,
+            }]
+        );
+
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "p2"}), &mut ids);
+        let undelivered_actions = core.on_prompt_not_delivered("hk1-2", &mut ids);
+        assert_eq!(
+            undelivered_actions,
+            vec![Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Result(json!({
+                    "stopReason": "cancelled",
+                    "_meta": {
+                        "honk": {
+                            "reason": "not_delivered"
+                        }
+                    }
+                })),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_interrupt_in_flight_announced_and_parked_two_replies() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "first"}), &mut ids);
+        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+        let _ = core.on_prompt(owner2.clone(), json!({"prompt": "second"}), &mut ids);
+
+        let _ = core.on_run_state(Some("run_1".into()), &mut ids);
+        assert!(core.inflight.as_ref().unwrap().announced);
+
+        let actions = core.interrupt("cancelled");
+        assert_eq!(
+            actions,
+            vec![
+                Action::Reply {
+                    owners: vec![owner1],
+                    body: Reply::Result(json!({
+                        "stopReason": "cancelled",
+                        "_meta": {
+                            "honk": {
+                                "reason": "cancelled"
+                            }
+                        }
+                    })),
+                    user_text: None,
+                    prompt_index: Some(0),
+                    turn: Some(TurnMeta {
+                        upstream_id: "hk1-1".into(),
+                        client_req_ids: vec!["req_1".into()],
+                        prompt_text: "first".into(),
+                        run_id: Some("run_1".into()),
+                        honk_reason: Some("cancelled".into()),
+                    }),
+                },
+                Action::Reply {
+                    owners: vec![owner2],
+                    body: Reply::Result(json!({
+                        "stopReason": "cancelled",
+                        "_meta": {
+                            "honk": {
+                                "reason": "cancelled"
+                            }
+                        }
+                    })),
+                    user_text: None,
+                    prompt_index: None,
+                    turn: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_interrupt_unannounced_cancelled_no_turn_meta() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "first"}), &mut ids);
+
+        let actions = core.interrupt("cancelled");
+        assert_eq!(
+            actions,
+            vec![Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Result(json!({
+                    "stopReason": "cancelled",
+                    "_meta": {
+                        "honk": {
+                            "reason": "cancelled"
+                        }
+                    }
+                })),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_interrupt_unannounced_upstream_restart_has_turn_meta() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner1.clone(), json!({"prompt": "first"}), &mut ids);
+
+        let actions = core.interrupt("upstream_restart");
+        assert_eq!(
+            actions,
+            vec![Action::Reply {
+                owners: vec![owner1.clone()],
+                body: Reply::Result(json!({
+                    "stopReason": "cancelled",
+                    "_meta": {
+                        "honk": {
+                            "reason": "upstream_restart"
+                        }
+                    }
+                })),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-1".into(),
+                    client_req_ids: vec!["req_1".into()],
+                    prompt_text: "first".into(),
+                    run_id: None,
+                    honk_reason: Some("upstream_restart".into()),
+                }),
+            }]
+        );
+
+        // Also test delivery_unknown
+        let mut core2 = TurnCore::default();
+        let _ = core2.on_prompt(owner1.clone(), json!({"prompt": "first"}), &mut ids);
+        let actions2 = core2.interrupt("delivery_unknown");
+        assert_eq!(
+            actions2,
+            vec![Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Result(json!({
+                    "stopReason": "cancelled",
+                    "_meta": {
+                        "honk": {
+                            "reason": "delivery_unknown"
+                        }
+                    }
+                })),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-2".into(),
+                    client_req_ids: vec!["req_1".into()],
+                    prompt_text: "first".into(),
+                    run_id: None,
+                    honk_reason: Some("delivery_unknown".into()),
+                }),
             }]
         );
     }

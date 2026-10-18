@@ -226,3 +226,47 @@ async fn viewer_overflow_closes_with_4001() {
     }
     assert_eq!(close_code, Some(4001));
 }
+
+#[test]
+fn refuses_invalid_turn_hook_options() {
+    let dummy_dir = tempfile::tempdir().unwrap();
+    let valid_secret = dummy_dir.path().join("secret");
+    std::fs::write(&valid_secret, "0123456789abcdef0123456789abcdef").unwrap();
+
+    let dummy_token = dummy_dir.path().join("token");
+    std::fs::write(&dummy_token, "my-token").unwrap();
+
+    // 1. Token file without URL
+    let (code1, stderr1) = Honkd::spawn_expect_exit(
+        "http://127.0.0.1:4181/acp",
+        &valid_secret,
+        &["--turn-hook-token-file", dummy_token.to_str().unwrap()],
+    );
+    assert_ne!(code1, 0);
+    assert!(stderr1.contains("--turn-hook-token-file requires --turn-hook-url"));
+
+    // 2. Invalid URL scheme
+    let (code2, stderr2) = Honkd::spawn_expect_exit(
+        "http://127.0.0.1:4181/acp",
+        &valid_secret,
+        &["--turn-hook-url", "ftp://127.0.0.1/hook"],
+    );
+    assert_ne!(code2, 0);
+    assert!(stderr2.contains("must be http or https"));
+
+    // 3. Empty token file
+    let empty_token = dummy_dir.path().join("empty_token");
+    std::fs::write(&empty_token, "  \n  ").unwrap();
+    let (code3, stderr3) = Honkd::spawn_expect_exit(
+        "http://127.0.0.1:4181/acp",
+        &valid_secret,
+        &[
+            "--turn-hook-url",
+            "http://127.0.0.1:4096/hook",
+            "--turn-hook-token-file",
+            empty_token.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code3, 0);
+    assert!(stderr3.contains("invalid (empty)"));
+}

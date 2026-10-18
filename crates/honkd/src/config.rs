@@ -39,6 +39,12 @@ pub struct Args {
     pub session_new_timeout_secs: u64,
     #[arg(long, hide = true)]
     pub session_new_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub turn_hook_url: Option<String>,
+    #[arg(long)]
+    pub turn_hook_token_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 1200, hide = true)]
+    pub turn_hook_retry_secs: u64,
 }
 
 impl Args {
@@ -77,5 +83,36 @@ mod tests {
             .expect("parse args");
         assert_eq!(args.session_new_timeout_secs, 30);
         assert_eq!(args.session_new_timeout_ms, None);
+    }
+
+    #[test]
+    fn default_turn_hook_flags() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.turn_hook_url, None);
+        assert_eq!(args.turn_hook_token_file, None);
+        assert_eq!(args.turn_hook_retry_secs, 1200);
+    }
+
+    #[test]
+    fn parsed_turn_hook_flags() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--turn-hook-url",
+            "http://127.0.0.1:4096/goose/turn-event",
+            "--turn-hook-token-file",
+            "/tmp/token",
+            "--turn-hook-retry-secs",
+            "60",
+        ])
+        .expect("parse args");
+        assert_eq!(
+            args.turn_hook_url.as_deref(),
+            Some("http://127.0.0.1:4096/goose/turn-event")
+        );
+        assert_eq!(args.turn_hook_token_file, Some(PathBuf::from("/tmp/token")));
+        assert_eq!(args.turn_hook_retry_secs, 60);
     }
 }
