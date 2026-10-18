@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::hub::Hub;
 use crate::log::SessionLog;
 use crate::rpc::UpstreamIds;
-use crate::turn::{Action, OwnerRef, Reply, TurnCore};
+use crate::turn::{Action, OwnerRef, Reply, TurnCore, TurnMeta};
+use crate::turn_hook::TurnEvent;
 use crate::viewer::{ViewerId, ViewerTx};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub enum SessionMsg {
         owners: Vec<OwnerRef>,
         body: Reply,
         text: Option<String>,
+        turn: Option<TurnMeta>,
     },
     SynthesizeGapEndTurn {
         upstream_id: String,
@@ -204,6 +206,7 @@ pub struct Session {
     pub ambiguous_check_token: u64,
     pub ambiguous_window_expired: bool,
     pub ambiguous_export_in_flight: bool,
+    pub last_started_upstream: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1949,7 +1952,41 @@ impl Session {
                         )
                         .await;
                 }
-                Action::SynthUser { params, owner, .. } => {
+                Action::SynthUser {
+                    params,
+                    owner,
+                    upstream_id,
+                } => {
+                    if let Some(ref uid) = upstream_id
+                        && self.last_started_upstream.as_deref() != Some(uid.as_str())
+                    {
+                        self.last_started_upstream = Some(uid.clone());
+                        if let Some(hook) = &self.hub.turn_hook {
+                            let meta = self
+                                .turn
+                                .inflight
+                                .as_ref()
+                                .filter(|inf| &inf.upstream_id == uid)
+                                .map(|inf| inf.to_turn_meta(None))
+                                .unwrap_or_else(|| TurnMeta {
+                                    upstream_id: uid.clone(),
+                                    client_req_ids: owner
+                                        .client_req_id
+                                        .clone()
+                                        .into_iter()
+                                        .collect(),
+                                    prompt_text: crate::rpc::extract_user_text(&params),
+                                    run_id: self.turn.run.clone(),
+                                    honk_reason: None,
+                                });
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            hook.emit(TurnEvent::started(&self.sid, &meta, now_ms));
+                        }
+                    }
+
                     let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
                     let msg_id = crid
@@ -1995,15 +2032,15 @@ impl Session {
                     body,
                     user_text,
                     prompt_index,
-                    ..
+                    turn,
                 } => match body {
                     Reply::Error(err) => {
-                        self.handle_reply_text(owners, Reply::Error(err), None)
+                        self.handle_reply_text(owners, Reply::Error(err), None, turn)
                             .await;
                     }
                     Reply::Result(result_val) => {
                         if user_text.is_none() {
-                            self.handle_reply_text(owners, Reply::Result(result_val), None)
+                            self.handle_reply_text(owners, Reply::Result(result_val), None, turn)
                                 .await;
                         } else {
                             for o in &owners {
@@ -2043,6 +2080,7 @@ impl Session {
                                         owners,
                                         body: Reply::Result(result_val),
                                         text,
+                                        turn,
                                     })
                                     .await;
                             });
@@ -2543,8 +2581,13 @@ impl Session {
                 self.on_rebuilt(frames, keys, resume_from, client_prompts)
                     .await;
             }
-            SessionMsg::ReplyText { owners, body, text } => {
-                self.handle_reply_text(owners, body, text).await;
+            SessionMsg::ReplyText {
+                owners,
+                body,
+                text,
+                turn,
+            } => {
+                self.handle_reply_text(owners, body, text, turn).await;
             }
             SessionMsg::SynthesizeGapEndTurn { upstream_id } => {
                 self.gap_synthesis_pending = false;
@@ -2947,13 +2990,33 @@ impl Session {
         owners: Vec<OwnerRef>,
         body: Reply,
         text: Option<String>,
+        turn: Option<TurnMeta>,
     ) {
+        let (stop_reason, error) = if self.hub.turn_hook.is_some() && turn.is_some() {
+            match &body {
+                Reply::Result(res) => (
+                    res.get("stopReason")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    None,
+                ),
+                Reply::Error(err) => (
+                    None,
+                    err.get("message")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                ),
+            }
+        } else {
+            (None, None)
+        };
+
         match body {
             Reply::Result(mut res) => {
-                if let Some(t) = text {
+                if let Some(t) = text.as_ref() {
                     if let Some(meta) = res.get_mut("_meta").and_then(Value::as_object_mut) {
                         if let Some(honk) = meta.get_mut("honk").and_then(Value::as_object_mut) {
-                            honk.insert("text".to_string(), Value::String(t));
+                            honk.insert("text".to_string(), Value::String(t.clone()));
                         } else {
                             meta.insert("honk".to_string(), json!({ "text": t }));
                         }
@@ -3053,6 +3116,17 @@ impl Session {
                     self.send_to_owner(o, resp);
                 }
             }
+        }
+
+        if let Some(hook) = &self.hub.turn_hook
+            && let Some(meta) = &turn
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let ev = TurnEvent::ended(&self.sid, meta, stop_reason, text, error, now_ms);
+            hook.emit(ev);
         }
 
         self.sync_inflight().await;

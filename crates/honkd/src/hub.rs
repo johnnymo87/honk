@@ -379,6 +379,7 @@ impl Hub {
                 ambiguous_check_token: 0,
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
+                last_started_upstream: None,
             };
 
             tokio::spawn(session.run());
@@ -1234,6 +1235,7 @@ impl Hub {
             ambiguous_check_token: 0,
             ambiguous_window_expired: false,
             ambiguous_export_in_flight: false,
+            last_started_upstream: None,
         };
 
         tokio::spawn(session.run());
@@ -1600,6 +1602,7 @@ impl Hub {
                 ambiguous_check_token: 0,
                 ambiguous_window_expired: false,
                 ambiguous_export_in_flight: false,
+                last_started_upstream: None,
             };
 
             tokio::spawn(session.run());

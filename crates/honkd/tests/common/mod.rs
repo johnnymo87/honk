@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
+
+pub mod hook_stub;
+pub use hook_stub::HookStub;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
