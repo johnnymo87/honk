@@ -90,7 +90,8 @@ honkd).
    original request in the resume prompt (self-requested compaction does not preserve
    it), call the tool alone in its own step, read the result.
 
-**Known trade-offs.** A goose restart between arming and compacting loses the request
+**Known trade-offs.** A `/compact` that fails in goose (summarizer error, or a provider that manages its own context) is not persisted, but honkd has already counted it as a client prompt; live receipts recover through the text fallback, and honkd's prompt index resyncs at the next rebuild. This predates this work and applies to any failing goose slash command.
+ A goose restart between arming and compacting loses the request
 (the run dies anyway, honkd reports the interruption). There is no per-session off
 switch (it could not live in `extension_data`); `GOOSE_SELF_COMPACT=false` turns it off
 server-wide. Summarization runs for up to minutes with only a progress notice.
@@ -138,7 +139,9 @@ through `systemd-run --user … --expand-environment=no` with a log.
   `HONK_GOOSE_BIN`): `ToolCall("self_compact_and_resume", {prompt:"R"})` then
   `Text("after")` → one run, receipt includes "after", a second prompt's receipt still
   matches; honk chat keeps ownership Own. Recipe with a response schema lists exactly
-  `[recipe__final_output]`. CI's pinned goose moves to `patched-1.54.0.6`.
+  `[recipe__final_output]`. The tests skip while CI's pinned goose lacks the tool;
+  `HONK_REQUIRE_SELF_COMPACT=1` turns the skip into a failure. Follow-up after the fork
+  release: move CI's pin to `patched-1.54.0.6` and set that variable in `ci.yml`.
 
 ### W — workstation
 
@@ -148,7 +151,7 @@ through `systemd-run --user … --expand-environment=no` with a log.
 
 ## Deploy and verify (author runs; restarting goose-serve interrupts live goose turns)
 
-1. `cp ~/.local/share/goose/sessions/sessions.db ~/.local/share/goose/sessions/sessions.db.bak-$(date +%F)`
+1. `sqlite3 ~/.local/share/goose/sessions/sessions.db ".backup '$HOME/.local/share/goose/sessions/sessions.db.bak-$(date +%F)'"` (the DB runs in WAL mode, so copy it with `.backup`, not `cp`)
 2. `sudo nixos-rebuild switch --flake .#cloudbox` and `nix run home-manager -- switch --flake .#cloudbox`
 3. In a quiet window: `sudo systemctl restart goose-serve`, then `systemctl --user restart honkd`.
 4. Verify: in a honk chat session ask the agent to list its tools (expect
