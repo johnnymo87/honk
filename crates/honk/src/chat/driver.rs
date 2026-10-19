@@ -520,7 +520,7 @@ async fn run_driver(
                     "enabledExtensions": ext_arr,
                 });
             }
-            if let Some(mcp_cfg) = mcp {
+            if let Some(ref mcp_cfg) = mcp {
                 if params.get("_meta").is_none() {
                     params["_meta"] = json!({});
                 }
@@ -541,7 +541,8 @@ async fn run_driver(
                 return;
             }
 
-            let new_res = tokio::time::timeout(Duration::from_secs(30), async {
+            let timeout_duration = session_new_timeout_secs(mcp.as_ref());
+            let new_res = tokio::time::timeout(timeout_duration, async {
                 while let Some(frame) = frame_rx.recv().await {
                     if frame.get("id") == Some(&json!(new_req_id))
                         && crate::conn::is_response(&frame)
@@ -1139,6 +1140,14 @@ pub async fn start(
     Ok((handle, ui_rx))
 }
 
+fn session_new_timeout_secs(mcp_launch: Option<&McpLaunchConfig>) -> Duration {
+    if mcp_launch.is_some_and(|c| !c.names.is_empty()) {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1201,26 @@ mod tests {
             }
         );
         assert_eq!(ConnectionState::Detached, ConnectionState::Detached);
+    }
+
+    #[test]
+    fn test_session_new_timeout_secs_with_and_without_mcp() {
+        assert_eq!(session_new_timeout_secs(None), Duration::from_secs(30));
+        let empty_mcp = McpLaunchConfig {
+            names: vec![],
+            confirm: vec![],
+        };
+        assert_eq!(
+            session_new_timeout_secs(Some(&empty_mcp)),
+            Duration::from_secs(30)
+        );
+        let with_mcp = McpLaunchConfig {
+            names: vec!["slack-ro".into()],
+            confirm: vec![],
+        };
+        assert_eq!(
+            session_new_timeout_secs(Some(&with_mcp)),
+            Duration::from_secs(120)
+        );
     }
 }
