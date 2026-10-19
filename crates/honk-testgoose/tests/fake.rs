@@ -1092,3 +1092,144 @@ async fn test_load_frames_delivered_after_load_reply() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_session_extensions_crud_and_failures() -> anyhow::Result<()> {
+    let fake = FakeGoose::start().await;
+
+    let mut up = Upstream::initialize(
+        &fake.url(),
+        fake.secret().to_string(),
+        honk_upstream::Recorder::disabled(),
+    )
+    .await?;
+
+    up.subscribe(None).await?;
+
+    let new_res = up
+        .call(
+            "session/new",
+            json!({"cwd": "/tmp"}),
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+    let sid = new_res["sessionId"].as_str().unwrap().to_string();
+    up.subscribe(Some(&sid)).await?;
+
+    // 1. Initial extensions list is empty
+    let list_res = up
+        .call(
+            "_goose/unstable/session/extensions/list",
+            json!({"sessionId": sid}),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert_eq!(list_res["extensions"], json!([]));
+
+    // 2. Add an extension
+    let ext_obj = json!({
+        "type": "mcp",
+        "description": "honk-mcp:test-server",
+        "server": {
+            "name": "test-server",
+            "command": "/bin/echo",
+            "args": ["hello"],
+            "env": []
+        }
+    });
+    let add_res = up
+        .call(
+            "_goose/unstable/session/extensions/add",
+            json!({
+                "sessionId": sid,
+                "extension": ext_obj,
+            }),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert_eq!(add_res["extensionKey"], "test-server");
+
+    // 3. List contains the added extension
+    let list_res2 = up
+        .call(
+            "_goose/unstable/session/extensions/list",
+            json!({"sessionId": sid}),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await?;
+    let exts = list_res2["extensions"].as_array().unwrap();
+    assert_eq!(exts.len(), 1);
+    assert_eq!(exts[0]["extensionKey"], "test-server");
+    assert_eq!(exts[0]["extension"]["description"], "honk-mcp:test-server");
+
+    // 4. Remove extension
+    let rm_res = up
+        .call(
+            "_goose/unstable/session/extensions/remove",
+            json!({
+                "sessionId": sid,
+                "extensionKey": "test-server",
+            }),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert!(rm_res.is_object());
+
+    // 5. Remove again returns error ("Extension 'test-server' not found")
+    let rm_err = up
+        .call(
+            "_goose/unstable/session/extensions/remove",
+            json!({
+                "sessionId": sid,
+                "extensionKey": "test-server",
+            }),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(rm_err.is_err());
+    assert!(
+        rm_err
+            .unwrap_err()
+            .to_string()
+            .contains("Extension 'test-server' not found")
+    );
+
+    // 6. Scripted failing command fails on add
+    fake.script_extension_add_failure("failing-cmd", "command failed to start: permission denied");
+    let failing_ext = json!({
+        "type": "mcp",
+        "description": "honk-mcp:bad-server",
+        "server": {
+            "name": "bad-server",
+            "command": "failing-cmd",
+            "args": [],
+            "env": []
+        }
+    });
+    let add_err = up
+        .call(
+            "_goose/unstable/session/extensions/add",
+            json!({
+                "sessionId": sid,
+                "extension": failing_ext,
+            }),
+            Some(&sid),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(add_err.is_err());
+    assert!(
+        add_err
+            .unwrap_err()
+            .to_string()
+            .contains("permission denied")
+    );
+
+    Ok(())
+}
