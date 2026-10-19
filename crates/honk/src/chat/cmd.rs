@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /mcp        - list or configure MCP servers (/mcp, /mcp on <names>, /mcp on! <names>, /mcp off <names>)\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /mcp        - list or configure MCP servers (/mcp, /mcp on <names>, /mcp on! <names>, /mcp off <names>; servers marked ! need /mcp on!; honkd decides which via --mcp-no-confirm)\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -161,9 +161,9 @@ impl ChatCore {
 
         match subcmd {
             "on" | "on!" => {
-                let confirm = subcmd == "on!";
+                let is_confirm_cmd = subcmd == "on!";
                 if args_str.is_empty() {
-                    let usage = if confirm {
+                    let usage = if is_confirm_cmd {
                         "usage: /mcp on! <name>..."
                     } else {
                         "usage: /mcp on <name>... (or /mcp on! <name>... to confirm)"
@@ -172,6 +172,11 @@ impl ChatCore {
                     return;
                 }
                 let names: Vec<String> = args_str.split_whitespace().map(String::from).collect();
+                let confirm = if is_confirm_cmd {
+                    names.clone()
+                } else {
+                    Vec::new()
+                };
 
                 if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
                     return;

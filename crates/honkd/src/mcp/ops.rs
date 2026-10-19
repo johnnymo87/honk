@@ -38,13 +38,13 @@ pub trait GooseRequester: Send + Sync {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
-    pub confirm: BTreeSet<String>,
+    pub no_confirm: BTreeSet<String>,
 }
 
 impl Policy {
-    pub fn new(confirm: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(no_confirm: impl IntoIterator<Item = String>) -> Self {
         Self {
-            confirm: confirm.into_iter().collect(),
+            no_confirm: no_confirm.into_iter().collect(),
         }
     }
 }
@@ -248,7 +248,7 @@ pub async fn list(
 
         let supported = entry.supported.is_ok();
         let reason = entry.supported.as_ref().err().cloned();
-        let confirm = policy.confirm.contains(name);
+        let confirm = !policy.no_confirm.contains(name);
         let sibling = find_sibling(name, catalog);
 
         servers.push(ServerInfo {
@@ -309,7 +309,7 @@ pub async fn enable(
     policy: &Policy,
     session_id: &str,
     names: &[String],
-    confirm: bool,
+    confirm: &[String],
 ) -> Result<OpResult, OpError> {
     if names.is_empty() {
         return Err(OpError::invalid_params("no MCP servers specified"));
@@ -349,7 +349,7 @@ pub async fn enable(
             )));
         }
 
-        if policy.confirm.contains(name) && !confirm {
+        if !policy.no_confirm.contains(name) && !confirm.iter().any(|c| c == name) {
             let mut msg = format!("'{name}' can write; use /mcp on! {name} to confirm");
             if let Some(sibling) = find_sibling(name, catalog)
                 && sibling.ends_with("-ro")
@@ -755,7 +755,7 @@ mod tests {
     }
 
     fn sample_policy() -> Policy {
-        Policy::new(["slack".to_string(), "pagerduty".to_string()])
+        Policy::new(["slack-ro".to_string(), "figma".to_string()])
     }
 
     #[tokio::test]
@@ -842,16 +842,9 @@ mod tests {
         let req = FakeRequester::new(initial_exts);
 
         // Enable figma (already enabled with marker)
-        let res = enable(
-            &req,
-            &cat,
-            &policy,
-            "ses_123",
-            &["figma".to_string()],
-            false,
-        )
-        .await
-        .unwrap();
+        let res = enable(&req, &cat, &policy, "ses_123", &["figma".to_string()], &[])
+            .await
+            .unwrap();
         assert_eq!(res.results.len(), 1);
         assert!(res.results[0].ok);
         assert_eq!(res.results[0].note.as_deref(), Some("already on"));
@@ -863,7 +856,7 @@ mod tests {
             &policy,
             "ses_123",
             &["slack-ro".to_string()],
-            false,
+            &[],
         )
         .await
         .unwrap();
@@ -900,7 +893,7 @@ mod tests {
             &policy,
             "ses_123",
             &["slack-ro".to_string()],
-            false,
+            &[],
         )
         .await
         .unwrap();
@@ -916,7 +909,7 @@ mod tests {
         });
         assert!(remove_call.is_some());
 
-        // 2. Start with slack-ro enabled. Enable slack (with confirm=true) -> replaces slack-ro
+        // 2. Start with slack-ro enabled. Enable slack (with confirm=["slack"]) -> replaces slack-ro
         let initial_exts2 = vec![serde_json::json!({
             "extensionKey": "slack-ro",
             "extension": {
@@ -933,7 +926,7 @@ mod tests {
             &policy,
             "ses_123",
             &["slack".to_string()],
-            true,
+            &["slack".to_string()],
         )
         .await
         .unwrap();
@@ -955,7 +948,7 @@ mod tests {
             &policy,
             "ses_123",
             &["slack".to_string(), "slack-ro".to_string()],
-            true,
+            &["slack".to_string()],
         )
         .await
         .unwrap_err();
@@ -988,7 +981,7 @@ mod tests {
             &policy,
             "ses_123",
             &["slack".to_string(), "figma".to_string()],
-            true,
+            &["slack".to_string()],
         )
         .await
         .unwrap();
@@ -1017,16 +1010,9 @@ mod tests {
         let req = FakeRequester::new(initial_exts);
 
         // 1. Enable figma (already on) -> has_changes is false
-        let res1 = enable(
-            &req,
-            &cat,
-            &policy,
-            "ses_123",
-            &["figma".to_string()],
-            false,
-        )
-        .await
-        .unwrap();
+        let res1 = enable(&req, &cat, &policy, "ses_123", &["figma".to_string()], &[])
+            .await
+            .unwrap();
         assert!(!res1.has_changes());
         assert!(!res1.results[0].changed);
 
@@ -1052,16 +1038,9 @@ mod tests {
         let req = FakeRequester::new(vec![]);
 
         // slack requires confirm and has slack-ro sibling
-        let err1 = enable(
-            &req,
-            &cat,
-            &policy,
-            "ses_123",
-            &["slack".to_string()],
-            false,
-        )
-        .await
-        .unwrap_err();
+        let err1 = enable(&req, &cat, &policy, "ses_123", &["slack".to_string()], &[])
+            .await
+            .unwrap_err();
         assert_eq!(err1.code, -32602);
         assert_eq!(
             err1.message,
@@ -1075,7 +1054,7 @@ mod tests {
             &policy,
             "ses_123",
             &["pagerduty".to_string()],
-            false,
+            &[],
         )
         .await
         .unwrap_err();
@@ -1083,6 +1062,43 @@ mod tests {
         assert_eq!(
             err2.message,
             "'pagerduty' can write; use /mcp on! pagerduty to confirm"
+        );
+
+        // slack with confirm: ["slack"] succeeds
+        let res_slack = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string()],
+            &["slack".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(res_slack.results[0].ok);
+
+        // figma is in no_confirm -> succeeds without confirm
+        let res_figma = enable(&req, &cat, &policy, "ses_123", &["figma".to_string()], &[])
+            .await
+            .unwrap();
+        assert!(res_figma.results[0].ok);
+
+        // Fail-safe default policy (empty no_confirm): EVERY server requires confirmation
+        let default_policy = Policy::default();
+        let err_default = enable(
+            &req,
+            &cat,
+            &default_policy,
+            "ses_123",
+            &["figma".to_string()],
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_default.code, -32602);
+        assert_eq!(
+            err_default.message,
+            "'figma' can write; use /mcp on! figma to confirm"
         );
     }
 
@@ -1099,7 +1115,7 @@ mod tests {
             &policy,
             "ses_123",
             &["unknown_srv".to_string()],
-            false,
+            &[],
         )
         .await
         .unwrap_err();
@@ -1111,16 +1127,9 @@ mod tests {
         assert!(req.calls().is_empty());
 
         // Unsupported name
-        let err_unsupported = enable(
-            &req,
-            &cat,
-            &policy,
-            "ses_123",
-            &["broken".to_string()],
-            false,
-        )
-        .await
-        .unwrap_err();
+        let err_unsupported = enable(&req, &cat, &policy, "ses_123", &["broken".to_string()], &[])
+            .await
+            .unwrap_err();
         assert_eq!(err_unsupported.code, -32602);
         assert!(
             err_unsupported
@@ -1130,7 +1139,7 @@ mod tests {
         assert!(req.calls().is_empty());
 
         // Empty names
-        let err_empty = enable(&req, &cat, &policy, "ses_123", &[], false)
+        let err_empty = enable(&req, &cat, &policy, "ses_123", &[], &[])
             .await
             .unwrap_err();
         assert_eq!(err_empty.code, -32602);
@@ -1144,16 +1153,9 @@ mod tests {
         let req = FakeRequester::new(vec![]);
         req.set_fail_method(Some("_goose/unstable/session/extensions/add".to_string()));
 
-        let res = enable(
-            &req,
-            &cat,
-            &policy,
-            "ses_123",
-            &["figma".to_string()],
-            false,
-        )
-        .await
-        .unwrap();
+        let res = enable(&req, &cat, &policy, "ses_123", &["figma".to_string()], &[])
+            .await
+            .unwrap();
         assert_eq!(res.results.len(), 1);
         assert!(!res.results[0].ok);
         assert!(res.results[0].error.is_some());

@@ -488,6 +488,28 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                 } else if method == Some("session/new") {
                     let mcp_launch_req = params.pointer("/_meta/honk/mcp").cloned();
+                    if let Some(mcp_req) = &mcp_launch_req
+                        && let Some(conf_val) = mcp_req.get("confirm")
+                    {
+                        let is_valid = conf_val
+                            .as_array()
+                            .is_some_and(|arr| arr.iter().all(Value::is_string));
+                        if !is_valid {
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32602,
+                                "Invalid params: `confirm` in _meta.honk.mcp must be an array of strings",
+                                None,
+                            );
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     match hub.create_session(params).await {
                         Ok(mut new_res) => {
                             if let Some(sid) = new_res.get("sessionId").and_then(Value::as_str) {
@@ -534,8 +556,14 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                             });
                                         let confirm = mcp_req
                                             .get("confirm")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
+                                            .and_then(Value::as_array)
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(Value::as_str)
+                                                    .map(String::from)
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
 
                                         match names_opt {
                                             Some(names) => {
@@ -821,20 +849,50 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                             .map(|s| s.map(String::from))
                                             .collect::<Option<Vec<_>>>()
                                     });
-                            match names {
-                                Some(names) => {
-                                    let confirm = params
-                                        .get("confirm")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
-                                    Ok(crate::session::McpOpKind::Enable { names, confirm })
+                            if let Some(conf_val) = params.get("confirm") {
+                                let is_valid = conf_val
+                                    .as_array()
+                                    .is_some_and(|arr| arr.iter().all(Value::is_string));
+                                if !is_valid {
+                                    Err(crate::rpc::error(
+                                        id.clone(),
+                                        -32602,
+                                        "Invalid params: `confirm` in _honk/mcp/enable must be an array of strings",
+                                        None,
+                                    ))
+                                } else {
+                                    let confirm = conf_val
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(String::from)
+                                        .collect();
+                                    match names {
+                                        Some(names) => {
+                                            Ok(crate::session::McpOpKind::Enable { names, confirm })
+                                        }
+                                        None => Err(crate::rpc::error(
+                                            id.clone(),
+                                            -32602,
+                                            "Invalid or missing 'names' array in _honk/mcp/enable",
+                                            None,
+                                        )),
+                                    }
                                 }
-                                None => Err(crate::rpc::error(
-                                    id.clone(),
-                                    -32602,
-                                    "Invalid or missing 'names' array in _honk/mcp/enable",
-                                    None,
-                                )),
+                            } else {
+                                match names {
+                                    Some(names) => Ok(crate::session::McpOpKind::Enable {
+                                        names,
+                                        confirm: Vec::new(),
+                                    }),
+                                    None => Err(crate::rpc::error(
+                                        id.clone(),
+                                        -32602,
+                                        "Invalid or missing 'names' array in _honk/mcp/enable",
+                                        None,
+                                    )),
+                                }
                             }
                         }
                         "_honk/mcp/disable" => {

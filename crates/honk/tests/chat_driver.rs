@@ -2874,8 +2874,8 @@ async fn test_mcp_driver_e2e_fake_goose() {
             "--allow-unpatched-upstream",
             "--mcp-catalog",
             cat_str,
-            "--mcp-confirm",
-            "slack",
+            "--mcp-no-confirm",
+            "slack-ro",
         ],
     )
     .await;
@@ -2889,7 +2889,7 @@ async fn test_mcp_driver_e2e_fake_goose() {
             extensions: None,
             mcp: Some(honk::chat::McpLaunchConfig {
                 names: vec!["slack-ro".into()],
-                confirm: false,
+                confirm: vec![],
             }),
         },
     );

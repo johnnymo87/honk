@@ -193,11 +193,11 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
         let mcp = if args.mcp.is_empty() {
             None
         } else {
-            let mut confirm = false;
+            let mut confirm = Vec::new();
             let mut names = Vec::new();
             for item in &args.mcp {
                 if let Some(stripped) = item.strip_suffix('!') {
-                    confirm = true;
+                    confirm.push(stripped.to_string());
                     names.push(stripped.to_string());
                 } else {
                     names.push(item.clone());
@@ -424,7 +424,28 @@ mod tests {
                             mcp,
                             Some(honk::chat::driver::McpLaunchConfig {
                                 names: vec!["slack-ro".into(), "slack".into()],
-                                confirm: true,
+                                confirm: vec!["slack".into()],
+                            })
+                        );
+                    }
+                    _ => panic!("expected Target::New"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        let cli2 =
+            Cli::try_parse_from(["honk", "chat", "--new", "--mcp", "a!", "--mcp", "b"]).unwrap();
+        match cli2.command {
+            Commands::Chat(args) => {
+                let target = resolve_chat_target(&args).unwrap();
+                match target {
+                    honk::chat::driver::Target::New { mcp, .. } => {
+                        assert_eq!(
+                            mcp,
+                            Some(honk::chat::driver::McpLaunchConfig {
+                                names: vec!["a".into(), "b".into()],
+                                confirm: vec!["a".into()],
                             })
                         );
                     }

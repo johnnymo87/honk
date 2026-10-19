@@ -3965,7 +3965,7 @@ fn test_mcp_on_idle_sends_enable() {
     };
     assert_eq!(params["sessionId"], "test-session");
     assert_eq!(params["names"], json!(["slack-ro"]));
-    assert_eq!(params["confirm"], false);
+    assert_eq!(params["confirm"], json!([]));
 
     let effs = core.handle(Input::Line("/mcp on a b".into()));
     let req = effs
@@ -3976,7 +3976,7 @@ fn test_mcp_on_idle_sends_enable() {
         panic!()
     };
     assert_eq!(params["names"], json!(["a", "b"]));
-    assert_eq!(params["confirm"], false);
+    assert_eq!(params["confirm"], json!([]));
 }
 
 #[test]
@@ -3992,7 +3992,21 @@ fn test_mcp_on_confirm_idle_sends_enable() {
     };
     assert_eq!(params["sessionId"], "test-session");
     assert_eq!(params["names"], json!(["slack"]));
-    assert_eq!(params["confirm"], true);
+    assert_eq!(params["confirm"], json!(["slack"]));
+
+    let effs2 = core.handle(Input::Line("/mcp on! a b".into()));
+    let req2 = effs2
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .expect("should send _honk/mcp/enable request with confirm");
+    let Effect::Request {
+        params: params2, ..
+    } = req2
+    else {
+        panic!()
+    };
+    assert_eq!(params2["names"], json!(["a", "b"]));
+    assert_eq!(params2["confirm"], json!(["a", "b"]));
 }
 
 #[test]
@@ -4080,7 +4094,7 @@ fn test_mcp_on_queued_during_own_run() {
         panic!()
     };
     assert_eq!(params["names"], json!(["slack-ro"]));
-    assert_eq!(params["confirm"], false);
+    assert_eq!(params["confirm"], json!([]));
 }
 
 #[test]

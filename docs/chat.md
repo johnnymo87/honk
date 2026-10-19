@@ -207,13 +207,13 @@ When creating a new session with `honk chat --new`:
 - **Catalog source**: `honkd` reads OpenCode's generated MCP configuration (`~/.config/opencode/opencode.json`) via `--mcp-catalog <path>`. All catalog servers are off by default.
 - **Session-scoped & persistent**: Server toggles are stored in goose's session extension database, so enabled servers persist across goose-serve and honkd restarts.
 - **Commands**:
-  - `/mcp` (or `:mcp`): Lists catalog servers (`on`/`off`), `!` markers for servers requiring confirmation, conflicts, and unsupported servers (`n/a <name> — <reason>`).
+  - `/mcp` (or `:mcp`): Lists catalog servers (`on`/`off`), `!` markers for servers requiring confirmation, conflicts, and unsupported servers (`n/a <name> — <reason>`). Servers marked `!` need `/mcp on!`; honkd decides which via `--mcp-no-confirm`.
   - `/mcp on <names...>`: Enables one or more catalog servers.
-  - `/mcp on! <names...>`: Enables servers that can perform writes (marked with `!`). For servers like Slack, prefer read-only siblings (`slack-ro`) unless write permissions are explicitly needed. Sibling toggles are exclusive (enabling `slack` automatically replaces `slack-ro` and vice versa).
+  - `/mcp on! <names...>`: Enables servers marked with `!`. For servers like Slack, prefer read-only siblings (`slack-ro`) unless write permissions are explicitly needed. Sibling toggles are exclusive (enabling `slack` automatically replaces `slack-ro` and vice versa).
   - `/mcp off <names...>`: Disables one or more servers previously enabled by honk. Built-in platform extensions (e.g. `developer`) are never removed by `/mcp`.
 - **Queued during active turns**: MCP changes are refused by `honkd` while a turn is in flight (`-32002`). When typed during an active turn, `honk chat` queues `/mcp on|off` locally (`queued: /mcp on <name>`) and dispatches them automatically when the turn ends.
 - **Shared visibility**: Enabled MCP servers appear in the status bar (`mcp:slack-ro,atlassian`, falling back to `mcp:2` on narrower terminals and dropped on the narrowest). Changes made by another client connected to the same session trigger an informational notice (`mcp: <change> (by another client)`).
-- **Session creation flag**: `honk chat --new --mcp <name>` enables catalog servers at creation time. Append `!` (e.g. `--mcp slack!`) to confirm servers that require confirmation.
+- **Session creation flag**: `honk chat --new --mcp <name>` enables catalog servers at creation time. Append `!` (e.g. `--mcp slack!`) to confirm servers that require confirmation (honkd decides which via `--mcp-no-confirm`).
 - **Unsupported servers**: Remote MCP servers requiring OAuth or bearer tokens (such as Datadog or Notion) are listed as `n/a` and cannot be enabled in v1.
 
 ---

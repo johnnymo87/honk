@@ -101,8 +101,8 @@ async fn test_mcp_lifecycle_e2e() {
             "--allow-unpatched-upstream",
             "--mcp-catalog",
             cat_str,
-            "--mcp-confirm",
-            "slack",
+            "--mcp-no-confirm",
+            "local-test,slack-ro",
         ],
     )
     .await;
@@ -160,6 +160,37 @@ async fn test_mcp_lifecycle_e2e() {
             .unwrap()
             .contains("'slack' can write; use /mcp on! slack to confirm")
     );
+
+    // 3b. Non-array confirm rejection
+    let non_array_enable = v1
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": sid,
+                "names": ["slack"],
+                "confirm": true
+            }),
+        )
+        .await;
+    assert_eq!(non_array_enable["error"]["code"], -32602);
+
+    let non_array_new = v1
+        .call(
+            "session/new",
+            json!({
+                "cwd": "/tmp",
+                "_meta": {
+                    "honk": {
+                        "mcp": {
+                            "names": ["local-test"],
+                            "confirm": true
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(non_array_new["error"]["code"], -32602);
 
     // 4. Unknown name refusal
     let unknown_refuse = v1

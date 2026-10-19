@@ -216,15 +216,15 @@ async fn test_mcp_live_e2e() {
     let catalog_path = temp_dir.path().join("opencode.json");
     std::fs::write(&catalog_path, catalog_content.to_string()).expect("write opencode.json");
 
-    // 3. Spawn honkd with --mcp-catalog and --mcp-confirm honktest-w
+    // 3. Spawn honkd with --mcp-catalog and --mcp-no-confirm honktest-ro
     let h = Honkd::spawn(
         &g.url(),
         g.secret_file(),
         &[
             "--mcp-catalog",
             catalog_path.to_str().unwrap(),
-            "--mcp-confirm",
-            "honktest-w",
+            "--mcp-no-confirm",
+            "honktest-ro",
         ],
     )
     .await;
@@ -338,7 +338,7 @@ async fn test_mcp_live_e2e() {
             json!({
                 "sessionId": &sid,
                 "names": ["honktest-w"],
-                "confirm": true
+                "confirm": ["honktest-w"]
             }),
         )
         .await;

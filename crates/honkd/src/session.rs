@@ -44,8 +44,13 @@ pub struct PendingSessionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpOpKind {
     List,
-    Enable { names: Vec<String>, confirm: bool },
-    Disable { names: Vec<String> },
+    Enable {
+        names: Vec<String>,
+        confirm: Vec<String>,
+    },
+    Disable {
+        names: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +172,7 @@ pub enum SessionMsg {
     McpLaunch {
         viewer_id: ViewerId,
         names: Vec<String>,
-        confirm: bool,
+        confirm: Vec<String>,
         reply: tokio::sync::oneshot::Sender<
             Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
         >,
@@ -2394,7 +2399,7 @@ impl Session {
                             &mcp_config.policy,
                             &sid,
                             &names,
-                            confirm,
+                            &confirm,
                         )
                         .await?;
                         Ok(McpOpOutput::Op(res))
@@ -4674,7 +4679,7 @@ mod tests {
         session.queued_msgs.push_back(SessionMsg::McpLaunch {
             viewer_id: 1,
             names: vec!["slack".to_string()],
-            confirm: true,
+            confirm: vec!["slack".to_string()],
             reply: launch_tx,
         });
 
@@ -4729,7 +4734,7 @@ mod tests {
                 id: json!(101),
                 op: McpOpKind::Enable {
                     names: vec!["slack".to_string()],
-                    confirm: false,
+                    confirm: vec![],
                 },
             })
             .await;

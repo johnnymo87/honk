@@ -15,7 +15,7 @@ use crate::conn::Conn;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpLaunchConfig {
     pub names: Vec<String>,
-    pub confirm: bool,
+    pub confirm: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

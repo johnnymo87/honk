@@ -197,7 +197,7 @@ impl Hub {
 
         let mcp = args.mcp_catalog.as_ref().map(|path| crate::mcp::McpConfig {
             catalog_path: path.clone(),
-            policy: crate::mcp::ops::Policy::new(args.mcp_confirm.clone()),
+            policy: crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone()),
         });
 
         let hub = Arc::new(Self {
