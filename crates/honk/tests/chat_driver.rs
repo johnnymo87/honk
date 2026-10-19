@@ -2701,11 +2701,38 @@ async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
     }
     let sid = attached_sid.expect("session_id must be known");
 
-    // Capability check: check if goose supports self-compact
-    let tools = g.tools_list(&sid).await;
-    let has_self_compact = tools.iter().any(|name| name == "self_compact_and_resume");
+    // Capability check: probe through honkd (reuses honkd's upstream session connection)
+    let mut client = honk::Client::connect(&h.ws_url(), &h.secret())
+        .await
+        .expect("client connect to honkd");
+    let tools_res = client
+        .call(
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": sid }),
+        )
+        .await
+        .expect("tools_list RPC call");
+    assert!(
+        tools_res.get("error").is_none(),
+        "_goose/unstable/tools/list RPC error: {tools_res}"
+    );
+    let tools = tools_res
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected tools array in tools/list response, got: {tools_res}"));
+    let has_self_compact = tools
+        .iter()
+        .any(|t| t.get("name").and_then(Value::as_str) == Some("self_compact_and_resume"));
 
     if !has_self_compact {
+        if std::env::var("HONK_REQUIRE_SELF_COMPACT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            panic!(
+                "self_compact_and_resume tool required by HONK_REQUIRE_SELF_COMPACT=1 but not offered"
+            );
+        }
         eprintln!("skipping test: self_compact_and_resume tool not offered by goose under test");
         handle.send(UiCommand::Shutdown).expect("send shutdown");
         return;
