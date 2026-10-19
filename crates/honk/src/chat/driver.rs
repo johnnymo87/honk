@@ -918,12 +918,11 @@ async fn run_driver(
                             && connection_state == ConnectionState::Live
                         {
                             live_since = Some(Instant::now());
-                            if let Some(conn) = conn_opt.as_mut() {
-                                if let Some(Effect::Request { id, method, params }) =
+                            if let Some(conn) = conn_opt.as_mut()
+                                && let Some(Effect::Request { id, method, params }) =
                                     core.auto_refresh_mcp()
-                                {
-                                    let _ = conn.send_request(id, &method, params).await;
-                                }
+                            {
+                                let _ = conn.send_request(id, &method, params).await;
                             }
                         }
                         if frame.get("method").and_then(Value::as_str)
