@@ -58,6 +58,7 @@ pub struct Hub {
     pub evicting: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     pub in_flight_creations: Arc<std::sync::atomic::AtomicUsize>,
     pub next_actor_id: Arc<std::sync::atomic::AtomicU64>,
+    pub mcp: Option<crate::mcp::McpConfig>,
 }
 
 impl Hub {
@@ -194,6 +195,11 @@ impl Hub {
 
         // 7. Register session handles from state (Task A12 fills this in)
 
+        let mcp = args.mcp_catalog.as_ref().map(|path| crate::mcp::McpConfig {
+            catalog_path: path.clone(),
+            policy: crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone()),
+        });
+
         let hub = Arc::new(Self {
             args,
             state,
@@ -217,6 +223,7 @@ impl Hub {
             evicting: Arc::new(Mutex::new(HashMap::new())),
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            mcp,
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
@@ -383,6 +390,7 @@ impl Hub {
                 ambiguous_export_in_flight: false,
                 last_started_upstream: None,
                 last_usage,
+                mcp_op_running: false,
             };
 
             tokio::spawn(session.run());
@@ -1240,6 +1248,7 @@ impl Hub {
             ambiguous_export_in_flight: false,
             last_started_upstream: None,
             last_usage: None,
+            mcp_op_running: false,
         };
 
         tokio::spawn(session.run());
@@ -1623,6 +1632,7 @@ impl Hub {
                 ambiguous_export_in_flight: false,
                 last_started_upstream: None,
                 last_usage,
+                mcp_op_running: false,
             };
 
             tokio::spawn(session.run());

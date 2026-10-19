@@ -26,10 +26,82 @@ pub enum ActorState {
     Gone,
 }
 
+#[derive(Debug)]
+pub enum PendingTarget {
+    Viewer {
+        viewer_id: ViewerId,
+        downstream_id: Value,
+        is_steer: bool,
+        raw_extension_op: bool,
+    },
+    Internal(tokio::sync::oneshot::Sender<Result<Value, String>>),
+}
+
 pub struct PendingSessionRequest {
-    pub viewer_id: ViewerId,
-    pub downstream_id: Value,
-    pub is_steer: bool,
+    pub target: PendingTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpOpKind {
+    List,
+    Enable {
+        names: Vec<String>,
+        confirm: Vec<String>,
+    },
+    Disable {
+        names: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ActorRequester {
+    pub tx: tokio::sync::mpsc::Sender<SessionMsg>,
+}
+
+impl crate::mcp::ops::GooseRequester for ActorRequester {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, crate::mcp::ops::RequestError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(SessionMsg::Internal {
+                method: method.to_string(),
+                params,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| crate::mcp::ops::RequestError::new("session actor channel closed"))?;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(45), reply_rx).await {
+            Ok(Ok(Ok(val))) => Ok(val),
+            Ok(Ok(Err(err_msg))) => Err(crate::mcp::ops::RequestError::new(err_msg)),
+            Ok(Err(_dropped)) => Err(crate::mcp::ops::RequestError::new(
+                "request cancelled or dropped",
+            )),
+            Err(_elapsed) => Err(crate::mcp::ops::RequestError::new(
+                "request timed out waiting for upstream",
+            )),
+        }
+    }
+}
+
+enum McpOpOutput {
+    List(crate::mcp::ops::ListResult),
+    Op(crate::mcp::ops::OpResult),
+}
+
+enum McpTarget {
+    Viewer {
+        viewer: ViewerTx,
+        id: Value,
+    },
+    Launch {
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
+        >,
+    },
 }
 
 pub struct ReactivationData {
@@ -85,6 +157,31 @@ pub enum SessionMsg {
         id: Value,
         method: String,
         params: Value,
+    },
+    Internal {
+        method: String,
+        params: Value,
+        reply: tokio::sync::oneshot::Sender<Result<Value, String>>,
+    },
+    McpOp {
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        id: Value,
+        op: McpOpKind,
+    },
+    McpLaunch {
+        viewer_id: ViewerId,
+        names: Vec<String>,
+        confirm: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
+        >,
+    },
+    McpOpDone {
+        origin_viewer: Option<ViewerId>,
+        enabled: Vec<String>,
+        change: String,
+        changed: bool,
     },
     // from spawned recovery / helper tasks (I1)
     Reattached {
@@ -209,6 +306,7 @@ pub struct Session {
     pub ambiguous_export_in_flight: bool,
     pub last_started_upstream: Option<String>,
     pub last_usage: Option<honk_wire::Usage>,
+    pub mcp_op_running: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -686,13 +784,26 @@ impl Session {
     fn fail_pending_requests(&mut self, reason: &str) {
         let pending = std::mem::take(&mut self.pending_requests);
         for (_, req) in pending {
-            let err_resp = crate::rpc::error(
-                req.downstream_id,
-                -32000,
-                format!("Upstream connection was replaced; request cancelled ({reason})"),
-                None,
-            );
-            self.send_to_viewer(req.viewer_id, err_resp);
+            match req.target {
+                PendingTarget::Viewer {
+                    viewer_id,
+                    downstream_id,
+                    ..
+                } => {
+                    let err_resp = crate::rpc::error(
+                        downstream_id,
+                        -32000,
+                        format!("Upstream connection was replaced; request cancelled ({reason})"),
+                        None,
+                    );
+                    self.send_to_viewer(viewer_id, err_resp);
+                }
+                PendingTarget::Internal(reply) => {
+                    let _ = reply.send(Err(format!(
+                        "Upstream connection was replaced; request cancelled ({reason})"
+                    )));
+                }
+            }
         }
     }
 
@@ -1339,7 +1450,18 @@ impl Session {
         }
     }
 
-    pub fn is_idle(&self) -> bool {
+    pub fn prune_closed_internal_requests(&mut self) {
+        self.pending_requests.retain(|_, req| {
+            if let PendingTarget::Internal(reply) = &req.target {
+                !reply.is_closed()
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn is_idle(&mut self) -> bool {
+        self.prune_closed_internal_requests();
         self.viewers.is_empty()
             && self.turn.run.is_none()
             && self.turn.inflight.is_none()
@@ -1353,6 +1475,7 @@ impl Session {
             && !self.rebuild_at_turn_end
             && !self.needs_rebuild
             && self.finalizing_waiters.is_empty()
+            && !self.mcp_op_running
     }
 
     async fn evict(&mut self) -> bool {
@@ -1722,19 +1845,71 @@ impl Session {
 
                     if let Some(up_id) = found_pending {
                         let pending = self.pending_requests.remove(&up_id).unwrap();
-                        let mut resp = frame.clone();
-                        resp["id"] = pending.downstream_id;
+                        match pending.target {
+                            PendingTarget::Viewer {
+                                viewer_id,
+                                downstream_id,
+                                is_steer,
+                                raw_extension_op,
+                            } => {
+                                let mut resp = frame.clone();
+                                resp["id"] = downstream_id;
 
-                        if pending.is_steer
-                            && let Some(msg_id) =
-                                frame.pointer("/result/messageId").and_then(Value::as_str)
-                        {
-                            let actions =
-                                self.turn.on_steer_ok(msg_id.to_string(), pending.viewer_id);
-                            self.execute_actions(actions).await;
+                                if is_steer
+                                    && let Some(msg_id) =
+                                        frame.pointer("/result/messageId").and_then(Value::as_str)
+                                {
+                                    let actions =
+                                        self.turn.on_steer_ok(msg_id.to_string(), viewer_id);
+                                    self.execute_actions(actions).await;
+                                }
+
+                                self.send_to_viewer(viewer_id, resp);
+
+                                if raw_extension_op && frame.get("error").is_none() {
+                                    let viewers: Vec<ViewerId> =
+                                        self.viewers
+                                            .iter()
+                                            .filter_map(|(vid, (_, is_honk_aware))| {
+                                                if *is_honk_aware { Some(*vid) } else { None }
+                                            })
+                                            .collect();
+                                    for vid in viewers {
+                                        let origin = if vid == viewer_id { "you" } else { "other" };
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "_honk/mcp_changed",
+                                            "params": {
+                                                "sessionId": self.sid,
+                                                "origin": origin,
+                                            }
+                                        });
+                                        self.send_to_viewer(vid, notif);
+                                    }
+                                }
+                            }
+                            PendingTarget::Internal(reply) => {
+                                if let Some(err) = frame.get("error") {
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("upstream request failed");
+                                    let raw_msg = match err.get("data") {
+                                        Some(Value::String(s)) => format!("{msg}: {s}"),
+                                        Some(other) if !other.is_null() => {
+                                            format!("{msg}: {other}")
+                                        }
+                                        _ => msg.to_string(),
+                                    };
+                                    let redactor = honk_upstream::Redactor::from_env();
+                                    let redacted = redactor.redact_string(&raw_msg);
+                                    let _ = reply.send(Err(redacted));
+                                } else {
+                                    let res = frame.get("result").cloned().unwrap_or(Value::Null);
+                                    let _ = reply.send(Ok(res));
+                                }
+                            }
                         }
-
-                        self.send_to_viewer(pending.viewer_id, resp);
                     } else {
                         // Check if response to inflight prompt
                         let is_inflight_reply = self.turn.inflight.as_ref().is_some_and(|inf| {
@@ -2178,6 +2353,153 @@ impl Session {
         }
     }
 
+    fn spawn_mcp_task(
+        &mut self,
+        origin_viewer: Option<ViewerId>,
+        op: McpOpKind,
+        target: McpTarget,
+    ) {
+        let is_list = matches!(op, McpOpKind::List);
+        let mcp_config = match &self.hub.mcp {
+            Some(cfg) => cfg.clone(),
+            None => {
+                if !is_list {
+                    self.mcp_op_running = false;
+                }
+                let err = crate::mcp::ops::OpError {
+                    code: -32601,
+                    message: "MCP catalog not configured (honkd --mcp-catalog)".to_string(),
+                };
+                match target {
+                    McpTarget::Viewer { viewer, id } => {
+                        let err_resp = crate::rpc::error(id, err.code as i64, err.message, None);
+                        let _ = viewer.send_frame(axum::extract::ws::Message::Text(
+                            err_resp.to_string().into(),
+                        ));
+                    }
+                    McpTarget::Launch { reply } => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+                return;
+            }
+        };
+
+        let sid = self.sid.clone();
+        let self_tx = self.self_tx.clone();
+        let requester = ActorRequester {
+            tx: self_tx.clone(),
+        };
+
+        let task = tokio::spawn(async move {
+            let budget = std::time::Duration::from_secs(60);
+            let work = async {
+                let catalog = crate::mcp::catalog::Catalog::load(&mcp_config.catalog_path)
+                    .map_err(crate::mcp::ops::OpError::catalog_unreadable)?;
+                match op {
+                    McpOpKind::List => {
+                        let res =
+                            crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
+                                .await?;
+                        Ok(McpOpOutput::List(res))
+                    }
+                    McpOpKind::Enable { names, confirm } => {
+                        let res = crate::mcp::ops::enable(
+                            &requester,
+                            &catalog,
+                            &mcp_config.policy,
+                            &sid,
+                            &names,
+                            &confirm,
+                        )
+                        .await?;
+                        Ok(McpOpOutput::Op(res))
+                    }
+                    McpOpKind::Disable { names } => {
+                        let res = crate::mcp::ops::disable(
+                            &requester,
+                            &catalog,
+                            &mcp_config.policy,
+                            &sid,
+                            &names,
+                        )
+                        .await?;
+                        Ok(McpOpOutput::Op(res))
+                    }
+                }
+            };
+
+            let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
+                match tokio::time::timeout(budget, work).await {
+                    Ok(res) => res,
+                    Err(_) => Err(crate::mcp::ops::OpError::request_failed(
+                        "MCP change timed out; run /mcp to see the current state",
+                    )),
+                };
+
+            match target {
+                McpTarget::Viewer { viewer, id } => {
+                    let resp = match &outcome {
+                        Ok(McpOpOutput::List(res)) => {
+                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                        }
+                        Ok(McpOpOutput::Op(res)) => {
+                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                        }
+                        Err(err) => {
+                            crate::rpc::error(id, err.code as i64, err.message.clone(), None)
+                        }
+                    };
+                    let _ = viewer
+                        .send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
+                }
+                McpTarget::Launch { reply } => {
+                    let res = match outcome.as_ref() {
+                        Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
+                        Ok(McpOpOutput::List(_)) => unreachable!(),
+                        Err(err) => Err(err.clone()),
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+
+            if !is_list {
+                let (enabled, change, changed) = match &outcome {
+                    Ok(McpOpOutput::Op(res)) => {
+                        (res.enabled.clone(), res.summary.clone(), res.has_changes())
+                    }
+                    _ => (Vec::new(), String::new(), false),
+                };
+                let _ = self_tx
+                    .send(SessionMsg::McpOpDone {
+                        origin_viewer,
+                        enabled,
+                        change,
+                        changed,
+                    })
+                    .await;
+            }
+        });
+
+        if !is_list {
+            let watcher_tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = task.await
+                    && (e.is_panic() || e.is_cancelled())
+                {
+                    let _ = watcher_tx
+                        .send(SessionMsg::McpOpDone {
+                            origin_viewer: None,
+                            enabled: Vec::new(),
+                            change: String::new(),
+                            changed: false,
+                        })
+                        .await;
+                }
+            });
+        }
+    }
+
     async fn on_msg(&mut self, msg: SessionMsg) {
         match msg {
             SessionMsg::Attach {
@@ -2430,9 +2752,12 @@ impl Session {
                 self.pending_requests.insert(
                     up_id.clone(),
                     PendingSessionRequest {
-                        viewer_id,
-                        downstream_id: id.clone(),
-                        is_steer: true,
+                        target: PendingTarget::Viewer {
+                            viewer_id,
+                            downstream_id: id.clone(),
+                            is_steer: true,
+                            raw_extension_op: false,
+                        },
                     },
                 );
 
@@ -2565,13 +2890,18 @@ impl Session {
                     );
                     return;
                 }
+                let raw_extension_op = method == "_goose/unstable/session/extensions/add"
+                    || method == "_goose/unstable/session/extensions/remove";
                 let up_id = self.ids.next();
                 self.pending_requests.insert(
                     up_id.clone(),
                     PendingSessionRequest {
-                        viewer_id,
-                        downstream_id: id.clone(),
-                        is_steer: false,
+                        target: PendingTarget::Viewer {
+                            viewer_id,
+                            downstream_id: id.clone(),
+                            is_steer: false,
+                            raw_extension_op,
+                        },
                     },
                 );
 
@@ -2596,6 +2926,168 @@ impl Session {
                     self.send_to_viewer(viewer_id, err_resp);
                     if is_gone {
                         Box::pin(self.handle_gone()).await;
+                    }
+                }
+            }
+            SessionMsg::Internal {
+                method,
+                params,
+                reply,
+            } => {
+                if reply.is_closed() {
+                    return;
+                }
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    if self.queued_msgs.len() >= 1024 {
+                        let _ = reply.send(Err("Session message queue full".to_string()));
+                    } else {
+                        self.queued_msgs.push_back(SessionMsg::Internal {
+                            method,
+                            params,
+                            reply,
+                        });
+                    }
+                    return;
+                }
+                let up_id = self.ids.next();
+                self.pending_requests.insert(
+                    up_id.clone(),
+                    PendingSessionRequest {
+                        target: PendingTarget::Internal(reply),
+                    },
+                );
+
+                let mut clean_params = params;
+                crate::rpc::strip_honk_meta(&mut clean_params);
+
+                if let Err(e) = self
+                    .up
+                    .request_with_id(json!(up_id), &method, clean_params, Some(&self.sid))
+                    .await
+                    && let Some(req) = self.pending_requests.remove(&up_id)
+                    && let PendingTarget::Internal(reply) = req.target
+                {
+                    let is_gone = honk_upstream::is_gone(&e);
+                    let redactor = honk_upstream::Redactor::from_env();
+                    let err_msg =
+                        redactor.redact_string(&format!("Internal request POST failed: {e:#}"));
+                    let _ = reply.send(Err(err_msg));
+                    if is_gone {
+                        Box::pin(self.handle_gone()).await;
+                    }
+                }
+            }
+            SessionMsg::McpOp {
+                viewer_id,
+                viewer,
+                id,
+                op,
+            } => {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    self.queue_msg(
+                        viewer_id,
+                        id.clone(),
+                        SessionMsg::McpOp {
+                            viewer_id,
+                            viewer,
+                            id,
+                            op,
+                        },
+                    );
+                    return;
+                }
+
+                let is_list = matches!(op, McpOpKind::List);
+                if !is_list {
+                    if self.turn.run.is_some() || self.turn.inflight.is_some() {
+                        let err = crate::rpc::error(
+                            id,
+                            -32002,
+                            "session is busy; try after this turn",
+                            None,
+                        );
+                        self.send_to_viewer(viewer_id, err);
+                        return;
+                    }
+                    if self.mcp_op_running {
+                        let err = crate::rpc::error(
+                            id,
+                            -32002,
+                            "another /mcp change is in progress",
+                            None,
+                        );
+                        self.send_to_viewer(viewer_id, err);
+                        return;
+                    }
+                    self.mcp_op_running = true;
+                }
+
+                self.spawn_mcp_task(Some(viewer_id), op, McpTarget::Viewer { viewer, id });
+            }
+            SessionMsg::McpLaunch {
+                viewer_id,
+                names,
+                confirm,
+                reply,
+            } => {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    if self.queued_msgs.len() >= 1024 {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
+                        }));
+                    } else {
+                        self.queued_msgs.push_back(SessionMsg::McpLaunch {
+                            viewer_id,
+                            names,
+                            confirm,
+                            reply,
+                        });
+                    }
+                    return;
+                }
+
+                self.mcp_op_running = true;
+                self.spawn_mcp_task(
+                    Some(viewer_id),
+                    McpOpKind::Enable { names, confirm },
+                    McpTarget::Launch { reply },
+                );
+            }
+            SessionMsg::McpOpDone {
+                origin_viewer,
+                enabled,
+                change,
+                changed,
+            } => {
+                self.mcp_op_running = false;
+                if changed {
+                    let viewers: Vec<ViewerId> = self
+                        .viewers
+                        .iter()
+                        .filter_map(
+                            |(vid, (_, is_honk_aware))| {
+                                if *is_honk_aware { Some(*vid) } else { None }
+                            },
+                        )
+                        .collect();
+                    for vid in viewers {
+                        let origin = if Some(vid) == origin_viewer {
+                            "you"
+                        } else {
+                            "other"
+                        };
+                        let frame = json!({
+                            "jsonrpc": "2.0",
+                            "method": "_honk/mcp_changed",
+                            "params": {
+                                "sessionId": self.sid,
+                                "enabled": enabled,
+                                "change": change,
+                                "origin": origin,
+                            }
+                        });
+                        self.send_to_viewer(vid, frame);
                     }
                 }
             }
@@ -2951,7 +3443,8 @@ impl Session {
                     match m {
                         SessionMsg::Prompt { viewer_id, id, .. }
                         | SessionMsg::Steer { viewer_id, id, .. }
-                        | SessionMsg::Forward { viewer_id, id, .. } => {
+                        | SessionMsg::Forward { viewer_id, id, .. }
+                        | SessionMsg::McpOp { viewer_id, id, .. } => {
                             let err_resp = crate::rpc::error(
                                 id,
                                 -32000,
@@ -2959,6 +3452,15 @@ impl Session {
                                 None,
                             );
                             self.send_to_viewer(viewer_id, err_resp);
+                        }
+                        SessionMsg::Internal { reply, .. } => {
+                            let _ = reply.send(Err(format!("Session is gone: {reason}")));
+                        }
+                        SessionMsg::McpLaunch { reply, .. } => {
+                            let _ = reply.send(Err(crate::mcp::ops::OpError {
+                                code: -32000,
+                                message: format!("Session is gone: {reason}"),
+                            }));
                         }
                         _ => {}
                     }
@@ -3842,6 +4344,7 @@ mod tests {
             evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            mcp: None,
         });
 
         // Seeded from log::last_usage_frame
@@ -3891,6 +4394,7 @@ mod tests {
             ambiguous_export_in_flight: false,
             last_started_upstream: None,
             last_usage: seeded_usage,
+            mcp_op_running: false,
         };
 
         // 1. Upstream frame with method != "session/update" must NOT update last_usage
@@ -3972,5 +4476,444 @@ mod tests {
             Some(40),
             "hook must report the fresh usage (40), not the stale log value (100)"
         );
+    }
+
+    use clap::Parser;
+
+    fn test_viewer_tx(
+        tx: tokio::sync::mpsc::Sender<axum::extract::ws::Message>,
+    ) -> crate::viewer::ViewerTx {
+        let (replay_tx, _replay_rx) = tokio::sync::mpsc::channel(1);
+        let evict = Arc::new(tokio::sync::Notify::new());
+        crate::viewer::ViewerTx::new(tx, replay_tx, evict)
+    }
+
+    #[tokio::test]
+    async fn test_internal_request_and_actor_requester() {
+        use crate::mcp::ops::GooseRequester;
+        let (self_tx, mut self_rx) = tokio::sync::mpsc::channel(10);
+        let requester = ActorRequester { tx: self_tx };
+
+        let req_fut = requester.request(
+            "_goose/unstable/session/extensions/list",
+            json!({"sessionId": "ses_test"}),
+        );
+
+        let handle_msg = tokio::spawn(async move {
+            let msg = self_rx.recv().await.unwrap();
+            match msg {
+                SessionMsg::Internal {
+                    method,
+                    params,
+                    reply,
+                } => {
+                    assert_eq!(method, "_goose/unstable/session/extensions/list");
+                    assert_eq!(params["sessionId"], "ses_test");
+                    let _ = reply.send(Ok(json!({"extensions": []})));
+                }
+                _ => panic!("unexpected msg"),
+            }
+        });
+
+        let res = req_fut.await.unwrap();
+        assert_eq!(res, json!({"extensions": []}));
+        handle_msg.await.unwrap();
+    }
+
+    async fn create_test_session(
+        sid: &str,
+        state: ActorState,
+    ) -> (Session, tempfile::TempDir, honk_testgoose::FakeGoose) {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let log = crate::log::SessionLog::create(&d.path().join("test.jsonl"), 1, None, Vec::new())
+            .unwrap();
+        let (self_tx, rx) = tokio::sync::mpsc::channel(10);
+        let fake = honk_testgoose::FakeGoose::start().await;
+        let up = honk_upstream::Upstream::initialize(
+            &fake.url(),
+            fake.secret().to_string(),
+            honk_upstream::Recorder::disabled(),
+        )
+        .await
+        .unwrap();
+        let (up_handle, event_rx) = up.split();
+
+        let session = Session {
+            sid: sid.to_string(),
+            state_dir: d.path().to_path_buf(),
+            state_store: state_store.clone(),
+            hub: Arc::new(crate::hub::Hub {
+                args: Arc::new(
+                    crate::config::Args::try_parse_from([
+                        "honkd",
+                        "--upstream-secret-file",
+                        fake.secret_file().to_str().unwrap(),
+                    ])
+                    .unwrap(),
+                ),
+                state: state_store.clone(),
+                state_dir: d.path().to_path_buf(),
+                upstream_url: fake.url(),
+                upstream_secret: fake.secret().to_string(),
+                turn_hook: None,
+                control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
+                control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
+                is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                control_connected_notify: Arc::new(tokio::sync::Notify::new()),
+                control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+                upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
+                pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
+                self_weak: std::sync::RwLock::new(None),
+                activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                mcp: None,
+            }),
+            up: up_handle,
+            events: event_rx,
+            rx,
+            self_tx,
+            log,
+            turn: TurnCore::default(),
+            state,
+            ids: crate::rpc::UpstreamIds::new(1),
+            last_processed_session_id: None,
+            last_processed_conn_id: None,
+            viewers: HashMap::new(),
+            pending_requests: HashMap::new(),
+            pending_server_requests: Vec::new(),
+            recently_resolved: HashSet::new(),
+            init_result: json!({}),
+            queued_msgs: VecDeque::new(),
+            rebuilding_buffered_frames: Vec::new(),
+            rebuild_at_turn_end: false,
+            suppressed_keys: HashSet::new(),
+            gap_evidenced: false,
+            start_reattach: false,
+            needs_rebuild: false,
+            inflight_needs_delivery_check: false,
+            finalizing_waiters: HashMap::new(),
+            active_probe_id: None,
+            gap_synthesis_grace: Duration::from_millis(500),
+            synthesized_replies: HashSet::new(),
+            initial_events: Vec::new(),
+            gap_synthesis_pending: false,
+            reactivating: false,
+            reactivation_token: 0,
+            rebuild_token: 0,
+            ambiguous_check_token: 0,
+            ambiguous_window_expired: false,
+            ambiguous_export_in_flight: false,
+            last_started_upstream: None,
+            last_usage: None,
+            mcp_op_running: false,
+        };
+        (session, d, fake)
+    }
+
+    #[tokio::test]
+    async fn test_internal_and_mcp_op_queued_while_rebuilding() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_queue_test", ActorState::Rebuilding).await;
+
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::Internal {
+                method: "_goose/unstable/session/extensions/list".to_string(),
+                params: json!({"sessionId": "ses_queue_test"}),
+                reply: reply_tx,
+            })
+            .await;
+        assert_eq!(session.queued_msgs.len(), 1);
+
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                id: json!(10),
+                op: McpOpKind::List,
+            })
+            .await;
+        assert_eq!(session.queued_msgs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fail_pending_requests_fails_internal_oneshot() {
+        let (mut session, _d, _fake) = create_test_session("ses_fail_test", ActorState::Live).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.pending_requests.insert(
+            "up_req_1".to_string(),
+            PendingSessionRequest {
+                target: PendingTarget::Internal(reply_tx),
+            },
+        );
+
+        session.fail_pending_requests("upstream_gone");
+
+        let err = reply_rx.await.unwrap().unwrap_err();
+        assert!(err.contains("Upstream connection was replaced"));
+        assert!(err.contains("upstream_gone"));
+    }
+
+    #[tokio::test]
+    async fn test_is_idle_requires_mcp_op_not_running() {
+        let (mut session, _d, _fake) = create_test_session("ses_idle_test", ActorState::Live).await;
+        assert!(session.is_idle());
+
+        session.mcp_op_running = true;
+        assert!(!session.is_idle());
+
+        session.mcp_op_running = false;
+        assert!(session.is_idle());
+    }
+
+    #[tokio::test]
+    async fn test_internal_request_closed_reply_not_sent() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_internal_closed", ActorState::Live).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        drop(reply_rx); // receiver gone/timed out
+
+        session
+            .on_msg(SessionMsg::Internal {
+                method: "test_method".to_string(),
+                params: json!({}),
+                reply: reply_tx,
+            })
+            .await;
+
+        assert!(session.pending_requests.is_empty());
+        assert!(session.queued_msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_is_idle_prunes_closed_internal_requests() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_idle_prune", ActorState::Live).await;
+        assert!(session.is_idle());
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.pending_requests.insert(
+            "up_req_internal".to_string(),
+            PendingSessionRequest {
+                target: PendingTarget::Internal(reply_tx),
+            },
+        );
+
+        // While receiver is alive, not idle
+        assert!(!session.is_idle());
+
+        // Drop receiver -> receiver is closed
+        drop(reply_rx);
+
+        // is_idle() must prune closed internal requests and return true
+        assert!(session.is_idle());
+        assert!(session.pending_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reactivation_failed_fails_queued_mcp_and_internal_msgs() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_react_fail", ActorState::Reattaching).await;
+        session.reactivating = true;
+
+        let (internal_tx, internal_rx) = tokio::sync::oneshot::channel();
+        session.queued_msgs.push_back(SessionMsg::Internal {
+            method: "test_method".to_string(),
+            params: json!({}),
+            reply: internal_tx,
+        });
+
+        let (launch_tx, launch_rx) = tokio::sync::oneshot::channel();
+        session.queued_msgs.push_back(SessionMsg::McpLaunch {
+            viewer_id: 1,
+            names: vec!["slack".to_string()],
+            confirm: vec!["slack".to_string()],
+            reply: launch_tx,
+        });
+
+        let (viewer_tx, mut viewer_rx) = tokio::sync::mpsc::channel(10);
+        let vtx = test_viewer_tx(viewer_tx);
+        session.attach_live(2, vtx.clone(), true);
+
+        session.queued_msgs.push_back(SessionMsg::McpOp {
+            viewer_id: 2,
+            viewer: vtx,
+            id: json!(42),
+            op: McpOpKind::List,
+        });
+
+        session
+            .on_msg(SessionMsg::ReactivationFailed {
+                token: session.reactivation_token,
+                reason: "upstream gone".to_string(),
+                permanent: true,
+            })
+            .await;
+
+        // Internal oneshot failed
+        let int_res = internal_rx.await.unwrap();
+        assert!(int_res.unwrap_err().contains("Session is gone"));
+
+        // Launch oneshot failed
+        let launch_res = launch_rx.await.unwrap();
+        assert_eq!(launch_res.unwrap_err().code, -32000);
+
+        // Viewer got -32000 error
+        let v_frame = viewer_rx.recv().await.unwrap();
+        let v_json: Value = serde_json::from_str(v_frame.to_text().unwrap()).unwrap();
+        assert_eq!(v_json["id"], 42);
+        assert_eq!(v_json["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_op_refusals_busy_and_in_progress() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_busy_test", ActorState::Live).await;
+        let (viewer_tx, mut viewer_rx) = tokio::sync::mpsc::channel(10);
+        let vtx = test_viewer_tx(viewer_tx);
+        session.attach_live(1, vtx.clone(), true);
+
+        // 1. Simulate active run: turn.run is Some
+        session.turn.run = Some("run_active_123".to_string());
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: vtx.clone(),
+                id: json!(101),
+                op: McpOpKind::Enable {
+                    names: vec!["slack".to_string()],
+                    confirm: vec![],
+                },
+            })
+            .await;
+
+        let frame1 = viewer_rx.recv().await.unwrap();
+        let frame1_json: Value = serde_json::from_str(frame1.to_text().unwrap()).unwrap();
+        assert_eq!(frame1_json["error"]["code"], -32002);
+        assert_eq!(
+            frame1_json["error"]["message"],
+            "session is busy; try after this turn"
+        );
+
+        // 2. Clear run, simulate mcp_op_running = true
+        session.turn.run = None;
+        session.mcp_op_running = true;
+
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: vtx.clone(),
+                id: json!(102),
+                op: McpOpKind::Disable {
+                    names: vec!["slack".to_string()],
+                },
+            })
+            .await;
+
+        let frame2 = viewer_rx.recv().await.unwrap();
+        let frame2_json: Value = serde_json::from_str(frame2.to_text().unwrap()).unwrap();
+        assert_eq!(frame2_json["error"]["code"], -32002);
+        assert_eq!(
+            frame2_json["error"]["message"],
+            "another /mcp change is in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_op_done_fanout_origins() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_done_test", ActorState::Live).await;
+        session.mcp_op_running = true;
+
+        let (v1_tx, mut v1_rx) = tokio::sync::mpsc::channel(10);
+        let (v2_tx, mut v2_rx) = tokio::sync::mpsc::channel(10);
+        let (v3_tx, mut v3_rx) = tokio::sync::mpsc::channel(10);
+
+        session.attach_live(1, test_viewer_tx(v1_tx), true);
+        session.attach_live(2, test_viewer_tx(v2_tx), true);
+        session.attach_live(3, test_viewer_tx(v3_tx), false);
+
+        // Legacy viewer gets synthetic session_info_update on attach; drain it
+        let initial_v3 = v3_rx.recv().await.unwrap();
+        let initial_v3_json: Value = serde_json::from_str(initial_v3.to_text().unwrap()).unwrap();
+        assert_eq!(
+            initial_v3_json.pointer("/params/update/sessionUpdate"),
+            Some(&json!("session_info_update"))
+        );
+
+        session
+            .on_msg(SessionMsg::McpOpDone {
+                origin_viewer: Some(1),
+                enabled: vec!["slack".to_string()],
+                change: "enabled slack".to_string(),
+                changed: true,
+            })
+            .await;
+
+        // mcp_op_running must be cleared
+        assert!(!session.mcp_op_running);
+
+        // Viewer 1 gets origin: "you"
+        let f1 = v1_rx.recv().await.unwrap();
+        let f1_json: Value = serde_json::from_str(f1.to_text().unwrap()).unwrap();
+        assert_eq!(f1_json["method"], "_honk/mcp_changed");
+        assert_eq!(f1_json["params"]["origin"], "you");
+        assert_eq!(f1_json["params"]["change"], "enabled slack");
+        assert_eq!(f1_json["params"]["enabled"], json!(["slack"]));
+
+        // Viewer 2 gets origin: "other"
+        let f2 = v2_rx.recv().await.unwrap();
+        let f2_json: Value = serde_json::from_str(f2.to_text().unwrap()).unwrap();
+        assert_eq!(f2_json["method"], "_honk/mcp_changed");
+        assert_eq!(f2_json["params"]["origin"], "other");
+        assert_eq!(f2_json["params"]["change"], "enabled slack");
+
+        // Viewer 3 (legacy) receives NOTHING
+        assert!(v3_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_internal_request_error_includes_error_data() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_internal_err_test", ActorState::Live).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.pending_requests.insert(
+            "up_req_internal".to_string(),
+            PendingSessionRequest {
+                target: PendingTarget::Internal(reply_tx),
+            },
+        );
+
+        let err_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "up_req_internal",
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": "honk-mcp: cannot read /path/to/secret"
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                err_frame,
+                None,
+            ))
+            .await;
+
+        let err = reply_rx.await.unwrap().unwrap_err();
+        assert!(err.contains("Internal error"));
+        assert!(err.contains("cannot read /path/to/secret"));
     }
 }

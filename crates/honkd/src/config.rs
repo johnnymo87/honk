@@ -45,6 +45,10 @@ pub struct Args {
     pub turn_hook_token_file: Option<PathBuf>,
     #[arg(long, default_value_t = 1200, hide = true)]
     pub turn_hook_retry_secs: u64,
+    #[arg(long)]
+    pub mcp_catalog: Option<PathBuf>,
+    #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
+    pub mcp_no_confirm: Vec<String>,
 }
 
 impl Args {
@@ -114,5 +118,31 @@ mod tests {
         );
         assert_eq!(args.turn_hook_token_file, Some(PathBuf::from("/tmp/token")));
         assert_eq!(args.turn_hook_retry_secs, 60);
+    }
+
+    #[test]
+    fn default_mcp_flags() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.mcp_catalog, None);
+        assert!(args.mcp_no_confirm.is_empty());
+    }
+
+    #[test]
+    fn parsed_mcp_flags() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--mcp-catalog",
+            "/tmp/opencode.json",
+            "--mcp-no-confirm",
+            "slack-ro,figma",
+            "--mcp-no-confirm",
+            "local-test",
+        ])
+        .expect("parse args");
+        assert_eq!(args.mcp_catalog, Some(PathBuf::from("/tmp/opencode.json")));
+        assert_eq!(args.mcp_no_confirm, vec!["slack-ro", "figma", "local-test"]);
     }
 }

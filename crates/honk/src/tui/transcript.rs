@@ -413,6 +413,9 @@ impl Transcript {
                     };
                     self.apply_notice(notice);
                 }
+                for notice in format_mcp_launch_notices(result) {
+                    self.apply_notice(notice);
+                }
             }
             UiEvent::Attached { result } => {
                 if let Some(text) = format_failed_extensions(result) {
@@ -2033,6 +2036,44 @@ fn format_failed_extensions(result: &Value) -> Option<String> {
     }
 }
 
+fn format_mcp_launch_notices(result: &Value) -> Vec<Notice> {
+    let mut notices = Vec::new();
+    let Some(mcp) = result.pointer("/_meta/honk/mcp") else {
+        return notices;
+    };
+
+    if let Some(err) = mcp.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("MCP error");
+        notices.push(Notice::error(msg));
+        return notices;
+    }
+
+    if let Some(results) = mcp.get("results").and_then(Value::as_array) {
+        for r in results {
+            let name = r.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            if ok {
+                let line = if let Some(replaced) = r.get("replaced").and_then(Value::as_str) {
+                    format!("mcp: {name} on (replaced {replaced})")
+                } else if let Some(note) = r.get("note").and_then(Value::as_str) {
+                    format!("mcp: {name} on ({note})")
+                } else {
+                    format!("mcp: {name} on")
+                };
+                notices.push(Notice::info(line));
+            } else {
+                let err = r.get("error").and_then(Value::as_str).unwrap_or("failed");
+                notices.push(Notice::error(format!("mcp: {name} failed: {err}")));
+            }
+        }
+    }
+
+    notices
+}
+
 fn render_notice(block: &Block, width: u16) -> Vec<Line<'static>> {
     let (prefix_style, text_style) = match block.notice.as_ref().map(|n| n.kind) {
         Some(NoticeKind::Error) => (
@@ -3426,6 +3467,7 @@ mod tests {
             replaying: false,
             prompt_in_flight: false,
             connection: ConnectionState::Reconnecting { attempt: 1 },
+            mcp_enabled: Vec::new(),
         };
         transcript.apply_ui_event(&UiEvent::State(snapshot), &mut viewport);
         assert!(!transcript.is_rebuilding);
@@ -3872,5 +3914,53 @@ mod tests {
         transcript.abort_rebuild();
         // Aborted: kept the pre-reset value (50_000)
         assert_eq!(transcript.usage().map(|u| u.used), Some(50_000));
+    }
+
+    #[test]
+    fn test_format_mcp_launch_notices_success_and_error() {
+        let success_result = json!({
+            "sessionId": "ses_123",
+            "_meta": {
+                "honk": {
+                    "mcp": {
+                        "results": [
+                            { "name": "slack-ro", "ok": true },
+                            { "name": "slack", "ok": true, "replaced": "slack-ro" },
+                            { "name": "fail", "ok": false, "error": "timeout" }
+                        ],
+                        "servers": []
+                    }
+                }
+            }
+        });
+        let notices = format_mcp_launch_notices(&success_result);
+        assert_eq!(notices.len(), 3);
+        assert_eq!(notices[0].text, "mcp: slack-ro on");
+        assert_eq!(notices[0].kind, NoticeKind::Info);
+        assert_eq!(notices[1].text, "mcp: slack on (replaced slack-ro)");
+        assert_eq!(notices[1].kind, NoticeKind::Info);
+        assert_eq!(notices[2].text, "mcp: fail failed: timeout");
+        assert_eq!(notices[2].kind, NoticeKind::Error);
+
+        let error_result = json!({
+            "sessionId": "ses_123",
+            "_meta": {
+                "honk": {
+                    "mcp": {
+                        "error": {
+                            "code": -32601,
+                            "message": "MCP catalog not configured (honkd --mcp-catalog)"
+                        }
+                    }
+                }
+            }
+        });
+        let err_notices = format_mcp_launch_notices(&error_result);
+        assert_eq!(err_notices.len(), 1);
+        assert_eq!(
+            err_notices[0].text,
+            "MCP catalog not configured (honkd --mcp-catalog)"
+        );
+        assert_eq!(err_notices[0].kind, NoticeKind::Error);
     }
 }

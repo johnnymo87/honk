@@ -38,6 +38,9 @@ pub struct ChatCore {
     pub(crate) current_time: Instant,
     pub(crate) last_activity: Instant,
     pub(crate) disconnected: bool,
+    pub(crate) mcp_enabled: Vec<String>,
+    pub(crate) mcp_available: bool,
+    pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
 }
 
 impl ChatCore {
@@ -86,6 +89,9 @@ impl ChatCore {
             current_time: now,
             last_activity: now,
             disconnected: false,
+            mcp_enabled: Vec::new(),
+            mcp_available: true,
+            pending_mcp_reqs: HashMap::new(),
         }
     }
 
@@ -162,6 +168,10 @@ impl ChatCore {
 
     pub fn max_turns(&self) -> Option<u32> {
         self.opts.max_turns
+    }
+
+    pub fn mcp_enabled(&self) -> &[String] {
+        &self.mcp_enabled
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
@@ -404,13 +414,28 @@ impl ChatCore {
         }
     }
 
+    pub fn has_pending_mcp_mutation(&self) -> bool {
+        self.pending_mcp_reqs.values().any(|req| {
+            matches!(
+                req,
+                super::types::PendingMcpReq::Enable { .. }
+                    | super::types::PendingMcpReq::Disable { .. }
+            )
+        })
+    }
+
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
         if !self.is_replaying
             && !self.run_state.is_running()
             && self.prompt_sent.is_none()
+            && !self.has_pending_mcp_mutation()
             && let Some((next_text, conv_count)) = self.local_queue.pop_front()
         {
-            self.send_prompt(next_text, conv_count, effects);
+            if next_text.starts_with("/mcp ") {
+                self.handle_queued_mcp_command(&next_text, conv_count, effects);
+            } else {
+                self.send_prompt(next_text, conv_count, effects);
+            }
         }
     }
 
@@ -630,6 +655,14 @@ impl ChatCore {
                     // steer accepted dropped
                 }
             }
+            return;
+        }
+
+        if let Some(mcp_req) = self.pending_mcp_reqs.remove(&id) {
+            let requeued = self.handle_mcp_response(mcp_req, frame, effects);
+            if !requeued {
+                self.check_queued_prompts(effects);
+            }
         }
     }
 
@@ -842,12 +875,40 @@ impl ChatCore {
                     "session evicted; re-attaching...",
                 )));
             }
+            "_honk/mcp_changed" => {
+                if let Some(params) = frame.get("params") {
+                    let origin = params
+                        .get("origin")
+                        .and_then(Value::as_str)
+                        .unwrap_or("other");
+                    if let Some(enabled_arr) = params.get("enabled").and_then(Value::as_array) {
+                        let mut enabled: Vec<String> = enabled_arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        enabled.sort();
+                        self.mcp_enabled = enabled;
+                        self.mcp_available = true;
+                    } else {
+                        self.maybe_refresh_mcp(effects, false);
+                    }
+
+                    if origin == "other"
+                        && let Some(change) = params.get("change").and_then(Value::as_str)
+                    {
+                        effects.push(Effect::Notice(Notice::info(format!(
+                            "mcp: {change} (by another client)"
+                        ))));
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     fn handle_connected(&mut self, effects: &mut Vec<Effect>) {
         self.disconnected = false;
+        self.mcp_available = true;
         if self.prompt_sent.is_some() {
             let req_id = self.allocate_id();
             let p = self.prompt_sent.as_mut().unwrap();
@@ -899,5 +960,218 @@ impl ChatCore {
                 inflight.text
             ))));
         }
+        let mut had_mutation = false;
+        for (_req_id, req) in self.pending_mcp_reqs.drain() {
+            if matches!(
+                req,
+                super::types::PendingMcpReq::Enable { .. }
+                    | super::types::PendingMcpReq::Disable { .. }
+            ) {
+                had_mutation = true;
+            }
+        }
+        if had_mutation {
+            effects.push(Effect::Notice(Notice::warning(
+                "mcp: change may or may not have applied; run /mcp to check",
+            )));
+        }
     }
+
+    pub fn auto_refresh_mcp(&mut self) -> Option<Effect> {
+        if !self.mcp_available {
+            return None;
+        }
+        let req_id = self.allocate_id();
+        self.pending_mcp_reqs.insert(
+            req_id,
+            super::types::PendingMcpReq::List { explicit: false },
+        );
+        Some(Effect::Request {
+            id: req_id,
+            method: "_honk/mcp/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        })
+    }
+
+    pub(crate) fn maybe_refresh_mcp(&mut self, effects: &mut Vec<Effect>, explicit: bool) {
+        if !explicit && !self.mcp_available {
+            return;
+        }
+        let req_id = self.allocate_id();
+        self.pending_mcp_reqs
+            .insert(req_id, super::types::PendingMcpReq::List { explicit });
+        effects.push(Effect::Request {
+            id: req_id,
+            method: "_honk/mcp/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
+    }
+
+    fn handle_mcp_response(
+        &mut self,
+        req: super::types::PendingMcpReq,
+        frame: &Value,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        if let Some(err) = frame.get("error") {
+            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("MCP error");
+
+            if code == -32601 {
+                self.mcp_available = false;
+            }
+
+            if code == -32002 {
+                let queued_info = match &req {
+                    super::types::PendingMcpReq::Enable { queued, .. }
+                    | super::types::PendingMcpReq::Disable { queued, .. } => queued.clone(),
+                    _ => None,
+                };
+                if let Some((raw_line, count)) = queued_info
+                    && count < 3
+                {
+                    self.local_queue.push_front((raw_line, count + 1));
+                    return true;
+                }
+            }
+
+            let explicit = match req {
+                super::types::PendingMcpReq::List { explicit } => explicit,
+                super::types::PendingMcpReq::Enable { .. }
+                | super::types::PendingMcpReq::Disable { .. } => true,
+            };
+
+            if explicit {
+                effects.push(Effect::Notice(Notice::error(msg)));
+            }
+            return false;
+        }
+
+        let result = frame.get("result").unwrap_or(&Value::Null);
+
+        if let Some(servers) = result.get("servers").and_then(Value::as_array) {
+            let mut enabled: Vec<String> = servers
+                .iter()
+                .filter(|s| s.get("enabled").and_then(Value::as_bool).unwrap_or(false))
+                .filter_map(|s| s.get("name").and_then(Value::as_str).map(String::from))
+                .collect();
+            enabled.sort();
+            self.mcp_enabled = enabled;
+            self.mcp_available = true;
+        } else if let Some(enabled_arr) = result.get("enabled").and_then(Value::as_array) {
+            let mut enabled: Vec<String> = enabled_arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            enabled.sort();
+            self.mcp_enabled = enabled;
+            self.mcp_available = true;
+        }
+
+        match req {
+            super::types::PendingMcpReq::List { explicit } => {
+                if explicit {
+                    let text = format_mcp_list_block(result);
+                    effects.push(Effect::Notice(Notice::info(text)));
+                }
+            }
+            super::types::PendingMcpReq::Enable { .. } => {
+                if let Some(results) = result.get("results").and_then(Value::as_array) {
+                    for r in results {
+                        let name = r.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                        let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        if ok {
+                            let line =
+                                if let Some(replaced) = r.get("replaced").and_then(Value::as_str) {
+                                    format!("mcp: {name} on (replaced {replaced})")
+                                } else if let Some(note) = r.get("note").and_then(Value::as_str) {
+                                    format!("mcp: {name} on ({note})")
+                                } else {
+                                    format!("mcp: {name} on")
+                                };
+                            effects.push(Effect::Notice(Notice::info(line)));
+                        } else {
+                            let err = r.get("error").and_then(Value::as_str).unwrap_or("failed");
+                            effects.push(Effect::Notice(Notice::error(format!(
+                                "mcp: {name} failed: {err}"
+                            ))));
+                        }
+                    }
+                }
+            }
+            super::types::PendingMcpReq::Disable { .. } => {
+                if let Some(results) = result.get("results").and_then(Value::as_array) {
+                    for r in results {
+                        let name = r.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                        let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        if ok {
+                            let line = if let Some(note) = r.get("note").and_then(Value::as_str) {
+                                format!("mcp: {name} off ({note})")
+                            } else {
+                                format!("mcp: {name} off")
+                            };
+                            effects.push(Effect::Notice(Notice::info(line)));
+                        } else {
+                            let err = r.get("error").and_then(Value::as_str).unwrap_or("failed");
+                            effects.push(Effect::Notice(Notice::error(format!(
+                                "mcp: {name} failed: {err}"
+                            ))));
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+fn format_mcp_list_block(result: &Value) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(servers) = result.get("servers").and_then(Value::as_array) {
+        for s in servers {
+            let name = s.get("name").and_then(Value::as_str).unwrap_or("");
+            let supported = s.get("supported").and_then(Value::as_bool).unwrap_or(true);
+            let reason = s.get("reason").and_then(Value::as_str);
+
+            if !supported {
+                lines.push(format!(
+                    "n/a {} — {}",
+                    name,
+                    reason.unwrap_or("unsupported")
+                ));
+            } else {
+                let enabled = s.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                let state = if enabled { "on" } else { "off" };
+                let mut line = format!("{state} {name}");
+                let confirm = s.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+                if confirm {
+                    line.push_str(" !");
+                }
+                let conflict = s.get("conflict").and_then(Value::as_bool).unwrap_or(false);
+                if conflict {
+                    line.push_str(" (conflict)");
+                }
+                lines.push(line);
+            }
+        }
+    }
+
+    if let Some(other) = result.get("other").and_then(Value::as_array) {
+        let keys: Vec<&str> = other
+            .iter()
+            .filter_map(|o| o.get("key").and_then(Value::as_str))
+            .collect();
+        if !keys.is_empty() {
+            lines.push(format!("other: {}", keys.join(", ")));
+        }
+    }
+
+    lines.push(
+        "/mcp on <name> · /mcp on! <name> for servers marked ! · /mcp off <name>".to_string(),
+    );
+    lines.join("\n")
 }

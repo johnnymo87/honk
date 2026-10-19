@@ -487,8 +487,31 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         }
                     }
                 } else if method == Some("session/new") {
+                    let mcp_launch_req = params.pointer("/_meta/honk/mcp").cloned();
+                    if let Some(mcp_req) = &mcp_launch_req
+                        && let Some(conf_val) = mcp_req.get("confirm")
+                    {
+                        let is_valid = conf_val
+                            .as_array()
+                            .is_some_and(|arr| arr.iter().all(Value::is_string));
+                        if !is_valid {
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32602,
+                                "Invalid params: `confirm` in _meta.honk.mcp must be an array of strings",
+                                None,
+                            );
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     match hub.create_session(params).await {
-                        Ok(new_res) => {
+                        Ok(mut new_res) => {
                             if let Some(sid) = new_res.get("sessionId").and_then(Value::as_str) {
                                 viewer.attached_sessions.insert(sid.to_string());
                                 let session_tx = {
@@ -496,7 +519,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     sessions.get(sid).map(|h| h.tx.clone())
                                 };
 
-                                if let Some(tx) = session_tx {
+                                if let Some(tx) = &session_tx {
                                     let _ = tx
                                         .send(crate::session::SessionMsg::AttachLive {
                                             viewer_id: viewer.id,
@@ -504,6 +527,92 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                             is_honk_aware: viewer.is_honk_aware,
                                         })
                                         .await;
+                                }
+
+                                if let Some(mcp_req) = mcp_launch_req {
+                                    if new_res.get("_meta").is_none() {
+                                        new_res["_meta"] = json!({});
+                                    }
+                                    if new_res["_meta"].get("honk").is_none() {
+                                        new_res["_meta"]["honk"] = json!({});
+                                    }
+
+                                    if hub.mcp.is_none() {
+                                        new_res["_meta"]["honk"]["mcp"] = json!({
+                                            "error": {
+                                                "code": -32601,
+                                                "message": "MCP catalog not configured (honkd --mcp-catalog)"
+                                            }
+                                        });
+                                    } else if let Some(tx) = session_tx {
+                                        let names_opt = mcp_req
+                                            .get("names")
+                                            .and_then(Value::as_array)
+                                            .and_then(|arr| {
+                                                arr.iter()
+                                                    .map(Value::as_str)
+                                                    .map(|s| s.map(String::from))
+                                                    .collect::<Option<Vec<_>>>()
+                                            });
+                                        let confirm = mcp_req
+                                            .get("confirm")
+                                            .and_then(Value::as_array)
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(Value::as_str)
+                                                    .map(String::from)
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+
+                                        match names_opt {
+                                            Some(names) => {
+                                                let (reply_tx, reply_rx) =
+                                                    tokio::sync::oneshot::channel();
+                                                let _ = tx
+                                                    .send(crate::session::SessionMsg::McpLaunch {
+                                                        viewer_id: viewer.id,
+                                                        names,
+                                                        confirm,
+                                                        reply: reply_tx,
+                                                    })
+                                                    .await;
+                                                match reply_rx.await {
+                                                    Ok(Ok(op_res)) => {
+                                                        new_res["_meta"]["honk"]["mcp"] = json!({
+                                                            "results": op_res.results,
+                                                            "servers": op_res.servers,
+                                                            "other": op_res.other,
+                                                        });
+                                                    }
+                                                    Ok(Err(op_err)) => {
+                                                        new_res["_meta"]["honk"]["mcp"] = json!({
+                                                            "error": {
+                                                                "code": op_err.code,
+                                                                "message": op_err.message,
+                                                            }
+                                                        });
+                                                    }
+                                                    Err(_) => {
+                                                        new_res["_meta"]["honk"]["mcp"] = json!({
+                                                            "error": {
+                                                                "code": -32603,
+                                                                "message": "failed to enable MCP servers",
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                new_res["_meta"]["honk"]["mcp"] = json!({
+                                                    "error": {
+                                                        "code": -32602,
+                                                        "message": "invalid names in _meta.honk.mcp"
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             let resp_frame = crate::rpc::response(id, new_res);
@@ -691,6 +800,210 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             .send_frame(Message::Text(err_resp.to_string().into()))
                         {
                             break;
+                        }
+                    }
+                } else if method.is_some_and(|m| m.starts_with("_honk/mcp/")) {
+                    if hub.mcp.is_none() {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32601,
+                            "MCP catalog not configured (honkd --mcp-catalog)",
+                            None,
+                        );
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let sid_opt = params.get("sessionId").and_then(Value::as_str);
+                    let Some(sid) = sid_opt else {
+                        let err_resp = crate::rpc::error(
+                            id,
+                            -32602,
+                            format!("Missing sessionId in {}", method.unwrap_or("")),
+                            None,
+                        );
+                        if !viewer
+                            .tx
+                            .send_frame(Message::Text(err_resp.to_string().into()))
+                        {
+                            break;
+                        }
+                        continue;
+                    };
+
+                    let op_res = match method.unwrap() {
+                        "_honk/mcp/list" => Ok(crate::session::McpOpKind::List),
+                        "_honk/mcp/enable" => {
+                            let names =
+                                params
+                                    .get("names")
+                                    .and_then(Value::as_array)
+                                    .and_then(|arr| {
+                                        arr.iter()
+                                            .map(Value::as_str)
+                                            .map(|s| s.map(String::from))
+                                            .collect::<Option<Vec<_>>>()
+                                    });
+                            if let Some(conf_val) = params.get("confirm") {
+                                let is_valid = conf_val
+                                    .as_array()
+                                    .is_some_and(|arr| arr.iter().all(Value::is_string));
+                                if !is_valid {
+                                    Err(crate::rpc::error(
+                                        id.clone(),
+                                        -32602,
+                                        "Invalid params: `confirm` in _honk/mcp/enable must be an array of strings",
+                                        None,
+                                    ))
+                                } else {
+                                    let confirm = conf_val
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(String::from)
+                                        .collect();
+                                    match names {
+                                        Some(names) => {
+                                            Ok(crate::session::McpOpKind::Enable { names, confirm })
+                                        }
+                                        None => Err(crate::rpc::error(
+                                            id.clone(),
+                                            -32602,
+                                            "Invalid or missing 'names' array in _honk/mcp/enable",
+                                            None,
+                                        )),
+                                    }
+                                }
+                            } else {
+                                match names {
+                                    Some(names) => Ok(crate::session::McpOpKind::Enable {
+                                        names,
+                                        confirm: Vec::new(),
+                                    }),
+                                    None => Err(crate::rpc::error(
+                                        id.clone(),
+                                        -32602,
+                                        "Invalid or missing 'names' array in _honk/mcp/enable",
+                                        None,
+                                    )),
+                                }
+                            }
+                        }
+                        "_honk/mcp/disable" => {
+                            let names =
+                                params
+                                    .get("names")
+                                    .and_then(Value::as_array)
+                                    .and_then(|arr| {
+                                        arr.iter()
+                                            .map(Value::as_str)
+                                            .map(|s| s.map(String::from))
+                                            .collect::<Option<Vec<_>>>()
+                                    });
+                            match names {
+                                Some(names) => Ok(crate::session::McpOpKind::Disable { names }),
+                                None => Err(crate::rpc::error(
+                                    id.clone(),
+                                    -32602,
+                                    "Invalid or missing 'names' array in _honk/mcp/disable",
+                                    None,
+                                )),
+                            }
+                        }
+                        unknown => Err(crate::rpc::error(
+                            id.clone(),
+                            -32601,
+                            format!("Method not found: {unknown}"),
+                            None,
+                        )),
+                    };
+
+                    let op = match op_res {
+                        Ok(o) => o,
+                        Err(err_resp) => {
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let session_tx = {
+                        let sessions = hub.sessions.read().await;
+                        sessions.get(sid).map(|h| h.tx.clone())
+                    };
+
+                    let tx = match session_tx {
+                        Some(tx) => Some(tx),
+                        None => match hub.get_or_activate_session(sid).await {
+                            Ok(h) => Some(h.tx),
+                            Err(e) => {
+                                let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                if !viewer
+                                    .tx
+                                    .send_frame(Message::Text(err_resp.to_string().into()))
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        },
+                    };
+
+                    if let Some(tx) = tx {
+                        // Auto-attach if not already attached
+                        if !viewer.attached_sessions.contains(sid) {
+                            let _ = tx
+                                .send(crate::session::SessionMsg::AttachLive {
+                                    viewer_id: viewer.id,
+                                    viewer: viewer.tx.clone(),
+                                    is_honk_aware: viewer.is_honk_aware,
+                                })
+                                .await;
+                            viewer.attached_sessions.insert(sid.to_string());
+                        }
+
+                        if tx
+                            .send(crate::session::SessionMsg::McpOp {
+                                viewer_id: viewer.id,
+                                viewer: viewer.tx.clone(),
+                                id: id.clone(),
+                                op: op.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            match hub.get_or_activate_session(sid).await {
+                                Ok(new_h) => {
+                                    let _ = new_h
+                                        .tx
+                                        .send(crate::session::SessionMsg::McpOp {
+                                            viewer_id: viewer.id,
+                                            viewer: viewer.tx.clone(),
+                                            id,
+                                            op,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let err_resp = crate::rpc::error(id, e.code, e.message, None);
+                                    if !viewer
+                                        .tx
+                                        .send_frame(Message::Text(err_resp.to_string().into()))
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 } else if let Some(sid) = params.get("sessionId").and_then(Value::as_str) {

@@ -94,8 +94,12 @@ struct ChatArgs {
     cwd: Option<PathBuf>,
 
     /// Extensions to enable for a new session (repeatable)
-    #[arg(long = "ext", requires = "new")]
+    #[arg(long = "ext", requires = "new", conflicts_with = "session")]
     ext: Vec<String>,
+
+    /// MCP servers to enable for a new session (repeatable, append '!' to confirm)
+    #[arg(long = "mcp", requires = "new", conflicts_with = "session")]
+    mcp: Vec<String>,
 
     /// Cap model calls per turn (positive integer)
     #[arg(long = "max-turns", env = "HONK_MAX_TURNS", value_parser = parse_max_turns)]
@@ -186,8 +190,33 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
         } else {
             Some(args.ext.clone())
         };
-        Ok(honk::chat::driver::Target::New { cwd, extensions })
+        let mcp = if args.mcp.is_empty() {
+            None
+        } else {
+            let mut confirm = Vec::new();
+            let mut names = Vec::new();
+            for item in &args.mcp {
+                if let Some(stripped) = item.strip_suffix('!') {
+                    confirm.push(stripped.to_string());
+                    names.push(stripped.to_string());
+                } else {
+                    names.push(item.clone());
+                }
+            }
+            Some(honk::chat::driver::McpLaunchConfig { names, confirm })
+        };
+        Ok(honk::chat::driver::Target::New {
+            cwd,
+            extensions,
+            mcp,
+        })
     } else {
+        if !args.ext.is_empty() {
+            anyhow::bail!("--ext requires --new");
+        }
+        if !args.mcp.is_empty() {
+            anyhow::bail!("--mcp requires --new");
+        }
         Ok(honk::chat::driver::Target::Attach(
             args.session.clone().unwrap(),
         ))
@@ -327,6 +356,7 @@ mod tests {
             new: true,
             cwd: Some(PathBuf::from("/nonexistent_path_xyz_123")),
             ext: vec![],
+            mcp: vec![],
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
@@ -348,6 +378,7 @@ mod tests {
             new: true,
             cwd: Some(temp.path().to_path_buf()),
             ext: vec!["dev".into()],
+            mcp: vec![],
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
@@ -359,12 +390,76 @@ mod tests {
         };
         let target = resolve_chat_target(&args).unwrap();
         match target {
-            honk::chat::driver::Target::New { cwd, extensions } => {
+            honk::chat::driver::Target::New {
+                cwd, extensions, ..
+            } => {
                 assert_eq!(cwd, temp.path().canonicalize().unwrap());
                 assert_eq!(extensions, Some(vec!["dev".into()]));
             }
             _ => panic!("expected Target::New"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_mcp_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "slack-ro",
+            "--mcp",
+            "slack!",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                let target = resolve_chat_target(&args).unwrap();
+                match target {
+                    honk::chat::driver::Target::New { mcp, .. } => {
+                        assert_eq!(
+                            mcp,
+                            Some(honk::chat::driver::McpLaunchConfig {
+                                names: vec!["slack-ro".into(), "slack".into()],
+                                confirm: vec!["slack".into()],
+                            })
+                        );
+                    }
+                    _ => panic!("expected Target::New"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        let cli2 =
+            Cli::try_parse_from(["honk", "chat", "--new", "--mcp", "a!", "--mcp", "b"]).unwrap();
+        match cli2.command {
+            Commands::Chat(args) => {
+                let target = resolve_chat_target(&args).unwrap();
+                match target {
+                    honk::chat::driver::Target::New { mcp, .. } => {
+                        assert_eq!(
+                            mcp,
+                            Some(honk::chat::driver::McpLaunchConfig {
+                                names: vec!["a".into(), "b".into()],
+                                confirm: vec!["a".into()],
+                            })
+                        );
+                    }
+                    _ => panic!("expected Target::New"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_mcp_requires_new() {
+        let res = Cli::try_parse_from(["honk", "chat", "ses_1", "--mcp", "slack-ro"]);
+        assert!(res.is_err());
     }
 
     #[test]

@@ -172,6 +172,8 @@ struct FakeGooseInner {
     run_announcement_delay: Mutex<Option<Duration>>,
     export_commit_delay: Mutex<Option<Duration>>,
     session_info_error: Mutex<Option<(i64, String)>>,
+    session_extensions: Mutex<HashMap<String, Vec<Value>>>,
+    extension_fail_command: Mutex<Option<(String, String)>>,
 }
 
 pub struct FakeGoose {
@@ -230,6 +232,8 @@ impl FakeGoose {
             run_announcement_delay: Mutex::new(None),
             export_commit_delay: Mutex::new(None),
             session_info_error: Mutex::new(None),
+            session_extensions: Mutex::new(HashMap::new()),
+            extension_fail_command: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -484,6 +488,25 @@ impl FakeGoose {
         }
     }
 
+    pub fn script_extension_add_failure(
+        &self,
+        command_needle: impl Into<String>,
+        error_msg: impl Into<String>,
+    ) {
+        *self.state.extension_fail_command.lock().unwrap() =
+            Some((command_needle.into(), error_msg.into()));
+    }
+
+    pub fn get_session_extensions(&self, sid: &str) -> Vec<Value> {
+        self.state
+            .session_extensions
+            .lock()
+            .unwrap()
+            .get(sid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub async fn restart(&mut self) {
         self.state.connections.lock().unwrap().clear();
     }
@@ -526,7 +549,22 @@ fn method_requires_session(method: &str) -> bool {
             | "session/set_model"
             | "_goose/unstable/session/export"
             | "_goose/unstable/session/steer"
+            | "_goose/unstable/session/extensions/list"
+            | "_goose/unstable/session/extensions/add"
+            | "_goose/unstable/session/extensions/remove"
     )
+}
+
+fn name_to_key(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            result.push(c);
+        } else {
+            result.push('_');
+        }
+    }
+    result
 }
 
 fn register_new_session(
@@ -998,6 +1036,165 @@ async fn handle_post(
                 let stream = conn
                     .sessions
                     .entry(sid.to_string())
+                    .or_insert_with(StreamState::new);
+                stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/extensions/list") => {
+            let sid = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let exts = state
+                .session_extensions
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "extensions": exts
+                    }
+                });
+                let stream = conn
+                    .sessions
+                    .entry(sid.clone())
+                    .or_insert_with(StreamState::new);
+                stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/extensions/add") => {
+            let sid = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let ext = frame
+                .pointer("/params/extension")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let srv_name = ext
+                .pointer("/server/name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let key = name_to_key(srv_name);
+
+            let fail_check = state.extension_fail_command.lock().unwrap().clone();
+            let should_fail = if let Some((cmd_needle, err_msg)) = fail_check {
+                let cmd_str = ext
+                    .pointer("/server/command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let cmd_arr = ext.pointer("/server/command").and_then(Value::as_array);
+                let matches_cmd = cmd_str.contains(&cmd_needle)
+                    || cmd_arr.is_some_and(|arr| {
+                        arr.iter()
+                            .any(|v| v.as_str().is_some_and(|s| s.contains(&cmd_needle)))
+                    });
+                if matches_cmd { Some(err_msg) } else { None }
+            } else {
+                None
+            };
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = if let Some(err_msg) = should_fail {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": err_msg,
+                            "data": err_msg
+                        }
+                    })
+                } else {
+                    let mut all_exts = state.session_extensions.lock().unwrap();
+                    let session_exts = all_exts.entry(sid.clone()).or_default();
+                    session_exts
+                        .retain(|e| e.get("extensionKey").and_then(Value::as_str) != Some(&key));
+                    session_exts.push(json!({
+                        "extensionKey": key,
+                        "extension": ext
+                    }));
+
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "extensionKey": key
+                        }
+                    })
+                };
+
+                let stream = conn
+                    .sessions
+                    .entry(sid.clone())
+                    .or_insert_with(StreamState::new);
+                stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/extensions/remove") => {
+            let sid = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let key = frame
+                .pointer("/params/extensionKey")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+
+            let mut all_exts = state.session_extensions.lock().unwrap();
+            let session_exts = all_exts.entry(sid.clone()).or_default();
+            let pos = session_exts
+                .iter()
+                .position(|e| e.get("extensionKey").and_then(Value::as_str) == Some(key));
+
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = match pos {
+                    Some(idx) => {
+                        session_exts.remove(idx);
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {}
+                        })
+                    }
+                    None => {
+                        let msg = format!("Extension '{key}' not found");
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32603,
+                                "message": msg,
+                                "data": msg
+                            }
+                        })
+                    }
+                };
+
+                let stream = conn
+                    .sessions
+                    .entry(sid.clone())
                     .or_insert_with(StreamState::new);
                 stream.push_frame(resp, patched, false);
             }

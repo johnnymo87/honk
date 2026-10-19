@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /mcp        - list or configure MCP servers (/mcp, /mcp on <names>, /mcp on! <names>, /mcp off <names>; servers marked ! need /mcp on!; honkd decides which via --mcp-no-confirm)\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -108,10 +108,148 @@ impl ChatCore {
             return true;
         }
 
+        if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
+            self.handle_mcp_command(trimmed, effects);
+            return true;
+        }
+
         effects.push(Effect::Notice(Notice::warning(format!(
             "unknown command: '{trimmed}'; type /help for commands"
         ))));
         true
+    }
+
+    pub(crate) fn handle_mcp_command(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        self.handle_mcp_command_inner(line, None, effects);
+    }
+
+    pub(crate) fn handle_queued_mcp_command(
+        &mut self,
+        line: &str,
+        requeues: u32,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.handle_mcp_command_inner(line, Some((line.to_string(), requeues)), effects);
+    }
+
+    fn handle_mcp_command_inner(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rest = line.strip_prefix("/mcp").unwrap().trim();
+        if rest.is_empty() {
+            if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+                return;
+            }
+            let req_id = self.allocate_id();
+            self.pending_mcp_reqs
+                .insert(req_id, super::types::PendingMcpReq::List { explicit: true });
+            effects.push(Effect::Request {
+                id: req_id,
+                method: "_honk/mcp/list".to_string(),
+                params: json!({ "sessionId": self.session_id }),
+            });
+            return;
+        }
+
+        let (subcmd, args_str) = match rest.split_once(char::is_whitespace) {
+            Some((cmd, args)) => (cmd, args.trim()),
+            None => (rest, ""),
+        };
+
+        match subcmd {
+            "on" | "on!" => {
+                let is_confirm_cmd = subcmd == "on!";
+                if args_str.is_empty() {
+                    let usage = if is_confirm_cmd {
+                        "usage: /mcp on! <name>..."
+                    } else {
+                        "usage: /mcp on <name>... (or /mcp on! <name>... to confirm)"
+                    };
+                    effects.push(Effect::Notice(Notice::warning(usage)));
+                    return;
+                }
+                let names: Vec<String> = args_str.split_whitespace().map(String::from).collect();
+                let confirm = if is_confirm_cmd {
+                    names.clone()
+                } else {
+                    Vec::new()
+                };
+
+                if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+                    return;
+                }
+
+                if self.prompt_sent.is_some()
+                    || self.run_state.is_running()
+                    || !self.local_queue.is_empty()
+                {
+                    self.local_queue.push_back((line.to_string(), 0));
+                    effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
+                } else {
+                    let req_id = self.allocate_id();
+                    self.pending_mcp_reqs.insert(
+                        req_id,
+                        super::types::PendingMcpReq::Enable {
+                            names: names.clone(),
+                            queued,
+                        },
+                    );
+                    effects.push(Effect::Request {
+                        id: req_id,
+                        method: "_honk/mcp/enable".to_string(),
+                        params: json!({
+                            "sessionId": self.session_id,
+                            "names": names,
+                            "confirm": confirm,
+                        }),
+                    });
+                }
+            }
+            "off" => {
+                if args_str.is_empty() {
+                    effects.push(Effect::Notice(Notice::warning("usage: /mcp off <name>...")));
+                    return;
+                }
+                let names: Vec<String> = args_str.split_whitespace().map(String::from).collect();
+
+                if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+                    return;
+                }
+
+                if self.prompt_sent.is_some()
+                    || self.run_state.is_running()
+                    || !self.local_queue.is_empty()
+                {
+                    self.local_queue.push_back((line.to_string(), 0));
+                    effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
+                } else {
+                    let req_id = self.allocate_id();
+                    self.pending_mcp_reqs.insert(
+                        req_id,
+                        super::types::PendingMcpReq::Disable {
+                            names: names.clone(),
+                            queued,
+                        },
+                    );
+                    effects.push(Effect::Request {
+                        id: req_id,
+                        method: "_honk/mcp/disable".to_string(),
+                        params: json!({
+                            "sessionId": self.session_id,
+                            "names": names,
+                        }),
+                    });
+                }
+            }
+            _ => {
+                effects.push(Effect::Notice(Notice::warning(format!(
+                    "unknown /mcp subcommand '{subcmd}'; use /mcp, /mcp on, /mcp on!, or /mcp off"
+                ))));
+            }
+        }
     }
 
     pub(crate) fn handle_approve_command(&mut self, effects: &mut Vec<Effect>) {

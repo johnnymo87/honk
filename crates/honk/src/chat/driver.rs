@@ -13,11 +13,18 @@ use crate::chat::types::{ChatOpts, Effect, IdAlloc, Input, Notice, Ownership, Ru
 use crate::conn::Conn;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpLaunchConfig {
+    pub names: Vec<String>,
+    pub confirm: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Attach(String),
     New {
         cwd: PathBuf,
         extensions: Option<Vec<String>>,
+        mcp: Option<McpLaunchConfig>,
     },
 }
 
@@ -110,6 +117,7 @@ pub struct StateSnapshot {
     pub replaying: bool,
     pub prompt_in_flight: bool,
     pub connection: ConnectionState,
+    pub mcp_enabled: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,6 +265,7 @@ fn maybe_emit_state(
         replaying: core.is_replaying(),
         prompt_in_flight: core.prompt_in_flight(),
         connection: connection.clone(),
+        mcp_enabled: core.mcp_enabled().to_vec(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -464,6 +473,7 @@ async fn run_driver(
         replaying: true,
         prompt_in_flight: false,
         connection: connection_state.clone(),
+        mcp_enabled: Vec::new(),
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
@@ -484,7 +494,11 @@ async fn run_driver(
     };
 
     let mut core = match opts.target.clone() {
-        Target::New { cwd, extensions } => {
+        Target::New {
+            cwd,
+            extensions,
+            mcp,
+        } => {
             let cwd_for_pigeon = cwd.to_string_lossy().to_string();
             let mut ids = IdAlloc::new();
             let new_req_id = ids.allocate();
@@ -506,6 +520,18 @@ async fn run_driver(
                     "enabledExtensions": ext_arr,
                 });
             }
+            if let Some(ref mcp_cfg) = mcp {
+                if params.get("_meta").is_none() {
+                    params["_meta"] = json!({});
+                }
+                if params["_meta"].get("honk").is_none() {
+                    params["_meta"]["honk"] = json!({});
+                }
+                params["_meta"]["honk"]["mcp"] = json!({
+                    "names": mcp_cfg.names,
+                    "confirm": mcp_cfg.confirm,
+                });
+            }
 
             if let Err(e) = conn.send_request(new_req_id, "session/new", params).await {
                 let _ = ui_tx.send(UiEvent::Fatal(format!(
@@ -515,7 +541,8 @@ async fn run_driver(
                 return;
             }
 
-            let new_res = tokio::time::timeout(Duration::from_secs(30), async {
+            let timeout_duration = session_new_timeout_secs(mcp.as_ref());
+            let new_res = tokio::time::timeout(timeout_duration, async {
                 while let Some(frame) = frame_rx.recv().await {
                     if frame.get("id") == Some(&json!(new_req_id))
                         && crate::conn::is_response(&frame)
@@ -879,6 +906,12 @@ async fn run_driver(
                             let _ = conn
                                 .send_request(list_id, "session/list", Value::Object(params))
                                 .await;
+
+                            if let Some(Effect::Request { id, method, params }) =
+                                core.auto_refresh_mcp()
+                            {
+                                let _ = conn.send_request(id, &method, params).await;
+                            }
                         }
 
                         if frame.get("method").and_then(Value::as_str)
@@ -886,6 +919,12 @@ async fn run_driver(
                             && connection_state == ConnectionState::Live
                         {
                             live_since = Some(Instant::now());
+                            if let Some(conn) = conn_opt.as_mut()
+                                && let Some(Effect::Request { id, method, params }) =
+                                    core.auto_refresh_mcp()
+                            {
+                                let _ = conn.send_request(id, &method, params).await;
+                            }
                         }
                         if frame.get("method").and_then(Value::as_str)
                             == Some(honk_wire::method::RESET)
@@ -1101,6 +1140,14 @@ pub async fn start(
     Ok((handle, ui_rx))
 }
 
+fn session_new_timeout_secs(mcp_launch: Option<&McpLaunchConfig>) -> Duration {
+    if mcp_launch.is_some_and(|c| !c.names.is_empty()) {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1201,26 @@ mod tests {
             }
         );
         assert_eq!(ConnectionState::Detached, ConnectionState::Detached);
+    }
+
+    #[test]
+    fn test_session_new_timeout_secs_with_and_without_mcp() {
+        assert_eq!(session_new_timeout_secs(None), Duration::from_secs(30));
+        let empty_mcp = McpLaunchConfig {
+            names: vec![],
+            confirm: vec![],
+        };
+        assert_eq!(
+            session_new_timeout_secs(Some(&empty_mcp)),
+            Duration::from_secs(30)
+        );
+        let with_mcp = McpLaunchConfig {
+            names: vec!["slack-ro".into()],
+            confirm: vec![],
+        };
+        assert_eq!(
+            session_new_timeout_secs(Some(&with_mcp)),
+            Duration::from_secs(120)
+        );
     }
 }
