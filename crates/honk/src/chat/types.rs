@@ -174,3 +174,10 @@ pub(crate) struct InflightSteer {
     pub expected_run_id: String,
     pub conversion_count: u32,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingMcpReq {
+    List { explicit: bool },
+    Enable { names: Vec<String> },
+    Disable { names: Vec<String> },
+}

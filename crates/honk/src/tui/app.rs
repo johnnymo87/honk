@@ -316,6 +316,9 @@ impl App {
             cmd if cmd == "compact" || cmd.starts_with("compact ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
+            cmd if cmd == "mcp" || cmd.starts_with("mcp ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             other => {
                 self.transcript
                     .apply_notice(Notice::warning(format!("unknown command: :{other}")));
@@ -957,6 +960,8 @@ mod tests {
             ("turns off", "/turns off"),
             ("compact", "/compact"),
             ("compact now", "/compact now"),
+            ("mcp", "/mcp"),
+            ("mcp on slack-ro", "/mcp on slack-ro"),
         ];
 
         for (typed, expected_cmd) in commands {
@@ -1178,6 +1183,7 @@ mod tests {
             connection: ConnectionState::Stopped {
                 reason: "closed".into(),
             },
+            mcp_enabled: Vec::new(),
         });
 
         // Any key sends RetryAttach AND performs normal key
@@ -1235,6 +1241,7 @@ mod tests {
             replaying: false,
             prompt_in_flight: false,
             connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
         });
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
@@ -1275,6 +1282,7 @@ mod tests {
             replaying: false,
             prompt_in_flight: false,
             connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
         }));
 
         let backend = TestBackend::new(100, 20);

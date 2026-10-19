@@ -157,6 +157,12 @@ impl<'a> StatusBar<'a> {
         }
     }
 
+    pub fn mcp_enabled(&self) -> &[String] {
+        self.state_snapshot
+            .map(|s| s.mcp_enabled.as_slice())
+            .unwrap_or(&[])
+    }
+
     pub fn to_line(&self, width: u16) -> Line<'static> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
 
@@ -165,7 +171,7 @@ impl<'a> StatusBar<'a> {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
 
-        let build_left_spans = |max_title_w: usize| -> Vec<Span<'static>> {
+        let build_left_spans = |max_title_w: usize, mcp_text: Option<&str>| -> Vec<Span<'static>> {
             let mut spans = Vec::new();
 
             // Mode badge
@@ -217,58 +223,106 @@ impl<'a> StatusBar<'a> {
             });
             spans.push(Span::styled(format!("  {}", conn), conn_style));
 
+            // MCP
+            if let Some(mcp) = mcp_text {
+                let mcp_style = Style::default().bg(Color::DarkGray).fg(Color::Cyan);
+                spans.push(Span::styled(format!("  {}", mcp), mcp_style));
+            }
+
             spans
         };
 
-        let mut chosen = None;
-        if let Some(u) = self.usage {
-            let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
-            let spacer_w = 1;
-            let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
-            let queued_w = self
-                .queued_text()
-                .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
-                .unwrap_or(0);
-            let conn_text = self.connection_text();
-            let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
-            let non_title_left = badge_w + spacer_w + run_state_w + queued_w + conn_w;
+        let mcp_enabled = self.mcp_enabled();
+        let mcp_candidates: Vec<Option<String>> = if mcp_enabled.is_empty() {
+            vec![None]
+        } else {
+            vec![
+                Some(format!("mcp:{}", mcp_enabled.join(","))),
+                Some(format!("mcp:{}", mcp_enabled.len())),
+                None,
+            ]
+        };
 
+        let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
+        let spacer_w = 1;
+        let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
+        let queued_w = self
+            .queued_text()
+            .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
+            .unwrap_or(0);
+        let conn_text = self.connection_text();
+        let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
+        let base_non_title_left = badge_w + spacer_w + run_state_w + queued_w + conn_w;
+
+        let usage_candidates: Vec<Option<String>> = if let Some(u) = self.usage {
             let levels = [UsageLevel::Full, UsageLevel::NoCost, UsageLevel::TokensOnly];
-            let mut candidates = Vec::new();
+            let mut list = Vec::new();
             for lvl in levels {
                 if let Some(text) = usage_text(u, lvl)
-                    && !candidates.contains(&text)
+                    && !list.contains(&Some(text.clone()))
                 {
-                    candidates.push(text);
+                    list.push(Some(text));
                 }
             }
+            list.push(None);
+            list
+        } else {
+            vec![None]
+        };
 
-            for cand in candidates {
-                let cand_w = unicode_width::UnicodeWidthStr::width(cand.as_str());
-                let max_title_w = (width as usize)
-                    .saturating_sub(non_title_left + 2 + cand_w)
-                    .max(10);
-                let left_spans = build_left_spans(max_title_w);
-                let left_w: usize = left_spans
-                    .iter()
-                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                    .sum();
-                if left_w + 2 + cand_w <= width as usize {
-                    let padding = (width as usize) - left_w - cand_w;
-                    chosen = Some((left_spans, padding, cand));
-                    break;
+        let mut candidate_pairs = Vec::new();
+        for mcp in &mcp_candidates {
+            for usage in &usage_candidates {
+                if usage.is_some() {
+                    candidate_pairs.push((mcp.clone(), usage.clone()));
                 }
             }
         }
+        for mcp in &mcp_candidates {
+            candidate_pairs.push((mcp.clone(), None));
+        }
 
-        let spans = if let Some((mut left_spans, padding, cand)) = chosen {
+        let mut chosen = None;
+        for (mcp_opt, usage_opt) in candidate_pairs {
+            let mcp_w = mcp_opt
+                .as_ref()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 2)
+                .unwrap_or(0);
+            let non_title_left = base_non_title_left + mcp_w;
+
+            let usage_w = usage_opt
+                .as_ref()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .unwrap_or(0);
+            let right_needed = if usage_w > 0 { usage_w + 2 } else { 0 };
+
+            let max_title_w = (width as usize)
+                .saturating_sub(non_title_left + right_needed)
+                .max(10);
+            let left_spans = build_left_spans(max_title_w, mcp_opt.as_deref());
+            let left_w: usize = left_spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+
+            if left_w + right_needed <= width as usize {
+                chosen = Some((left_spans, left_w, usage_opt));
+                break;
+            }
+        }
+
+        let spans = if let Some((mut left_spans, left_w, Some(cand))) = chosen {
+            let cand_w = unicode_width::UnicodeWidthStr::width(cand.as_str());
+            let padding = (width as usize).saturating_sub(left_w + cand_w);
             left_spans.push(Span::styled(" ".repeat(padding), base_style));
             let usage_style = Style::default().bg(Color::DarkGray).fg(Color::Gray);
             left_spans.push(Span::styled(cand, usage_style));
             left_spans
+        } else if let Some((left_spans, _, None)) = chosen {
+            left_spans
         } else {
-            let max_title_w = (width as usize).saturating_sub(45).max(10);
-            build_left_spans(max_title_w)
+            let max_title_w = (width as usize).saturating_sub(base_non_title_left).max(10);
+            build_left_spans(max_title_w, None)
         };
 
         Line::from(spans).style(base_style)
@@ -304,6 +358,7 @@ mod tests {
             replaying: false,
             prompt_in_flight: false,
             connection,
+            mcp_enabled: Vec::new(),
         }
     }
 
@@ -791,5 +846,37 @@ mod tests {
             "title of length 30 must not be truncated, got: {rendered}"
         );
         assert!(!rendered.contains('…'), "must not contain ellipsis");
+    }
+
+    #[test]
+    fn test_status_line_with_mcp_enabled() {
+        let mut snapshot =
+            make_snapshot(RunState::Idle, Ownership::Unknown, 0, ConnectionState::Live);
+        snapshot.mcp_enabled = vec!["slack-ro".into(), "atlassian".into()];
+
+        let bar = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: Some(&snapshot),
+            mode: EditorMode::Normal,
+            usage: None,
+        };
+
+        // Wide terminal: full list
+        let line_140 = bar.to_line(140);
+        let rendered_140: String = line_140.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_140.contains("mcp:slack-ro,atlassian"));
+
+        // Narrow terminal: falls back to count
+        let line_45 = bar.to_line(45);
+        let rendered_45: String = line_45.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_45.contains("mcp:2"));
+        assert!(!rendered_45.contains("mcp:slack-ro,atlassian"));
+
+        // Very narrow terminal: dropped completely
+        let line_25 = bar.to_line(25);
+        let rendered_25: String = line_25.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!rendered_25.contains("mcp:"));
     }
 }

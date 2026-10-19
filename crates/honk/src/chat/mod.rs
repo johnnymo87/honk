@@ -6,7 +6,8 @@ pub mod types;
 
 pub use core::ChatCore;
 pub use driver::{
-    ConnectionState, DriverHandle, DriverOpts, StateSnapshot, Target, UiCommand, UiEvent, start,
+    ConnectionState, DriverHandle, DriverOpts, McpLaunchConfig, StateSnapshot, Target, UiCommand,
+    UiEvent, start,
 };
 pub use types::{
     ChatOpts, Effect, IdAlloc, Input, Notice, NoticeKind, Ownership, PendingPermission,

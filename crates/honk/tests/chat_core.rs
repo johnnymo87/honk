@@ -3880,3 +3880,526 @@ fn test_compact_buffered_reattach_with_subsequent_line_queues_no_steer() {
     };
     assert_eq!(p2["prompt"][0]["text"], "next line");
 }
+
+#[test]
+fn test_help_command_includes_mcp() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/help".into()));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(&n.text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(notice.contains("/mcp"));
+}
+
+#[test]
+fn test_mcp_list_idle_sends_request() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
+        .expect("should send _honk/mcp/list request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+}
+
+#[test]
+fn test_mcp_list_during_active_run_sends_request_immediately() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+    assert_eq!(*core.run_state(), RunState::Running("run_foreign".into()));
+
+    let effs = core.handle(Input::Line("/mcp".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
+        .expect("list should run immediately even during active run");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+}
+
+#[test]
+fn test_mcp_usage_missing_names() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/mcp on".into()));
+    assert!(has_notice(&effs, "usage: /mcp on <name>"));
+
+    let effs = core.handle(Input::Line("/mcp on!".into()));
+    assert!(has_notice(&effs, "usage: /mcp on! <name>"));
+
+    let effs = core.handle(Input::Line("/mcp off".into()));
+    assert!(has_notice(&effs, "usage: /mcp off <name>"));
+
+    let effs = core.handle(Input::Line("/mcp invalid".into()));
+    assert!(has_notice(&effs, "unknown /mcp subcommand"));
+}
+
+#[test]
+fn test_mcp_on_idle_sends_enable() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .expect("should send _honk/mcp/enable request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert_eq!(params["names"], json!(["slack-ro"]));
+    assert_eq!(params["confirm"], false);
+
+    let effs = core.handle(Input::Line("/mcp on a b".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .expect("should send _honk/mcp/enable request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["a", "b"]));
+    assert_eq!(params["confirm"], false);
+}
+
+#[test]
+fn test_mcp_on_confirm_idle_sends_enable() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp on! slack".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .expect("should send _honk/mcp/enable request with confirm");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert_eq!(params["names"], json!(["slack"]));
+    assert_eq!(params["confirm"], true);
+}
+
+#[test]
+fn test_mcp_off_idle_sends_disable() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp off slack-ro".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
+        .expect("should send _honk/mcp/disable request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert_eq!(params["names"], json!(["slack-ro"]));
+}
+
+#[test]
+fn test_mcp_on_queued_during_own_run() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("run something".into()));
+    let prompt_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/prompt" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    let crid = core.prompt_sent().unwrap().crid.clone();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "_meta": { "honk": { "source": { "client_req_id": crid } } }
+            }
+        }
+    })));
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_1" } }
+            }
+        }
+    })));
+    assert_eq!(*core.run_state(), RunState::Running("run_1".into()));
+
+    // Queue /mcp on slack-ro
+    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    assert!(has_notice(&effs, "queued: /mcp on slack-ro"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+    );
+    assert_eq!(core.local_queue()[0].0, "/mcp on slack-ro");
+
+    // End run
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_req_id,
+        "result": { "stopReason": "end_turn" }
+    })));
+
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .expect("should send queued _honk/mcp/enable request after turn ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["slack-ro"]));
+    assert_eq!(params["confirm"], false);
+}
+
+#[test]
+fn test_mcp_off_queued_during_foreign_run() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+
+    let effs = core.handle(Input::Line("/mcp off slack-ro".into()));
+    assert!(has_notice(&effs, "queued: /mcp off slack-ro"));
+    assert_eq!(core.local_queue()[0].0, "/mcp off slack-ro");
+
+    // Turn ends
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+
+    let req = end_effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
+        .expect("should send queued _honk/mcp/disable request after turn ends");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["slack-ro"]));
+}
+
+#[test]
+fn test_drop_command_clears_queued_mcp() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+
+    core.handle(Input::Line("/mcp on slack-ro".into()));
+    assert_eq!(core.local_queue().len(), 1);
+
+    let effs = core.handle(Input::Line("/drop".into()));
+    assert!(has_notice(&effs, "dropped 1 queued message(s)"));
+    assert_eq!(core.local_queue().len(), 0);
+}
+
+#[test]
+fn test_mcp_list_response_rendering() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "servers": [
+                { "name": "slack", "enabled": false, "supported": true, "confirm": true },
+                { "name": "slack-ro", "enabled": true, "supported": true, "confirm": false },
+                { "name": "other-conflict", "enabled": false, "supported": true, "confirm": false, "conflict": true },
+                { "name": "datadog", "enabled": false, "supported": false, "reason": "remote MCP servers not supported yet", "confirm": false }
+            ],
+            "other": [
+                { "key": "developer" },
+                { "key": "analyze" }
+            ]
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(&n.text),
+            _ => None,
+        })
+        .expect("should emit notice with list block");
+
+    assert!(notice.contains("off slack !"));
+    assert!(notice.contains("on slack-ro"));
+    assert!(notice.contains("off other-conflict (conflict)"));
+    assert!(notice.contains("n/a datadog — remote MCP servers not supported yet"));
+    assert!(notice.contains("other: developer, analyze"));
+    assert!(
+        notice.contains("/mcp on <name> · /mcp on! <name> for servers marked ! · /mcp off <name>")
+    );
+    assert_eq!(core.mcp_enabled(), &["slack-ro"]);
+}
+
+#[test]
+fn test_mcp_enable_response_rendering() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "results": [
+                { "name": "slack-ro", "ok": true, "changed": true },
+                { "name": "slack", "ok": true, "replaced": "slack-ro", "changed": true },
+                { "name": "broken", "ok": false, "error": "failed to start", "changed": false }
+            ],
+            "servers": [
+                { "name": "slack", "enabled": true, "supported": true, "confirm": true }
+            ],
+            "other": []
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    assert!(has_notice(&resp_effs, "mcp: slack-ro on"));
+    assert!(has_notice(&resp_effs, "mcp: slack on (replaced slack-ro)"));
+    assert!(has_notice(
+        &resp_effs,
+        "mcp: broken failed: failed to start"
+    ));
+    assert_eq!(core.mcp_enabled(), &["slack"]);
+}
+
+#[test]
+fn test_mcp_disable_response_rendering() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp off slack".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/disable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "results": [
+                { "name": "slack", "ok": true, "changed": true },
+                { "name": "already-off", "ok": true, "note": "already off", "changed": false },
+                { "name": "failed-srv", "ok": false, "error": "permission denied", "changed": false }
+            ],
+            "servers": [],
+            "other": []
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    assert!(has_notice(&resp_effs, "mcp: slack off"));
+    assert!(has_notice(&resp_effs, "mcp: already-off off (already off)"));
+    assert!(has_notice(
+        &resp_effs,
+        "mcp: failed-srv failed: permission denied"
+    ));
+    assert_eq!(core.mcp_enabled(), &[] as &[String]);
+}
+
+#[test]
+fn test_mcp_error_verbatim_notice() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp on slack".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    let err_msg =
+        "'slack' can write; use /mcp on! slack to confirm (or /mcp on slack-ro for read-only)";
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32602,
+            "message": err_msg
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.text.contains(err_msg) => Some(n),
+            _ => None,
+        })
+        .expect("should emit verbatim error notice");
+    assert_eq!(notice.kind, NoticeKind::Error);
+}
+
+#[test]
+fn test_mcp_catalog_unconfigured_stops_auto_refresh() {
+    let (mut core, _) = new_test_core();
+
+    // Initial attach or background refresh
+    let req = core
+        .auto_refresh_mcp()
+        .expect("should trigger auto-refresh");
+    let Effect::Request { id: req_id, .. } = req else {
+        panic!()
+    };
+
+    // Honkd responds with -32601 (not configured)
+    let resp_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32601,
+            "message": "MCP catalog not configured (honkd --mcp-catalog)"
+        }
+    })));
+    // Must NOT spam notice on auto-refresh error
+    assert!(!has_notice(&resp_effs, "MCP catalog not configured"));
+
+    // Future auto-refresh returns None (stops auto-refreshing)
+    assert!(core.auto_refresh_mcp().is_none());
+
+    // Explicit /mcp still sends request and shows error notice
+    let explicit_effs = core.handle(Input::Line("/mcp".into()));
+    let explicit_req_id = explicit_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/list" => Some(*id),
+            _ => None,
+        })
+        .expect("explicit /mcp should still send request");
+
+    let explicit_resp_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": explicit_req_id,
+        "error": {
+            "code": -32601,
+            "message": "MCP catalog not configured (honkd --mcp-catalog)"
+        }
+    })));
+    assert!(has_notice(
+        &explicit_resp_effs,
+        "MCP catalog not configured (honkd --mcp-catalog)"
+    ));
+}
+
+#[test]
+fn test_mcp_changed_notification() {
+    let (mut core, _) = new_test_core();
+
+    // From other client with change summary
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "enabled": ["slack-ro", "atlassian"],
+            "change": "enabled slack-ro",
+            "origin": "other"
+        }
+    })));
+    assert!(has_notice(
+        &effs,
+        "mcp: enabled slack-ro (by another client)"
+    ));
+    assert_eq!(core.mcp_enabled(), &["atlassian", "slack-ro"]);
+
+    // From you: no extra notice
+    let effs2 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "enabled": ["atlassian"],
+            "change": "disabled slack-ro",
+            "origin": "you"
+        }
+    })));
+    assert!(!has_notice(&effs2, "another client"));
+    assert_eq!(core.mcp_enabled(), &["atlassian"]);
+
+    // Raw change without enabled array triggers re-list
+    let effs3 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "origin": "other"
+        }
+    })));
+    assert!(
+        effs3
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
+    );
+}

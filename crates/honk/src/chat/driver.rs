@@ -13,11 +13,18 @@ use crate::chat::types::{ChatOpts, Effect, IdAlloc, Input, Notice, Ownership, Ru
 use crate::conn::Conn;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpLaunchConfig {
+    pub names: Vec<String>,
+    pub confirm: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Attach(String),
     New {
         cwd: PathBuf,
         extensions: Option<Vec<String>>,
+        mcp: Option<McpLaunchConfig>,
     },
 }
 
@@ -110,6 +117,7 @@ pub struct StateSnapshot {
     pub replaying: bool,
     pub prompt_in_flight: bool,
     pub connection: ConnectionState,
+    pub mcp_enabled: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,6 +265,7 @@ fn maybe_emit_state(
         replaying: core.is_replaying(),
         prompt_in_flight: core.prompt_in_flight(),
         connection: connection.clone(),
+        mcp_enabled: core.mcp_enabled().to_vec(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -464,6 +473,7 @@ async fn run_driver(
         replaying: true,
         prompt_in_flight: false,
         connection: connection_state.clone(),
+        mcp_enabled: Vec::new(),
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
@@ -484,7 +494,11 @@ async fn run_driver(
     };
 
     let mut core = match opts.target.clone() {
-        Target::New { cwd, extensions } => {
+        Target::New {
+            cwd,
+            extensions,
+            mcp,
+        } => {
             let cwd_for_pigeon = cwd.to_string_lossy().to_string();
             let mut ids = IdAlloc::new();
             let new_req_id = ids.allocate();
@@ -504,6 +518,18 @@ async fn run_driver(
                     .collect();
                 params["_meta"] = json!({
                     "enabledExtensions": ext_arr,
+                });
+            }
+            if let Some(mcp_cfg) = mcp {
+                if params.get("_meta").is_none() {
+                    params["_meta"] = json!({});
+                }
+                if params["_meta"].get("honk").is_none() {
+                    params["_meta"]["honk"] = json!({});
+                }
+                params["_meta"]["honk"]["mcp"] = json!({
+                    "names": mcp_cfg.names,
+                    "confirm": mcp_cfg.confirm,
                 });
             }
 
@@ -879,6 +905,12 @@ async fn run_driver(
                             let _ = conn
                                 .send_request(list_id, "session/list", Value::Object(params))
                                 .await;
+
+                            if let Some(Effect::Request { id, method, params }) =
+                                core.auto_refresh_mcp()
+                            {
+                                let _ = conn.send_request(id, &method, params).await;
+                            }
                         }
 
                         if frame.get("method").and_then(Value::as_str)
@@ -886,6 +918,13 @@ async fn run_driver(
                             && connection_state == ConnectionState::Live
                         {
                             live_since = Some(Instant::now());
+                            if let Some(conn) = conn_opt.as_mut() {
+                                if let Some(Effect::Request { id, method, params }) =
+                                    core.auto_refresh_mcp()
+                                {
+                                    let _ = conn.send_request(id, &method, params).await;
+                                }
+                            }
                         }
                         if frame.get("method").and_then(Value::as_str)
                             == Some(honk_wire::method::RESET)

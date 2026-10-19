@@ -65,6 +65,7 @@ struct HonkdHarness {
     upstream: String,
     upstream_secret: PathBuf,
     bin_path: PathBuf,
+    extra_args: Vec<String>,
 }
 
 impl HonkdHarness {
@@ -74,6 +75,16 @@ impl HonkdHarness {
         upstream_secret: &Path,
         explicit_addr: Option<SocketAddr>,
     ) -> Self {
+        Self::spawn_with_extra(bin, upstream, upstream_secret, explicit_addr, &[]).await
+    }
+
+    pub async fn spawn_with_extra(
+        bin: &Path,
+        upstream: &str,
+        upstream_secret: &Path,
+        explicit_addr: Option<SocketAddr>,
+        extra_args: &[&str],
+    ) -> Self {
         let state_dir = tempfile::tempdir().expect("create state dir");
         let (child, addr) = spawn_honkd_process(
             bin,
@@ -81,6 +92,7 @@ impl HonkdHarness {
             upstream_secret,
             state_dir.path(),
             explicit_addr,
+            extra_args,
         )
         .await;
 
@@ -91,6 +103,7 @@ impl HonkdHarness {
             upstream: upstream.to_string(),
             upstream_secret: upstream_secret.to_path_buf(),
             bin_path: bin.to_path_buf(),
+            extra_args: extra_args.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -132,12 +145,14 @@ impl HonkdHarness {
             }
         }
 
+        let extra: Vec<&str> = self.extra_args.iter().map(|s| s.as_str()).collect();
         let (child, addr) = spawn_honkd_process(
             &self.bin_path,
             &self.upstream,
             &self.upstream_secret,
             self.state_dir.path(),
             Some(self.addr),
+            &extra,
         )
         .await;
 
@@ -158,6 +173,7 @@ async fn spawn_honkd_process(
     upstream_secret: &Path,
     state_dir: &Path,
     explicit_addr: Option<SocketAddr>,
+    extra_args: &[&str],
 ) -> (Child, SocketAddr) {
     let mut cmd = Command::new(bin);
     if let Some(a) = explicit_addr {
@@ -168,6 +184,9 @@ async fn spawn_honkd_process(
     cmd.arg("--upstream").arg(upstream);
     cmd.arg("--upstream-secret-file").arg(upstream_secret);
     cmd.arg("--state-dir").arg(state_dir);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -227,6 +246,7 @@ async fn test_scenario_a_new_session_prompt_assistant_text_and_idle() {
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
 
@@ -445,6 +465,7 @@ async fn test_scenario_c_steer_consumed_in_own_gated_turn() {
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
 
@@ -706,6 +727,7 @@ async fn test_scenario_e_interrupt_own_vs_foreign() {
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
 
@@ -1056,6 +1078,7 @@ async fn test_scenario_g_kill9_honkd_mid_turn_reconnects_resends_crid_single_ass
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
 
@@ -1283,6 +1306,7 @@ async fn test_driver_idle_detach_and_reattach() {
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
     // Short idle timeout so it detaches on ticks
@@ -2006,8 +2030,9 @@ async fn test_session_info_with_cwd_emitted_on_attach_and_new() {
         h.ws_url(),
         h.secret(),
         Target::New {
-            cwd: tmp_cwd.clone(),
+            cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
     let (handle_new, mut rx_new) = start(opts_new).await.expect("start driver new");
@@ -2410,6 +2435,7 @@ async fn test_driver_forwards_known_cwd_to_session_list() {
         Target::New {
             cwd: PathBuf::from("/test/known/driver/cwd"),
             extensions: None,
+            mcp: None,
         },
     );
     let (handle, mut rx) = start(opts).await.expect("start driver");
@@ -2555,6 +2581,7 @@ async fn new_session_pigeon_notice(
         Target::New {
             cwd: cwd.to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
     opts.pigeon = Some(pigeon);
@@ -2668,6 +2695,7 @@ async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
         Target::New {
             cwd: tmp.path().to_path_buf(),
             extensions: None,
+            mcp: None,
         },
     );
 
@@ -2803,4 +2831,136 @@ async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
     );
 
     handle.send(UiCommand::Shutdown).expect("send shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_driver_e2e_fake_goose() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+
+    let temp_cat_dir = tempfile::tempdir().unwrap();
+    let cat_path = temp_cat_dir.path().join("opencode.json");
+    let cat_json = json!({
+        "mcp": {
+            "local-test": {
+                "type": "local",
+                "command": ["/bin/sh"],
+                "args": ["-c", "echo local-test"]
+            },
+            "slack": {
+                "type": "local",
+                "command": ["/bin/sh"],
+                "args": ["-c", "echo slack"]
+            },
+            "slack-ro": {
+                "type": "local",
+                "command": ["/bin/sh"],
+                "args": ["-c", "echo slack-ro"]
+            }
+        }
+    });
+    std::fs::write(&cat_path, cat_json.to_string()).unwrap();
+
+    let cat_str = cat_path.to_str().unwrap();
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &[
+            "--allow-unpatched-upstream",
+            "--mcp-catalog",
+            cat_str,
+            "--mcp-confirm",
+            "slack",
+        ],
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let opts = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: Some(honk::chat::McpLaunchConfig {
+                names: vec!["slack-ro".into()],
+                confirm: false,
+            }),
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    // Collect until attached
+    let mut session_new_seen = false;
+    let mut attached_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !attached_seen {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::SessionNew { .. } => session_new_seen = true,
+                UiEvent::Attached { .. } => attached_seen = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(session_new_seen);
+    assert!(attached_seen);
+
+    // Send /mcp list
+    handle
+        .send(UiCommand::Line("/mcp".into()))
+        .expect("send /mcp");
+    let mut list_notice_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !list_notice_seen {
+        if let Ok(Some(UiEvent::Notice(n))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && n.text.contains("on slack-ro")
+            && n.text.contains("off slack !")
+        {
+            list_notice_seen = true;
+            break;
+        }
+    }
+    assert!(list_notice_seen, "expected /mcp list notice");
+
+    // Enable slack with confirm
+    handle
+        .send(UiCommand::Line("/mcp on! slack".into()))
+        .expect("send /mcp on!");
+    let mut enable_notice_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !enable_notice_seen {
+        if let Ok(Some(UiEvent::Notice(n))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && n.text.contains("mcp: slack on (replaced slack-ro)")
+        {
+            enable_notice_seen = true;
+            break;
+        }
+    }
+    assert!(enable_notice_seen, "expected slack enable notice");
+
+    // Disable slack
+    handle
+        .send(UiCommand::Line("/mcp off slack".into()))
+        .expect("send /mcp off");
+    let mut disable_notice_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !disable_notice_seen {
+        if let Ok(Some(UiEvent::Notice(n))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && n.text.contains("mcp: slack off")
+        {
+            disable_notice_seen = true;
+            break;
+        }
+    }
+    assert!(disable_notice_seen, "expected slack disable notice");
 }
