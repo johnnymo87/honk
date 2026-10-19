@@ -94,22 +94,25 @@ blocking raw `extensions/add|remove` in honkd (breaks stall-watch).
 3. **honkd methods** (viewer-facing, honk-aware or not):
    - `_honk/mcp/list {sessionId}` → `{servers:[{name, enabled, supported, reason?,
      confirm, sibling?}], other:[{key}]}`. `enabled` = the goose list has the key **and** the
-     marker; a key present without the marker is reported as `conflict:true`.
+     marker; a key present without the marker is reported as `conflict:true`. `confirm` is true
+     for any server not in `--mcp-no-confirm`.
    - `_honk/mcp/enable {sessionId, names, confirm?}` and `_honk/mcp/disable {sessionId,
-     names}` → `{results:[{name, ok, error?}], servers:[…]}`. Whole-request refusals are
-     JSON-RPC errors: catalog missing/unreadable, unknown or unsupported name, a confirm
-     name without `confirm:true` (message suggests the `-ro` sibling when one exists),
+     names}` → `{results:[{name, ok, error?}], servers:[…]}`. `confirm` is an array of names
+     to confirm (e.g. `["slack"]`); non-array `confirm` is rejected with `-32602`. Whole-request
+     refusals are JSON-RPC errors: catalog missing/unreadable, unknown or unsupported name, a confirm
+     name not listed in `confirm` (message suggests the `-ro` sibling when one exists),
      **session busy** (a run is active; `-32002`, "try after this turn"), another MCP op
      already in flight. Per-name failures (goose add errors) are results, redacted with
-     honkd's `Redactor`.
+     honkd's `{file:}` secret redaction and capped to 2000 chars.
    - enable skips names already on; refuses a name whose key is held by an extension
      without the marker; **siblings are exclusive**: enabling `X` first removes a
      marker-carrying `X-ro` and vice versa (no duplicate slack tools).
    - disable only removes marker-carrying entries. Builtins/platform extensions are never
      touched by `/mcp`, so a viewer cannot strip what pigeon or a coordinator relies on.
-   - **Confirm list:** `honkd --mcp-confirm <name>` (repeatable/comma list). Workstation sets
-     `slack,atlassian,devcycle,pagerduty` (servers that can write). The `-ro` sibling rule only
-     drives the hint.
+   - **No-confirm list (fail-safe):** `honkd --mcp-no-confirm <name>` (repeatable/comma list).
+     Servers in this list enable without confirmation; EVERY other catalog server requires
+     confirmation. Workstation sets `--mcp-no-confirm slack-ro,figma`. The `-ro` sibling rule
+     only drives the hint.
 4. **Actor plumbing.** A new `SessionMsg::McpOp` is handled like `Forward` (queued while
    Reattaching/Rebuilding). The actor refuses when `turn.run`/`turn.inflight` is set or an
    op is running, else marks `mcp_op_running` and spawns a task. The task talks to goose
@@ -176,7 +179,7 @@ methods or goose's directly; `confirm` prevents accidents, not misuse — same s
 ### W — workstation
 
 - **W1** honkd `ExecStart` gains `--mcp-catalog %h/.config/opencode/opencode.json
-  --mcp-confirm slack,atlassian,devcycle,pagerduty`; bump `flake.lock` honk (after the honk
+  --mcp-no-confirm slack-ro,figma`; bump `flake.lock` honk (after the honk
   PR merges — honkd rejects unknown flags); skill `enabling-mcp-servers`.
 - **W2** after the fork release: `pkgs/goose/default.nix` → `patched-1.54.0.7`.
 

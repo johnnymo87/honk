@@ -216,7 +216,7 @@ async fn test_mcp_live_e2e() {
     let catalog_path = temp_dir.path().join("opencode.json");
     std::fs::write(&catalog_path, catalog_content.to_string()).expect("write opencode.json");
 
-    // 3. Spawn honkd with --mcp-catalog and --mcp-no-confirm honktest-ro
+    // 3. Spawn honkd with --mcp-catalog and --mcp-no-confirm honktest,honktest-missing
     let h = Honkd::spawn(
         &g.url(),
         g.secret_file(),
@@ -224,7 +224,7 @@ async fn test_mcp_live_e2e() {
             "--mcp-catalog",
             catalog_path.to_str().unwrap(),
             "--mcp-no-confirm",
-            "honktest-ro",
+            "honktest,honktest-missing",
         ],
     )
     .await;
@@ -419,10 +419,8 @@ async fn test_mcp_live_e2e() {
         .as_str()
         .expect("error string in per-name failure");
     assert!(
-        err_str.contains("cannot read")
-            || err_str.contains("exit status")
-            || err_str.contains("78"),
-        "error must mention 'cannot read' or exit status, got: {err_str}"
+        err_str.contains("cannot read"),
+        "error must mention 'cannot read', got: {err_str}"
     );
 
     let list_after_missing = v.call("_honk/mcp/list", json!({ "sessionId": &sid })).await;
