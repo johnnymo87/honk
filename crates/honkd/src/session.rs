@@ -87,6 +87,18 @@ enum McpOpOutput {
     Op(crate::mcp::ops::OpResult),
 }
 
+enum McpTarget {
+    Viewer {
+        viewer: ViewerTx,
+        id: Value,
+    },
+    Launch {
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
+        >,
+    },
+}
+
 pub struct ReactivationData {
     pub conn_id: String,
     pub up_handle: UpstreamHandle,
@@ -153,6 +165,7 @@ pub enum SessionMsg {
         op: McpOpKind,
     },
     McpLaunch {
+        viewer_id: ViewerId,
         names: Vec<String>,
         confirm: bool,
         reply: tokio::sync::oneshot::Sender<
@@ -1446,6 +1459,7 @@ impl Session {
             && !self.rebuild_at_turn_end
             && !self.needs_rebuild
             && self.finalizing_waiters.is_empty()
+            && !self.mcp_op_running
     }
 
     async fn evict(&mut self) -> bool {
@@ -2316,6 +2330,153 @@ impl Session {
         }
     }
 
+    fn spawn_mcp_task(
+        &mut self,
+        origin_viewer: Option<ViewerId>,
+        op: McpOpKind,
+        target: McpTarget,
+    ) {
+        let is_list = matches!(op, McpOpKind::List);
+        let mcp_config = match &self.hub.mcp {
+            Some(cfg) => cfg.clone(),
+            None => {
+                if !is_list {
+                    self.mcp_op_running = false;
+                }
+                let err = crate::mcp::ops::OpError {
+                    code: -32601,
+                    message: "MCP catalog not configured (honkd --mcp-catalog)".to_string(),
+                };
+                match target {
+                    McpTarget::Viewer { viewer, id } => {
+                        let err_resp = crate::rpc::error(id, err.code as i64, err.message, None);
+                        let _ = viewer.send_frame(axum::extract::ws::Message::Text(
+                            err_resp.to_string().into(),
+                        ));
+                    }
+                    McpTarget::Launch { reply } => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+                return;
+            }
+        };
+
+        let sid = self.sid.clone();
+        let self_tx = self.self_tx.clone();
+        let requester = ActorRequester {
+            tx: self_tx.clone(),
+        };
+
+        let task = tokio::spawn(async move {
+            let budget = std::time::Duration::from_secs(60);
+            let work = async {
+                let catalog = crate::mcp::catalog::Catalog::load(&mcp_config.catalog_path)
+                    .map_err(crate::mcp::ops::OpError::catalog_unreadable)?;
+                match op {
+                    McpOpKind::List => {
+                        let res =
+                            crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
+                                .await?;
+                        Ok(McpOpOutput::List(res))
+                    }
+                    McpOpKind::Enable { names, confirm } => {
+                        let res = crate::mcp::ops::enable(
+                            &requester,
+                            &catalog,
+                            &mcp_config.policy,
+                            &sid,
+                            &names,
+                            confirm,
+                        )
+                        .await?;
+                        Ok(McpOpOutput::Op(res))
+                    }
+                    McpOpKind::Disable { names } => {
+                        let res = crate::mcp::ops::disable(
+                            &requester,
+                            &catalog,
+                            &mcp_config.policy,
+                            &sid,
+                            &names,
+                        )
+                        .await?;
+                        Ok(McpOpOutput::Op(res))
+                    }
+                }
+            };
+
+            let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
+                match tokio::time::timeout(budget, work).await {
+                    Ok(res) => res,
+                    Err(_) => Err(crate::mcp::ops::OpError::request_failed(
+                        "MCP change timed out; run /mcp to see the current state",
+                    )),
+                };
+
+            match target {
+                McpTarget::Viewer { viewer, id } => {
+                    let resp = match &outcome {
+                        Ok(McpOpOutput::List(res)) => {
+                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                        }
+                        Ok(McpOpOutput::Op(res)) => {
+                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                        }
+                        Err(err) => {
+                            crate::rpc::error(id, err.code as i64, err.message.clone(), None)
+                        }
+                    };
+                    let _ = viewer
+                        .send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
+                }
+                McpTarget::Launch { reply } => {
+                    let res = match outcome.as_ref() {
+                        Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
+                        Ok(McpOpOutput::List(_)) => unreachable!(),
+                        Err(err) => Err(err.clone()),
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+
+            if !is_list {
+                let (enabled, change, changed) = match &outcome {
+                    Ok(McpOpOutput::Op(res)) => {
+                        (res.enabled.clone(), res.summary.clone(), res.has_changes())
+                    }
+                    _ => (Vec::new(), String::new(), false),
+                };
+                let _ = self_tx
+                    .send(SessionMsg::McpOpDone {
+                        origin_viewer,
+                        enabled,
+                        change,
+                        changed,
+                    })
+                    .await;
+            }
+        });
+
+        if !is_list {
+            let watcher_tx = self.self_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = task.await
+                    && (e.is_panic() || e.is_cancelled())
+                {
+                    let _ = watcher_tx
+                        .send(SessionMsg::McpOpDone {
+                            origin_viewer: None,
+                            enabled: Vec::new(),
+                            change: String::new(),
+                            changed: false,
+                        })
+                        .await;
+                }
+            });
+        }
+    }
+
     async fn on_msg(&mut self, msg: SessionMsg) {
         match msg {
             SessionMsg::Attach {
@@ -2835,226 +2996,37 @@ impl Session {
                     self.mcp_op_running = true;
                 }
 
-                let mcp_config = match &self.hub.mcp {
-                    Some(cfg) => cfg.clone(),
-                    None => {
-                        if !is_list {
-                            self.mcp_op_running = false;
-                        }
-                        let err = crate::rpc::error(
-                            id,
-                            -32601,
-                            "MCP catalog not configured (honkd --mcp-catalog)",
-                            None,
-                        );
-                        self.send_to_viewer(viewer_id, err);
-                        return;
-                    }
-                };
-
-                let sid = self.sid.clone();
-                let self_tx = self.self_tx.clone();
-                let requester = ActorRequester {
-                    tx: self_tx.clone(),
-                };
-
-                let task = tokio::spawn(async move {
-                    let budget = std::time::Duration::from_secs(60);
-                    let work = async {
-                        let catalog = crate::mcp::catalog::Catalog::load(&mcp_config.catalog_path)
-                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?;
-                        match op {
-                            McpOpKind::List => {
-                                let res = crate::mcp::ops::list(
-                                    &requester,
-                                    &catalog,
-                                    &mcp_config.policy,
-                                    &sid,
-                                )
-                                .await?;
-                                Ok(McpOpOutput::List(res))
-                            }
-                            McpOpKind::Enable { names, confirm } => {
-                                let res = crate::mcp::ops::enable(
-                                    &requester,
-                                    &catalog,
-                                    &mcp_config.policy,
-                                    &sid,
-                                    &names,
-                                    confirm,
-                                )
-                                .await?;
-                                Ok(McpOpOutput::Op(res))
-                            }
-                            McpOpKind::Disable { names } => {
-                                let res = crate::mcp::ops::disable(
-                                    &requester,
-                                    &catalog,
-                                    &mcp_config.policy,
-                                    &sid,
-                                    &names,
-                                )
-                                .await?;
-                                Ok(McpOpOutput::Op(res))
-                            }
-                        }
-                    };
-
-                    let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
-                        match tokio::time::timeout(budget, work).await {
-                            Ok(res) => res,
-                            Err(_) => Err(crate::mcp::ops::OpError::request_failed(
-                                "MCP change timed out; run /mcp to see the current state",
-                            )),
-                        };
-
-                    match &outcome {
-                        Ok(McpOpOutput::List(res)) => {
-                            let resp = crate::rpc::response(id, serde_json::to_value(res).unwrap());
-                            let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                                resp.to_string().into(),
-                            ));
-                        }
-                        Ok(McpOpOutput::Op(res)) => {
-                            let resp = crate::rpc::response(id, serde_json::to_value(res).unwrap());
-                            let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                                resp.to_string().into(),
-                            ));
-                        }
-                        Err(err) => {
-                            let err_resp =
-                                crate::rpc::error(id, err.code as i64, err.message.clone(), None);
-                            let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                                err_resp.to_string().into(),
-                            ));
-                        }
-                    }
-
-                    if !is_list {
-                        let (enabled, change, changed) = match &outcome {
-                            Ok(McpOpOutput::Op(res)) => {
-                                let changed = res.results.iter().any(|r| {
-                                    r.ok && r.note.as_deref() != Some("already on")
-                                        && r.note.as_deref() != Some("already off")
-                                });
-                                (res.enabled.clone(), res.summary.clone(), changed)
-                            }
-                            _ => (Vec::new(), String::new(), false),
-                        };
-                        let _ = self_tx
-                            .send(SessionMsg::McpOpDone {
-                                origin_viewer: Some(viewer_id),
-                                enabled,
-                                change,
-                                changed,
-                            })
-                            .await;
-                    }
-                });
-
-                if !is_list {
-                    let watcher_tx = self.self_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = task.await
-                            && (e.is_panic() || e.is_cancelled())
-                        {
-                            let _ = watcher_tx
-                                .send(SessionMsg::McpOpDone {
-                                    origin_viewer: None,
-                                    enabled: Vec::new(),
-                                    change: String::new(),
-                                    changed: false,
-                                })
-                                .await;
-                        }
-                    });
-                }
+                self.spawn_mcp_task(Some(viewer_id), op, McpTarget::Viewer { viewer, id });
             }
             SessionMsg::McpLaunch {
+                viewer_id,
                 names,
                 confirm,
                 reply,
             } => {
-                self.mcp_op_running = true;
-                let mcp_config = match &self.hub.mcp {
-                    Some(cfg) => cfg.clone(),
-                    None => {
-                        self.mcp_op_running = false;
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    if self.queued_msgs.len() >= 1024 {
                         let _ = reply.send(Err(crate::mcp::ops::OpError {
-                            code: -32601,
-                            message: "MCP catalog not configured (honkd --mcp-catalog)".to_string(),
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
                         }));
-                        return;
-                    }
-                };
-
-                let sid = self.sid.clone();
-                let self_tx = self.self_tx.clone();
-                let requester = ActorRequester {
-                    tx: self_tx.clone(),
-                };
-
-                let task = tokio::spawn(async move {
-                    let budget = std::time::Duration::from_secs(60);
-                    let work = async {
-                        let catalog = crate::mcp::catalog::Catalog::load(&mcp_config.catalog_path)
-                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?;
-                        crate::mcp::ops::enable(
-                            &requester,
-                            &catalog,
-                            &mcp_config.policy,
-                            &sid,
-                            &names,
+                    } else {
+                        self.queued_msgs.push_back(SessionMsg::McpLaunch {
+                            viewer_id,
+                            names,
                             confirm,
-                        )
-                        .await
-                    };
-
-                    let outcome = match tokio::time::timeout(budget, work).await {
-                        Ok(res) => res,
-                        Err(_) => Err(crate::mcp::ops::OpError::request_failed(
-                            "MCP change timed out; run /mcp to see the current state",
-                        )),
-                    };
-
-                    let (enabled, change, changed) = match &outcome {
-                        Ok(res) => {
-                            let changed = res.results.iter().any(|r| {
-                                r.ok && r.note.as_deref() != Some("already on")
-                                    && r.note.as_deref() != Some("already off")
-                            });
-                            (res.enabled.clone(), res.summary.clone(), changed)
-                        }
-                        _ => (Vec::new(), String::new(), false),
-                    };
-
-                    let _ = reply.send(outcome);
-
-                    let _ = self_tx
-                        .send(SessionMsg::McpOpDone {
-                            origin_viewer: None,
-                            enabled,
-                            change,
-                            changed,
-                        })
-                        .await;
-                });
-
-                let watcher_tx = self.self_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = task.await
-                        && (e.is_panic() || e.is_cancelled())
-                    {
-                        let _ = watcher_tx
-                            .send(SessionMsg::McpOpDone {
-                                origin_viewer: None,
-                                enabled: Vec::new(),
-                                change: String::new(),
-                                changed: false,
-                            })
-                            .await;
+                            reply,
+                        });
                     }
-                });
+                    return;
+                }
+
+                self.mcp_op_running = true;
+                self.spawn_mcp_task(
+                    Some(viewer_id),
+                    McpOpKind::Enable { names, confirm },
+                    McpTarget::Launch { reply },
+                );
             }
             SessionMsg::McpOpDone {
                 origin_viewer,
@@ -3445,7 +3417,8 @@ impl Session {
                     match m {
                         SessionMsg::Prompt { viewer_id, id, .. }
                         | SessionMsg::Steer { viewer_id, id, .. }
-                        | SessionMsg::Forward { viewer_id, id, .. } => {
+                        | SessionMsg::Forward { viewer_id, id, .. }
+                        | SessionMsg::McpOp { viewer_id, id, .. } => {
                             let err_resp = crate::rpc::error(
                                 id,
                                 -32000,
@@ -3453,6 +3426,15 @@ impl Session {
                                 None,
                             );
                             self.send_to_viewer(viewer_id, err_resp);
+                        }
+                        SessionMsg::Internal { reply, .. } => {
+                            let _ = reply.send(Err(format!("Session is gone: {reason}")));
+                        }
+                        SessionMsg::McpLaunch { reply, .. } => {
+                            let _ = reply.send(Err(crate::mcp::ops::OpError {
+                                code: -32000,
+                                message: format!("Session is gone: {reason}"),
+                            }));
                         }
                         _ => {}
                     }
@@ -4512,9 +4494,10 @@ mod tests {
         handle_msg.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_internal_and_mcp_op_queued_while_rebuilding() {
-        let sid = "ses_queue_test";
+    async fn create_test_session(
+        sid: &str,
+        state: ActorState,
+    ) -> (Session, tempfile::TempDir, honk_testgoose::FakeGoose) {
         let d = tempfile::tempdir().unwrap();
         let state_store = Arc::new(tokio::sync::Mutex::new(
             crate::state::StateStore::open(d.path(), None, false).unwrap(),
@@ -4532,7 +4515,7 @@ mod tests {
         .unwrap();
         let (up_handle, event_rx) = up.split();
 
-        let mut session = Session {
+        let session = Session {
             sid: sid.to_string(),
             state_dir: d.path().to_path_buf(),
             state_store: state_store.clone(),
@@ -4574,7 +4557,7 @@ mod tests {
             self_tx,
             log,
             turn: TurnCore::default(),
-            state: ActorState::Rebuilding,
+            state,
             ids: crate::rpc::UpstreamIds::new(1),
             last_processed_session_id: None,
             last_processed_conn_id: None,
@@ -4607,12 +4590,19 @@ mod tests {
             last_usage: None,
             mcp_op_running: false,
         };
+        (session, d, fake)
+    }
+
+    #[tokio::test]
+    async fn test_internal_and_mcp_op_queued_while_rebuilding() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_queue_test", ActorState::Rebuilding).await;
 
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         session
             .on_msg(SessionMsg::Internal {
                 method: "_goose/unstable/session/extensions/list".to_string(),
-                params: json!({"sessionId": sid}),
+                params: json!({"sessionId": "ses_queue_test"}),
                 reply: reply_tx,
             })
             .await;
@@ -4632,100 +4622,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_pending_requests_fails_internal_oneshot() {
-        let sid = "ses_fail_test";
-        let d = tempfile::tempdir().unwrap();
-        let state_store = Arc::new(tokio::sync::Mutex::new(
-            crate::state::StateStore::open(d.path(), None, false).unwrap(),
-        ));
-        let log = crate::log::SessionLog::create(&d.path().join("test.jsonl"), 1, None, Vec::new())
-            .unwrap();
-        let (self_tx, rx) = tokio::sync::mpsc::channel(10);
-        let fake = honk_testgoose::FakeGoose::start().await;
-        let up = honk_upstream::Upstream::initialize(
-            &fake.url(),
-            fake.secret().to_string(),
-            honk_upstream::Recorder::disabled(),
-        )
-        .await
-        .unwrap();
-        let (up_handle, event_rx) = up.split();
-
-        let mut session = Session {
-            sid: sid.to_string(),
-            state_dir: d.path().to_path_buf(),
-            state_store: state_store.clone(),
-            hub: Arc::new(crate::hub::Hub {
-                args: Arc::new(
-                    crate::config::Args::try_parse_from([
-                        "honkd",
-                        "--upstream-secret-file",
-                        fake.secret_file().to_str().unwrap(),
-                    ])
-                    .unwrap(),
-                ),
-                state: state_store.clone(),
-                state_dir: d.path().to_path_buf(),
-                upstream_url: fake.url(),
-                upstream_secret: fake.secret().to_string(),
-                turn_hook: None,
-                control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
-                control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
-                is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                control_connected_notify: Arc::new(tokio::sync::Notify::new()),
-                control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
-                upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
-                pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-                running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
-                self_weak: std::sync::RwLock::new(None),
-                activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                mcp: None,
-            }),
-            up: up_handle,
-            events: event_rx,
-            rx,
-            self_tx,
-            log,
-            turn: TurnCore::default(),
-            state: ActorState::Live,
-            ids: crate::rpc::UpstreamIds::new(1),
-            last_processed_session_id: None,
-            last_processed_conn_id: None,
-            viewers: HashMap::new(),
-            pending_requests: HashMap::new(),
-            pending_server_requests: Vec::new(),
-            recently_resolved: HashSet::new(),
-            init_result: json!({}),
-            queued_msgs: VecDeque::new(),
-            rebuilding_buffered_frames: Vec::new(),
-            rebuild_at_turn_end: false,
-            suppressed_keys: HashSet::new(),
-            gap_evidenced: false,
-            start_reattach: false,
-            needs_rebuild: false,
-            inflight_needs_delivery_check: false,
-            finalizing_waiters: HashMap::new(),
-            active_probe_id: None,
-            gap_synthesis_grace: Duration::from_millis(500),
-            synthesized_replies: HashSet::new(),
-            initial_events: Vec::new(),
-            gap_synthesis_pending: false,
-            reactivating: false,
-            reactivation_token: 0,
-            rebuild_token: 0,
-            ambiguous_check_token: 0,
-            ambiguous_window_expired: false,
-            ambiguous_export_in_flight: false,
-            last_started_upstream: None,
-            last_usage: None,
-            mcp_op_running: false,
-        };
-
+        let (mut session, _d, _fake) = create_test_session("ses_fail_test", ActorState::Live).await;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         session.pending_requests.insert(
             "up_req_1".to_string(),
@@ -4742,101 +4639,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_idle_requires_mcp_op_not_running() {
+        let (mut session, _d, _fake) = create_test_session("ses_idle_test", ActorState::Live).await;
+        assert!(session.is_idle());
+
+        session.mcp_op_running = true;
+        assert!(!session.is_idle());
+
+        session.mcp_op_running = false;
+        assert!(session.is_idle());
+    }
+
+    #[tokio::test]
+    async fn test_reactivation_failed_fails_queued_mcp_and_internal_msgs() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_react_fail", ActorState::Reattaching).await;
+        session.reactivating = true;
+
+        let (internal_tx, internal_rx) = tokio::sync::oneshot::channel();
+        session.queued_msgs.push_back(SessionMsg::Internal {
+            method: "test_method".to_string(),
+            params: json!({}),
+            reply: internal_tx,
+        });
+
+        let (launch_tx, launch_rx) = tokio::sync::oneshot::channel();
+        session.queued_msgs.push_back(SessionMsg::McpLaunch {
+            viewer_id: 1,
+            names: vec!["slack".to_string()],
+            confirm: true,
+            reply: launch_tx,
+        });
+
+        let (viewer_tx, mut viewer_rx) = tokio::sync::mpsc::channel(10);
+        let vtx = test_viewer_tx(viewer_tx);
+        session.attach_live(2, vtx.clone(), true);
+
+        session.queued_msgs.push_back(SessionMsg::McpOp {
+            viewer_id: 2,
+            viewer: vtx,
+            id: json!(42),
+            op: McpOpKind::List,
+        });
+
+        session
+            .on_msg(SessionMsg::ReactivationFailed {
+                token: session.reactivation_token,
+                reason: "upstream gone".to_string(),
+                permanent: true,
+            })
+            .await;
+
+        // Internal oneshot failed
+        let int_res = internal_rx.await.unwrap();
+        assert!(int_res.unwrap_err().contains("Session is gone"));
+
+        // Launch oneshot failed
+        let launch_res = launch_rx.await.unwrap();
+        assert_eq!(launch_res.unwrap_err().code, -32000);
+
+        // Viewer got -32000 error
+        let v_frame = viewer_rx.recv().await.unwrap();
+        let v_json: Value = serde_json::from_str(v_frame.to_text().unwrap()).unwrap();
+        assert_eq!(v_json["id"], 42);
+        assert_eq!(v_json["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
     async fn test_mcp_op_refusals_busy_and_in_progress() {
-        let sid = "ses_mcp_busy_test";
-        let d = tempfile::tempdir().unwrap();
-        let state_store = Arc::new(tokio::sync::Mutex::new(
-            crate::state::StateStore::open(d.path(), None, false).unwrap(),
-        ));
-        let log = crate::log::SessionLog::create(&d.path().join("test.jsonl"), 1, None, Vec::new())
-            .unwrap();
-        let (self_tx, rx) = tokio::sync::mpsc::channel(10);
-        let fake = honk_testgoose::FakeGoose::start().await;
-        let up = honk_upstream::Upstream::initialize(
-            &fake.url(),
-            fake.secret().to_string(),
-            honk_upstream::Recorder::disabled(),
-        )
-        .await
-        .unwrap();
-        let (up_handle, event_rx) = up.split();
-
-        let mut session = Session {
-            sid: sid.to_string(),
-            state_dir: d.path().to_path_buf(),
-            state_store: state_store.clone(),
-            hub: Arc::new(crate::hub::Hub {
-                args: Arc::new(
-                    crate::config::Args::try_parse_from([
-                        "honkd",
-                        "--upstream-secret-file",
-                        fake.secret_file().to_str().unwrap(),
-                    ])
-                    .unwrap(),
-                ),
-                state: state_store.clone(),
-                state_dir: d.path().to_path_buf(),
-                upstream_url: fake.url(),
-                upstream_secret: fake.secret().to_string(),
-                turn_hook: None,
-                control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
-                control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
-                is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                control_connected_notify: Arc::new(tokio::sync::Notify::new()),
-                control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
-                upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
-                pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-                running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
-                self_weak: std::sync::RwLock::new(None),
-                activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                mcp: None,
-            }),
-            up: up_handle,
-            events: event_rx,
-            rx,
-            self_tx,
-            log,
-            turn: TurnCore::default(),
-            state: ActorState::Live,
-            ids: crate::rpc::UpstreamIds::new(1),
-            last_processed_session_id: None,
-            last_processed_conn_id: None,
-            viewers: HashMap::new(),
-            pending_requests: HashMap::new(),
-            pending_server_requests: Vec::new(),
-            recently_resolved: HashSet::new(),
-            init_result: json!({}),
-            queued_msgs: VecDeque::new(),
-            rebuilding_buffered_frames: Vec::new(),
-            rebuild_at_turn_end: false,
-            suppressed_keys: HashSet::new(),
-            gap_evidenced: false,
-            start_reattach: false,
-            needs_rebuild: false,
-            inflight_needs_delivery_check: false,
-            finalizing_waiters: HashMap::new(),
-            active_probe_id: None,
-            gap_synthesis_grace: Duration::from_millis(500),
-            synthesized_replies: HashSet::new(),
-            initial_events: Vec::new(),
-            gap_synthesis_pending: false,
-            reactivating: false,
-            reactivation_token: 0,
-            rebuild_token: 0,
-            ambiguous_check_token: 0,
-            ambiguous_window_expired: false,
-            ambiguous_export_in_flight: false,
-            last_started_upstream: None,
-            last_usage: None,
-            mcp_op_running: false,
-        };
-
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_busy_test", ActorState::Live).await;
         let (viewer_tx, mut viewer_rx) = tokio::sync::mpsc::channel(10);
         let vtx = test_viewer_tx(viewer_tx);
         session.attach_live(1, vtx.clone(), true);
@@ -4889,101 +4761,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_op_done_fanout_origins() {
-        let sid = "ses_mcp_done_test";
-        let d = tempfile::tempdir().unwrap();
-        let state_store = Arc::new(tokio::sync::Mutex::new(
-            crate::state::StateStore::open(d.path(), None, false).unwrap(),
-        ));
-        let log = crate::log::SessionLog::create(&d.path().join("test.jsonl"), 1, None, Vec::new())
-            .unwrap();
-        let (self_tx, rx) = tokio::sync::mpsc::channel(10);
-        let fake = honk_testgoose::FakeGoose::start().await;
-        let up = honk_upstream::Upstream::initialize(
-            &fake.url(),
-            fake.secret().to_string(),
-            honk_upstream::Recorder::disabled(),
-        )
-        .await
-        .unwrap();
-        let (up_handle, event_rx) = up.split();
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_done_test", ActorState::Live).await;
+        session.mcp_op_running = true;
 
-        let mut session = Session {
-            sid: sid.to_string(),
-            state_dir: d.path().to_path_buf(),
-            state_store: state_store.clone(),
-            hub: Arc::new(crate::hub::Hub {
-                args: Arc::new(
-                    crate::config::Args::try_parse_from([
-                        "honkd",
-                        "--upstream-secret-file",
-                        fake.secret_file().to_str().unwrap(),
-                    ])
-                    .unwrap(),
-                ),
-                state: state_store.clone(),
-                state_dir: d.path().to_path_buf(),
-                upstream_url: fake.url(),
-                upstream_secret: fake.secret().to_string(),
-                turn_hook: None,
-                control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
-                control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
-                is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                control_connected_notify: Arc::new(tokio::sync::Notify::new()),
-                control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
-                upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
-                pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-                running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
-                self_weak: std::sync::RwLock::new(None),
-                activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                mcp: None,
-            }),
-            up: up_handle,
-            events: event_rx,
-            rx,
-            self_tx,
-            log,
-            turn: TurnCore::default(),
-            state: ActorState::Live,
-            ids: crate::rpc::UpstreamIds::new(1),
-            last_processed_session_id: None,
-            last_processed_conn_id: None,
-            viewers: HashMap::new(),
-            pending_requests: HashMap::new(),
-            pending_server_requests: Vec::new(),
-            recently_resolved: HashSet::new(),
-            init_result: json!({}),
-            queued_msgs: VecDeque::new(),
-            rebuilding_buffered_frames: Vec::new(),
-            rebuild_at_turn_end: false,
-            suppressed_keys: HashSet::new(),
-            gap_evidenced: false,
-            start_reattach: false,
-            needs_rebuild: false,
-            inflight_needs_delivery_check: false,
-            finalizing_waiters: HashMap::new(),
-            active_probe_id: None,
-            gap_synthesis_grace: Duration::from_millis(500),
-            synthesized_replies: HashSet::new(),
-            initial_events: Vec::new(),
-            gap_synthesis_pending: false,
-            reactivating: false,
-            reactivation_token: 0,
-            rebuild_token: 0,
-            ambiguous_check_token: 0,
-            ambiguous_window_expired: false,
-            ambiguous_export_in_flight: false,
-            last_started_upstream: None,
-            last_usage: None,
-            mcp_op_running: true,
-        };
-
-        // Attach 2 honk-aware viewers (viewer 1 and viewer 2) and 1 legacy viewer (viewer 3)
         let (v1_tx, mut v1_rx) = tokio::sync::mpsc::channel(10);
         let (v2_tx, mut v2_rx) = tokio::sync::mpsc::channel(10);
         let (v3_tx, mut v3_rx) = tokio::sync::mpsc::channel(10);

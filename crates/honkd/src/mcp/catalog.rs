@@ -412,7 +412,11 @@ fn parse_entry(name: &str, val: &serde_json::Value, home: Option<&Path>) -> Cata
                         };
                     }
                     let inner = &v_str["{file:".len()..v_str.len() - 1];
-                    if inner.is_empty() || inner.contains("{file:") || inner.contains("{env:") {
+                    if inner.is_empty()
+                        || inner.contains("{file:")
+                        || inner.contains("{env:")
+                        || inner.contains('}')
+                    {
                         return CatalogEntry {
                             name: name.to_string(),
                             supported: Err(format!(
@@ -465,6 +469,7 @@ fn parse_entry(name: &str, val: &serde_json::Value, home: Option<&Path>) -> Cata
                     if inner.is_empty()
                         || inner.contains("{file:")
                         || inner.contains("{env:")
+                        || inner.contains('}')
                         || !is_valid_env_key(inner)
                     {
                         return CatalogEntry {
@@ -850,6 +855,31 @@ mod tests {
         }"#;
         let cat = Catalog::load_from_str(json_malformed, Some(fake_home)).unwrap();
         assert!(cat.entries[0].supported.is_err());
+    }
+
+    #[test]
+    fn test_file_ref_with_inner_closing_brace_unsupported() {
+        let fake_home = Path::new("/home/dev");
+        let json = r#"{
+            "mcp": {
+                "srv": {
+                    "type": "local",
+                    "command": ["npx"],
+                    "environment": {
+                        "TOKEN": "{file:/run/secrets/foo}bar}"
+                    }
+                }
+            }
+        }"#;
+        let cat = Catalog::load_from_str(json, Some(fake_home)).unwrap();
+        assert!(cat.entries[0].supported.is_err());
+        assert!(
+            cat.entries[0]
+                .supported
+                .as_ref()
+                .unwrap_err()
+                .contains("invalid file path")
+        );
     }
 
     #[test]

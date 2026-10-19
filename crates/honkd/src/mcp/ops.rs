@@ -127,6 +127,8 @@ pub struct NameResult {
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced: Option<String>,
+    #[serde(default)]
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +138,12 @@ pub struct OpResult {
     pub other: Vec<OtherExtension>,
     pub enabled: Vec<String>,
     pub summary: String,
+}
+
+impl OpResult {
+    pub fn has_changes(&self) -> bool {
+        self.results.iter().any(|r| r.changed)
+    }
 }
 
 fn find_sibling(name: &str, catalog: &Catalog) -> Option<String> {
@@ -333,6 +341,14 @@ pub async fn enable(
             )));
         }
 
+        if let Some(sibling) = find_sibling(name, catalog)
+            && unique_names.contains(&sibling)
+        {
+            return Err(OpError::invalid_params(format!(
+                "cannot enable both '{name}' and its sibling '{sibling}' in the same request"
+            )));
+        }
+
         if policy.confirm.contains(name) && !confirm {
             let mut msg = format!("'{name}' can write; use /mcp on! {name} to confirm");
             if let Some(sibling) = find_sibling(name, catalog)
@@ -344,7 +360,7 @@ pub async fn enable(
         }
     }
 
-    let goose_exts = fetch_goose_extensions(req, session_id).await?;
+    let mut goose_exts = fetch_goose_extensions(req, session_id).await?;
 
     let mut results = Vec::new();
     for name in &unique_names {
@@ -360,6 +376,7 @@ pub async fn enable(
                     error: None,
                     note: Some("already on".to_string()),
                     replaced: None,
+                    changed: false,
                 });
                 continue;
             } else {
@@ -372,6 +389,7 @@ pub async fn enable(
                     )),
                     note: None,
                     replaced: None,
+                    changed: false,
                 });
                 continue;
             }
@@ -398,6 +416,7 @@ pub async fn enable(
                     .await;
                 match remove_res {
                     Ok(_) => {
+                        goose_exts.retain(|e| e.key != sibling);
                         replaced = Some(sibling);
                     }
                     Err(e) => {
@@ -407,6 +426,7 @@ pub async fn enable(
                             error: Some(format!("failed to replace '{sibling}': {}", e.message)),
                             note: None,
                             replaced: None,
+                            changed: false,
                         });
                         continue;
                     }
@@ -429,21 +449,29 @@ pub async fn enable(
 
         match add_res {
             Ok(_) => {
+                goose_exts.retain(|e| &e.key != name);
+                goose_exts.push(GooseExtensionInfo {
+                    key: name.clone(),
+                    description: Some(expected_marker),
+                });
                 results.push(NameResult {
                     name: name.clone(),
                     ok: true,
                     error: None,
                     note: None,
                     replaced,
+                    changed: true,
                 });
             }
             Err(e) => {
+                let changed = replaced.is_some();
                 results.push(NameResult {
                     name: name.clone(),
                     ok: false,
                     error: Some(e.message),
                     note: None,
-                    replaced: None,
+                    replaced,
+                    changed,
                 });
             }
         }
@@ -521,7 +549,7 @@ pub async fn disable(
         }
     }
 
-    let goose_exts = fetch_goose_extensions(req, session_id).await?;
+    let mut goose_exts = fetch_goose_extensions(req, session_id).await?;
 
     let mut results = Vec::new();
     for name in &unique_names {
@@ -542,12 +570,14 @@ pub async fn disable(
                         .await;
                     match remove_res {
                         Ok(_) => {
+                            goose_exts.retain(|e| &e.key != name);
                             results.push(NameResult {
                                 name: name.clone(),
                                 ok: true,
                                 error: None,
                                 note: None,
                                 replaced: None,
+                                changed: true,
                             });
                         }
                         Err(e) => {
@@ -557,6 +587,7 @@ pub async fn disable(
                                 error: Some(e.message),
                                 note: None,
                                 replaced: None,
+                                changed: false,
                             });
                         }
                     }
@@ -568,6 +599,7 @@ pub async fn disable(
                         error: Some("not added by honk; refusing to remove".to_string()),
                         note: None,
                         replaced: None,
+                        changed: false,
                     });
                 }
             }
@@ -579,6 +611,7 @@ pub async fn disable(
                     error: None,
                     note: Some("already off".to_string()),
                     replaced: None,
+                    changed: false,
                 });
             }
         }
@@ -908,6 +941,108 @@ mod tests {
         assert!(res2.results[0].ok);
         assert_eq!(res2.results[0].replaced.as_deref(), Some("slack-ro"));
         assert_eq!(res2.summary, "enabled slack; replaced slack-ro");
+    }
+
+    #[tokio::test]
+    async fn test_enable_rejects_mutual_siblings_in_same_request() {
+        let cat = sample_catalog();
+        let policy = sample_policy();
+        let req = FakeRequester::new(vec![]);
+
+        let err = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string(), "slack-ro".to_string()],
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message
+                .contains("cannot enable both 'slack' and its sibling 'slack-ro'")
+        );
+        assert!(req.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enable_loop_uses_fresh_state_between_items() {
+        let cat = sample_catalog();
+        let policy = sample_policy();
+        let initial_exts = vec![serde_json::json!({
+            "extensionKey": "slack-ro",
+            "extension": {
+                "type": "mcp",
+                "description": "honk-mcp:slack-ro",
+                "server": { "name": "slack-ro" }
+            }
+        })];
+        let req = FakeRequester::new(initial_exts);
+
+        let res = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string(), "figma".to_string()],
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.results.len(), 2);
+        assert!(res.results[0].ok);
+        assert_eq!(res.results[0].replaced.as_deref(), Some("slack-ro"));
+        assert!(res.results[0].changed);
+        assert!(res.results[1].ok);
+        assert!(res.results[1].changed);
+        assert!(res.has_changes());
+    }
+
+    #[tokio::test]
+    async fn test_has_changes_flag() {
+        let cat = sample_catalog();
+        let policy = sample_policy();
+        let initial_exts = vec![serde_json::json!({
+            "extensionKey": "figma",
+            "extension": {
+                "type": "mcp",
+                "description": "honk-mcp:figma",
+                "server": { "name": "figma" }
+            }
+        })];
+        let req = FakeRequester::new(initial_exts);
+
+        // 1. Enable figma (already on) -> has_changes is false
+        let res1 = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["figma".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!res1.has_changes());
+        assert!(!res1.results[0].changed);
+
+        // 2. Disable figma -> has_changes is true
+        let res2 = disable(&req, &cat, &policy, "ses_123", &["figma".to_string()])
+            .await
+            .unwrap();
+        assert!(res2.has_changes());
+        assert!(res2.results[0].changed);
+
+        // 3. Disable figma again (already off) -> has_changes is false
+        let res3 = disable(&req, &cat, &policy, "ses_123", &["figma".to_string()])
+            .await
+            .unwrap();
+        assert!(!res3.has_changes());
+        assert!(!res3.results[0].changed);
     }
 
     #[tokio::test]

@@ -543,6 +543,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                                     tokio::sync::oneshot::channel();
                                                 let _ = tx
                                                     .send(crate::session::SessionMsg::McpLaunch {
+                                                        viewer_id: viewer.id,
                                                         names,
                                                         confirm,
                                                         reply: reply_tx,

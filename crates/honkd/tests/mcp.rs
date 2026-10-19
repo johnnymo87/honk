@@ -324,6 +324,16 @@ async fn test_mcp_lifecycle_e2e() {
     assert_eq!(launch_results[0]["name"], "local-test");
     assert_eq!(launch_results[0]["ok"], true);
 
+    // Creating viewer receives _honk/mcp_changed with origin "you"
+    let notif_launch = v1
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("_honk/mcp_changed")
+                && f.pointer("/params/sessionId").and_then(Value::as_str) == Some(&launch_sid)
+        })
+        .await;
+    assert_eq!(notif_launch["params"]["origin"], "you");
+    assert_eq!(notif_launch["params"]["enabled"], json!(["local-test"]));
+
     // List on launch session shows local-test enabled
     let list_launch = v1
         .call("_honk/mcp/list", json!({ "sessionId": launch_sid }))
