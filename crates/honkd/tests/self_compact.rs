@@ -4,6 +4,21 @@ use serde_json::Value;
 
 mod common;
 
+fn read_reply_sidecar(h: &Honkd, sid: &str) -> Vec<Value> {
+    let path = h
+        .state_dir
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.replies.jsonl"));
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read replies.jsonl at {}: {e}", path.display()));
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse jsonl line"))
+        .collect()
+}
+
 async fn goose_has_self_compact(v: &mut Viewer, sid: &str) -> bool {
     let tools_res = v
         .call(
@@ -11,13 +26,27 @@ async fn goose_has_self_compact(v: &mut Viewer, sid: &str) -> bool {
             serde_json::json!({ "sessionId": sid }),
         )
         .await;
-    let tools = tools_res.pointer("/result/tools").and_then(Value::as_array);
-    match tools {
-        Some(list) => list
-            .iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some("self_compact_and_resume")),
-        None => false,
+    assert!(
+        tools_res.get("error").is_none(),
+        "_goose/unstable/tools/list RPC error: {tools_res}"
+    );
+    let tools = tools_res
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected tools array in response, got: {tools_res}"));
+    let has_tool = tools
+        .iter()
+        .any(|t| t.get("name").and_then(Value::as_str) == Some("self_compact_and_resume"));
+    if !has_tool
+        && std::env::var("HONK_REQUIRE_SELF_COMPACT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        panic!(
+            "self_compact_and_resume tool required by HONK_REQUIRE_SELF_COMPACT=1 but not offered"
+        );
     }
+    has_tool
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -155,6 +184,24 @@ async fn self_compact_and_resume_e2e() {
         .expect("receipt2 text");
     assert_eq!(receipt2, "second reply");
 
+    // Sidecar prompt_index assertions:
+    // P1 prompt_index = 0
+    // second prompt prompt_index = 1
+    let sidecar_entries = read_reply_sidecar(&h, &sid);
+    assert_eq!(
+        sidecar_entries.len(),
+        2,
+        "expected exactly 2 prompt replies in sidecar, got: {sidecar_entries:?}"
+    );
+    assert_eq!(
+        sidecar_entries[0]["prompt_index"], 0,
+        "first prompt sidecar prompt_index must be 0"
+    );
+    assert_eq!(
+        sidecar_entries[1]["prompt_index"], 1,
+        "second prompt sidecar prompt_index must be 1 (proving prompt counter did not drift)"
+    );
+
     let export = g.export(&sid).await;
     let export_turn1_text = honk_wire::export::turn_text_at_index(&export, 1, "second")
         .expect("export turn text at index 1");
@@ -197,14 +244,26 @@ async fn recipe_session_does_not_offer_self_compact() {
             serde_json::json!({ "sessionId": sid }),
         )
         .await;
+    assert!(
+        initial_tools_res.get("error").is_none(),
+        "_goose/unstable/tools/list RPC error: {initial_tools_res}"
+    );
     let initial_tools = initial_tools_res
         .pointer("/result/tools")
-        .and_then(Value::as_array);
-    let has_self_compact = initial_tools.is_some_and(|list| {
-        list.iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some("self_compact_and_resume"))
-    });
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected tools array in response, got: {initial_tools_res}"));
+    let has_self_compact = initial_tools
+        .iter()
+        .any(|t| t.get("name").and_then(Value::as_str) == Some("self_compact_and_resume"));
     if !has_self_compact {
+        if std::env::var("HONK_REQUIRE_SELF_COMPACT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            panic!(
+                "self_compact_and_resume tool required by HONK_REQUIRE_SELF_COMPACT=1 but not offered"
+            );
+        }
         eprintln!("skipping test: self_compact_and_resume tool not offered by goose under test");
         return;
     }
@@ -233,10 +292,10 @@ async fn recipe_session_does_not_offer_self_compact() {
             }),
         )
         .await;
-    if set_res.get("error").is_some() {
-        eprintln!("skipping recipe session test: settings/set returned error: {set_res}");
-        return;
-    }
+    assert!(
+        set_res.get("error").is_none(),
+        "_goose/unstable/session/settings/set failed: {set_res}"
+    );
 
     let tools_res = v
         .call(
@@ -244,10 +303,14 @@ async fn recipe_session_does_not_offer_self_compact() {
             serde_json::json!({ "sessionId": sid }),
         )
         .await;
+    assert!(
+        tools_res.get("error").is_none(),
+        "_goose/unstable/tools/list RPC error: {tools_res}"
+    );
     let tools = tools_res
         .pointer("/result/tools")
         .and_then(Value::as_array)
-        .expect("tools array");
+        .unwrap_or_else(|| panic!("expected tools array in response, got: {tools_res}"));
     let tool_names: Vec<&str> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -257,4 +320,102 @@ async fn recipe_session_does_not_offer_self_compact() {
         vec!["recipe__final_output"],
         "recipe session with response schema should list exactly [recipe__final_output]"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_compact_over_honkd_e2e() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    // Turn 1: P1
+    g.model().push([Turn::Text(vec!["p1 reply".into()])]);
+    let r1 = v
+        .call("session/prompt", prompt_params(&sid, "P1", None))
+        .await;
+
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId") == Some(&serde_json::Value::Null)
+    })
+    .await;
+
+    assert_eq!(r1["result"]["stopReason"], "end_turn");
+    assert_eq!(r1["result"]["_meta"]["honk"]["text"], "p1 reply");
+
+    // Turn 2: "/compact"
+    // Goose executes built-in compaction command without invoking a model turn;
+    // summarization auxiliary call is answered by StubModel with "ok".
+    let r_compact = v
+        .call("session/prompt", prompt_params(&sid, "/compact", None))
+        .await;
+
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId") == Some(&serde_json::Value::Null)
+    })
+    .await;
+
+    assert_eq!(r_compact["result"]["stopReason"], "end_turn");
+    let receipt_compact = r_compact["result"]["_meta"]["honk"]["text"]
+        .as_str()
+        .expect("receipt text for /compact");
+    assert_eq!(receipt_compact, "Compaction complete");
+
+    // Turn 3: P2
+    g.model().push([Turn::Text(vec!["p2 reply".into()])]);
+    let r2 = v
+        .call("session/prompt", prompt_params(&sid, "P2", None))
+        .await;
+
+    v.wait_for(|f| {
+        f.pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("session_info_update")
+            && f.pointer("/params/update/_meta/goose/activeRunId") == Some(&serde_json::Value::Null)
+    })
+    .await;
+
+    assert_eq!(r2["result"]["stopReason"], "end_turn");
+    let receipt2 = r2["result"]["_meta"]["honk"]["text"]
+        .as_str()
+        .expect("receipt text for P2");
+    assert_eq!(receipt2, "p2 reply");
+
+    // Sidecar prompt_index assertions:
+    // P1 prompt_index = 0
+    // /compact prompt_index = 1
+    // P2 prompt_index = 2
+    let sidecar_entries = read_reply_sidecar(&h, &sid);
+    assert_eq!(
+        sidecar_entries.len(),
+        3,
+        "expected exactly 3 prompt replies in sidecar, got: {sidecar_entries:?}"
+    );
+    assert_eq!(
+        sidecar_entries[0]["prompt_index"], 0,
+        "P1 sidecar prompt_index must be 0"
+    );
+    assert_eq!(
+        sidecar_entries[1]["prompt_index"], 1,
+        "/compact sidecar prompt_index must be 1"
+    );
+    assert_eq!(
+        sidecar_entries[2]["prompt_index"], 2,
+        "P2 sidecar prompt_index must be 2"
+    );
+
+    // P2 receipt equals export turn text
+    let export = g.export(&sid).await;
+    let export_turn2_text = honk_wire::export::turn_text_at_index(&export, 2, "P2")
+        .expect("export turn text at index 2 for P2");
+    assert_eq!(receipt2, export_turn2_text);
 }
