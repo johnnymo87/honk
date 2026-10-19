@@ -283,24 +283,25 @@ impl StubGoose {
                 Some(sid),
                 Duration::from_secs(10),
             )
-            .await;
+            .await
+            .expect("call _goose/unstable/tools/list");
         let _ = up.delete().await;
 
-        res.ok()
-            .and_then(|r| {
-                r.pointer("/tools")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|list| {
-                        list.iter()
-                            .filter_map(|t| {
-                                t.get("name")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .collect()
-                    })
+        assert!(
+            res.get("error").is_none(),
+            "tools/list returned RPC error: {res}"
+        );
+
+        res.pointer("/tools")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("tools array missing in tools/list response: {res}"))
+            .iter()
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn kill9(&mut self) {
