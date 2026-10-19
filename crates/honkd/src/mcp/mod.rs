@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod ops;
+pub mod redact;
 pub mod wrapper;
 
 use crate::mcp::ops::Policy;

@@ -465,10 +465,11 @@ pub async fn enable(
             }
             Err(e) => {
                 let changed = replaced.is_some();
+                let redacted_error = crate::mcp::redact::redact_mcp_error(&e.message, spec);
                 results.push(NameResult {
                     name: name.clone(),
                     ok: false,
-                    error: Some(e.message),
+                    error: Some(redacted_error),
                     note: None,
                     replaced,
                     changed,
@@ -645,6 +646,7 @@ mod tests {
         calls: Mutex<Vec<(String, Value)>>,
         extensions: Mutex<Vec<Value>>,
         fail_method: Mutex<Option<String>>,
+        fail_error: Mutex<Option<String>>,
     }
 
     impl FakeRequester {
@@ -653,6 +655,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 extensions: Mutex::new(initial_extensions),
                 fail_method: Mutex::new(None),
+                fail_error: Mutex::new(None),
             }
         }
 
@@ -662,6 +665,10 @@ mod tests {
 
         fn set_fail_method(&self, method: Option<String>) {
             *self.fail_method.lock().unwrap() = method;
+        }
+
+        fn set_fail_error(&self, err: Option<String>) {
+            *self.fail_error.lock().unwrap() = err;
         }
     }
 
@@ -675,7 +682,13 @@ mod tests {
             if let Some(fail) = self.fail_method.lock().unwrap().as_ref()
                 && fail == method
             {
-                return Err(RequestError::new(format!("simulated failure for {method}")));
+                let msg = self
+                    .fail_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| format!("simulated failure for {method}"));
+                return Err(RequestError::new(msg));
             }
 
             match method {
@@ -1159,6 +1172,51 @@ mod tests {
         assert_eq!(res.results.len(), 1);
         assert!(!res.results[0].ok);
         assert!(res.results[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_enable_per_name_add_failure_redacts_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_file = dir.path().join("token");
+        std::fs::write(&secret_file, "secret_key_12345\n").unwrap();
+
+        let json = format!(
+            r#"{{
+            "mcp": {{
+                "custom": {{
+                    "type": "local",
+                    "command": ["custom-mcp"],
+                    "environment": {{
+                        "TOKEN": "{{file:{}}}"
+                    }}
+                }}
+            }}
+        }}"#,
+            secret_file.display()
+        );
+        let cat = Catalog::load_from_str(&json, None).unwrap();
+        let policy = Policy::new(["custom".to_string()]);
+
+        let req = FakeRequester::new(vec![]);
+        req.set_fail_method(Some("_goose/unstable/session/extensions/add".to_string()));
+        req.set_fail_error(Some(
+            "goose add failed: connection with token secret_key_12345 refused".to_string(),
+        ));
+
+        let res = enable(&req, &cat, &policy, "ses_123", &["custom".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(res.results.len(), 1);
+        assert!(!res.results[0].ok);
+        let err = res.results[0].error.as_deref().unwrap();
+        assert!(
+            err.contains("[redacted]"),
+            "error must contain [redacted]: {err}"
+        );
+        assert!(
+            !err.contains("secret_key_12345"),
+            "error must NOT contain the secret: {err}"
+        );
     }
 
     #[tokio::test]
