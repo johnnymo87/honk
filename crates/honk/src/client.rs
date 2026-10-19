@@ -57,6 +57,9 @@ pub struct SessionEntry {
     pub session_type: Option<String>,
     /// `_meta.hasRecipe`: true for recipe runs (lanes, stall-watch coordinators).
     pub has_recipe: Option<bool>,
+    /// `_meta.honk.pending`: requests from goose (permission prompts,
+    /// elicitations) waiting on an answer. `None` from an older honkd.
+    pub pending_requests: Option<u64>,
 }
 
 impl SessionEntry {
@@ -83,6 +86,7 @@ impl SessionEntry {
             archived_at: str_at(s.pointer("/_meta/archivedAt")),
             session_type: str_at(s.pointer("/_meta/sessionType")),
             has_recipe: s.pointer("/_meta/hasRecipe").and_then(Value::as_bool),
+            pending_requests: s.pointer("/_meta/honk/pending").and_then(Value::as_u64),
         }
     }
 
@@ -101,6 +105,7 @@ impl SessionEntry {
             "archivedAt": self.archived_at,
             "sessionType": self.session_type,
             "hasRecipe": self.has_recipe,
+            "pendingRequests": self.pending_requests,
         })
     }
 
@@ -463,7 +468,7 @@ mod tests {
                 "sessionType": "acp",
                 "hasRecipe": false,
                 "workingDir": "/work/honk",
-                "honk": { "held": true, "running": true }
+                "honk": { "held": true, "running": true, "pending": 2 }
             }
         });
         let e = SessionEntry::from_list_entry(&v);
@@ -477,6 +482,7 @@ mod tests {
         assert_eq!(e.archived_at, None);
         assert_eq!(e.session_type.as_deref(), Some("acp"));
         assert_eq!(e.has_recipe, Some(false));
+        assert_eq!(e.pending_requests, Some(2));
     }
 
     #[test]
@@ -494,6 +500,7 @@ mod tests {
         assert_eq!(e.archived_at, None);
         assert_eq!(e.session_type, None);
         assert_eq!(e.has_recipe, None);
+        assert_eq!(e.pending_requests, None);
     }
 
     #[test]
@@ -509,7 +516,7 @@ mod tests {
                 "archivedAt": "2026-10-19T23:00:00Z",
                 "sessionType": "acp",
                 "hasRecipe": true,
-                "honk": { "held": true, "running": false }
+                "honk": { "held": true, "running": false, "pending": 0 }
             }
         });
         let got = SessionEntry::from_list_entry(&v).to_json();
@@ -525,7 +532,8 @@ mod tests {
                 "lastMessageAt": null,
                 "archivedAt": "2026-10-19T23:00:00Z",
                 "sessionType": "acp",
-                "hasRecipe": true
+                "hasRecipe": true,
+                "pendingRequests": 0
             })
         );
     }

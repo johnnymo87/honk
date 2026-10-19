@@ -754,3 +754,79 @@ async fn failed_up_respond_404_broadcasts_stale() {
         "404 on respond must broadcast reason 'stale'"
     );
 }
+
+/// The pickers (honk-9qf.15.11) read `_meta.honk.pending` from `session/list`
+/// to show a session waiting on a permission prompt as blocked, not working.
+#[tokio::test]
+async fn session_list_reports_pending_requests() {
+    let Some(goose) = StubGoose::start_or_skip().await else {
+        return;
+    };
+
+    goose.model().push([
+        Turn::ToolCall {
+            tool: "shell".to_string(),
+            arguments: json!({"command": "echo listed_pending"}),
+        },
+        Turn::Text(vec!["done".to_string()]),
+    ]);
+
+    let honkd = Honkd::spawn(&goose.url(), goose.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&honkd).await;
+    let sid = new_session(&mut v, goose.cwd().to_str().unwrap()).await;
+    let mode_res = v
+        .call(
+            "session/set_mode",
+            json!({"sessionId": &sid, "modeId": "approve"}),
+        )
+        .await;
+    assert!(mode_res.get("error").is_none());
+
+    let pending_of = |list: &Value, sid: &str| -> Option<Value> {
+        list.pointer("/result/sessions")?
+            .as_array()?
+            .iter()
+            .find(|e| e.get("sessionId").and_then(Value::as_str) == Some(sid))?
+            .pointer("/_meta/honk/pending")
+            .cloned()
+    };
+
+    let _pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "run echo in approve mode", None),
+        )
+        .await;
+    let req = v
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("request_permission")
+                || f.get("method").and_then(Value::as_str) == Some("session/request_permission")
+        })
+        .await;
+
+    let listed = v.call("session/list", json!({})).await;
+    assert_eq!(
+        pending_of(&listed, &sid),
+        Some(json!(1)),
+        "a parked permission request is reported: {listed}"
+    );
+
+    v.respond(
+        req["id"].clone(),
+        json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let listed = v.call("session/list", json!({})).await;
+        if pending_of(&listed, &sid) == Some(json!(0)) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pending never dropped back to 0 after the answer: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
