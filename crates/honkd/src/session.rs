@@ -1874,12 +1874,19 @@ impl Session {
                             }
                             PendingTarget::Internal(reply) => {
                                 if let Some(err) = frame.get("error") {
-                                    let raw_msg = err
+                                    let msg = err
                                         .get("message")
                                         .and_then(Value::as_str)
                                         .unwrap_or("upstream request failed");
+                                    let raw_msg = match err.get("data") {
+                                        Some(Value::String(s)) => format!("{msg}: {s}"),
+                                        Some(other) if !other.is_null() => {
+                                            format!("{msg}: {other}")
+                                        }
+                                        _ => msg.to_string(),
+                                    };
                                     let redactor = honk_upstream::Redactor::from_env();
-                                    let redacted = redactor.redact_string(raw_msg);
+                                    let redacted = redactor.redact_string(&raw_msg);
                                     let _ = reply.send(Err(redacted));
                                 } else {
                                     let res = frame.get("result").cloned().unwrap_or(Value::Null);
@@ -4810,5 +4817,40 @@ mod tests {
 
         // Viewer 3 (legacy) receives NOTHING
         assert!(v3_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_internal_request_error_includes_error_data() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_internal_err_test", ActorState::Live).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.pending_requests.insert(
+            "up_req_internal".to_string(),
+            PendingSessionRequest {
+                target: PendingTarget::Internal(reply_tx),
+            },
+        );
+
+        let err_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "up_req_internal",
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": "honk-mcp: cannot read /path/to/secret"
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                err_frame,
+                None,
+            ))
+            .await;
+
+        let err = reply_rx.await.unwrap().unwrap_err();
+        assert!(err.contains("Internal error"));
+        assert!(err.contains("cannot read /path/to/secret"));
     }
 }
