@@ -1450,7 +1450,18 @@ impl Session {
         }
     }
 
-    pub fn is_idle(&self) -> bool {
+    pub fn prune_closed_internal_requests(&mut self) {
+        self.pending_requests.retain(|_, req| {
+            if let PendingTarget::Internal(reply) = &req.target {
+                !reply.is_closed()
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn is_idle(&mut self) -> bool {
+        self.prune_closed_internal_requests();
         self.viewers.is_empty()
             && self.turn.run.is_none()
             && self.turn.inflight.is_none()
@@ -2923,6 +2934,9 @@ impl Session {
                 params,
                 reply,
             } => {
+                if reply.is_closed() {
+                    return;
+                }
                 if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
                     if self.queued_msgs.len() >= 1024 {
                         let _ = reply.send(Err("Session message queue full".to_string()));
@@ -4660,6 +4674,50 @@ mod tests {
 
         session.mcp_op_running = false;
         assert!(session.is_idle());
+    }
+
+    #[tokio::test]
+    async fn test_internal_request_closed_reply_not_sent() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_internal_closed", ActorState::Live).await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        drop(reply_rx); // receiver gone/timed out
+
+        session
+            .on_msg(SessionMsg::Internal {
+                method: "test_method".to_string(),
+                params: json!({}),
+                reply: reply_tx,
+            })
+            .await;
+
+        assert!(session.pending_requests.is_empty());
+        assert!(session.queued_msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_is_idle_prunes_closed_internal_requests() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_idle_prune", ActorState::Live).await;
+        assert!(session.is_idle());
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session.pending_requests.insert(
+            "up_req_internal".to_string(),
+            PendingSessionRequest {
+                target: PendingTarget::Internal(reply_tx),
+            },
+        );
+
+        // While receiver is alive, not idle
+        assert!(!session.is_idle());
+
+        // Drop receiver -> receiver is closed
+        drop(reply_rx);
+
+        // is_idle() must prune closed internal requests and return true
+        assert!(session.is_idle());
+        assert!(session.pending_requests.is_empty());
     }
 
     #[tokio::test]
