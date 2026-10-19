@@ -170,7 +170,7 @@ methods or goose's directly; `confirm` prevents accidents, not misuse — same s
   trait (unit tests with a fake: marker, conflict, siblings, confirm, unknown, idempotence).
 - **H3** actor + viewer + hub: `SessionMsg::{McpOp, Internal, McpOpDone}`, busy refusal,
   fan-out, raw-forward notification, `session/new` `_meta.honk.mcp`, `--mcp-catalog` /
-  `--mcp-confirm` flags. e2e (`honkd/tests/mcp.rs`, StubGoose + a tiny stdio MCP fixture
+  `--mcp-no-confirm` flags. e2e (`honkd/tests/mcp.rs`, StubGoose + a tiny stdio MCP fixture
   server): enable → `tools/list` shows its tool → second viewer gets `_honk/mcp_changed` →
   disable; busy refusal; persistence across goose restart; raw remove still forwarded.
 - **H4** honk chat: `/mcp` commands, queueing, status bar, notices, `--new --mcp`;
