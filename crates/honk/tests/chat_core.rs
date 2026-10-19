@@ -4403,3 +4403,203 @@ fn test_mcp_changed_notification() {
             .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
     );
 }
+
+#[test]
+fn test_mcp_disconnect_drains_mutations_with_notice_and_list_silently() {
+    let (mut core, _) = new_test_core();
+
+    // 1. In-flight list request is drained silently on disconnect
+    core.handle(Input::Line("/mcp".into()));
+    assert!(!core.has_pending_mcp_mutation());
+    let effs = core.handle(Input::Disconnected);
+    assert!(!has_notice(
+        &effs,
+        "mcp: change may or may not have applied"
+    ));
+
+    // Reconnect and finish replay
+    core.handle(Input::Connected);
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": {
+            "sessionId": "test-session",
+            "epoch": 2,
+            "seq": 0
+        }
+    })));
+
+    // 2. In-flight enable mutation emits warning notice on disconnect
+    core.handle(Input::Line("/mcp on slack-ro".into()));
+    assert!(core.has_pending_mcp_mutation());
+    let effs = core.handle(Input::Disconnected);
+    assert!(has_notice(
+        &effs,
+        "mcp: change may or may not have applied; run /mcp to check"
+    ));
+    assert!(!core.has_pending_mcp_mutation());
+}
+
+#[test]
+fn test_mcp_available_resets_on_connected() {
+    let (mut core, _) = new_test_core();
+
+    // Trigger an MCP list request
+    let effs = core.handle(Input::Line("/mcp".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd responds with -32601 method not found (catalog not configured or old honkd)
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": { "code": -32601, "message": "Method not found" }
+    })));
+
+    // auto_refresh_mcp returns None because mcp_available is false
+    assert!(core.auto_refresh_mcp().is_none());
+
+    // On reconnect, mcp_available must be reset to true
+    core.handle(Input::Connected);
+    assert!(core.auto_refresh_mcp().is_some());
+}
+
+#[test]
+fn test_mcp_queued_busy_requeues_bounded() {
+    let (mut core, _) = new_test_core();
+
+    // Active run
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_1" } }
+            }
+        }
+    })));
+
+    // Queue /mcp on slack-ro
+    core.handle(Input::Line("/mcp on slack-ro".into()));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 1 ends -> queued /mcp on slack-ro dispatched
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let enable_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .expect("should dispatch queued enable request");
+
+    // Honkd returns -32002 session is busy (Attempt 1 fails -> requeue 1)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": enable_req_id,
+        "error": { "code": -32002, "message": "session is busy; try after this turn" }
+    })));
+    // Should NOT show error notice; should be re-queued in local_queue
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/mcp on slack-ro");
+
+    // Run 2 ends -> dispatched again (Attempt 2)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let enable_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 2 fails -> requeue 2)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": enable_req_id,
+        "error": { "code": -32002, "message": "session is busy; try after this turn" }
+    })));
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 3 ends -> dispatched again (Attempt 3)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let enable_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 3 fails -> requeue 3)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": enable_req_id,
+        "error": { "code": -32002, "message": "session is busy; try after this turn" }
+    })));
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 4 ends -> dispatched again (Attempt 4)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let enable_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 4 exceeds 3 requeues limit -> show error)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": enable_req_id,
+        "error": { "code": -32002, "message": "session is busy; try after this turn" }
+    })));
+    assert!(has_notice(&effs, "session is busy; try after this turn"));
+    assert_eq!(core.local_queue().len(), 0);
+}

@@ -177,7 +177,15 @@ pub(crate) struct InflightSteer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingMcpReq {
-    List { explicit: bool },
-    Enable { names: Vec<String> },
-    Disable { names: Vec<String> },
+    List {
+        explicit: bool,
+    },
+    Enable {
+        names: Vec<String>,
+        queued: Option<(String, u32)>,
+    },
+    Disable {
+        names: Vec<String>,
+        queued: Option<(String, u32)>,
+    },
 }

@@ -120,6 +120,24 @@ impl ChatCore {
     }
 
     pub(crate) fn handle_mcp_command(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        self.handle_mcp_command_inner(line, None, effects);
+    }
+
+    pub(crate) fn handle_queued_mcp_command(
+        &mut self,
+        line: &str,
+        requeues: u32,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.handle_mcp_command_inner(line, Some((line.to_string(), requeues)), effects);
+    }
+
+    fn handle_mcp_command_inner(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        effects: &mut Vec<Effect>,
+    ) {
         let rest = line.strip_prefix("/mcp").unwrap().trim();
         if rest.is_empty() {
             if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
@@ -171,6 +189,7 @@ impl ChatCore {
                         req_id,
                         super::types::PendingMcpReq::Enable {
                             names: names.clone(),
+                            queued,
                         },
                     );
                     effects.push(Effect::Request {
@@ -207,6 +226,7 @@ impl ChatCore {
                         req_id,
                         super::types::PendingMcpReq::Disable {
                             names: names.clone(),
+                            queued,
                         },
                     );
                     effects.push(Effect::Request {

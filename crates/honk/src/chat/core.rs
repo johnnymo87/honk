@@ -414,7 +414,7 @@ impl ChatCore {
         }
     }
 
-    pub(crate) fn has_pending_mcp_mutation(&self) -> bool {
+    pub fn has_pending_mcp_mutation(&self) -> bool {
         self.pending_mcp_reqs.values().any(|req| {
             matches!(
                 req,
@@ -432,7 +432,7 @@ impl ChatCore {
             && let Some((next_text, conv_count)) = self.local_queue.pop_front()
         {
             if next_text.starts_with("/mcp ") {
-                self.handle_mcp_command(&next_text, effects);
+                self.handle_queued_mcp_command(&next_text, conv_count, effects);
             } else {
                 self.send_prompt(next_text, conv_count, effects);
             }
@@ -659,8 +659,10 @@ impl ChatCore {
         }
 
         if let Some(mcp_req) = self.pending_mcp_reqs.remove(&id) {
-            self.handle_mcp_response(mcp_req, frame, effects);
-            self.check_queued_prompts(effects);
+            let requeued = self.handle_mcp_response(mcp_req, frame, effects);
+            if !requeued {
+                self.check_queued_prompts(effects);
+            }
         }
     }
 
@@ -906,6 +908,7 @@ impl ChatCore {
 
     fn handle_connected(&mut self, effects: &mut Vec<Effect>) {
         self.disconnected = false;
+        self.mcp_available = true;
         if self.prompt_sent.is_some() {
             let req_id = self.allocate_id();
             let p = self.prompt_sent.as_mut().unwrap();
@@ -957,6 +960,21 @@ impl ChatCore {
                 inflight.text
             ))));
         }
+        let mut had_mutation = false;
+        for (_req_id, req) in self.pending_mcp_reqs.drain() {
+            if matches!(
+                req,
+                super::types::PendingMcpReq::Enable { .. }
+                    | super::types::PendingMcpReq::Disable { .. }
+            ) {
+                had_mutation = true;
+            }
+        }
+        if had_mutation {
+            effects.push(Effect::Notice(Notice::warning(
+                "mcp: change may or may not have applied; run /mcp to check",
+            )));
+        }
     }
 
     pub fn auto_refresh_mcp(&mut self) -> Option<Effect> {
@@ -994,7 +1012,7 @@ impl ChatCore {
         req: super::types::PendingMcpReq,
         frame: &Value,
         effects: &mut Vec<Effect>,
-    ) {
+    ) -> bool {
         if let Some(err) = frame.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             let msg = err
@@ -1006,6 +1024,20 @@ impl ChatCore {
                 self.mcp_available = false;
             }
 
+            if code == -32002 {
+                let queued_info = match &req {
+                    super::types::PendingMcpReq::Enable { queued, .. }
+                    | super::types::PendingMcpReq::Disable { queued, .. } => queued.clone(),
+                    _ => None,
+                };
+                if let Some((raw_line, count)) = queued_info
+                    && count < 3
+                {
+                    self.local_queue.push_front((raw_line, count + 1));
+                    return true;
+                }
+            }
+
             let explicit = match req {
                 super::types::PendingMcpReq::List { explicit } => explicit,
                 super::types::PendingMcpReq::Enable { .. }
@@ -1015,7 +1047,7 @@ impl ChatCore {
             if explicit {
                 effects.push(Effect::Notice(Notice::error(msg)));
             }
-            return;
+            return false;
         }
 
         let result = frame.get("result").unwrap_or(&Value::Null);
@@ -1092,6 +1124,7 @@ impl ChatCore {
                 }
             }
         }
+        false
     }
 }
 
