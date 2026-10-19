@@ -313,6 +313,9 @@ impl App {
             cmd if cmd.starts_with("turns ") || cmd == "turns" => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
+            cmd if cmd == "compact" || cmd.starts_with("compact ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             other => {
                 self.transcript
                     .apply_notice(Notice::warning(format!("unknown command: :{other}")));
@@ -952,6 +955,8 @@ mod tests {
             ("help", "/help"),
             ("turns 5", "/turns 5"),
             ("turns off", "/turns off"),
+            ("compact", "/compact"),
+            ("compact now", "/compact now"),
         ];
 
         for (typed, expected_cmd) in commands {

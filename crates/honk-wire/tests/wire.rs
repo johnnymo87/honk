@@ -1,4 +1,7 @@
-use honk_wire::export::{client_prompts, export_used_tokens, to_updates, turn_text};
+use honk_wire::export::{
+    client_prompt_entries, client_prompts, export_used_tokens, to_updates, turn_text,
+    turn_text_at_index,
+};
 use honk_wire::{BlockKey, Blocks, block_key, run_state};
 use serde_json::Value;
 use std::fs::read_to_string;
@@ -6,6 +9,10 @@ use std::fs::read_to_string;
 const EXPORT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../fixtures/goose-1.54.0-patched.2/canonical/export.json"
+);
+const SELF_COMPACT_EXPORT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/self_compact/export.json"
 );
 const LIVE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -909,4 +916,43 @@ fn test_export_used_tokens_canonical_fixture() {
         }
     });
     assert_eq!(export_used_tokens(&str_tokens), None);
+}
+
+#[test]
+fn test_self_compact_export_fixture() {
+    let export = load_json(SELF_COMPACT_EXPORT_PATH);
+
+    let conversation = export
+        .get("conversation")
+        .and_then(Value::as_array)
+        .expect("conversation array");
+
+    // Assert client_prompt_entries yields only P1
+    let entries: Vec<_> = client_prompt_entries(conversation).collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, 0);
+    assert_eq!(entries[0].1, "P1");
+
+    let prompts = client_prompts(&export);
+    assert_eq!(prompts, vec!["P1".to_string()]);
+
+    // Assert turn_text_at_index(..., 0, "P1") spans to the end including "after" and the note
+    let text = turn_text_at_index(&export, 0, "P1");
+    assert!(text.is_some(), "turn_text_at_index should return text");
+    let text = text.unwrap();
+    assert!(
+        text.contains("Context self-compacted."),
+        "turn text must include 'Context self-compacted.', got: {text}"
+    );
+    assert!(
+        text.contains("after"),
+        "turn text must include 'after', got: {text}"
+    );
+    assert_eq!(text, "Context self-compacted.after");
+
+    // Also assert turn_text(&export, "P1") matches
+    assert_eq!(
+        turn_text(&export, "P1"),
+        Some("Context self-compacted.after".to_string())
+    );
 }

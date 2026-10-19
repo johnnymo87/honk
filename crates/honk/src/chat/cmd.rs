@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -77,6 +77,33 @@ impl ChatCore {
                         "invalid /turns argument: must be a positive integer (>= 1) or 'off'",
                     )));
                 }
+            }
+            return true;
+        }
+
+        if trimmed == "/compact" || trimmed.starts_with("/compact ") {
+            let arg = trimmed.strip_prefix("/compact").unwrap().trim();
+            if !arg.is_empty() {
+                effects.push(Effect::Notice(Notice::warning(
+                    "/compact takes no arguments",
+                )));
+                return true;
+            }
+
+            if self.buffer_if_detached_or_replaying("/compact".to_string(), effects) {
+                return true;
+            }
+
+            if self.prompt_sent.is_some()
+                || self.run_state.is_running()
+                || !self.local_queue.is_empty()
+            {
+                self.local_queue.push_back(("/compact".to_string(), 0));
+                effects.push(Effect::Notice(Notice::info(
+                    "compaction queued; it runs after the current turn ends",
+                )));
+            } else {
+                self.send_prompt("/compact".to_string(), 0, effects);
             }
             return true;
         }

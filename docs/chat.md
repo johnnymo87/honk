@@ -153,6 +153,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/drop` | `:drop` | Discard all locally queued or held messages. |
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
+| `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
 | — | `:json` | Toggle JSON payload expansion (`zj`). |

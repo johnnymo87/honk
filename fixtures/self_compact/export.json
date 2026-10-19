@@ -1,0 +1,257 @@
+{
+  "accumulated_cost": null,
+  "accumulated_usage": {
+    "cache_read_input_tokens": 0,
+    "cache_write_input_tokens": 0,
+    "input_tokens": 30,
+    "output_tokens": 30,
+    "total_tokens": 60
+  },
+  "archived_at": null,
+  "conversation": [
+    {
+      "content": [
+        {
+          "text": "P1",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_1f593867-cd98-4bb9-b148-f6da2e925bbf",
+      "metadata": {
+        "agentVisible": false,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "<turn-context>\n<current-time>2026-10-18 17:21:00 -04:00</current-time>\n<working-directory>/tmp/honk-self-compact</working-directory>\n</turn-context>",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_98e061cc-618c-4d22-a403-c50c414e8cce",
+      "metadata": {
+        "agentVisible": false,
+        "turnContext": true,
+        "userVisible": false
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "_meta": {
+            "goose.toolCall.providerIndex": 0
+          },
+          "id": "call_stub_001",
+          "toolCall": {
+            "status": "success",
+            "value": {
+              "arguments": {
+                "prompt": "R"
+              },
+              "name": "self_compact_and_resume"
+            }
+          },
+          "type": "toolRequest"
+        }
+      ],
+      "created": 1792358516,
+      "id": "chatcmpl-stub",
+      "metadata": {
+        "agentVisible": false,
+        "inference": {
+          "provider": "openai",
+          "requestedModel": "stub-model"
+        },
+        "usage": {
+          "elapsedMs": 9,
+          "inputTokens": 10,
+          "outputTokens": 10,
+          "timeToFirstTokenMs": 4,
+          "totalTokens": 20
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "id": "call_stub_001",
+          "toolResult": {
+            "status": "success",
+            "value": {
+              "content": [
+                {
+                  "text": "Compaction runs right after this step; your prompt will be the next user message. Do not call other tools in this step.",
+                  "type": "text"
+                }
+              ],
+              "isError": false,
+              "resultType": "complete"
+            }
+          },
+          "type": "toolResponse"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_81ef195d-ebc7-4946-a630-db970b919b26",
+      "metadata": {
+        "agentVisible": false,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "ok",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "chatcmpl-stub",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": false
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "You compacted your own context. The previous message contains a summary of the conversation so far.\nThe next user message is the resumption prompt you wrote before compacting. Act on it.\nDo not mention that you read a summary or that conversation summarization occurred.",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_20261018_1_1999de7f-8911-413b-8f76-51965e6b057c",
+      "metadata": {
+        "agentVisible": true,
+        "userVisible": false
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "text": "Context self-compacted.",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_ee347d03-1b59-4b95-8ae9-47dfdfd66bdb",
+      "metadata": {
+        "agentVisible": false,
+        "userVisible": true
+      },
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "text": "R",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_efa6417e-16e8-4f28-9e7e-ca2151195d2a",
+      "metadata": {
+        "agentVisible": true,
+        "steer": true,
+        "userVisible": true
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "<turn-context>\n<current-time>2026-10-18 17:21:00 -04:00</current-time>\n<working-directory>/tmp/honk-self-compact</working-directory>\n</turn-context>",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "msg_74f404c1-f308-4a88-b01e-e2d51655d37a",
+      "metadata": {
+        "agentVisible": true,
+        "turnContext": true,
+        "userVisible": false
+      },
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "after",
+          "type": "text"
+        }
+      ],
+      "created": 1792358516,
+      "id": "chatcmpl-stub",
+      "metadata": {
+        "agentVisible": true,
+        "inference": {
+          "provider": "openai",
+          "requestedModel": "stub-model"
+        },
+        "usage": {
+          "elapsedMs": 20,
+          "inputTokens": 10,
+          "outputTokens": 10,
+          "timeToFirstTokenMs": 9,
+          "totalTokens": 20
+        },
+        "userVisible": true
+      },
+      "role": "assistant"
+    }
+  ],
+  "created_at": "2026-10-18T21:21:55Z",
+  "extension_data": {
+    "enabled_extensions.v0": {
+      "extensions": [
+        {
+          "bundled": null,
+          "description": "",
+          "display_name": null,
+          "name": "developer",
+          "type": "platform"
+        }
+      ]
+    }
+  },
+  "goose_mode": "auto",
+  "id": "20261018_1",
+  "last_message_at": "2026-10-18T21:21:56Z",
+  "last_message_snippet": null,
+  "message_count": 6,
+  "model_config": {
+    "max_tokens": null,
+    "model_name": "stub-model",
+    "temperature": null,
+    "toolshim": false,
+    "toolshim_model": null
+  },
+  "name": "New Chat",
+  "parent_session_id": null,
+  "project_id": null,
+  "provider_name": "openai",
+  "recipe": null,
+  "schedule_id": null,
+  "session_type": "acp",
+  "updated_at": "2026-10-18T21:21:56Z",
+  "usage": {
+    "cache_read_input_tokens": null,
+    "cache_write_input_tokens": null,
+    "input_tokens": 10,
+    "output_tokens": 10,
+    "total_tokens": 20
+  },
+  "user_recipe_values": null,
+  "user_set_name": false,
+  "working_dir": "/tmp/honk-self-compact"
+}

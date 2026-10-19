@@ -264,6 +264,46 @@ impl StubGoose {
         extract_turn_text(&export)
     }
 
+    pub async fn tools_list(&self, sid: &str) -> Vec<String> {
+        let mut up =
+            Upstream::initialize(&self.url(), self.secret().to_string(), Recorder::disabled())
+                .await
+                .expect("initialize tools_list upstream");
+        up.subscribe(None).await.expect("subscribe tools_list conn");
+        up.subscribe(Some(sid))
+            .await
+            .expect("subscribe tools_list session");
+
+        let res = up
+            .call(
+                "_goose/unstable/tools/list",
+                serde_json::json!({
+                    "sessionId": sid,
+                }),
+                Some(sid),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("call _goose/unstable/tools/list");
+        let _ = up.delete().await;
+
+        assert!(
+            res.get("error").is_none(),
+            "tools/list returned RPC error: {res}"
+        );
+
+        res.pointer("/tools")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("tools array missing in tools/list response: {res}"))
+            .iter()
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     pub fn kill9(&mut self) {
         if let Some(mut child) = self.child.take() {
             kill_pgid(self.pid);
