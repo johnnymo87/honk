@@ -188,7 +188,17 @@ impl ChatCore {
                     )));
                     return;
                 }
-                let names: Vec<String> = args_str.split_whitespace().map(String::from).collect();
+                // `!` means nothing for disable; strip it so `/mcp disable slack!` works.
+                let names: Vec<String> = args_str
+                    .split_whitespace()
+                    .map(|t| t.trim_end_matches('!').to_string())
+                    .collect();
+                if names.iter().any(String::is_empty) {
+                    effects.push(Effect::Notice(Notice::warning(
+                        "usage: /mcp disable <name>...",
+                    )));
+                    return;
+                }
                 self.dispatch_mcp_disable(line, queued, names, effects);
             }
             _ => {
@@ -213,6 +223,16 @@ impl ChatCore {
         });
     }
 
+    /// A fresh /mcp mutation waits behind a running turn or anything already queued. One
+    /// popped off the queue (`queued_dispatch`) was already ordered; checking the queue again
+    /// would push it behind the lines that followed it, and nothing re-runs the queue after
+    /// that, so it would stall.
+    fn must_queue_mcp(&self, queued_dispatch: bool) -> bool {
+        self.prompt_sent.is_some()
+            || self.run_state.is_running()
+            || (!queued_dispatch && !self.local_queue.is_empty())
+    }
+
     fn dispatch_mcp_enable(
         &mut self,
         line: &str,
@@ -225,8 +245,7 @@ impl ChatCore {
             return;
         }
 
-        if self.prompt_sent.is_some() || self.run_state.is_running() || !self.local_queue.is_empty()
-        {
+        if self.must_queue_mcp(queued.is_some()) {
             self.local_queue.push_back((line.to_string(), 0));
             effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
         } else {
@@ -261,8 +280,7 @@ impl ChatCore {
             return;
         }
 
-        if self.prompt_sent.is_some() || self.run_state.is_running() || !self.local_queue.is_empty()
-        {
+        if self.must_queue_mcp(queued.is_some()) {
             self.local_queue.push_back((line.to_string(), 0));
             effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
         } else {

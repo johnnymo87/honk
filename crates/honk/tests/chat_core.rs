@@ -4265,6 +4265,68 @@ fn test_mcp_disable_queued_during_foreign_run() {
 }
 
 #[test]
+fn test_queued_mcp_with_prompt_behind_it_dispatches_then_prompt_follows() {
+    let (mut core, _) = new_test_core();
+    let running = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": { "goose": { "activeRunId": "run_foreign" } }
+        } }
+    });
+    core.handle(Input::Frame(running));
+    core.handle(Input::Line("/mcp enable slack-ro".into()));
+    core.handle(Input::Line("do the thing".into()));
+    assert_eq!(core.local_queue().len(), 2);
+
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": { "goose": { "activeRunId": null } }
+        } }
+    })));
+    let mcp_id = end_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .expect("queued /mcp enable must dispatch even with a prompt queued behind it");
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "do the thing");
+
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": mcp_id,
+        "result": { "results": [{ "name": "slack-ro", "ok": true, "changed": true }], "enabled": ["slack-ro"] }
+    })));
+    assert!(
+        effs.iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "prompt queued behind the /mcp command should be sent once it completes"
+    );
+}
+
+#[test]
+fn test_mcp_disable_strips_trailing_bang() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp disable slack! figma".into()));
+    let Some(Effect::Request { params, .. }) = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
+    else {
+        panic!("should send _honk/mcp/disable request")
+    };
+    assert_eq!(params["names"], json!(["slack", "figma"]));
+
+    let effs = core.handle(Input::Line("/mcp disable !".into()));
+    assert!(has_notice(&effs, "usage: /mcp disable <name>"));
+}
+
+#[test]
 fn test_drop_command_clears_queued_mcp() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Frame(json!({

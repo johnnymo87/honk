@@ -329,7 +329,7 @@ async fn test_mcp_live_e2e() {
         refuse_w["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("'honktest-w' can write; use /mcp enable honktest-w to confirm")
+            .contains("'honktest-w' can write; use /mcp enable honktest-w! to confirm")
     );
 
     let enable_w = v
