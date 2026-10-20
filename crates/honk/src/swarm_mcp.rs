@@ -381,17 +381,28 @@ async fn handle_swarm_read(
             let text = resp.text().await.unwrap_or_default();
             if !status.is_success() {
                 let n = msg_ids.len();
-                let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
+                let s = if n == 1 {
+                    "1 message"
+                } else {
+                    &format!("{n} messages")
+                };
                 let msg = format!("warning: {s} could not be acknowledged and may be shown again");
-                eprintln!("honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}");
+                eprintln!(
+                    "honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}"
+                );
                 ack_warning = Some(msg);
             } else if let Ok(val) = serde_json::from_str::<Value>(&text) {
                 if let Some(rej) = val.get("rejected").and_then(Value::as_array)
                     && !rej.is_empty()
                 {
                     let n = rej.len();
-                    let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
-                    let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+                    let s = if n == 1 {
+                        "1 message"
+                    } else {
+                        &format!("{n} messages")
+                    };
+                    let msg =
+                        format!("warning: {s} could not be acknowledged and may be shown again");
                     eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
                     ack_warning = Some(msg);
                 }
@@ -399,7 +410,11 @@ async fn handle_swarm_read(
         }
         Err(e) => {
             let n = msg_ids.len();
-            let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
+            let s = if n == 1 {
+                "1 message"
+            } else {
+                &format!("{n} messages")
+            };
             let msg = format!("warning: {s} could not be acknowledged and may be shown again");
             eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
             ack_warning = Some(msg);
@@ -421,7 +436,10 @@ async fn handle_swarm_read(
         let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
         let priority = m.get("priority").and_then(Value::as_str);
         let reply_to = m.get("reply_to").and_then(Value::as_str);
-        let redelivered = m.get("redelivered").and_then(Value::as_bool).unwrap_or(false);
+        let redelivered = m
+            .get("redelivered")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
 
         let mut attrs = format!(

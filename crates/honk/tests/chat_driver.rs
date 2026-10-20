@@ -3438,7 +3438,9 @@ async fn test_new_session_swarm_enable_timeout_surfaces_in_progress_notice() {
         if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             match evt {
                 UiEvent::Notice(n) => {
-                    if n.text.contains("swarm: enabling is still in progress; /mcp shows the result") {
+                    if n.text
+                        .contains("swarm: enabling is still in progress; /mcp shows the result")
+                    {
                         assert_eq!(n.kind, honk::chat::NoticeKind::Info);
                         notice_seen = true;
                         break;

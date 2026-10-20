@@ -1799,7 +1799,9 @@ mod tests {
     fn test_validate_swarm_args_valid_cases() {
         use clap::Parser;
         // Neither set
-        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        let mut args =
+            crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+                .unwrap();
         assert!(validate_swarm_args(&args).is_ok());
 
         // Both bin and url set
@@ -1815,12 +1817,16 @@ mod tests {
     #[test]
     fn test_validate_swarm_args_exactly_one_set() {
         use clap::Parser;
-        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        let mut args =
+            crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+                .unwrap();
         args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
         let err = validate_swarm_args(&args).unwrap_err().to_string();
         assert!(err.contains("--swarm-mcp-bin requires --swarm-pigeon-url"));
 
-        let mut args2 = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        let mut args2 =
+            crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+                .unwrap();
         args2.swarm_pigeon_url = Some("http://127.0.0.1:4731".to_string());
         let err2 = validate_swarm_args(&args2).unwrap_err().to_string();
         assert!(err2.contains("--swarm-pigeon-url requires --swarm-mcp-bin"));
@@ -1829,13 +1835,19 @@ mod tests {
     #[test]
     fn test_validate_swarm_args_token_file_without_others() {
         use clap::Parser;
-        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        let mut args =
+            crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+                .unwrap();
         args.swarm_pigeon_token_file = Some(PathBuf::from("/tmp/tok"));
         let err = validate_swarm_args(&args).unwrap_err().to_string();
-        assert!(err.contains("--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"));
+        assert!(err.contains(
+            "--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"
+        ));
 
         args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
         let err2 = validate_swarm_args(&args).unwrap_err().to_string();
-        assert!(err2.contains("--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"));
+        assert!(err2.contains(
+            "--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"
+        ));
     }
 }
