@@ -655,6 +655,19 @@ pub fn setup_terminal() -> anyhow::Result<(
     Ok((terminal, guard))
 }
 
+/// Drains warning and error notices still queued for the TUI.
+fn unseen_warnings(ui_rx: &mut mpsc::UnboundedReceiver<UiEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(evt) = ui_rx.try_recv() {
+        if let UiEvent::Notice(n) = evt
+            && n.kind != crate::chat::NoticeKind::Info
+        {
+            out.push(n.text);
+        }
+    }
+    out
+}
+
 pub async fn run_app(
     mut app: App,
     mut ui_rx: mpsc::UnboundedReceiver<UiEvent>,
@@ -790,6 +803,12 @@ pub async fn run_app(
     // waits briefly for a pigeon registration in flight) runs on every exit path.
     let _ = handle.send(UiCommand::Shutdown);
     let _ = handle.join().await;
+    // Warnings that arrived after the TUI stopped drawing (a pigeon or oc-tags
+    // failure right after a quick `:q`, or one not confirmed by the exit
+    // grace) would otherwise be lost; the terminal is restored, so print them.
+    for text in unseen_warnings(&mut ui_rx) {
+        eprintln!("honk: {text}");
+    }
 
     if let Some(err) = app.fatal_error {
         eprintln!("{err}");
@@ -805,6 +824,22 @@ pub async fn run_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unseen_warnings_keeps_warnings_and_errors_only() {
+        use crate::chat::Notice;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(UiEvent::Notice(Notice::info("Tag: fine"))).unwrap();
+        tx.send(UiEvent::Notice(Notice::warning("Tag: not applied")))
+            .unwrap();
+        tx.send(UiEvent::Exit(0)).unwrap();
+        tx.send(UiEvent::Notice(Notice::error("boom"))).unwrap();
+        assert_eq!(
+            unseen_warnings(&mut rx),
+            vec!["Tag: not applied".to_string(), "boom".to_string()]
+        );
+        assert!(unseen_warnings(&mut rx).is_empty());
+    }
     use crate::chat::types::{NoticeKind, Ownership, RunState};
     use crate::tui::BlockKind;
     use crossterm::event::{KeyEventKind, KeyEventState};

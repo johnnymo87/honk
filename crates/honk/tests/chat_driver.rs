@@ -2677,19 +2677,28 @@ async fn test_new_session_pigeon_failure_is_a_warning_not_fatal() {
 
 /// A fake oc-tags that records its argv to `<dir>/argv` (one per line) after
 /// `delay` seconds, then prints what oc-tags prints on success.
+///
+/// The script is written by a child process: written from this one, its
+/// write fd can leak into a concurrent test's fork and make exec'ing it fail
+/// with ETXTBSY ("Text file busy").
 fn fake_oc_tags(dir: &Path, delay: &str) -> (String, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
     let argv = dir.join("argv");
     let bin = dir.join("oc-tags");
-    std::fs::write(
-        &bin,
-        format!(
-            "#!/bin/sh\nsleep {delay}\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\necho \"Tagged session '$4' as '$3'\"\n",
-            argv.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let body = format!(
+        "#!/bin/sh\nsleep {delay}\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\necho \"Tagged session '$4' as '$3'\"\n",
+        argv.display()
+    );
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&bin)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(body.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
     (bin.to_string_lossy().into_owned(), argv)
 }
 
@@ -2795,6 +2804,71 @@ async fn test_quick_quit_after_new_still_tags() {
     assert!(
         argv.exists(),
         "oc-tags must have finished before the driver stopped"
+    );
+}
+
+/// An oc-tags slower than the exit grace must not hold quitting hostage: the
+/// driver stops after the grace (not the 10s tag timeout) and reports the tag
+/// as unconfirmed, on the channel run_app drains after join.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quit_with_slow_oc_tags_waits_only_the_grace_and_says_unconfirmed() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, _argv) = fake_oc_tags(tmp.path(), "30");
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagSettings {
+        tag: "honk".to_string(),
+        bin,
+        timeout: Duration::from_secs(10),
+    });
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let sid = loop {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for SessionNew")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { result } => {
+                break result["sessionId"].as_str().unwrap().to_string();
+            }
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    };
+    let quit_at = Instant::now();
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(8), handle.join())
+        .await
+        .expect("driver waited past the grace for a slow oc-tags")
+        .expect("driver task panicked");
+    assert!(
+        quit_at.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        quit_at.elapsed()
+    );
+    let mut unconfirmed = None;
+    while let Ok(evt) = rx.try_recv() {
+        if let UiEvent::Notice(n) = evt
+            && n.text.starts_with("Tag:")
+        {
+            unconfirmed = Some(n);
+        }
+    }
+    let n = unconfirmed.expect("an unconfirmed-tag warning after join");
+    assert_eq!(n.kind, honk::chat::NoticeKind::Warning, "{n:?}");
+    assert_eq!(
+        n.text,
+        format!(
+            "Tag: 'honk' for goose:{sid} was not confirmed before exit; check with: oc-tags which goose:{sid}"
+        )
     );
 }
 

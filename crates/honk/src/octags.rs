@@ -79,23 +79,51 @@ pub fn parse_tag(s: &str) -> Result<String, String> {
 /// nothing, and a locked tags.db prints a traceback whose last line is the
 /// useful one.
 pub async fn tag_session(settings: &TagSettings, goose_session_id: &str) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+    // NOT kill_on_drop: if honk exits while oc-tags is still writing, the write
+    // should finish (it is idempotent and bounded by oc-tags' own busy
+    // timeout). Only this function's own timeout kills it.
     let child = tokio::process::Command::new(&settings.bin)
         .args(["set", "--", &settings.tag, &tagged_id(goose_session_id)])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
         .spawn();
-    let child = match child {
+    let mut child = match child {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             anyhow::bail!("'{}' not found", settings.bin)
         }
         Err(e) => anyhow::bail!("could not run '{}': {e}", settings.bin),
     };
-    let out = match tokio::time::timeout(settings.timeout, child.wait_with_output()).await {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let run = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let read_out = async {
+            match stdout.as_mut() {
+                Some(s) => s.read_to_end(&mut out).await.map(|_| ()),
+                None => Ok(()),
+            }
+        };
+        let read_err = async {
+            match stderr.as_mut() {
+                Some(s) => s.read_to_end(&mut err).await.map(|_| ()),
+                None => Ok(()),
+            }
+        };
+        tokio::try_join!(read_out, read_err)?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    };
+    let res = tokio::time::timeout(settings.timeout, run).await;
+    let (status, out, err) = match res {
         Ok(r) => r.map_err(|e| anyhow::anyhow!("could not run '{}': {e}", settings.bin))?,
-        Err(_) => anyhow::bail!("timed out after {:?}", settings.timeout),
+        Err(_) => {
+            let _ = child.start_kill();
+            anyhow::bail!("timed out after {:?}", settings.timeout)
+        }
     };
     let last_line = |bytes: &[u8]| {
         String::from_utf8_lossy(bytes)
@@ -104,18 +132,28 @@ pub async fn tag_session(settings: &TagSettings, goose_session_id: &str) -> anyh
             .rfind(|l| !l.is_empty())
             .map(str::to_string)
     };
-    if out.status.success() {
-        return Ok(last_line(&out.stdout).unwrap_or_else(|| {
+    if status.success() {
+        return Ok(last_line(&out).unwrap_or_else(|| {
             format!("tagged {} as {}", tagged_id(goose_session_id), settings.tag)
         }));
     }
-    let reason = last_line(&out.stderr)
-        .or_else(|| last_line(&out.stdout))
-        .unwrap_or_else(|| match out.status.code() {
+    let reason = last_line(&err)
+        .or_else(|| last_line(&out))
+        .unwrap_or_else(|| match status.code() {
             Some(c) => format!("exit {c}, no output"),
             None => "killed by a signal, no output".to_string(),
         });
     anyhow::bail!("{reason}")
+}
+
+/// The warning for a tag that had not been confirmed when honk exited. The
+/// write is not cancelled; this says how to check it.
+pub fn unconfirmed_text(settings: &TagSettings, goose_session_id: &str) -> String {
+    let id = tagged_id(goose_session_id);
+    format!(
+        "Tag: '{tag}' for {id} was not confirmed before exit; check with: oc-tags which {id}",
+        tag = settings.tag
+    )
 }
 
 /// The chat notice for a tagging outcome.
@@ -140,12 +178,26 @@ pub fn notice(
 mod tests {
     use super::*;
     use crate::chat::NoticeKind;
-    use std::os::unix::fs::PermissionsExt;
 
+    /// Writes an executable script FROM A CHILD PROCESS. Written by this
+    /// process, its write fd could be inherited by another test thread's
+    /// fork for the moment before that child execs, and exec'ing the script
+    /// then fails with ETXTBSY ("Text file busy").
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::io::Write;
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&p)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
         p.to_string_lossy().into_owned()
     }
 

@@ -114,13 +114,15 @@ fn spawn_tagging(
 }
 
 /// How long quitting waits for post-create work still in flight (pigeon
-/// registration, oc-tags tagging), so that a quick `:q` after `--new` does not
-/// leave pigeon with a session but no topic, or the session untagged. One
-/// deadline covers all of them; each is time-bounded on its own as well.
+/// registration, oc-tags tagging), so that a quick `:q` after `--new` still
+/// reports how it went. One deadline covers all of them; each is time-bounded
+/// on its own as well. A task still running at the deadline is not aborted
+/// (an oc-tags write finishes on its own); it is reported as unconfirmed.
 const EXIT_GRACE: Duration = Duration::from_secs(3);
 
-/// Background tasks started after `session/new` that quitting waits for.
-type BackgroundTasks = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+/// Background tasks started after `session/new` that quitting waits for, each
+/// with the warning to give if it has not finished by the deadline.
+type BackgroundTasks = Arc<std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -626,11 +628,15 @@ async fn run_driver(
                     cwd_for_pigeon.clone(),
                     ui_tx.clone(),
                 );
-                background.lock().unwrap().push(task);
+                let unconfirmed = format!(
+                    "Telegram: registering {session_id} with pigeon was not confirmed before exit; `honk telegram {session_id}` registers it (it refuses if pigeon already has it)"
+                );
+                background.lock().unwrap().push((unconfirmed, task));
             }
             if let Some(settings) = opts.tag.clone() {
+                let unconfirmed = crate::octags::unconfirmed_text(&settings, session_id);
                 let task = spawn_tagging(settings, session_id.to_string(), ui_tx.clone());
-                background.lock().unwrap().push(task);
+                background.lock().unwrap().push((unconfirmed, task));
             }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
@@ -1155,11 +1161,17 @@ pub async fn start(
 
     let task = tokio::spawn(async move {
         let background = BackgroundTasks::default();
+        let exit_tx = ui_tx.clone();
         run_driver(opts, cmd_rx, ui_tx, background.clone()).await;
         let pending = std::mem::take(&mut *background.lock().unwrap());
         let deadline = tokio::time::Instant::now() + EXIT_GRACE;
-        for h in pending {
-            let _ = tokio::time::timeout_at(deadline, h).await;
+        for (unconfirmed, h) in pending {
+            // Past the deadline the task is left running, not aborted: an
+            // oc-tags write still finishes. The user is told it is unconfirmed
+            // (run_app prints warnings the TUI never showed).
+            if tokio::time::timeout_at(deadline, h).await.is_err() {
+                let _ = exit_tx.send(UiEvent::Notice(Notice::warning(unconfirmed)));
+            }
         }
     });
     *join_handle.lock().await = Some(task);

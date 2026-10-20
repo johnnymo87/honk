@@ -251,6 +251,7 @@ honk telegram 20261016_7
 
 - It runs `oc-tags set -- <tag> goose:<id>` (or `$HONK_OC_TAGS_BIN`) in the background after the session exists, bounded to 10 seconds. The outcome is a `Tag:` notice; a failure is a warning that includes the command to apply the tag by hand, never a reason the chat stops.
 - The tag is checked before the session is created, with opencode-launch's rule: a letter or digit, then up to 63 letters, digits or `._:/-`. `auto` and `auto:...` are refused (oc-tags reserves `auto:` for the tags it derives). oc-tags stores tags lowercased.
+- Quitting right after `--new` waits up to 3 seconds for tagging (and pigeon registration) to finish. A tag write still running then is left to finish on its own, and honk prints a "not confirmed" warning with an `oc-tags which` command to check it. Warnings that arrive after the chat screen has closed are printed to stderr.
 - `--tag` requires `--new`. To tag an existing session, run `oc-tags set <tag> goose:<id>`.
 
 ---
