@@ -165,6 +165,7 @@ struct FakeGooseInner {
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
     prompt_error_reply: Mutex<Option<Value>>,
+    prompt_result_meta: Mutex<Option<Value>>,
     session_new_status: Mutex<Option<StatusCode>>,
     session_new_error_reply: Mutex<Option<Value>>,
     session_new_delay: Mutex<Option<Duration>>,
@@ -225,6 +226,7 @@ impl FakeGoose {
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
             prompt_error_reply: Mutex::new(None),
+            prompt_result_meta: Mutex::new(None),
             session_new_status: Mutex::new(None),
             session_new_error_reply: Mutex::new(None),
             session_new_delay: Mutex::new(None),
@@ -436,6 +438,12 @@ impl FakeGoose {
 
     pub fn set_prompt_error_reply(&self, err: Option<Value>) {
         *self.state.prompt_error_reply.lock().unwrap() = err;
+    }
+
+    /// `_meta` for the result of every later `session/prompt` (e.g.
+    /// `{"goose": {"turnError": ...}}`); `None` sends no `_meta`.
+    pub fn set_prompt_result_meta(&self, meta: Option<Value>) {
+        *self.state.prompt_result_meta.lock().unwrap() = meta;
     }
 
     pub fn set_session_new_status(&self, status: Option<StatusCode>) {
@@ -1330,9 +1338,7 @@ async fn handle_post(
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
-                                "result": {
-                                    "stopReason": stop_reason
-                                }
+                                "result": prompt_result(&state_clone, stop_reason)
                             }),
                         );
                     }
@@ -1447,9 +1453,7 @@ async fn handle_post(
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": {
-                                "stopReason": stop_reason
-                            }
+                            "result": prompt_result(&state_clone, stop_reason)
                         }),
                     );
                 }
@@ -1479,6 +1483,14 @@ async fn handle_post(
         }
         _ => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+fn prompt_result(state: &FakeGooseInner, stop_reason: &str) -> Value {
+    let mut result = json!({ "stopReason": stop_reason });
+    if let Some(meta) = state.prompt_result_meta.lock().unwrap().clone() {
+        result["_meta"] = meta;
+    }
+    result
 }
 
 fn emit_session_frame(state: &FakeGooseInner, conn_id: &str, sid: &str, frame: Value) {

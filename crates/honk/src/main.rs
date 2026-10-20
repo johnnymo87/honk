@@ -158,7 +158,7 @@ struct ListArgs {
 
     /// Print one JSON array instead of text lines. Each object has sessionId,
     /// title, cwd, held, running, updatedAt, lastMessageAt, archivedAt,
-    /// sessionType, hasRecipe and pendingRequests (unknown values are null).
+    /// sessionType, hasRecipe, pendingRequests and lastError (unknown values are null).
     #[arg(long)]
     json: bool,
 

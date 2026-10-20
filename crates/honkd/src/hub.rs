@@ -808,12 +808,38 @@ impl Hub {
             // sid -> number of goose->client requests (permission prompts,
             // elicitations) waiting on an answer. A session with any is blocked
             // on the human; the nvim pickers show it as such (honk-9qf.15.11).
-            let held: std::collections::HashMap<String, usize> = {
+            //
+            // sid -> why its last turn failed, held or not (honk-9qf.15.11.3).
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let (held, turn_errors): (
+                std::collections::HashMap<String, usize>,
+                std::collections::HashMap<String, Value>,
+            ) = {
                 let s = self.state.lock().await;
-                s.sessions
+                let held = s
+                    .sessions
                     .iter()
                     .map(|(sid, h)| (sid.clone(), h.pending.len()))
-                    .collect()
+                    .collect();
+                let turn_errors = s
+                    .turn_errors
+                    .keys()
+                    .filter_map(|sid| {
+                        let e = s.listed_turn_error(sid, now_unix)?;
+                        Some((
+                            sid.clone(),
+                            serde_json::json!({
+                                "kind": e.kind,
+                                "message": e.message,
+                                "at": e.at_unix,
+                            }),
+                        ))
+                    })
+                    .collect();
+                (held, turn_errors)
             };
 
             if let Some(sessions_arr) = resp
@@ -829,6 +855,7 @@ impl Hub {
                         "held": is_held,
                         "running": is_running,
                         "pending": pending.unwrap_or(0),
+                        "error": turn_errors.get(sid).cloned().unwrap_or(Value::Null),
                     });
                     if let Some(meta_obj) = entry.get_mut("_meta").and_then(Value::as_object_mut) {
                         meta_obj.insert("honk".to_string(), honk_meta);

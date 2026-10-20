@@ -60,6 +60,38 @@ pub struct SessionEntry {
     /// `_meta.honk.pending`: requests from goose (permission prompts,
     /// elicitations) waiting on an answer. `None` from an older honkd.
     pub pending_requests: Option<u64>,
+    /// `_meta.honk.error`: why the session's last turn failed, if it did
+    /// recently. `None` from an older honkd too.
+    pub last_error: Option<TurnError>,
+}
+
+/// A failed last turn, as honkd reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnError {
+    /// `network`, `provider`, `context_length`, ... from goose, or honkd's
+    /// `rpc` (an error reply) and `interrupted` (goose restarted mid-turn).
+    pub kind: String,
+    pub message: String,
+    /// Unix seconds when honkd recorded it.
+    pub at: Option<u64>,
+}
+
+impl TurnError {
+    fn from_meta(v: &Value) -> Option<Self> {
+        Some(Self {
+            kind: v.get("kind")?.as_str()?.to_string(),
+            message: v
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            at: v.get("at").and_then(Value::as_u64),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({ "kind": self.kind, "message": self.message, "at": self.at })
+    }
 }
 
 impl SessionEntry {
@@ -87,6 +119,9 @@ impl SessionEntry {
             session_type: str_at(s.pointer("/_meta/sessionType")),
             has_recipe: s.pointer("/_meta/hasRecipe").and_then(Value::as_bool),
             pending_requests: s.pointer("/_meta/honk/pending").and_then(Value::as_u64),
+            last_error: s
+                .pointer("/_meta/honk/error")
+                .and_then(TurnError::from_meta),
         }
     }
 
@@ -106,6 +141,7 @@ impl SessionEntry {
             "sessionType": self.session_type,
             "hasRecipe": self.has_recipe,
             "pendingRequests": self.pending_requests,
+            "lastError": self.last_error.as_ref().map(TurnError::to_json),
         })
     }
 
@@ -483,6 +519,34 @@ mod tests {
         assert_eq!(e.session_type.as_deref(), Some("acp"));
         assert_eq!(e.has_recipe, Some(false));
         assert_eq!(e.pending_requests, Some(2));
+        assert_eq!(e.last_error, None);
+    }
+
+    #[test]
+    fn test_from_list_entry_reads_the_last_turn_error() {
+        let with_error = |error: Value| {
+            SessionEntry::from_list_entry(&json!({
+                "sessionId": "s1",
+                "_meta": { "honk": { "held": false, "running": false, "pending": 0, "error": error } }
+            }))
+        };
+        let e = with_error(
+            json!({ "kind": "network", "message": "connection reset", "at": 1_760_000_000 }),
+        );
+        assert_eq!(
+            e.last_error,
+            Some(TurnError {
+                kind: "network".into(),
+                message: "connection reset".into(),
+                at: Some(1_760_000_000),
+            })
+        );
+        assert_eq!(
+            e.to_json()["lastError"],
+            json!({ "kind": "network", "message": "connection reset", "at": 1_760_000_000 })
+        );
+        assert_eq!(with_error(Value::Null).last_error, None);
+        assert_eq!(with_error(json!({ "message": "no kind" })).last_error, None);
     }
 
     #[test]
@@ -501,6 +565,7 @@ mod tests {
         assert_eq!(e.session_type, None);
         assert_eq!(e.has_recipe, None);
         assert_eq!(e.pending_requests, None);
+        assert_eq!(e.last_error, None);
     }
 
     #[test]
@@ -533,7 +598,8 @@ mod tests {
                 "archivedAt": "2026-10-19T23:00:00Z",
                 "sessionType": "acp",
                 "hasRecipe": true,
-                "pendingRequests": 0
+                "pendingRequests": 0,
+                "lastError": null
             })
         );
     }
