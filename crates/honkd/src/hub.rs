@@ -195,10 +195,32 @@ impl Hub {
 
         // 7. Register session handles from state (Task A12 fills this in)
 
-        let mcp = args.mcp_catalog.as_ref().map(|path| crate::mcp::McpConfig {
-            catalog_path: path.clone(),
-            policy: crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone()),
-        });
+        let has_catalog = args.mcp_catalog.is_some();
+        let has_swarm = args.swarm_mcp_bin.is_some() && args.swarm_pigeon_url.is_some();
+        let mcp = if has_catalog || has_swarm {
+            let swarm = if has_swarm {
+                Some(crate::mcp::SwarmMcpConfig {
+                    bin: args.swarm_mcp_bin.clone().unwrap(),
+                    pigeon_url: args.swarm_pigeon_url.clone().unwrap(),
+                    pigeon_token_file: args.swarm_pigeon_token_file.clone(),
+                    honk_url: format!("http://{}/acp", args.listen),
+                    honk_secret_file: state_dir.join("secret"),
+                })
+            } else {
+                None
+            };
+            let mut policy = crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone());
+            if has_swarm {
+                policy.no_confirm.insert("swarm".to_string());
+            }
+            Some(crate::mcp::McpConfig {
+                catalog_path: args.mcp_catalog.clone(),
+                policy,
+                swarm,
+            })
+        } else {
+            None
+        };
 
         let hub = Arc::new(Self {
             args,
