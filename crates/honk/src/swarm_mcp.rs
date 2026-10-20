@@ -365,8 +365,36 @@ async fn handle_swarm_read(
     if let Some(tok) = &pigeon_token {
         ack_req = ack_req.bearer_auth(tok);
     }
-    if let Err(e) = ack_req.send().await {
-        eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
+    let mut ack_warning: Option<String> = None;
+    match ack_req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let n = msg_ids.len();
+                let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
+                let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+                eprintln!("honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}");
+                ack_warning = Some(msg);
+            } else if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                if let Some(rej) = val.get("rejected").and_then(Value::as_array)
+                    && !rej.is_empty()
+                {
+                    let n = rej.len();
+                    let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
+                    let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+                    eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
+                    ack_warning = Some(msg);
+                }
+            }
+        }
+        Err(e) => {
+            let n = msg_ids.len();
+            let s = if n == 1 { "1 message" } else { &format!("{n} messages") };
+            let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+            eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
+            ack_warning = Some(msg);
+        }
     }
 
     let pending_total = drain_res
@@ -382,22 +410,25 @@ async fn handle_swarm_read(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
-        let priority = m
-            .get("priority")
-            .and_then(Value::as_str)
-            .unwrap_or("normal");
+        let priority = m.get("priority").and_then(Value::as_str);
         let reply_to = m.get("reply_to").and_then(Value::as_str);
+        let redelivered = m.get("redelivered").and_then(Value::as_bool).unwrap_or(false);
         let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
 
         let mut attrs = format!(
-            r#"v="1" kind="{}" from="{}" msg_id="{}" priority="{}""#,
+            r#"v="1" kind="{}" from="{}" msg_id="{}""#,
             xml_escape(kind),
             xml_escape(from),
             xml_escape(msg_id),
-            xml_escape(priority),
         );
+        if let Some(p) = priority {
+            attrs.push_str(&format!(r#" priority="{}""#, xml_escape(p)));
+        }
         if let Some(r) = reply_to {
             attrs.push_str(&format!(r#" reply_to="{}""#, xml_escape(r)));
+        }
+        if redelivered {
+            attrs.push_str(r#" redelivered="true""#);
         }
         let block =
             format!("<swarm_message {attrs}>\n{payload}\n</swarm_message>\n\n{ECONOMY_FOOTER}");
@@ -412,6 +443,9 @@ async fn handle_swarm_read(
         result_text.push_str(&format!(
             "\n\n({remaining} more unread message{s} in inbox — call swarm_read again to drain.)"
         ));
+    }
+    if let Some(warn) = ack_warning {
+        result_text.push_str(&format!("\n\n{warn}"));
     }
 
     tool_ok(result_text)

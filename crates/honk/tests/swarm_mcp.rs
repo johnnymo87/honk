@@ -460,15 +460,23 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
                         "kind": "chat",
                         "payload": "ping from alice",
                         "reply_to": "msg_orig",
-                        "priority": "normal",
                         "created_at": 1700000000000i64,
+                    },
+                    {
+                        "msg_id": "msg_msg2",
+                        "source": "swarm",
+                        "sender_id": "ses_bob",
+                        "kind": "task.assign",
+                        "payload": "urgent task",
+                        "priority": "urgent",
+                        "created_at": 1700000000001i64,
                     }
                 ]
             }),
         ),
         pull_ack: (
             StatusCode::OK,
-            json!({"ok": true, "acked": ["msg_msg1"], "rejected": []}),
+            json!({"ok": true, "acked": ["msg_msg1", "msg_msg2"], "rejected": []}),
         ),
         ..Behaviour::default()
     })
@@ -498,9 +506,7 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
             "method": "tools/call",
             "params": {
                 "name": "swarm_read",
-                "arguments": {
-                    "limit": 1
-                },
+                "arguments": {},
                 "_meta": {
                     "agent-session-id": "20261020_owner"
                 }
@@ -512,15 +518,23 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
     assert_eq!(resp["result"]["isError"], Value::Null);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
 
-    assert!(text.contains("<swarm_message v=\"1\" kind=\"chat\" from=\"ses_alice\" msg_id=\"msg_msg1\" priority=\"normal\" reply_to=\"msg_orig\">"), "envelope header: {text}");
+    assert!(
+        text.contains("<swarm_message v=\"1\" kind=\"chat\" from=\"ses_alice\" msg_id=\"msg_msg1\" reply_to=\"msg_orig\">"),
+        "envelope header: {text}"
+    );
+    assert!(
+        text.contains("<swarm_message v=\"1\" kind=\"task.assign\" from=\"ses_bob\" msg_id=\"msg_msg2\" priority=\"urgent\">"),
+        "urgent envelope header: {text}"
+    );
     assert!(text.contains("ping from alice"), "envelope payload: {text}");
+    assert!(text.contains("urgent task"), "envelope payload 2: {text}");
     assert!(text.contains("</swarm_message>"), "envelope close: {text}");
     assert!(
         text.contains("[pigeon] Message economy"),
         "economy footer: {text}"
     );
     assert!(
-        text.contains("2 more unread messages in inbox — call swarm_read again to drain."),
+        text.contains("1 more unread message in inbox — call swarm_read again to drain."),
         "pending total note: {text}"
     );
 
@@ -532,10 +546,9 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
     assert_eq!(seen[0].body["cwd"], current_dir.to_str().unwrap());
     assert_eq!(seen[1].path, "/pull/drain");
     assert_eq!(seen[1].body["session_id"], "gse_reader");
-    assert_eq!(seen[1].body["limit"], 1);
     assert_eq!(seen[2].path, "/pull/ack");
     assert_eq!(seen[2].body["session_id"], "gse_reader");
-    assert_eq!(seen[2].body["msg_ids"], json!(["msg_msg1"]));
+    assert_eq!(seen[2].body["msg_ids"], json!(["msg_msg1", "msg_msg2"]));
 
     drop(client_tx);
     drop(client_rx);
@@ -754,6 +767,238 @@ async fn test_caller_id_from_env_var() {
             .as_str()
             .unwrap()
             .contains("subagents cannot use them")
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_renders_redelivered_attribute() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_reader",
+                "pending_total": 1,
+                "messages": [
+                    {
+                        "msg_id": "msg_redelivered",
+                        "source": "swarm",
+                        "sender_id": "ses_alice",
+                        "kind": "chat",
+                        "payload": "retry payload",
+                        "redelivered": true,
+                    }
+                ]
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(r#"redelivered="true""#),
+        "expected redelivered attribute: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_ack_http_failure_appends_warning() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_reader",
+                "pending_total": 1,
+                "messages": [
+                    {
+                        "msg_id": "msg_fail_ack",
+                        "source": "swarm",
+                        "sender_id": "ses_alice",
+                        "kind": "chat",
+                        "payload": "hello",
+                    }
+                ]
+            }),
+        ),
+        pull_ack: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "db failed"}),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("warning: 1 message could not be acknowledged and may be shown again"),
+        "expected warning in text: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_ack_rejected_appends_warning() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_reader",
+                "pending_total": 2,
+                "messages": [
+                    {
+                        "msg_id": "msg_rej1",
+                        "source": "swarm",
+                        "sender_id": "ses_alice",
+                        "kind": "chat",
+                        "payload": "m1",
+                    },
+                    {
+                        "msg_id": "msg_rej2",
+                        "source": "swarm",
+                        "sender_id": "ses_bob",
+                        "kind": "chat",
+                        "payload": "m2",
+                    }
+                ]
+            }),
+        ),
+        pull_ack: (
+            StatusCode::OK,
+            json!({"ok": true, "acked": ["msg_rej1"], "rejected": ["msg_rej2"]}),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("warning: 1 message could not be acknowledged and may be shown again"),
+        "expected warning in text: {text}"
     );
 
     drop(client_tx);
