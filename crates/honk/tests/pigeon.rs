@@ -164,3 +164,42 @@ async fn find_registered_matches_goose_acp_rows_by_goose_id() {
             .all(|s| s.auth.as_deref() == Some("Bearer tok"))
     );
 }
+
+#[tokio::test]
+async fn find_registered_skips_notify_false_rows() {
+    let p = StubPigeon::start(Behaviour {
+        sessions: json!({"ok": true, "sessions": [
+            {
+                "session_id": "gse_mailbox_only",
+                "backend_kind": "goose-acp",
+                "backend_session_id": "20261020_1",
+                "notify": false,
+            },
+            {
+                "session_id": "gse_notified",
+                "backend_kind": "goose-acp",
+                "backend_session_id": "20261020_2",
+                "notify": true,
+            },
+        ]}),
+        ..Behaviour::default()
+    })
+    .await;
+    let cfg = PigeonConfig {
+        url: p.url.clone(),
+        token: None,
+    };
+    assert_eq!(
+        find_registered(&cfg, "20261020_1").await.unwrap(),
+        None,
+        "notify: false row must be skipped so honk telegram can upgrade it"
+    );
+    assert_eq!(
+        find_registered(&cfg, "20261020_2")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("gse_notified"),
+        "notify: true row must match"
+    );
+}

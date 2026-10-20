@@ -44,6 +44,8 @@ pub struct DriverOpts {
     /// `goose:<id>`. Background and best-effort like `pigeon`; the outcome
     /// arrives as a `UiEvent::Notice` starting with `Tag:`.
     pub tag: Option<crate::octags::TagSettings>,
+    /// When true, do not enable the swarm MCP server by default on a new session.
+    pub no_swarm: bool,
 }
 
 impl DriverOpts {
@@ -57,6 +59,7 @@ impl DriverOpts {
             max_turns: None,
             pigeon: None,
             tag: None,
+            no_swarm: false,
         }
     }
 }
@@ -637,6 +640,76 @@ async fn run_driver(
                 let unconfirmed = crate::octags::unconfirmed_text(&settings, session_id);
                 let task = spawn_tagging(settings, session_id.to_string(), ui_tx.clone());
                 background.lock().unwrap().push((unconfirmed, task));
+            }
+
+            if !opts.no_swarm {
+                let mcp_req_id = ids.allocate();
+                let mcp_params = json!({
+                    "sessionId": session_id,
+                    "names": ["swarm"],
+                });
+                if let Err(e) = conn
+                    .send_request(mcp_req_id, "_honk/mcp/enable", mcp_params)
+                    .await
+                {
+                    let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
+                        "swarm: failed to send enable: {e}"
+                    ))));
+                } else {
+                    let mcp_timeout = Duration::from_secs(5);
+                    let mcp_res = tokio::time::timeout(mcp_timeout, async {
+                        while let Some(frame) = frame_rx.recv().await {
+                            if frame.get("id") == Some(&json!(mcp_req_id))
+                                && crate::conn::is_response(&frame)
+                            {
+                                return Ok(frame);
+                            }
+                        }
+                        Err(anyhow::anyhow!(
+                            "stream closed while awaiting _honk/mcp/enable response"
+                        ))
+                    })
+                    .await;
+
+                    match mcp_res {
+                        Ok(Ok(frame)) => {
+                            if let Some(err) = frame.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("enable failed");
+                                let _ = ui_tx
+                                    .send(UiEvent::Notice(Notice::info(format!("swarm: {msg}"))));
+                            } else if let Some(res) = frame.get("result")
+                                && let Some(results) = res.get("results").and_then(Value::as_array)
+                            {
+                                for r in results {
+                                    if r.get("name").and_then(Value::as_str) == Some("swarm")
+                                        && r.get("ok") == Some(&json!(false))
+                                    {
+                                        let err_msg = r
+                                            .get("error")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("failed to enable");
+                                        let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
+                                            "swarm: {err_msg}"
+                                        ))));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            let _ =
+                                ui_tx.send(UiEvent::Notice(Notice::info(format!("swarm: {e}"))));
+                        }
+                        Err(_) => {
+                            let _ = ui_tx.send(UiEvent::Notice(Notice::info(
+                                "swarm: enabling is still in progress; /mcp shows the result"
+                                    .to_string(),
+                            )));
+                        }
+                    }
+                }
             }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)

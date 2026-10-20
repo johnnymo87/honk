@@ -432,3 +432,196 @@ async fn test_mcp_live_e2e() {
         .unwrap();
     assert_eq!(srv_missing["enabled"], false);
 }
+
+fn find_honk_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HONK_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let candidates = [
+        PathBuf::from("target/debug/honk"),
+        PathBuf::from("../../target/debug/honk"),
+        PathBuf::from("../target/debug/honk"),
+    ];
+    for c in &candidates {
+        if c.is_file() {
+            return Some(c.canonicalize().unwrap_or_else(|_| c.clone()));
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_swarm_live_e2e() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honk_bin) = find_honk_bin() else {
+        eprintln!("honk binary not found; skipping test_swarm_live_e2e");
+        return;
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pigeon_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let app = axum::Router::new()
+            .route(
+                "/goose/swarm-mailbox",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "ok": true,
+                            "session_id": "gse_live_test",
+                            "backend_session_id": "test_sid"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/sessions",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "ok": true,
+                            "sessions": [
+                                {
+                                    "session_id": "ses_peer_opencode",
+                                    "backend_kind": "opencode",
+                                    "cwd": "/some/cwd",
+                                    "title": "peer work",
+                                    "updated_at": 1700000000000i64,
+                                }
+                            ]
+                        })),
+                    )
+                }),
+            );
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let h = Honkd::spawn(
+        &g.url(),
+        g.secret_file(),
+        &[
+            "--swarm-mcp-bin",
+            honk_bin.to_str().unwrap(),
+            "--swarm-pigeon-url",
+            &pigeon_url,
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some(honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(1))
+    })
+    .await;
+
+    // Enable built-in swarm entry
+    let enable_res = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": &sid,
+                "names": ["swarm"]
+            }),
+        )
+        .await;
+    assert!(
+        enable_res.get("error").is_none(),
+        "enable error: {enable_res:?}"
+    );
+    let results = &enable_res["result"]["results"];
+    assert_eq!(results[0]["name"], "swarm");
+    assert_eq!(results[0]["ok"], true, "swarm enable failed: {results:?}");
+
+    // tools/list on goose should now show the three swarm tools
+    let tools = g.tools_list(&sid).await;
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_send")),
+        "must include swarm_send tool: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_read")),
+        "must include swarm_read tool: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_list")),
+        "must include swarm_list tool: {tools:?}"
+    );
+
+    let swarm_list_tool = tools
+        .iter()
+        .find(|n| n.ends_with("swarm_list"))
+        .expect("must include swarm_list tool")
+        .clone();
+    assert_eq!(swarm_list_tool, "swarm__swarm_list");
+
+    // Script StubModel to call swarm_list tool
+    g.model().push([
+        Turn::ToolCall {
+            tool: swarm_list_tool.clone(),
+            arguments: json!({}),
+        },
+        Turn::Text(vec!["done".into()]),
+    ]);
+
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(&sid, "call swarm list tool", Some("crid-swarm-list")),
+        )
+        .await;
+    let prompt_resp = v.response(&pid).await;
+    assert_eq!(prompt_resp["result"]["stopReason"], "end_turn");
+
+    let export = g.export(&sid).await;
+    let export_str = export.to_string();
+
+    // Verify tool result in conversation is not an error and contains peer session
+    let mut found_tool_response = false;
+    if let Some(convo) = export.get("conversation").and_then(Value::as_array) {
+        for msg in convo {
+            if let Some(contents) = msg.get("content").and_then(Value::as_array) {
+                for block in contents {
+                    if block.get("type").and_then(Value::as_str) == Some("toolResponse") {
+                        found_tool_response = true;
+                        let is_error = block
+                            .pointer("/toolResult/value/isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        assert!(!is_error, "tool result must not be an error: {block:?}");
+                        let text = block
+                            .pointer("/toolResult/value/content/0/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        assert!(
+                            text.contains("ses_peer_opencode"),
+                            "tool result must contain peer session from stub: {text}"
+                        );
+                        assert!(
+                            !text.contains("subagents cannot use them"),
+                            "tool result must not fail identity check: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found_tool_response,
+        "must find toolResponse in export: {export_str}"
+    );
+}

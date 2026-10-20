@@ -30,6 +30,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Err(e) = honkd::hub::validate_swarm_args(&args) {
+        eprintln!("honkd: {e:#}");
+        std::process::exit(1);
+    }
+
     // 3. StateStore::open (it takes the lock and checks the upstream URL)
     let state_dir = args.resolve_state_dir();
     let state_store =

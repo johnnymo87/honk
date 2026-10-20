@@ -2453,8 +2453,14 @@ impl Session {
         let task = tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(60);
             let work = async {
-                let catalog = crate::mcp::catalog::Catalog::load(&mcp_config.catalog_path)
-                    .map_err(crate::mcp::ops::OpError::catalog_unreadable)?;
+                let mut catalog = match &mcp_config.catalog_path {
+                    Some(path) => crate::mcp::catalog::Catalog::load(path)
+                        .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
+                    None => crate::mcp::catalog::Catalog::default(),
+                };
+                if let Some(swarm) = &mcp_config.swarm {
+                    catalog.merge_swarm_entry(swarm, &sid);
+                }
                 match op {
                     McpOpKind::List => {
                         let res =

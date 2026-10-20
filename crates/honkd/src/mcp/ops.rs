@@ -1288,4 +1288,57 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_enable_swarm_builtin_without_confirm() {
+        let mut cat = Catalog::default();
+        let swarm_cfg = crate::mcp::SwarmMcpConfig {
+            bin: std::path::PathBuf::from("/etc/profiles/per-user/dev/bin/honk"),
+            pigeon_url: "http://127.0.0.1:4731".into(),
+            pigeon_token_file: None,
+            honk_url: "http://127.0.0.1:4280/acp".into(),
+            honk_secret_file: std::path::PathBuf::from("/tmp/state/secret"),
+        };
+        cat.merge_swarm_entry(&swarm_cfg, "ses_goose_1");
+
+        let mut policy = Policy::default();
+        policy.no_confirm.insert("swarm".to_string());
+
+        let req = FakeRequester::new(vec![]);
+
+        // Confirm array is empty, but swarm is implicitly no-confirm -> succeeds!
+        let res = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_goose_1",
+            &["swarm".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.results.len(), 1);
+        assert_eq!(res.results[0].name, "swarm");
+        assert!(res.results[0].ok);
+        assert_eq!(res.summary, "enabled swarm");
+
+        // Verify extensions/add call
+        let calls = req.calls();
+        let add_call = calls
+            .iter()
+            .find(|(m, _)| m == "_goose/unstable/session/extensions/add")
+            .expect("extensions/add call");
+        let ext = &add_call.1["extension"];
+        assert_eq!(ext["type"], "mcp");
+        assert_eq!(ext["description"], "honk-mcp:swarm");
+        assert_eq!(
+            ext["server"]["command"],
+            "/etc/profiles/per-user/dev/bin/honk"
+        );
+        let args = ext["server"]["args"].as_array().unwrap();
+        assert_eq!(args[0], "swarm-mcp");
+        assert_eq!(args[1], "--session");
+        assert_eq!(args[2], "ses_goose_1");
+    }
 }

@@ -49,6 +49,12 @@ pub struct Args {
     pub mcp_catalog: Option<PathBuf>,
     #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
     pub mcp_no_confirm: Vec<String>,
+    #[arg(long)]
+    pub swarm_mcp_bin: Option<PathBuf>,
+    #[arg(long)]
+    pub swarm_pigeon_url: Option<String>,
+    #[arg(long)]
+    pub swarm_pigeon_token_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -144,5 +150,42 @@ mod tests {
         .expect("parse args");
         assert_eq!(args.mcp_catalog, Some(PathBuf::from("/tmp/opencode.json")));
         assert_eq!(args.mcp_no_confirm, vec!["slack-ro", "figma", "local-test"]);
+    }
+
+    #[test]
+    fn default_swarm_flags() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.swarm_mcp_bin, None);
+        assert_eq!(args.swarm_pigeon_url, None);
+        assert_eq!(args.swarm_pigeon_token_file, None);
+    }
+
+    #[test]
+    fn parsed_swarm_flags() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--swarm-mcp-bin",
+            "/etc/profiles/per-user/dev/bin/honk",
+            "--swarm-pigeon-url",
+            "http://127.0.0.1:4731",
+            "--swarm-pigeon-token-file",
+            "/tmp/pigeon-token",
+        ])
+        .expect("parse args");
+        assert_eq!(
+            args.swarm_mcp_bin,
+            Some(PathBuf::from("/etc/profiles/per-user/dev/bin/honk"))
+        );
+        assert_eq!(
+            args.swarm_pigeon_url.as_deref(),
+            Some("http://127.0.0.1:4731")
+        );
+        assert_eq!(
+            args.swarm_pigeon_token_file,
+            Some(PathBuf::from("/tmp/pigeon-token"))
+        );
     }
 }

@@ -237,6 +237,44 @@ impl Catalog {
     pub fn get(&self, name: &str) -> Option<&CatalogEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
+
+    pub fn merge_swarm_entry(&mut self, swarm: &crate::mcp::SwarmMcpConfig, session_id: &str) {
+        let mut command = vec![
+            swarm.bin.to_string_lossy().to_string(),
+            "swarm-mcp".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--pigeon-url".to_string(),
+            swarm.pigeon_url.clone(),
+        ];
+        if let Some(ref token_file) = swarm.pigeon_token_file {
+            command.push("--pigeon-token-file".to_string());
+            command.push(token_file.to_string_lossy().to_string());
+        }
+        command.push("--honk-url".to_string());
+        command.push(swarm.honk_url.clone());
+        command.push("--honk-secret-file".to_string());
+        command.push(swarm.honk_secret_file.to_string_lossy().to_string());
+
+        let spec = GooseExtensionSpec {
+            name: "swarm".to_string(),
+            command,
+            env: BTreeMap::new(),
+        };
+
+        let entry = CatalogEntry {
+            name: "swarm".to_string(),
+            supported: Ok(spec),
+            kind: McpKind::Local,
+        };
+
+        if let Some(pos) = self.entries.iter().position(|e| e.name == "swarm") {
+            self.entries[pos] = entry;
+        } else {
+            self.entries.push(entry);
+            self.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+    }
 }
 
 fn parse_entry(name: &str, val: &serde_json::Value, home: Option<&Path>) -> CatalogEntry {
@@ -1067,5 +1105,100 @@ mod tests {
             macos_spec.env.get("AUTH_TOKEN").unwrap(),
             &EnvVarSpec::File(PathBuf::from("/var/mockhome/.secrets/token.txt"))
         );
+    }
+
+    #[test]
+    fn test_merge_swarm_entry_empty_catalog() {
+        let mut catalog = Catalog::default();
+        let swarm_cfg = crate::mcp::SwarmMcpConfig {
+            bin: PathBuf::from("/etc/profiles/per-user/dev/bin/honk"),
+            pigeon_url: "http://127.0.0.1:4731".into(),
+            pigeon_token_file: Some(PathBuf::from("/tmp/pigeon.token")),
+            honk_url: "http://127.0.0.1:4280/acp".into(),
+            honk_secret_file: PathBuf::from("/tmp/honk.secret"),
+        };
+
+        catalog.merge_swarm_entry(&swarm_cfg, "20261020_123");
+
+        assert_eq!(catalog.entries.len(), 1);
+        let entry = catalog.get("swarm").expect("swarm entry");
+        assert_eq!(entry.kind, McpKind::Local);
+        let spec = entry.supported.as_ref().expect("supported");
+        assert_eq!(spec.name, "swarm");
+        assert_eq!(
+            spec.command,
+            vec![
+                "/etc/profiles/per-user/dev/bin/honk",
+                "swarm-mcp",
+                "--session",
+                "20261020_123",
+                "--pigeon-url",
+                "http://127.0.0.1:4731",
+                "--pigeon-token-file",
+                "/tmp/pigeon.token",
+                "--honk-url",
+                "http://127.0.0.1:4280/acp",
+                "--honk-secret-file",
+                "/tmp/honk.secret",
+            ]
+        );
+        assert!(spec.env.is_empty(), "swarm entry must not have env vars");
+    }
+
+    #[test]
+    fn test_merge_swarm_entry_overrides_existing() {
+        let mut catalog = Catalog {
+            entries: vec![CatalogEntry {
+                name: "swarm".to_string(),
+                supported: Err("bogus".to_string()),
+                kind: McpKind::Unknown,
+            }],
+        };
+        let swarm_cfg = crate::mcp::SwarmMcpConfig {
+            bin: PathBuf::from("/bin/honk"),
+            pigeon_url: "http://127.0.0.1:4731".into(),
+            pigeon_token_file: None,
+            honk_url: "http://127.0.0.1:4280/acp".into(),
+            honk_secret_file: PathBuf::from("/tmp/honk.secret"),
+        };
+
+        catalog.merge_swarm_entry(&swarm_cfg, "20261020_456");
+
+        assert_eq!(catalog.entries.len(), 1);
+        let entry = catalog.get("swarm").unwrap();
+        assert_eq!(entry.kind, McpKind::Local);
+        assert!(entry.supported.is_ok());
+        let spec = entry.supported.as_ref().unwrap();
+        assert_eq!(spec.command[3], "20261020_456");
+    }
+
+    #[test]
+    fn test_swarm_generated_extensions_add_json_has_no_shell_wrapper() {
+        let mut catalog = Catalog::default();
+        let swarm_cfg = crate::mcp::SwarmMcpConfig {
+            bin: PathBuf::from("/bin/honk"),
+            pigeon_url: "http://127.0.0.1:4731".into(),
+            pigeon_token_file: None,
+            honk_url: "http://127.0.0.1:4280/acp".into(),
+            honk_secret_file: PathBuf::from("/tmp/honk.secret"),
+        };
+        catalog.merge_swarm_entry(&swarm_cfg, "20261020_sid");
+
+        let entry = catalog.get("swarm").unwrap();
+        let spec = entry.supported.as_ref().unwrap();
+        let add_json = spec.to_add_extension_json();
+
+        assert_eq!(add_json["type"], "mcp");
+        assert_eq!(add_json["description"], "honk-mcp:swarm");
+        assert_eq!(add_json["server"]["name"], "swarm");
+        assert_eq!(add_json["server"]["command"], "/bin/honk");
+        assert_ne!(
+            add_json["server"]["command"], "/bin/sh",
+            "swarm entry without env must not be wrapped in /bin/sh"
+        );
+        let args = add_json["server"]["args"].as_array().unwrap();
+        assert_eq!(args[0], "swarm-mcp");
+        assert_eq!(args[1], "--session");
+        assert_eq!(args[2], "20261020_sid");
     }
 }

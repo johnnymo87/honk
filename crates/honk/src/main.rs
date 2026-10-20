@@ -26,6 +26,9 @@ enum Commands {
         long_about = "Register an existing session with a pigeon daemon so it gets a Telegram topic.\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Telegram replies prompt the session; turns typed in honk chat are not mirrored to Telegram. pigeon is given the honkd secret so it can reach the session."
     )]
     Telegram(TelegramArgs),
+    /// Run the swarm MCP server over stdio for goose
+    #[command(name = "swarm-mcp")]
+    SwarmMcp(SwarmMcpArgs),
 }
 
 /// Where the pigeon daemon is. Registration is off unless a URL is given.
@@ -80,6 +83,29 @@ struct TelegramArgs {
 }
 
 #[derive(Args, Debug)]
+struct SwarmMcpArgs {
+    /// Owning goose session ID
+    #[arg(long)]
+    session: String,
+
+    /// pigeon daemon URL
+    #[arg(long, default_value = "http://127.0.0.1:4731", env = "HONK_PIGEON_URL")]
+    pigeon_url: String,
+
+    /// File holding pigeon's bearer token, if the daemon requires one
+    #[arg(long, env = "HONK_PIGEON_TOKEN_FILE")]
+    pigeon_token_file: Option<PathBuf>,
+
+    /// honkd ACP URL
+    #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
+    honk_url: String,
+
+    /// File holding honkd's auth token
+    #[arg(long, env = "HONK_SECRET_FILE")]
+    honk_secret_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 struct ChatArgs {
     /// Session ID to attach to
     #[arg(conflicts_with = "new", required_unless_present = "new")]
@@ -116,6 +142,10 @@ struct ChatArgs {
     /// Do not register a new session with pigeon, even if HONK_PIGEON_URL is set
     #[arg(long = "no-telegram")]
     no_telegram: bool,
+
+    /// Do not enable the swarm MCP server by default on a new session
+    #[arg(long = "no-swarm")]
+    no_swarm: bool,
 
     /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag),
     /// so it is listed under that program. Runs $HONK_OC_TAGS_BIN or oc-tags.
@@ -314,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
             opts.max_turns = args.max_turns;
             opts.pigeon = pigeon;
             opts.tag = tag;
+            opts.no_swarm = args.no_swarm;
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
@@ -364,6 +395,16 @@ async fn main() -> anyhow::Result<()> {
             let out = honk::pigeon::register(&cfg, &reg).await?;
             println!("{} (pigeon id {})", out.summary(), out.pigeon_session_id);
         }
+        Commands::SwarmMcp(args) => {
+            let config = honk::swarm_mcp::SwarmMcpServerConfig {
+                session: args.session,
+                pigeon_url: args.pigeon_url,
+                pigeon_token_file: args.pigeon_token_file,
+                honk_url: args.honk_url,
+                honk_secret_file: args.honk_secret_file,
+            };
+            honk::swarm_mcp::run_stdio(config).await?;
+        }
     }
     Ok(())
 }
@@ -384,6 +425,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            no_swarm: false,
             tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
@@ -407,6 +449,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            no_swarm: false,
             tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
@@ -438,6 +481,20 @@ mod tests {
         let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
         match cli.command {
             Commands::Chat(args) => assert!(chat_tag_settings(&args).is_none()),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_no_swarm_flag() {
+        let cli = Cli::try_parse_from(["honk", "chat", "--new", "--no-swarm"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert!(args.no_swarm),
+            _ => panic!("expected chat command"),
+        }
+        let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert!(!args.no_swarm),
             _ => panic!("expected chat command"),
         }
     }
@@ -625,6 +682,35 @@ mod tests {
                 assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
             }
             _ => panic!("expected telegram command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_swarm_mcp_subcommand() {
+        let cli = Cli::try_parse_from([
+            "honk",
+            "swarm-mcp",
+            "--session",
+            "20261020_1",
+            "--pigeon-url",
+            "http://127.0.0.1:4731",
+            "--pigeon-token-file",
+            "/tmp/tok",
+            "--honk-url",
+            "http://127.0.0.1:4280/acp",
+            "--honk-secret-file",
+            "/tmp/secret",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::SwarmMcp(a) => {
+                assert_eq!(a.session, "20261020_1");
+                assert_eq!(a.pigeon_url, "http://127.0.0.1:4731");
+                assert_eq!(a.pigeon_token_file, Some(PathBuf::from("/tmp/tok")));
+                assert_eq!(a.honk_url, "http://127.0.0.1:4280/acp");
+                assert_eq!(a.honk_secret_file, Some(PathBuf::from("/tmp/secret")));
+            }
+            _ => panic!("expected swarm-mcp command"),
         }
     }
 

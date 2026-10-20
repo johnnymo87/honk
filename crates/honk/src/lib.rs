@@ -4,6 +4,7 @@ pub mod conn;
 pub mod octags;
 pub mod pigeon;
 pub mod render;
+pub mod swarm_mcp;
 pub mod tail;
 pub mod tui;
 
