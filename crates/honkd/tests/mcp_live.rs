@@ -432,3 +432,109 @@ async fn test_mcp_live_e2e() {
         .unwrap();
     assert_eq!(srv_missing["enabled"], false);
 }
+
+fn find_honk_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HONK_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let candidates = [
+        PathBuf::from("target/debug/honk"),
+        PathBuf::from("../../target/debug/honk"),
+        PathBuf::from("../target/debug/honk"),
+    ];
+    for c in &candidates {
+        if c.is_file() {
+            return Some(c.canonicalize().unwrap_or_else(|_| c.clone()));
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_swarm_live_e2e() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honk_bin) = find_honk_bin() else {
+        eprintln!("honk binary not found; skipping test_swarm_live_e2e");
+        return;
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pigeon_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/goose/swarm-mailbox",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "ok": true,
+                        "session_id": "gse_live_test",
+                        "backend_session_id": "test_sid"
+                    })),
+                )
+            }),
+        );
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let h = Honkd::spawn(
+        &g.url(),
+        g.secret_file(),
+        &[
+            "--swarm-mcp-bin",
+            honk_bin.to_str().unwrap(),
+            "--swarm-pigeon-url",
+            &pigeon_url,
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some(honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(1))
+    })
+    .await;
+
+    // Enable built-in swarm entry
+    let enable_res = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": &sid,
+                "names": ["swarm"]
+            }),
+        )
+        .await;
+    assert!(enable_res.get("error").is_none(), "enable error: {enable_res:?}");
+    let results = &enable_res["result"]["results"];
+    assert_eq!(results[0]["name"], "swarm");
+    assert_eq!(results[0]["ok"], true, "swarm enable failed: {results:?}");
+
+    // tools/list on goose should now show the three swarm tools
+    let tools = g.tools_list(&sid).await;
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_send")),
+        "must include swarm_send tool: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_read")),
+        "must include swarm_read tool: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|n| n.ends_with("swarm_list")),
+        "must include swarm_list tool: {tools:?}"
+    );
+}

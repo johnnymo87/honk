@@ -602,19 +602,20 @@ where
                     .get("protocolVersion")
                     .and_then(Value::as_str)
                     .unwrap_or("2024-11-05");
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "protocolVersion": version,
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "honk-swarm"
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "protocolVersion": version,
+                            "capabilities": {
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": "honk-swarm",
+                                "version": "0.1.0"
+                            }
                         }
-                    }
-                })
+                    })
             }
             Some("ping") => {
                 json!({
