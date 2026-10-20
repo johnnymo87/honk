@@ -2932,8 +2932,8 @@ async fn test_mcp_driver_e2e_fake_goose() {
 
     // Enable slack with confirm
     handle
-        .send(UiCommand::Line("/mcp on! slack".into()))
-        .expect("send /mcp on!");
+        .send(UiCommand::Line("/mcp enable slack!".into()))
+        .expect("send /mcp enable slack!");
     let mut enable_notice_seen = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && !enable_notice_seen {
@@ -2949,8 +2949,8 @@ async fn test_mcp_driver_e2e_fake_goose() {
 
     // Disable slack
     handle
-        .send(UiCommand::Line("/mcp off slack".into()))
-        .expect("send /mcp off");
+        .send(UiCommand::Line("/mcp disable slack".into()))
+        .expect("send /mcp disable");
     let mut disable_notice_seen = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && !disable_notice_seen {
