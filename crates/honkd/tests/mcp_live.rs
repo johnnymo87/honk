@@ -518,7 +518,10 @@ async fn test_swarm_live_e2e() {
             }),
         )
         .await;
-    assert!(enable_res.get("error").is_none(), "enable error: {enable_res:?}");
+    assert!(
+        enable_res.get("error").is_none(),
+        "enable error: {enable_res:?}"
+    );
     let results = &enable_res["result"]["results"];
     assert_eq!(results[0]["name"], "swarm");
     assert_eq!(results[0]["ok"], true, "swarm enable failed: {results:?}");
