@@ -1171,7 +1171,8 @@ fn format_mcp_list_block(result: &Value) -> String {
     }
 
     lines.push(
-        "/mcp on <name> · /mcp on! <name> for servers marked ! · /mcp off <name>".to_string(),
+        "/mcp enable <name> · /mcp enable <name>! for servers marked ! · /mcp disable <name>"
+            .to_string(),
     );
     lines.join("\n")
 }

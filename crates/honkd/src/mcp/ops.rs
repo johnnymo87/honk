@@ -350,11 +350,11 @@ pub async fn enable(
         }
 
         if !policy.no_confirm.contains(name) && !confirm.iter().any(|c| c == name) {
-            let mut msg = format!("'{name}' can write; use /mcp on! {name} to confirm");
+            let mut msg = format!("'{name}' can write; use /mcp enable {name}! to confirm");
             if let Some(sibling) = find_sibling(name, catalog)
                 && sibling.ends_with("-ro")
             {
-                msg.push_str(&format!(" (or /mcp on {sibling} for read-only)"));
+                msg.push_str(&format!(" (or /mcp enable {sibling} for read-only)"));
             }
             return Err(OpError::invalid_params(msg));
         }
@@ -1057,7 +1057,7 @@ mod tests {
         assert_eq!(err1.code, -32602);
         assert_eq!(
             err1.message,
-            "'slack' can write; use /mcp on! slack to confirm (or /mcp on slack-ro for read-only)"
+            "'slack' can write; use /mcp enable slack! to confirm (or /mcp enable slack-ro for read-only)"
         );
 
         // pagerduty requires confirm but has NO -ro sibling
@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(err2.code, -32602);
         assert_eq!(
             err2.message,
-            "'pagerduty' can write; use /mcp on! pagerduty to confirm"
+            "'pagerduty' can write; use /mcp enable pagerduty! to confirm"
         );
 
         // slack with confirm: ["slack"] succeeds
@@ -1111,7 +1111,7 @@ mod tests {
         assert_eq!(err_default.code, -32602);
         assert_eq!(
             err_default.message,
-            "'figma' can write; use /mcp on! figma to confirm"
+            "'figma' can write; use /mcp enable figma! to confirm"
         );
     }
 

@@ -158,7 +158,7 @@ async fn test_mcp_lifecycle_e2e() {
         confirm_refuse["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("'slack' can write; use /mcp on! slack to confirm")
+            .contains("'slack' can write; use /mcp enable slack! to confirm")
     );
 
     // 3b. Non-array confirm rejection

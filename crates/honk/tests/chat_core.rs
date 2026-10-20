@@ -3939,23 +3939,52 @@ fn test_mcp_list_during_active_run_sends_request_immediately() {
 fn test_mcp_usage_missing_names() {
     let (mut core, _) = new_test_core();
 
-    let effs = core.handle(Input::Line("/mcp on".into()));
-    assert!(has_notice(&effs, "usage: /mcp on <name>"));
+    let effs = core.handle(Input::Line("/mcp enable".into()));
+    assert!(has_notice(
+        &effs,
+        "usage: /mcp enable <name>... (append ! to confirm a server marked !, e.g. /mcp enable slack!)"
+    ));
 
-    let effs = core.handle(Input::Line("/mcp on!".into()));
-    assert!(has_notice(&effs, "usage: /mcp on! <name>"));
-
-    let effs = core.handle(Input::Line("/mcp off".into()));
-    assert!(has_notice(&effs, "usage: /mcp off <name>"));
+    let effs = core.handle(Input::Line("/mcp disable".into()));
+    assert!(has_notice(&effs, "usage: /mcp disable <name>..."));
 
     let effs = core.handle(Input::Line("/mcp invalid".into()));
-    assert!(has_notice(&effs, "unknown /mcp subcommand"));
+    assert!(has_notice(
+        &effs,
+        "unknown /mcp subcommand 'invalid'; use /mcp list, /mcp enable, or /mcp disable"
+    ));
 }
 
 #[test]
-fn test_mcp_on_idle_sends_enable() {
+fn test_mcp_list_subcommand() {
     let (mut core, _) = new_test_core();
-    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    let effs = core.handle(Input::Line("/mcp list".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
+        .expect("should send _honk/mcp/list request for /mcp list");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+}
+
+#[test]
+fn test_mcp_list_with_args_usage() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp list x".into()));
+    assert!(has_notice(&effs, "usage: /mcp list"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/list"))
+    );
+}
+
+#[test]
+fn test_mcp_enable_idle_sends_enable() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp enable slack-ro".into()));
     let req = effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
@@ -3967,7 +3996,7 @@ fn test_mcp_on_idle_sends_enable() {
     assert_eq!(params["names"], json!(["slack-ro"]));
     assert_eq!(params["confirm"], json!([]));
 
-    let effs = core.handle(Input::Line("/mcp on a b".into()));
+    let effs = core.handle(Input::Line("/mcp enable a b".into()));
     let req = effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
@@ -3980,39 +4009,137 @@ fn test_mcp_on_idle_sends_enable() {
 }
 
 #[test]
-fn test_mcp_on_confirm_idle_sends_enable() {
+fn test_mcp_enable_mixed_per_name_confirm() {
     let (mut core, _) = new_test_core();
-    let effs = core.handle(Input::Line("/mcp on! slack".into()));
+    let effs = core.handle(Input::Line("/mcp enable a b!".into()));
     let req = effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
-        .expect("should send _honk/mcp/enable request with confirm");
+        .expect("should send _honk/mcp/enable request");
     let Effect::Request { params, .. } = req else {
         panic!()
     };
-    assert_eq!(params["sessionId"], "test-session");
-    assert_eq!(params["names"], json!(["slack"]));
-    assert_eq!(params["confirm"], json!(["slack"]));
+    assert_eq!(params["names"], json!(["a", "b"]));
+    assert_eq!(params["confirm"], json!(["b"]));
 
-    let effs2 = core.handle(Input::Line("/mcp on! a b".into()));
+    let effs2 = core.handle(Input::Line("/mcp enable slack! pagerduty!".into()));
     let req2 = effs2
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
-        .expect("should send _honk/mcp/enable request with confirm");
+        .expect("should send _honk/mcp/enable request");
     let Effect::Request {
         params: params2, ..
     } = req2
     else {
         panic!()
     };
-    assert_eq!(params2["names"], json!(["a", "b"]));
-    assert_eq!(params2["confirm"], json!(["a", "b"]));
+    assert_eq!(params2["names"], json!(["slack", "pagerduty"]));
+    assert_eq!(params2["confirm"], json!(["slack", "pagerduty"]));
 }
 
 #[test]
-fn test_mcp_off_idle_sends_disable() {
+fn test_mcp_enable_empty_token_usage() {
     let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp enable !".into()));
+    assert!(has_notice(
+        &effs,
+        "usage: /mcp enable <name>... (append ! to confirm a server marked !, e.g. /mcp enable slack!)"
+    ));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+    );
+
+    let effs2 = core.handle(Input::Line("/mcp enable a ! b".into()));
+    assert!(has_notice(
+        &effs2,
+        "usage: /mcp enable <name>... (append ! to confirm a server marked !, e.g. /mcp enable slack!)"
+    ));
+    assert!(
+        !effs2
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+    );
+}
+
+#[test]
+fn test_mcp_hidden_aliases_dispatch() {
+    let (mut core, _) = new_test_core();
+
+    // alias `on` plain
+    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .unwrap();
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["slack-ro"]));
+    assert_eq!(params["confirm"], json!([]));
+
+    // alias `on` with per-name trailing !
+    let effs = core.handle(Input::Line("/mcp on a b!".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .unwrap();
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["a", "b"]));
+    assert_eq!(params["confirm"], json!(["b"]));
+
+    // alias `on!` confirms all, stripping any trailing !
+    let effs = core.handle(Input::Line("/mcp on! slack".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .unwrap();
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["slack"]));
+    assert_eq!(params["confirm"], json!(["slack"]));
+
+    let effs = core.handle(Input::Line("/mcp on! a b!".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
+        .unwrap();
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["a", "b"]));
+    assert_eq!(params["confirm"], json!(["a", "b"]));
+
+    // alias `off`
     let effs = core.handle(Input::Line("/mcp off slack-ro".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
+        .unwrap();
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["names"], json!(["slack-ro"]));
+}
+
+#[test]
+fn test_mcp_unknown_subcommand() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp bogus".into()));
+    assert!(has_notice(
+        &effs,
+        "unknown /mcp subcommand 'bogus'; use /mcp list, /mcp enable, or /mcp disable"
+    ));
+}
+
+#[test]
+fn test_mcp_disable_idle_sends_disable() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp disable slack-ro".into()));
     let req = effs
         .iter()
         .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
@@ -4025,7 +4152,7 @@ fn test_mcp_off_idle_sends_disable() {
 }
 
 #[test]
-fn test_mcp_on_queued_during_own_run() {
+fn test_mcp_enable_queued_during_own_run() {
     let (mut core, _) = new_test_core();
     let effs = core.handle(Input::Line("run something".into()));
     let prompt_req_id = effs
@@ -4059,15 +4186,15 @@ fn test_mcp_on_queued_during_own_run() {
     })));
     assert_eq!(*core.run_state(), RunState::Running("run_1".into()));
 
-    // Queue /mcp on slack-ro
-    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
-    assert!(has_notice(&effs, "queued: /mcp on slack-ro"));
+    // Queue /mcp enable slack-ro
+    let effs = core.handle(Input::Line("/mcp enable slack-ro".into()));
+    assert!(has_notice(&effs, "queued: /mcp enable slack-ro"));
     assert!(
         !effs
             .iter()
             .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/enable"))
     );
-    assert_eq!(core.local_queue()[0].0, "/mcp on slack-ro");
+    assert_eq!(core.local_queue()[0].0, "/mcp enable slack-ro");
 
     // End run
     core.handle(Input::Frame(json!({
@@ -4098,7 +4225,7 @@ fn test_mcp_on_queued_during_own_run() {
 }
 
 #[test]
-fn test_mcp_off_queued_during_foreign_run() {
+fn test_mcp_disable_queued_during_foreign_run() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
@@ -4111,9 +4238,9 @@ fn test_mcp_off_queued_during_foreign_run() {
         }
     })));
 
-    let effs = core.handle(Input::Line("/mcp off slack-ro".into()));
-    assert!(has_notice(&effs, "queued: /mcp off slack-ro"));
-    assert_eq!(core.local_queue()[0].0, "/mcp off slack-ro");
+    let effs = core.handle(Input::Line("/mcp disable slack-ro".into()));
+    assert!(has_notice(&effs, "queued: /mcp disable slack-ro"));
+    assert_eq!(core.local_queue()[0].0, "/mcp disable slack-ro");
 
     // Turn ends
     let end_effs = core.handle(Input::Frame(json!({
@@ -4138,6 +4265,68 @@ fn test_mcp_off_queued_during_foreign_run() {
 }
 
 #[test]
+fn test_queued_mcp_with_prompt_behind_it_dispatches_then_prompt_follows() {
+    let (mut core, _) = new_test_core();
+    let running = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": { "goose": { "activeRunId": "run_foreign" } }
+        } }
+    });
+    core.handle(Input::Frame(running));
+    core.handle(Input::Line("/mcp enable slack-ro".into()));
+    core.handle(Input::Line("do the thing".into()));
+    assert_eq!(core.local_queue().len(), 2);
+
+    let end_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": { "goose": { "activeRunId": null } }
+        } }
+    })));
+    let mcp_id = end_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/mcp/enable" => Some(*id),
+            _ => None,
+        })
+        .expect("queued /mcp enable must dispatch even with a prompt queued behind it");
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "do the thing");
+
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": mcp_id,
+        "result": { "results": [{ "name": "slack-ro", "ok": true, "changed": true }], "enabled": ["slack-ro"] }
+    })));
+    assert!(
+        effs.iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "prompt queued behind the /mcp command should be sent once it completes"
+    );
+}
+
+#[test]
+fn test_mcp_disable_strips_trailing_bang() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/mcp disable slack! figma".into()));
+    let Some(Effect::Request { params, .. }) = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/mcp/disable"))
+    else {
+        panic!("should send _honk/mcp/disable request")
+    };
+    assert_eq!(params["names"], json!(["slack", "figma"]));
+
+    let effs = core.handle(Input::Line("/mcp disable !".into()));
+    assert!(has_notice(&effs, "usage: /mcp disable <name>"));
+}
+
+#[test]
 fn test_drop_command_clears_queued_mcp() {
     let (mut core, _) = new_test_core();
     core.handle(Input::Frame(json!({
@@ -4151,7 +4340,7 @@ fn test_drop_command_clears_queued_mcp() {
         }
     })));
 
-    core.handle(Input::Line("/mcp on slack-ro".into()));
+    core.handle(Input::Line("/mcp enable slack-ro".into()));
     assert_eq!(core.local_queue().len(), 1);
 
     let effs = core.handle(Input::Line("/drop".into()));
@@ -4202,16 +4391,16 @@ fn test_mcp_list_response_rendering() {
     assert!(notice.contains("off other-conflict (conflict)"));
     assert!(notice.contains("n/a datadog — remote MCP servers not supported yet"));
     assert!(notice.contains("other: developer, analyze"));
-    assert!(
-        notice.contains("/mcp on <name> · /mcp on! <name> for servers marked ! · /mcp off <name>")
-    );
+    assert!(notice.contains(
+        "/mcp enable <name> · /mcp enable <name>! for servers marked ! · /mcp disable <name>"
+    ));
     assert_eq!(core.mcp_enabled(), &["slack-ro"]);
 }
 
 #[test]
 fn test_mcp_enable_response_rendering() {
     let (mut core, _) = new_test_core();
-    let effs = core.handle(Input::Line("/mcp on slack-ro".into()));
+    let effs = core.handle(Input::Line("/mcp enable slack-ro".into()));
     let req_id = effs
         .iter()
         .find_map(|e| match e {
@@ -4249,7 +4438,7 @@ fn test_mcp_enable_response_rendering() {
 #[test]
 fn test_mcp_disable_response_rendering() {
     let (mut core, _) = new_test_core();
-    let effs = core.handle(Input::Line("/mcp off slack".into()));
+    let effs = core.handle(Input::Line("/mcp disable slack".into()));
     let req_id = effs
         .iter()
         .find_map(|e| match e {
@@ -4285,7 +4474,7 @@ fn test_mcp_disable_response_rendering() {
 #[test]
 fn test_mcp_error_verbatim_notice() {
     let (mut core, _) = new_test_core();
-    let effs = core.handle(Input::Line("/mcp on slack".into()));
+    let effs = core.handle(Input::Line("/mcp enable slack".into()));
     let req_id = effs
         .iter()
         .find_map(|e| match e {
@@ -4294,8 +4483,7 @@ fn test_mcp_error_verbatim_notice() {
         })
         .unwrap();
 
-    let err_msg =
-        "'slack' can write; use /mcp on! slack to confirm (or /mcp on slack-ro for read-only)";
+    let err_msg = "'slack' can write; use /mcp enable slack! to confirm (or /mcp enable slack-ro for read-only)";
     let resp = json!({
         "jsonrpc": "2.0",
         "id": req_id,
@@ -4444,7 +4632,7 @@ fn test_mcp_disconnect_drains_mutations_with_notice_and_list_silently() {
     })));
 
     // 2. In-flight enable mutation emits warning notice on disconnect
-    core.handle(Input::Line("/mcp on slack-ro".into()));
+    core.handle(Input::Line("/mcp enable slack-ro".into()));
     assert!(core.has_pending_mcp_mutation());
     let effs = core.handle(Input::Disconnected);
     assert!(has_notice(
@@ -4499,11 +4687,11 @@ fn test_mcp_queued_busy_requeues_bounded() {
         }
     })));
 
-    // Queue /mcp on slack-ro
-    core.handle(Input::Line("/mcp on slack-ro".into()));
+    // Queue /mcp enable slack-ro
+    core.handle(Input::Line("/mcp enable slack-ro".into()));
     assert_eq!(core.local_queue().len(), 1);
 
-    // Run 1 ends -> queued /mcp on slack-ro dispatched
+    // Run 1 ends -> queued /mcp enable slack-ro dispatched
     let effs = core.handle(Input::Frame(json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -4531,7 +4719,7 @@ fn test_mcp_queued_busy_requeues_bounded() {
     // Should NOT show error notice; should be re-queued in local_queue
     assert!(!has_notice(&effs, "session is busy"));
     assert_eq!(core.local_queue().len(), 1);
-    assert_eq!(core.local_queue()[0].0, "/mcp on slack-ro");
+    assert_eq!(core.local_queue()[0].0, "/mcp enable slack-ro");
 
     // Run 2 ends -> dispatched again (Attempt 2)
     let effs = core.handle(Input::Frame(json!({

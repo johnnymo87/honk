@@ -133,8 +133,10 @@ blocking raw `extensions/add|remove` in honkd (breaks stall-watch).
    `GOOSE_EXTENSION_STARTUP_TIMEOUT` seconds, default 25 (below honkd's 30 s load timeout),
    separate from the per-request `timeout`. A hung server then fails the add/load cleanly,
    and goose drops it from the stored set.
-8. **honk chat.** `/mcp` (table: name, on/off, `!` confirm marker, unsupported reason,
-   other extensions), `/mcp on <names>`, `/mcp on! <names>` (confirm), `/mcp off <names>`.
+8. **honk chat.** `/mcp list` (or bare `/mcp`; table: name, on/off, `!` confirm marker,
+   unsupported reason, other extensions), `/mcp enable <names>` (a trailing `!` on a name
+   confirms it, e.g. `/mcp enable slack!`), `/mcp disable <names>` — the Telegram spelling
+   (see "Addendum: Telegram syntax" below; the original `on`/`on!`/`off` remain hidden aliases).
    While a run is active the command is queued locally and runs after the turn (like
    `/compact`). Status bar shows `mcp:slack-ro,atlassian` (falls back to `mcp:2` when
    narrow; hidden when none). Refresh on attach/new, on `_honk/mcp_changed`, and on run end
@@ -142,7 +144,7 @@ blocking raw `extensions/add|remove` in honkd (breaks stall-watch).
    `name!` confirms). A change by another viewer prints a notice.
 9. **Skill.** A harness-neutral `enabling-mcp-servers` skill (workstation, deployed to
    `~/.agents/skills`, read by both opencode and goose): in goose/honk, ask the human to type
-   `/mcp on slack-ro`; prefer `-ro`; agents do not grant themselves write.
+   `/mcp enable slack-ro`; prefer `-ro`; agents do not grant themselves write.
 
 **Known trade-offs.** Stored server commands are Nix store paths: after a workstation
 update plus GC, a reload fails to start the server and goose drops it from the set (the
@@ -187,11 +189,34 @@ methods or goose's directly; `confirm` prevents accidents, not misuse — same s
 
 1. Merge honk PR, then workstation PR (W1). `nix run home-manager -- switch --flake .#cloudbox`;
    `systemctl --user restart honkd` (honkd restart keeps goose sessions; honk chat reattaches).
-2. In honk chat session `20261016_222`: `/mcp` lists servers; `/mcp on slack-ro` → status bar
+2. In honk chat session `20261016_222`: `/mcp list` lists servers; `/mcp enable slack-ro` → status bar
    shows `mcp:slack-ro`; ask the agent to call `slack-ro__channels_list` (or similar);
-   `/mcp on slack` is refused with the slack-ro hint; `/mcp off slack-ro` → indicator clears.
+   `/mcp enable slack` is refused with the slack-ro hint; `/mcp disable slack-ro` → indicator clears.
 3. `honk chat --new --mcp atlassian` → the notice reports it on.
 4. After the goose release (W2): `sqlite3 ~/.local/share/goose/sessions/sessions.db ".backup
    '$HOME/.local/share/goose/sessions/sessions.db.bak-$(date +%F)'"`, `sudo nixos-rebuild switch
    --flake .#cloudbox`, in a quiet window `sudo systemctl restart goose-serve`, then
    `systemctl --user restart honkd`; a session with `slack-ro` on still has it (`/mcp`).
+
+## Addendum: Telegram syntax (bead `honk-9qf.15.20`, 2026-10-20)
+
+Shipped first as `/mcp`, `/mcp on`, `/mcp on!`, `/mcp off`. pigeon's Telegram `/mcp` for
+opencode sessions (`packages/worker/src/webhook.ts`) is `/mcp list`, `/mcp enable <server>`,
+`/mcp disable <server>`; the author asked for honk to match it.
+
+- **Canonical:** `/mcp list`, `/mcp enable <name>[!]...`, `/mcp disable <name>...`. Bare
+  `/mcp` still lists. Multiple names stay allowed (a superset of Telegram's one).
+- **Confirm** is per name with a trailing `!` (`/mcp enable slack!`), the same spelling as
+  `honk chat --new --mcp slack!`. `/mcp enable slack-ro pagerduty!` confirms only pagerduty.
+  A bare `!` or `!`-only name is a usage error.
+  `/mcp disable` strips a trailing `!` too (it means nothing there).
+- **Hidden aliases:** `on` = `enable`, `on!` = `enable` with every name confirmed, `off` =
+  `disable`. Not in help or docs. Reason: a home-manager switch updates the `honk` CLI at
+  once but honkd only on restart, so during skew an old honkd still prints the `/mcp on!`
+  hint. (The reverse skew — a `honk chat` started before the switch reading a new honkd's
+  `enable X!` hint — lasts until that client restarts; acceptable.)
+- **honkd hint:** `'slack' can write; use /mcp enable slack! to confirm (or /mcp enable
+  slack-ro for read-only)`.
+- Skill `enabling-mcp-servers` (workstation) updated to the new spelling.
+- Rolled in: a queued `/mcp` mutation with lines queued behind it re-queued itself and
+  stalled the local queue; a dispatch popped from the queue now skips the queue check.

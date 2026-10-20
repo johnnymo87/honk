@@ -961,7 +961,7 @@ mod tests {
             ("compact", "/compact"),
             ("compact now", "/compact now"),
             ("mcp", "/mcp"),
-            ("mcp on slack-ro", "/mcp on slack-ro"),
+            ("mcp enable slack-ro", "/mcp enable slack-ro"),
         ];
 
         for (typed, expected_cmd) in commands {
