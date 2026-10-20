@@ -195,7 +195,10 @@ async fn find_registered_skips_notify_false_rows() {
         "notify: false row must be skipped so honk telegram can upgrade it"
     );
     assert_eq!(
-        find_registered(&cfg, "20261020_2").await.unwrap().as_deref(),
+        find_registered(&cfg, "20261020_2")
+            .await
+            .unwrap()
+            .as_deref(),
         Some("gse_notified"),
         "notify: true row must match"
     );
