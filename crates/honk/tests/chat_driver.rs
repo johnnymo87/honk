@@ -3362,3 +3362,98 @@ async fn test_new_session_no_swarm_flag_skips_enable() {
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_swarm_enable_timeout_surfaces_in_progress_notice() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. _honk/mcp/enable (do NOT answer it - let it time out after 5s)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "_honk/mcp/enable");
+
+            // 4. session/load (arrives after the 5s timeout)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // Keep alive
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut notice_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("swarm: enabling is still in progress; /mcp shows the result") {
+                        assert_eq!(n.kind, honk::chat::NoticeKind::Info);
+                        notice_seen = true;
+                        break;
+                    }
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        notice_seen,
+        "expected notice: swarm: enabling is still in progress; /mcp shows the result"
+    );
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}

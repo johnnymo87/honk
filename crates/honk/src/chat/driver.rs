@@ -704,7 +704,8 @@ async fn run_driver(
                         }
                         Err(_) => {
                             let _ = ui_tx.send(UiEvent::Notice(Notice::info(
-                                "swarm: enable timed out".to_string(),
+                                "swarm: enabling is still in progress; /mcp shows the result"
+                                    .to_string(),
                             )));
                         }
                     }
