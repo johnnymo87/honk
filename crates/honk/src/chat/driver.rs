@@ -40,6 +40,10 @@ pub struct DriverOpts {
     /// pigeon daemon (so it gets a Telegram topic). Runs in the background;
     /// its outcome arrives as a `UiEvent::Notice` and never blocks the chat.
     pub pigeon: Option<crate::pigeon::PigeonSettings>,
+    /// When set, a session created by `Target::New` is tagged in oc-tags as
+    /// `goose:<id>`. Background and best-effort like `pigeon`; the outcome
+    /// arrives as a `UiEvent::Notice` starting with `Tag:`.
+    pub tag: Option<crate::octags::TagSettings>,
 }
 
 impl DriverOpts {
@@ -52,6 +56,7 @@ impl DriverOpts {
             idle_timeout: None,
             max_turns: None,
             pigeon: None,
+            tag: None,
         }
     }
 }
@@ -94,11 +99,30 @@ fn spawn_pigeon_registration(
     })
 }
 
-/// How long quitting waits for a registration still in flight, so that a quick
-/// `:q` after `--new` does not leave pigeon with a session but no topic.
-const PIGEON_EXIT_GRACE: Duration = Duration::from_secs(3);
+/// Tags a just-created session in oc-tags in the background and reports the
+/// outcome as a notice. Never fatal, like pigeon registration.
+fn spawn_tagging(
+    settings: crate::octags::TagSettings,
+    goose_session_id: String,
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let outcome = crate::octags::tag_session(&settings, &goose_session_id).await;
+        let notice = crate::octags::notice(&settings, &goose_session_id, &outcome);
+        let _ = ui_tx.send(UiEvent::Notice(notice));
+    })
+}
 
-type PigeonSlot = Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
+/// How long quitting waits for post-create work still in flight (pigeon
+/// registration, oc-tags tagging), so that a quick `:q` after `--new` still
+/// reports how it went. One deadline covers all of them; each is time-bounded
+/// on its own as well. A task still running at the deadline is not aborted
+/// (an oc-tags write finishes on its own); it is reported as unconfirmed.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// Background tasks started after `session/new` that quitting waits for, each
+/// with the warning to give if it has not finished by the deadline.
+type BackgroundTasks = Arc<std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -463,7 +487,7 @@ async fn run_driver(
     opts: DriverOpts,
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
-    pigeon_slot: PigeonSlot,
+    background: BackgroundTasks,
 ) {
     let mut connection_state = ConnectionState::Connecting;
     let mut last_state = Some(StateSnapshot {
@@ -604,7 +628,15 @@ async fn run_driver(
                     cwd_for_pigeon.clone(),
                     ui_tx.clone(),
                 );
-                *pigeon_slot.lock().unwrap() = Some(task);
+                let unconfirmed = format!(
+                    "Telegram: registering {session_id} with pigeon was not confirmed before exit; `honk telegram {session_id}` registers it (it refuses if pigeon already has it)"
+                );
+                background.lock().unwrap().push((unconfirmed, task));
+            }
+            if let Some(settings) = opts.tag.clone() {
+                let unconfirmed = crate::octags::unconfirmed_text(&settings, session_id);
+                let task = spawn_tagging(settings, session_id.to_string(), ui_tx.clone());
+                background.lock().unwrap().push((unconfirmed, task));
             }
 
             ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
@@ -1128,11 +1160,18 @@ pub async fn start(
     };
 
     let task = tokio::spawn(async move {
-        let pigeon_slot = PigeonSlot::default();
-        run_driver(opts, cmd_rx, ui_tx, pigeon_slot.clone()).await;
-        let pending = pigeon_slot.lock().unwrap().take();
-        if let Some(h) = pending {
-            let _ = tokio::time::timeout(PIGEON_EXIT_GRACE, h).await;
+        let background = BackgroundTasks::default();
+        let exit_tx = ui_tx.clone();
+        run_driver(opts, cmd_rx, ui_tx, background.clone()).await;
+        let pending = std::mem::take(&mut *background.lock().unwrap());
+        let deadline = tokio::time::Instant::now() + EXIT_GRACE;
+        for (unconfirmed, h) in pending {
+            // Past the deadline the task is left running, not aborted: an
+            // oc-tags write still finishes. The user is told it is unconfirmed
+            // (run_app prints warnings the TUI never showed).
+            if tokio::time::timeout_at(deadline, h).await.is_err() {
+                let _ = exit_tx.send(UiEvent::Notice(Notice::warning(unconfirmed)));
+            }
         }
     });
     *join_handle.lock().await = Some(task);

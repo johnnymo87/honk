@@ -30,6 +30,9 @@ honk chat --new --mcp slack-ro --mcp atlassian!
 
 # Restrict loaded platform extensions (repeatable)
 honk chat --new --cwd /path/to/project --ext developer --ext summon
+
+# Tag the new session in oc-tags (as goose:<id>), like opencode-launch --tag
+honk chat --new --tag honk
 ```
 
 *(Note: `--cwd` is validated and canonicalized; it returns an error if the directory does not exist. If omitted, `--new` defaults to the canonicalized current working directory).*
@@ -239,6 +242,17 @@ honk telegram 20261016_7
 - Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk telegram <id>`. `honk telegram` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides.
 - The bearer token and the honkd secret travel in the request, so keep the pigeon URL on loopback or use `https://`.
 - The honkd URL is sent as honk sees it, so pigeon must be able to reach honkd at the same address (normally both on localhost).
+
+---
+
+## Tagging with oc-tags
+
+`honk chat --new --tag <tag>` tags the new session in oc-tags (workstation's `pkgs/oc-tags`) as `goose:<id>`, the same thing `opencode-launch --tag` does for an opencode session. oc-tags is what the nvim stall-watch picker (`,fp`) uses to list a program's sessions, and what spend reports group by.
+
+- It runs `oc-tags set -- <tag> goose:<id>` (or `$HONK_OC_TAGS_BIN`) in the background after the session exists, bounded to 10 seconds. The outcome is a `Tag:` notice; a failure is a warning that includes the command to apply the tag by hand, never a reason the chat stops.
+- The tag is checked before the session is created, with opencode-launch's rule: a letter or digit, then up to 63 letters, digits or `._:/-`. `auto` and `auto:...` are refused (oc-tags reserves `auto:` for the tags it derives). oc-tags stores tags lowercased.
+- Quitting right after `--new` waits up to 3 seconds for tagging (and pigeon registration) to finish. A tag write still running then is left to finish on its own, and honk prints a "not confirmed" warning with an `oc-tags which` command to check it. Warnings that arrive after the chat screen has closed are printed to stderr.
+- `--tag` requires `--new`. To tag an existing session, run `oc-tags set <tag> goose:<id>`.
 
 ---
 
