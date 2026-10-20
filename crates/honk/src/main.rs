@@ -151,6 +151,12 @@ struct ListArgs {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
+    /// Print one JSON array instead of text lines. Each object has sessionId,
+    /// title, cwd, held, running, updatedAt, lastMessageAt, archivedAt,
+    /// sessionType, hasRecipe and pendingRequests (unknown values are null).
+    #[arg(long)]
+    json: bool,
+
     /// honkd WebSocket or HTTP endpoint
     #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
     url: String,
@@ -266,11 +272,16 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
             let sessions = client.list_sessions_with(opts).await?;
+            let lines = if args.json {
+                vec![honk::client::sessions_json(&sessions)]
+            } else {
+                sessions.iter().map(|s| s.format_line()).collect()
+            };
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
             use std::io::Write;
-            for s in sessions {
-                if let Err(e) = writeln!(handle, "{}", s.format_line()) {
+            for line in lines {
+                if let Err(e) = writeln!(handle, "{line}") {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
                         std::process::exit(0);
                     }
@@ -460,6 +471,20 @@ mod tests {
     fn test_cli_parse_mcp_requires_new() {
         let res = Cli::try_parse_from(["honk", "chat", "ses_1", "--mcp", "slack-ro"]);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_list_json() {
+        let cli = Cli::try_parse_from(["honk", "list", "--json"]).unwrap();
+        match cli.command {
+            Commands::List(args) => assert!(args.json),
+            _ => panic!("expected list command"),
+        }
+        let cli = Cli::try_parse_from(["honk", "list"]).unwrap();
+        match cli.command {
+            Commands::List(args) => assert!(!args.json),
+            _ => panic!("expected list command"),
+        }
     }
 
     #[test]

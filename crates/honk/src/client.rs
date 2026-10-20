@@ -47,9 +47,68 @@ pub struct SessionEntry {
     pub running: bool,
     pub title: String,
     pub cwd: String,
+    /// goose's `updatedAt` (RFC 3339), when it sends one.
+    pub updated_at: Option<String>,
+    /// `_meta.lastMessageAt` (RFC 3339).
+    pub last_message_at: Option<String>,
+    /// `_meta.archivedAt` (RFC 3339); set only for archived sessions.
+    pub archived_at: Option<String>,
+    /// `_meta.sessionType`: `acp`, `user`, `scheduled`, ...
+    pub session_type: Option<String>,
+    /// `_meta.hasRecipe`: true for recipe runs (lanes, stall-watch coordinators).
+    pub has_recipe: Option<bool>,
+    /// `_meta.honk.pending`: requests from goose (permission prompts,
+    /// elicitations) waiting on an answer. `None` from an older honkd.
+    pub pending_requests: Option<u64>,
 }
 
 impl SessionEntry {
+    /// Parse one entry of a `session/list` result: goose's ACP `SessionInfo`
+    /// plus the `_meta.honk.{held,running}` that honkd adds. Every field is
+    /// optional on the wire; missing ones become empty, `false` or `None`.
+    pub fn from_list_entry(s: &Value) -> Self {
+        let str_at = |v: Option<&Value>| v.and_then(Value::as_str).map(String::from);
+        Self {
+            session_id: str_at(s.get("sessionId").or_else(|| s.get("id"))).unwrap_or_default(),
+            title: str_at(s.get("title").or_else(|| s.get("name"))).unwrap_or_default(),
+            cwd: str_at(s.get("cwd").or_else(|| s.pointer("/_meta/workingDir")))
+                .unwrap_or_default(),
+            held: s
+                .pointer("/_meta/honk/held")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            running: s
+                .pointer("/_meta/honk/running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            updated_at: str_at(s.get("updatedAt")),
+            last_message_at: str_at(s.pointer("/_meta/lastMessageAt")),
+            archived_at: str_at(s.pointer("/_meta/archivedAt")),
+            session_type: str_at(s.pointer("/_meta/sessionType")),
+            has_recipe: s.pointer("/_meta/hasRecipe").and_then(Value::as_bool),
+            pending_requests: s.pointer("/_meta/honk/pending").and_then(Value::as_u64),
+        }
+    }
+
+    /// The object `honk list --json` prints for this session. A machine
+    /// contract (workstation's oc-session-list reads it): every key is always
+    /// present, and an unknown value is `null` rather than a missing key.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "sessionId": self.session_id,
+            "title": self.title,
+            "cwd": self.cwd,
+            "held": self.held,
+            "running": self.running,
+            "updatedAt": self.updated_at,
+            "lastMessageAt": self.last_message_at,
+            "archivedAt": self.archived_at,
+            "sessionType": self.session_type,
+            "hasRecipe": self.has_recipe,
+            "pendingRequests": self.pending_requests,
+        })
+    }
+
     /// Formats one line per session: `{sessionId}  {held|    }{ running}  {title}  {cwd}`
     pub fn format_line(&self) -> String {
         format_session_line(
@@ -72,6 +131,11 @@ pub fn format_session_line(
     let held_str = if held { "held" } else { "    " };
     let running_str = if running { " running" } else { "" };
     format!("{session_id}  {held_str}{running_str}  {title}  {cwd}")
+}
+
+/// `honk list --json` output: one JSON array of [`SessionEntry::to_json`] objects.
+pub fn sessions_json(entries: &[SessionEntry]) -> String {
+    Value::Array(entries.iter().map(SessionEntry::to_json).collect()).to_string()
 }
 
 use url::Url;
@@ -335,40 +399,7 @@ impl Client {
                 .ok_or_else(|| anyhow::anyhow!("missing sessions array in response: {res}"))?;
 
             for s in sessions_val {
-                let session_id = s
-                    .get("sessionId")
-                    .or_else(|| s.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let title = s
-                    .get("title")
-                    .or_else(|| s.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let cwd = s
-                    .get("cwd")
-                    .or_else(|| s.pointer("/_meta/workingDir"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let held = s
-                    .pointer("/_meta/honk/held")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let running = s
-                    .pointer("/_meta/honk/running")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-
-                entries.push(SessionEntry {
-                    session_id,
-                    held,
-                    running,
-                    title,
-                    cwd,
-                });
+                entries.push(SessionEntry::from_list_entry(s));
             }
 
             pages_fetched += 1;
@@ -419,6 +450,107 @@ mod tests {
         // not held and not running
         let line4 = format_session_line("ses_4", false, false, "Old session", "/path/to/work");
         assert_eq!(line4, "ses_4        Old session  /path/to/work");
+    }
+
+    #[test]
+    fn test_from_list_entry_reads_goose_meta_and_honk_state() {
+        // The shape goose's ACP session/list returns, with honkd's `_meta.honk` added.
+        let v = json!({
+            "sessionId": "20261016_222",
+            "cwd": "/work/honk",
+            "title": "Honk TUI",
+            "updatedAt": "2026-10-19T22:33:01+00:00",
+            "_meta": {
+                "messageCount": 12,
+                "createdAt": "2026-10-16T10:00:00Z",
+                "lastMessageAt": "2026-10-19T22:33:00Z",
+                "userSetName": false,
+                "sessionType": "acp",
+                "hasRecipe": false,
+                "workingDir": "/work/honk",
+                "honk": { "held": true, "running": true, "pending": 2 }
+            }
+        });
+        let e = SessionEntry::from_list_entry(&v);
+        assert_eq!(e.session_id, "20261016_222");
+        assert_eq!(e.title, "Honk TUI");
+        assert_eq!(e.cwd, "/work/honk");
+        assert!(e.held);
+        assert!(e.running);
+        assert_eq!(e.updated_at.as_deref(), Some("2026-10-19T22:33:01+00:00"));
+        assert_eq!(e.last_message_at.as_deref(), Some("2026-10-19T22:33:00Z"));
+        assert_eq!(e.archived_at, None);
+        assert_eq!(e.session_type.as_deref(), Some("acp"));
+        assert_eq!(e.has_recipe, Some(false));
+        assert_eq!(e.pending_requests, Some(2));
+    }
+
+    #[test]
+    fn test_from_list_entry_tolerates_missing_fields() {
+        // An older goose (or a bare stub) sends none of the optional fields.
+        let v = json!({ "id": "s1", "name": "n", "_meta": { "workingDir": "/w" } });
+        let e = SessionEntry::from_list_entry(&v);
+        assert_eq!(e.session_id, "s1");
+        assert_eq!(e.title, "n");
+        assert_eq!(e.cwd, "/w");
+        assert!(!e.held);
+        assert!(!e.running);
+        assert_eq!(e.updated_at, None);
+        assert_eq!(e.last_message_at, None);
+        assert_eq!(e.archived_at, None);
+        assert_eq!(e.session_type, None);
+        assert_eq!(e.has_recipe, None);
+        assert_eq!(e.pending_requests, None);
+    }
+
+    #[test]
+    fn test_to_json_is_the_machine_contract() {
+        // oc-session-list (workstation) parses exactly these keys. Every key is
+        // always present; unknown values are null rather than omitted.
+        let v = json!({
+            "sessionId": "20261019_2",
+            "cwd": "/state/coord",
+            "title": "stallwatch-x",
+            "updatedAt": "2026-10-19T22:27:10+00:00",
+            "_meta": {
+                "archivedAt": "2026-10-19T23:00:00Z",
+                "sessionType": "acp",
+                "hasRecipe": true,
+                "honk": { "held": true, "running": false, "pending": 0 }
+            }
+        });
+        let got = SessionEntry::from_list_entry(&v).to_json();
+        assert_eq!(
+            got,
+            json!({
+                "sessionId": "20261019_2",
+                "title": "stallwatch-x",
+                "cwd": "/state/coord",
+                "held": true,
+                "running": false,
+                "updatedAt": "2026-10-19T22:27:10+00:00",
+                "lastMessageAt": null,
+                "archivedAt": "2026-10-19T23:00:00Z",
+                "sessionType": "acp",
+                "hasRecipe": true,
+                "pendingRequests": 0
+            })
+        );
+    }
+
+    #[test]
+    fn test_sessions_json_is_an_array() {
+        let entries = vec![
+            SessionEntry::from_list_entry(&json!({ "sessionId": "a" })),
+            SessionEntry::from_list_entry(&json!({ "sessionId": "b" })),
+        ];
+        let out = sessions_json(&entries);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["sessionId"], "a");
+        assert_eq!(arr[1]["sessionId"], "b");
+        assert_eq!(sessions_json(&[]), "[]");
     }
 
     #[test]

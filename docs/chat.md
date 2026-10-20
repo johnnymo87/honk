@@ -61,6 +61,8 @@ The per-prompt value *replaces* goose's own `GOOSE_MAX_TURNS` limit for that pro
 
 `honk list` walks every page of goose's `session/list` (50 per page, most recently updated first). A session updated while the walk is in progress can move to an already-fetched page and be missed; run it again if a busy session is absent. `honk list --cwd DIR` filters by exact working directory (no symlink or trailing-slash normalization).
 
+`honk list --json` prints the same sessions as one JSON array, for scripts. Each object has `sessionId`, `title`, `cwd`, `held`, `running`, `updatedAt`, `lastMessageAt`, `archivedAt`, `sessionType`, `hasRecipe` and `pendingRequests` (permission prompts and other goose requests waiting on an answer, counted by honkd); a value that was not sent is `null`. workstation's `oc-session-list` reads it to put goose sessions in the nvim session pickers.
+
 Authentication secret is resolved in the following priority order:
 1. `--secret <token>` CLI argument
 2. `$HONK_SECRET` environment variable

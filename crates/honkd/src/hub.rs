@@ -805,9 +805,15 @@ impl Hub {
         resp["id"] = downstream_id;
 
         if method == "session/list" {
-            let held_sids: std::collections::HashSet<String> = {
+            // sid -> number of goose->client requests (permission prompts,
+            // elicitations) waiting on an answer. A session with any is blocked
+            // on the human; the nvim pickers show it as such (honk-9qf.15.11).
+            let held: std::collections::HashMap<String, usize> = {
                 let s = self.state.lock().await;
-                s.sessions.keys().cloned().collect()
+                s.sessions
+                    .iter()
+                    .map(|(sid, h)| (sid.clone(), h.pending.len()))
+                    .collect()
             };
 
             if let Some(sessions_arr) = resp
@@ -816,20 +822,18 @@ impl Hub {
             {
                 for entry in sessions_arr {
                     let sid = entry.get("sessionId").and_then(Value::as_str).unwrap_or("");
-                    let is_held = held_sids.contains(sid);
+                    let pending = held.get(sid).copied();
+                    let is_held = pending.is_some();
                     let is_running = is_held && self.is_session_running(sid);
+                    let honk_meta = serde_json::json!({
+                        "held": is_held,
+                        "running": is_running,
+                        "pending": pending.unwrap_or(0),
+                    });
                     if let Some(meta_obj) = entry.get_mut("_meta").and_then(Value::as_object_mut) {
-                        meta_obj.insert(
-                            "honk".to_string(),
-                            serde_json::json!({ "held": is_held, "running": is_running }),
-                        );
+                        meta_obj.insert("honk".to_string(), honk_meta);
                     } else {
-                        entry["_meta"] = serde_json::json!({
-                            "honk": {
-                                "held": is_held,
-                                "running": is_running,
-                            }
-                        });
+                        entry["_meta"] = serde_json::json!({ "honk": honk_meta });
                     }
                 }
             }
