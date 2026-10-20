@@ -96,25 +96,46 @@ fn format_relative_time(updated_ms: i64, now_ms: i64) -> String {
     }
 }
 
+fn resolve_call_cwd(meta: Option<&Value>) -> Option<String> {
+    if let Some(agent_cwd) = meta
+        .and_then(|m| m.get("agent-working-dir"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(agent_cwd.to_string())
+    } else {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    }
+}
+
 async fn ensure_mailbox(
     client: &reqwest::Client,
     config: &SwarmMcpServerConfig,
+    cwd: Option<&str>,
 ) -> Result<String, String> {
     let endpoint = crate::pigeon::acp_endpoint(&config.honk_url)
         .map_err(|e| format!("invalid honk URL {}: {e}", config.honk_url))?;
     let secret = read_token(config.honk_secret_file.as_deref()).unwrap_or_default();
     let pigeon_token = read_token(config.pigeon_token_file.as_deref());
 
+    let mut body = json!({
+        "session_id": config.session,
+        "endpoint": endpoint,
+        "auth_token": secret,
+        "label": config.session,
+    });
+    if let Some(dir) = cwd {
+        body["cwd"] = json!(dir);
+    }
+
     let mut req = client
         .post(format!(
             "{}/goose/swarm-mailbox",
             config.pigeon_url.trim_end_matches('/')
         ))
-        .json(&json!({
-            "session_id": config.session,
-            "endpoint": endpoint,
-            "auth_token": secret,
-        }));
+        .json(&body);
     if let Some(tok) = pigeon_token {
         req = req.bearer_auth(tok);
     }
@@ -149,6 +170,7 @@ async fn handle_swarm_send(
     client: &reqwest::Client,
     config: &SwarmMcpServerConfig,
     args: &Value,
+    cwd: Option<&str>,
 ) -> Value {
     let to = match args.get("to").and_then(Value::as_str) {
         Some(t) if !t.trim().is_empty() => t.trim(),
@@ -162,7 +184,7 @@ async fn handle_swarm_send(
     let priority = args.get("priority").and_then(Value::as_str);
     let reply_to = args.get("reply_to").and_then(Value::as_str);
 
-    let from = match ensure_mailbox(client, config).await {
+    let from = match ensure_mailbox(client, config, cwd).await {
         Ok(f) => f,
         Err(e) => return tool_err(e),
     };
@@ -261,10 +283,11 @@ async fn handle_swarm_read(
     client: &reqwest::Client,
     config: &SwarmMcpServerConfig,
     args: &Value,
+    cwd: Option<&str>,
 ) -> Value {
     let limit = args.get("limit").and_then(Value::as_u64);
 
-    let session_id = match ensure_mailbox(client, config).await {
+    let session_id = match ensure_mailbox(client, config, cwd).await {
         Ok(s) => s,
         Err(e) => return tool_err(e),
     };
@@ -639,9 +662,15 @@ where
                     Ok(()) => {
                         let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
                         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+                        let meta = params.get("_meta");
+                        let cwd = resolve_call_cwd(meta);
                         match tool_name {
-                            "swarm_send" => handle_swarm_send(&client, &config, arguments).await,
-                            "swarm_read" => handle_swarm_read(&client, &config, arguments).await,
+                            "swarm_send" => {
+                                handle_swarm_send(&client, &config, arguments, cwd.as_deref()).await
+                            }
+                            "swarm_read" => {
+                                handle_swarm_read(&client, &config, arguments, cwd.as_deref()).await
+                            }
                             "swarm_list" => handle_swarm_list(&client, &config, arguments).await,
                             other => tool_err(format!("unknown tool '{other}'")),
                         }

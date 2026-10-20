@@ -259,7 +259,8 @@ async fn test_swarm_send_banked_and_pending_count() {
                     "priority": "urgent"
                 },
                 "_meta": {
-                    "agent-session-id": "20261020_owner"
+                    "agent-session-id": "20261020_owner",
+                    "agent-working-dir": "/test/working/dir"
                 }
             }
         }),
@@ -293,6 +294,8 @@ async fn test_swarm_send_banked_and_pending_count() {
     assert_eq!(seen[0].path, "/goose/swarm-mailbox");
     assert_eq!(seen[0].auth.as_deref(), Some("Bearer pigeon-bearer-token"));
     assert_eq!(seen[0].body["session_id"], "20261020_owner");
+    assert_eq!(seen[0].body["label"], "20261020_owner");
+    assert_eq!(seen[0].body["cwd"], "/test/working/dir");
     assert_eq!(seen[0].body["endpoint"], "ws://127.0.0.1:4280/acp");
     assert_eq!(seen[0].body["auth_token"], "honkd-test-secret");
 
@@ -465,6 +468,9 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
     let seen = p.seen();
     assert_eq!(seen.len(), 3, "expected mailbox, drain, ack: {seen:?}");
     assert_eq!(seen[0].path, "/goose/swarm-mailbox");
+    assert_eq!(seen[0].body["label"], "20261020_owner");
+    let current_dir = std::env::current_dir().unwrap();
+    assert_eq!(seen[0].body["cwd"], current_dir.to_str().unwrap());
     assert_eq!(seen[1].path, "/pull/drain");
     assert_eq!(seen[1].body["session_id"], "gse_reader");
     assert_eq!(seen[1].body["limit"], 1);
