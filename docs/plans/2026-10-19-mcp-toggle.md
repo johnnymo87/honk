@@ -209,6 +209,7 @@ opencode sessions (`packages/worker/src/webhook.ts`) is `/mcp list`, `/mcp enabl
 - **Confirm** is per name with a trailing `!` (`/mcp enable slack!`), the same spelling as
   `honk chat --new --mcp slack!`. `/mcp enable slack-ro pagerduty!` confirms only pagerduty.
   A bare `!` or `!`-only name is a usage error.
+  `/mcp disable` strips a trailing `!` too (it means nothing there).
 - **Hidden aliases:** `on` = `enable`, `on!` = `enable` with every name confirmed, `off` =
   `disable`. Not in help or docs. Reason: a home-manager switch updates the `honk` CLI at
   once but honkd only on restart, so during skew an old honkd still prints the `/mcp on!`
@@ -217,3 +218,5 @@ opencode sessions (`packages/worker/src/webhook.ts`) is `/mcp list`, `/mcp enabl
 - **honkd hint:** `'slack' can write; use /mcp enable slack! to confirm (or /mcp enable
   slack-ro for read-only)`.
 - Skill `enabling-mcp-servers` (workstation) updated to the new spelling.
+- Rolled in: a queued `/mcp` mutation with lines queued behind it re-queued itself and
+  stalled the local queue; a dispatch popped from the queue now skips the queue check.
