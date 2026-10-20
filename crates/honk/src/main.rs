@@ -117,6 +117,11 @@ struct ChatArgs {
     #[arg(long = "no-telegram")]
     no_telegram: bool,
 
+    /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag),
+    /// so it is listed under that program. Runs $HONK_OC_TAGS_BIN or oc-tags.
+    #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag)]
+    tag: Option<String>,
+
     #[command(flatten)]
     pigeon: PigeonArgs,
 }
@@ -240,6 +245,11 @@ fn chat_pigeon_settings(args: &ChatArgs) -> Option<honk::pigeon::PigeonSettings>
     }
 }
 
+/// Only a session this invocation creates is tagged; `--tag` requires `--new`.
+fn chat_tag_settings(args: &ChatArgs) -> Option<honk::octags::TagSettings> {
+    args.tag.clone().map(honk::octags::TagSettings::new)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -299,9 +309,11 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let pigeon = chat_pigeon_settings(&args);
+            let tag = chat_tag_settings(&args);
             let mut opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
             opts.max_turns = args.max_turns;
             opts.pigeon = pigeon;
+            opts.tag = tag;
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
@@ -372,6 +384,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
                 pigeon_token_file: None,
@@ -394,6 +407,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
                 pigeon_token_file: None,
@@ -408,6 +422,37 @@ mod tests {
                 assert_eq!(extensions, Some(vec!["dev".into()]));
             }
             _ => panic!("expected Target::New"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_tag_flag() {
+        let cli = Cli::try_parse_from(["honk", "chat", "--new", "--tag", "honk"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                let tag = chat_tag_settings(&args).expect("tag settings");
+                assert_eq!(tag.tag, "honk");
+            }
+            _ => panic!("expected chat command"),
+        }
+        let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert!(chat_tag_settings(&args).is_none()),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_tag_requires_new_and_a_valid_tag() {
+        // Attaching does not tag: the session already has whatever tag it has.
+        assert!(Cli::try_parse_from(["honk", "chat", "20261020_3", "--tag", "honk"]).is_err());
+        assert!(Cli::try_parse_from(["honk", "chat", "--tag", "honk"]).is_err());
+        // A bad tag is refused before any session exists.
+        for bad in ["auto:x", "auto", "has space", "-x", ""] {
+            assert!(
+                Cli::try_parse_from(["honk", "chat", "--new", "--tag", bad]).is_err(),
+                "{bad:?}"
+            );
         }
     }
 

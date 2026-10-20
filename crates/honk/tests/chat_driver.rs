@@ -2675,6 +2675,129 @@ async fn test_new_session_pigeon_failure_is_a_warning_not_fatal() {
     assert!(notice.text.contains("not registered"), "{notice:?}");
 }
 
+/// A fake oc-tags that records its argv to `<dir>/argv` (one per line) after
+/// `delay` seconds, then prints what oc-tags prints on success.
+fn fake_oc_tags(dir: &Path, delay: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let argv = dir.join("argv");
+    let bin = dir.join("oc-tags");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nsleep {delay}\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\necho \"Tagged session '$4' as '$3'\"\n",
+            argv.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin.to_string_lossy().into_owned(), argv)
+}
+
+fn new_target(cwd: &Path) -> Target {
+    Target::New {
+        cwd: cwd.to_path_buf(),
+        extensions: None,
+        mcp: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_is_tagged_in_oc_tags() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, argv) = fake_oc_tags(tmp.path(), "0");
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagSettings {
+        tag: "honk".to_string(),
+        bin,
+        timeout: Duration::from_secs(10),
+    });
+    let (_handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut sid = None;
+    let mut notice = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while notice.is_none() {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for the tag notice")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { result } => {
+                sid = result
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            UiEvent::Notice(n) if n.text.starts_with("Tag:") => notice = Some(n),
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    }
+    let sid = sid.expect("SessionNew came before the tag notice");
+    let notice = notice.unwrap();
+    assert_eq!(notice.kind, honk::chat::NoticeKind::Info, "{notice:?}");
+    assert_eq!(
+        notice.text,
+        format!("Tag: Tagged session 'goose:{sid}' as 'honk'")
+    );
+    assert_eq!(
+        std::fs::read_to_string(argv).unwrap(),
+        format!("set\n--\nhonk\ngoose:{sid}\n")
+    );
+}
+
+/// `:q` straight after `--new` must not lose the tag: shutdown waits (up to a
+/// grace) for tagging still in flight, as it does for pigeon registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quick_quit_after_new_still_tags() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, argv) = fake_oc_tags(tmp.path(), "1");
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagSettings {
+        tag: "honk".to_string(),
+        bin,
+        timeout: Duration::from_secs(10),
+    });
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for SessionNew")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { .. } => break,
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    }
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(10), handle.join())
+        .await
+        .expect("driver did not stop")
+        .expect("driver task panicked");
+    assert!(
+        argv.exists(),
+        "oc-tags must have finished before the driver stopped"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
     let Some(g) = StubGoose::start_or_skip().await else {
