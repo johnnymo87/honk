@@ -143,6 +143,10 @@ struct ChatArgs {
     #[arg(long = "no-telegram")]
     no_telegram: bool,
 
+    /// Do not enable the swarm MCP server by default on a new session
+    #[arg(long = "no-swarm")]
+    no_swarm: bool,
+
     /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag),
     /// so it is listed under that program. Runs $HONK_OC_TAGS_BIN or oc-tags.
     #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag)]
@@ -340,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
             opts.max_turns = args.max_turns;
             opts.pigeon = pigeon;
             opts.tag = tag;
+            opts.no_swarm = args.no_swarm;
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
@@ -420,6 +425,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            no_swarm: false,
             tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
@@ -443,6 +449,7 @@ mod tests {
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
             no_telegram: false,
+            no_swarm: false,
             tag: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
@@ -474,6 +481,20 @@ mod tests {
         let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
         match cli.command {
             Commands::Chat(args) => assert!(chat_tag_settings(&args).is_none()),
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_no_swarm_flag() {
+        let cli = Cli::try_parse_from(["honk", "chat", "--new", "--no-swarm"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert!(args.no_swarm),
+            _ => panic!("expected chat command"),
+        }
+        let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => assert!(!args.no_swarm),
             _ => panic!("expected chat command"),
         }
     }
