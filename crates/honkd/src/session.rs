@@ -1820,6 +1820,10 @@ impl Session {
                             }
                         }
                         self.sync_inflight().await;
+                        // The run's start frame was missed; this is where it
+                        // starts for honkd, so the same clear applies.
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                            .await;
                         self.turn.run = Some(run_id.to_string());
                         self.sync_running();
                         self.rebuild_at_turn_end = true;

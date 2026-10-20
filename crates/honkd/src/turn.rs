@@ -464,6 +464,23 @@ pub enum TurnOutcome {
     Failed { kind: String, message: String },
 }
 
+/// A turn error is written to state.json on every save and sent with every
+/// `session/list`; an error reply can quote a whole provider response.
+pub const TURN_ERROR_MAX_BYTES: usize = 2048;
+
+fn capped(mut text: String) -> String {
+    if text.len() <= TURN_ERROR_MAX_BYTES {
+        return text;
+    }
+    let mut end = TURN_ERROR_MAX_BYTES - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push('…');
+    text
+}
+
 /// Reads a turn's outcome from its `Action::Reply`. `None` means the reply
 /// says nothing about the session's last turn: a busy rejection, or a prompt
 /// that never reached goose and was answered `cancelled`.
@@ -486,7 +503,7 @@ pub fn turn_outcome(
             };
             Some(TurnOutcome::Failed {
                 kind: "rpc".to_string(),
-                message,
+                message: capped(message),
             })
         }
         Reply::Result(result) => {
@@ -512,12 +529,14 @@ pub fn turn_outcome(
                 .and_then(Value::as_str)
             {
                 Some(kind) => Some(TurnOutcome::Failed {
-                    kind: kind.to_string(),
-                    message: turn_error
-                        .and_then(|e| e.get("message"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
+                    kind: capped(kind.to_string()),
+                    message: capped(
+                        turn_error
+                            .and_then(|e| e.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
                 }),
                 None => Some(TurnOutcome::Clean),
             }
@@ -1679,6 +1698,18 @@ mod tests {
         let busy = Reply::Error(busy_error("run_1"));
         assert_eq!(turn_outcome(&busy, None, None), None);
         assert_eq!(turn_outcome(&busy, None, Some(0)), None);
+    }
+
+    #[test]
+    fn turn_outcome_caps_long_messages_on_a_char_boundary() {
+        let body = Reply::Error(json!({ "message": "é".repeat(TURN_ERROR_MAX_BYTES) }));
+        let Some(TurnOutcome::Failed { message, .. }) =
+            turn_outcome(&body, Some(&turn_meta(None)), Some(0))
+        else {
+            panic!("an error reply is a failure");
+        };
+        assert!(message.len() <= TURN_ERROR_MAX_BYTES);
+        assert!(message.ends_with('…'));
     }
 
     #[test]

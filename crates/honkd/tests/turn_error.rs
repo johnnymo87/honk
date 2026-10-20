@@ -65,6 +65,35 @@ async fn goose_turn_error_is_listed_until_a_clean_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_clean_reply_clears_even_without_a_run_start() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    fake.set_prompt_result_meta(Some(turn_error_meta("network", "connection reset")));
+    prompt(&mut v, &sid, "fails").await;
+    assert_eq!(listed_error(&mut v, &sid).await["kind"], "network");
+
+    // Scripted frames carry no activeRunId, so only the reply can clear.
+    fake.set_prompt_result_meta(None);
+    fake.script_frames(vec![json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": &sid,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "ok" }
+            }
+        }
+    })]);
+    let reply = prompt(&mut v, &sid, "works").await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn");
+    assert_eq!(listed_error(&mut v, &sid).await, Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn turn_error_survives_a_honkd_restart() {
     let fake = FakeGoose::start().await;
     let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
