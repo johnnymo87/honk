@@ -1,4 +1,13 @@
 //! stdio MCP server exposing pigeon swarm tools for goose sessions.
+//!
+//! # Lifecycle and Persistence
+//!
+//! Goose persists the swarm extension's command and arguments per session in its database.
+//! After changing honkd's `--swarm-*` flags, existing sessions need `/mcp disable swarm`
+//! followed by `/mcp enable swarm` to pick up updated arguments or binary paths.
+//!
+//! Removing the flags leaves already-enabled sessions with the extension configured;
+//! disable it with `/mcp disable swarm` before removing the flags.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
