@@ -163,6 +163,12 @@ async fn ensure_mailbox(
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("pigeon response missing session_id: {body}"))?;
+    if !session_id.starts_with("gse_") {
+        return Err(format!(
+            "session '{}' has legacy pigeon session id '{}' (expected 'gse_…'); re-register with `honk telegram {} --force`",
+            config.session, session_id, config.session
+        ));
+    }
     Ok(session_id.to_string())
 }
 
