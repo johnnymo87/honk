@@ -212,7 +212,8 @@ pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<
 ///
 /// Registering again overwrites pigeon's row wholesale (token, label, cwd,
 /// title), which can break a session pigeon launched itself, so `honk telegram`
-/// checks first.
+/// checks first. Rows with `notify: false` (e.g. swarm mailbox-only rows) are
+/// skipped so `honk telegram` proceeds to register and upgrade them.
 pub async fn find_registered(
     cfg: &PigeonConfig,
     goose_session_id: &str,
@@ -245,8 +246,10 @@ pub async fn find_registered(
         .find(|s| {
             let id = |k: &str| s.get(k).and_then(Value::as_str);
             // Rows from before pigeon minted its own ids carry goose's id as
-            // `session_id` and no `backend_session_id`.
-            id("backend_kind") == Some("goose-acp")
+            // `session_id` and no `backend_session_id`. Swarm mailbox-only rows
+            // have `notify: false` and are skipped so `honk telegram` can upgrade them.
+            s.get("notify") != Some(&Value::Bool(false))
+                && id("backend_kind") == Some("goose-acp")
                 && (id("backend_session_id") == Some(goose_session_id)
                     || id("session_id") == Some(goose_session_id))
         })
