@@ -17,7 +17,27 @@ pub struct State {
     /// Last epoch of sessions no longer held (evicted / gone), so the next activation is epoch+1.
     pub retired_epochs: BTreeMap<String, u64>,
     pub ledger: BTreeMap<String, LedgerEntry>, // client_req_id → entry
+    /// Why each session's last turn failed, until a later turn starts or ends
+    /// clean. Held or not, so the pickers can show it (honk-9qf.15.11.3).
+    /// The default is load-bearing: a state.json from before this field must
+    /// still load.
+    #[serde(default)]
+    pub turn_errors: BTreeMap<String, TurnErrorRecord>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TurnErrorRecord {
+    /// goose's `_meta.goose.turnError.kind`, or honkd's `rpc` / `interrupted`.
+    pub kind: String,
+    pub message: String,
+    pub at_unix: u64,
+}
+
+/// `session/list` reports a turn error only this long: an abandoned session
+/// whose last turn failed must not stay pinned in the pickers forever.
+pub const TURN_ERROR_LIST_TTL_SECS: u64 = 48 * 3600;
+/// Boot drops turn errors older than this.
+pub const TURN_ERROR_PRUNE_SECS: u64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidecarRecoveryInfo {
@@ -28,6 +48,18 @@ pub struct SidecarRecoveryInfo {
 }
 
 impl State {
+    pub fn prune_turn_errors(&mut self, now_unix: u64) {
+        self.turn_errors
+            .retain(|_, e| now_unix.saturating_sub(e.at_unix) <= TURN_ERROR_PRUNE_SECS);
+    }
+
+    /// The session's turn error if it is recent enough to report.
+    pub fn listed_turn_error(&self, sid: &str, now_unix: u64) -> Option<&TurnErrorRecord> {
+        self.turn_errors
+            .get(sid)
+            .filter(|e| now_unix.saturating_sub(e.at_unix) <= TURN_ERROR_LIST_TTL_SECS)
+    }
+
     pub fn prune_ledger(
         &mut self,
         now_unix: u64,
@@ -371,6 +403,12 @@ impl StateStore {
 
         state.version = 1;
         state.boot += 1;
+        state.prune_turn_errors(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
         save_atomic(dir, &state)?;
 
         Ok(Self {
@@ -458,6 +496,69 @@ mod tests {
         drop(s);
         let reopened = StateStore::open(d.path(), None, false).unwrap();
         assert_eq!(reopened.sessions["s1"].conn_id, "c1");
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn state_json_from_before_turn_errors_still_loads() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("state.json"),
+            r#"{"version":1,"boot":3,"upstream_url":null,"control_conn":null,
+                "orphan_conns":[],"sessions":{},"retired_epochs":{},"ledger":{}}"#,
+        )
+        .unwrap();
+        let s = StateStore::open(d.path(), None, false).unwrap();
+        assert_eq!(s.boot, 4);
+        assert!(s.turn_errors.is_empty());
+    }
+
+    #[test]
+    fn turn_errors_survive_reopen_and_boot_prunes_week_old_ones() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = StateStore::open(d.path(), None, false).unwrap();
+        let record = |at_unix| TurnErrorRecord {
+            kind: "network".into(),
+            message: "connection reset".into(),
+            at_unix,
+        };
+        s.mutate(|st| {
+            st.turn_errors.insert("recent".into(), record(now() - 3600));
+            st.turn_errors
+                .insert("old".into(), record(now() - TURN_ERROR_PRUNE_SECS - 60));
+        })
+        .unwrap();
+        drop(s);
+        let reopened = StateStore::open(d.path(), None, false).unwrap();
+        assert_eq!(
+            reopened.turn_errors.keys().collect::<Vec<_>>(),
+            vec!["recent"]
+        );
+    }
+
+    #[test]
+    fn listed_turn_error_expires_after_the_list_ttl() {
+        let mut st = State::default();
+        st.turn_errors.insert(
+            "s1".into(),
+            TurnErrorRecord {
+                kind: "provider".into(),
+                message: "HTTP 500".into(),
+                at_unix: 1_000,
+            },
+        );
+        assert!(st.listed_turn_error("s1", 1_000 + 60).is_some());
+        assert!(
+            st.listed_turn_error("s1", 1_000 + TURN_ERROR_LIST_TTL_SECS + 1)
+                .is_none()
+        );
+        assert!(st.listed_turn_error("other", 1_000).is_none());
     }
 
     #[test]

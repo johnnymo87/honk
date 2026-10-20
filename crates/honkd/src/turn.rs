@@ -456,6 +456,75 @@ impl TurnCore {
     }
 }
 
+/// What a prompt reply says about how the session's last turn went, for the
+/// turn-error state the pickers show (honk-9qf.15.11.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Clean,
+    Failed { kind: String, message: String },
+}
+
+/// Reads a turn's outcome from its `Action::Reply`. `None` means the reply
+/// says nothing about the session's last turn: a busy rejection, or a prompt
+/// that never reached goose and was answered `cancelled`.
+pub fn turn_outcome(
+    body: &Reply,
+    turn: Option<&TurnMeta>,
+    prompt_index: Option<usize>,
+) -> Option<TurnOutcome> {
+    match body {
+        Reply::Error(err) => {
+            if crate::rpc::busy_run_id(err).is_some() || (turn.is_none() && prompt_index.is_none())
+            {
+                return None;
+            }
+            let message = err.get("message").and_then(Value::as_str).unwrap_or("");
+            let message = match err.get("data").and_then(Value::as_str) {
+                Some(data) if !message.is_empty() => format!("{message}: {data}"),
+                Some(data) => data.to_string(),
+                None => message.to_string(),
+            };
+            Some(TurnOutcome::Failed {
+                kind: "rpc".to_string(),
+                message,
+            })
+        }
+        Reply::Result(result) => {
+            let turn = turn?;
+            match turn.honk_reason.as_deref() {
+                Some("upstream_restart") => {
+                    return Some(TurnOutcome::Failed {
+                        kind: "interrupted".to_string(),
+                        message: "goose restarted during the turn".to_string(),
+                    });
+                }
+                Some("delivery_unknown") => {
+                    return Some(TurnOutcome::Failed {
+                        kind: "interrupted".to_string(),
+                        message: "honkd could not tell whether goose got the prompt".to_string(),
+                    });
+                }
+                _ => {}
+            }
+            let turn_error = result.pointer("/_meta/goose/turnError");
+            match turn_error
+                .and_then(|e| e.get("kind"))
+                .and_then(Value::as_str)
+            {
+                Some(kind) => Some(TurnOutcome::Failed {
+                    kind: kind.to_string(),
+                    message: turn_error
+                        .and_then(|e| e.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                None => Some(TurnOutcome::Clean),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,5 +1568,138 @@ mod tests {
                 }),
             }]
         );
+    }
+
+    fn turn_meta(honk_reason: Option<&str>) -> TurnMeta {
+        TurnMeta {
+            upstream_id: "hk1-1".into(),
+            client_req_ids: vec![],
+            prompt_text: "hi".into(),
+            run_id: Some("run_1".into()),
+            honk_reason: honk_reason.map(String::from),
+        }
+    }
+
+    fn failed(kind: &str, message: &str) -> Option<TurnOutcome> {
+        Some(TurnOutcome::Failed {
+            kind: kind.into(),
+            message: message.into(),
+        })
+    }
+
+    #[test]
+    fn turn_outcome_goose_turn_error_is_recorded() {
+        let body = Reply::Result(json!({
+            "stopReason": "end_turn",
+            "_meta": { "goose": { "turnError": { "kind": "network", "message": "reset" } } }
+        }));
+        assert_eq!(
+            turn_outcome(&body, Some(&turn_meta(None)), Some(0)),
+            failed("network", "reset")
+        );
+    }
+
+    #[test]
+    fn turn_outcome_clean_result_clears_including_user_cancel() {
+        let clean = Reply::Result(json!({ "stopReason": "end_turn" }));
+        assert_eq!(
+            turn_outcome(&clean, Some(&turn_meta(None)), Some(0)),
+            Some(TurnOutcome::Clean)
+        );
+        let cancelled = Reply::Result(json!({
+            "stopReason": "cancelled",
+            "_meta": { "honk": { "reason": "cancelled" } }
+        }));
+        assert_eq!(
+            turn_outcome(&cancelled, Some(&turn_meta(Some("cancelled"))), Some(0)),
+            Some(TurnOutcome::Clean)
+        );
+        let malformed = Reply::Result(json!({
+            "stopReason": "end_turn",
+            "_meta": { "goose": { "turnError": { "kind": 7 } } }
+        }));
+        assert_eq!(
+            turn_outcome(&malformed, Some(&turn_meta(None)), Some(0)),
+            Some(TurnOutcome::Clean)
+        );
+    }
+
+    #[test]
+    fn turn_outcome_restart_and_unknown_delivery_interrupts_are_recorded() {
+        let mut ids = UpstreamIds::new(1);
+        for reason in ["upstream_restart", "delivery_unknown"] {
+            let mut core = TurnCore::default();
+            let _ = core.on_prompt(
+                make_owner(Some(1), 10, None),
+                json!({"prompt": "x"}),
+                &mut ids,
+            );
+            let actions = core.interrupt(reason);
+            let Some(Action::Reply {
+                body,
+                turn,
+                prompt_index,
+                ..
+            }) = actions.first()
+            else {
+                panic!("interrupt replies to the inflight prompt: {actions:?}");
+            };
+            assert!(
+                matches!(
+                    turn_outcome(body, turn.as_ref(), *prompt_index),
+                    Some(TurnOutcome::Failed { ref kind, .. }) if kind == "interrupted"
+                ),
+                "{reason} is an interrupted turn"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_outcome_rpc_errors_are_recorded_but_busy_is_ignored() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": "Error in agent response stream: boom"
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed(
+                "rpc",
+                "Internal error: Error in agent response stream: boom"
+            )
+        );
+        // on_prompt_send_failed: the prompt never reached goose (no turn meta).
+        assert_eq!(
+            turn_outcome(&err, None, Some(0)),
+            failed(
+                "rpc",
+                "Internal error: Error in agent response stream: boom"
+            )
+        );
+        let busy = Reply::Error(busy_error("run_1"));
+        assert_eq!(turn_outcome(&busy, None, None), None);
+        assert_eq!(turn_outcome(&busy, None, Some(0)), None);
+    }
+
+    #[test]
+    fn turn_outcome_prompts_that_never_ran_say_nothing() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let _ = core.on_prompt(
+            make_owner(Some(1), 10, None),
+            json!({"prompt": "x"}),
+            &mut ids,
+        );
+        let actions = core.on_prompt_not_delivered("hk1-1", &mut ids);
+        let Some(Action::Reply {
+            body,
+            turn,
+            prompt_index,
+            ..
+        }) = actions.first()
+        else {
+            panic!("not_delivered replies: {actions:?}");
+        };
+        assert_eq!(turn_outcome(body, turn.as_ref(), *prompt_index), None);
     }
 }

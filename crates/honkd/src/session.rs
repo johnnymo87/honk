@@ -1709,6 +1709,10 @@ impl Session {
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
+                    if run_opt.is_some() {
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                            .await;
+                    }
                     let actions = self.turn.on_run_state(run_opt, &mut self.ids);
                     self.execute_actions(actions).await;
                 }
@@ -1740,6 +1744,8 @@ impl Session {
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     if run_opt.is_some() {
                         self.ambiguous_check_token += 1;
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                            .await;
                     }
                     let actions = self.turn.on_run_state(run_opt.clone(), &mut self.ids);
                     self.execute_actions(actions).await;
@@ -2024,9 +2030,58 @@ impl Session {
         }
     }
 
+    /// Records or clears the session's turn error. A clear writes state only
+    /// when there is an entry, so clean turns cost no extra save.
+    async fn record_turn_outcome(&mut self, outcome: crate::turn::TurnOutcome) {
+        let sid = self.sid.clone();
+        let mut s = self.state_store.lock().await;
+        let res = match outcome {
+            crate::turn::TurnOutcome::Clean => {
+                if !s.turn_errors.contains_key(&sid) {
+                    return;
+                }
+                s.mutate(|st| {
+                    st.turn_errors.remove(&sid);
+                })
+            }
+            crate::turn::TurnOutcome::Failed { kind, message } => {
+                let at_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                s.mutate(|st| {
+                    st.turn_errors.insert(
+                        sid.clone(),
+                        crate::state::TurnErrorRecord {
+                            kind,
+                            message,
+                            at_unix,
+                        },
+                    );
+                })
+            }
+        };
+        if let Err(e) = res {
+            tracing::warn!("Session {sid}: failed to persist turn error state: {e:#}");
+        }
+    }
+
     async fn execute_actions(&mut self, actions: Vec<Action>) {
         let mut queue = std::collections::VecDeque::from(actions);
         while let Some(action) = queue.pop_front() {
+            // In actor order, before a Result reply's export: a parked turn's
+            // inline failure must not be overwritten by the earlier turn's
+            // late clean reply.
+            if let Action::Reply {
+                body,
+                turn,
+                prompt_index,
+                ..
+            } = &action
+                && let Some(outcome) = crate::turn::turn_outcome(body, turn.as_ref(), *prompt_index)
+            {
+                self.record_turn_outcome(outcome).await;
+            }
             match action {
                 Action::SendPrompt {
                     upstream_id,
