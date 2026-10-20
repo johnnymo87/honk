@@ -61,6 +61,44 @@ pub struct Hub {
     pub mcp: Option<crate::mcp::McpConfig>,
 }
 
+pub fn validate_swarm_args(args: &Args) -> anyhow::Result<()> {
+    if args.swarm_pigeon_token_file.is_some()
+        && (args.swarm_mcp_bin.is_none() || args.swarm_pigeon_url.is_none())
+    {
+        anyhow::bail!(
+            "--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"
+        );
+    }
+    if args.swarm_mcp_bin.is_some() != args.swarm_pigeon_url.is_some() {
+        if args.swarm_mcp_bin.is_some() {
+            anyhow::bail!("--swarm-mcp-bin requires --swarm-pigeon-url");
+        } else {
+            anyhow::bail!("--swarm-pigeon-url requires --swarm-mcp-bin");
+        }
+    }
+    Ok(())
+}
+
+pub fn format_honk_url(listen: std::net::SocketAddr) -> String {
+    let host_port = match listen {
+        std::net::SocketAddr::V4(v4) => {
+            if v4.ip().is_unspecified() {
+                format!("127.0.0.1:{}", v4.port())
+            } else {
+                v4.to_string()
+            }
+        }
+        std::net::SocketAddr::V6(v6) => {
+            if v6.ip().is_unspecified() {
+                format!("[::1]:{}", v6.port())
+            } else {
+                v6.to_string()
+            }
+        }
+    };
+    format!("http://{host_port}/acp")
+}
+
 impl Hub {
     pub async fn start(
         args: Arc<Args>,
@@ -68,6 +106,7 @@ impl Hub {
         upstream_secret: String,
         turn_hook: Option<TurnHook>,
     ) -> anyhow::Result<Arc<Self>> {
+        validate_swarm_args(&args)?;
         let state_dir = state_store.dir().to_path_buf();
         let boot = state_store.boot;
         let state = Arc::new(Mutex::new(state_store));
@@ -203,7 +242,7 @@ impl Hub {
                     bin: args.swarm_mcp_bin.clone().unwrap(),
                     pigeon_url: args.swarm_pigeon_url.clone().unwrap(),
                     pigeon_token_file: args.swarm_pigeon_token_file.clone(),
-                    honk_url: format!("http://{}/acp", args.listen),
+                    honk_url: format_honk_url(args.listen),
                     honk_secret_file: state_dir.join("secret"),
                 })
             } else {
@@ -1727,5 +1766,76 @@ impl Hub {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_format_honk_url_unspecified_ipv4() {
+        let addr: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert_eq!(format_honk_url(addr), "http://127.0.0.1:8080/acp");
+    }
+
+    #[test]
+    fn test_format_honk_url_unspecified_ipv6() {
+        let addr: std::net::SocketAddr = "[::]:8080".parse().unwrap();
+        assert_eq!(format_honk_url(addr), "http://[::1]:8080/acp");
+    }
+
+    #[test]
+    fn test_format_honk_url_loopback() {
+        let addr_v4: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(format_honk_url(addr_v4), "http://127.0.0.1:8080/acp");
+
+        let addr_v6: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+        assert_eq!(format_honk_url(addr_v6), "http://[::1]:8080/acp");
+    }
+
+    #[test]
+    fn test_validate_swarm_args_valid_cases() {
+        use clap::Parser;
+        // Neither set
+        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        assert!(validate_swarm_args(&args).is_ok());
+
+        // Both bin and url set
+        args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
+        args.swarm_pigeon_url = Some("http://127.0.0.1:4731".to_string());
+        assert!(validate_swarm_args(&args).is_ok());
+
+        // All three set
+        args.swarm_pigeon_token_file = Some(PathBuf::from("/tmp/tok"));
+        assert!(validate_swarm_args(&args).is_ok());
+    }
+
+    #[test]
+    fn test_validate_swarm_args_exactly_one_set() {
+        use clap::Parser;
+        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
+        let err = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--swarm-mcp-bin requires --swarm-pigeon-url"));
+
+        let mut args2 = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        args2.swarm_pigeon_url = Some("http://127.0.0.1:4731".to_string());
+        let err2 = validate_swarm_args(&args2).unwrap_err().to_string();
+        assert!(err2.contains("--swarm-pigeon-url requires --swarm-mcp-bin"));
+    }
+
+    #[test]
+    fn test_validate_swarm_args_token_file_without_others() {
+        use clap::Parser;
+        let mut args = crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"]).unwrap();
+        args.swarm_pigeon_token_file = Some(PathBuf::from("/tmp/tok"));
+        let err = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(err.contains("--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"));
+
+        args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
+        let err2 = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(err2.contains("--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"));
     }
 }
