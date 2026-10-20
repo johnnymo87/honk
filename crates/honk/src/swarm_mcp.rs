@@ -391,21 +391,19 @@ async fn handle_swarm_read(
                     "honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}"
                 );
                 ack_warning = Some(msg);
-            } else if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                if let Some(rej) = val.get("rejected").and_then(Value::as_array)
-                    && !rej.is_empty()
-                {
-                    let n = rej.len();
-                    let s = if n == 1 {
-                        "1 message"
-                    } else {
-                        &format!("{n} messages")
-                    };
-                    let msg =
-                        format!("warning: {s} could not be acknowledged and may be shown again");
-                    eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
-                    ack_warning = Some(msg);
-                }
+            } else if let Ok(val) = serde_json::from_str::<Value>(&text)
+                && let Some(rej) = val.get("rejected").and_then(Value::as_array)
+                && !rej.is_empty()
+            {
+                let n = rej.len();
+                let s = if n == 1 {
+                    "1 message"
+                } else {
+                    &format!("{n} messages")
+                };
+                let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+                eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
+                ack_warning = Some(msg);
             }
         }
         Err(e) => {
