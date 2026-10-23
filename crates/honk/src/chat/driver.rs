@@ -662,7 +662,8 @@ async fn run_driver(
                 background.lock().unwrap().push((unconfirmed, task));
             }
 
-            if !opts.no_swarm {
+            let swarm_handled_by_honkd = result.pointer("/_meta/honk/swarm").is_some();
+            if !opts.no_swarm && !swarm_handled_by_honkd {
                 let mcp_req_id = ids.allocate();
                 let mcp_params = json!({
                     "sessionId": session_id,

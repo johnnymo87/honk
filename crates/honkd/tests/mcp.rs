@@ -481,6 +481,25 @@ async fn test_mcp_self_grant_e2e() {
             .await
             .unwrap();
         assert_eq!(res_disable.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Capability probe when --mcp-self-grant is off
+        let res_probe_off = client
+            .get(format!("http://{}/mcp/self-grant", h_no_grant.addr))
+            .header("x-secret-key", h_no_grant.secret())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_probe_off.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let res_probe_off_no_auth = client
+            .get(format!("http://{}/mcp/self-grant", h_no_grant.addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res_probe_off_no_auth.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
     }
 
     // 2. Honkd WITH --mcp-self-grant
@@ -527,6 +546,36 @@ async fn test_mcp_self_grant_e2e() {
         .await
         .unwrap();
     assert_eq!(res_token_query.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 2c2. GET /mcp/self-grant capability probe auth and 204
+    let res_probe_no_secret = client
+        .get(format!("http://{}/mcp/self-grant", h.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res_probe_no_secret.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let res_probe_wrong_secret = client
+        .get(format!("http://{}/mcp/self-grant", h.addr))
+        .header("x-secret-key", "wrong-secret-12345678901234567890")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res_probe_wrong_secret.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let res_probe_ok = client
+        .get(format!("http://{}/mcp/self-grant", h.addr))
+        .header("x-secret-key", &secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_probe_ok.status(), reqwest::StatusCode::NO_CONTENT);
 
     // Connect a honk-aware viewer to create a session
     let mut v = Viewer::connect(&h).await;
@@ -632,6 +681,28 @@ async fn test_mcp_self_grant_e2e() {
     assert_eq!(
         ws_reason_json["error"]["message"],
         "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
+    );
+
+    // 2h2. Enable confirm-class server with reason > 500 characters -> -32602 "reason too long (max 500 characters)"
+    let long_reason = "a".repeat(501);
+    let res_long_reason = client
+        .post(format!("http://{}/mcp/enable", h.addr))
+        .header("x-secret-key", &secret)
+        .json(&json!({
+            "sessionId": sid,
+            "names": ["slack"],
+            "confirm": ["slack"],
+            "reason": long_reason,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_long_reason.status(), reqwest::StatusCode::OK);
+    let long_reason_json: Value = res_long_reason.json().await.unwrap();
+    assert_eq!(long_reason_json["error"]["code"], -32602);
+    assert_eq!(
+        long_reason_json["error"]["message"],
+        "reason too long (max 500 characters)"
     );
 
     // 2i. Enable confirm-class server with confirm + reason -> OK

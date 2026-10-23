@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -17,6 +17,7 @@ pub struct SeenHonk {
 
 #[derive(Clone)]
 pub struct HonkdBehaviour {
+    pub self_grant: StatusCode,
     pub list: (StatusCode, Value),
     pub enable: (StatusCode, Value),
     pub disable: (StatusCode, Value),
@@ -25,6 +26,7 @@ pub struct HonkdBehaviour {
 impl Default for HonkdBehaviour {
     fn default() -> Self {
         Self {
+            self_grant: StatusCode::NO_CONTENT,
             list: (
                 StatusCode::OK,
                 json!({
@@ -105,6 +107,7 @@ impl StubHonkd {
             behaviour,
         };
         let app = Router::new()
+            .route("/mcp/self-grant", get(mcp_self_grant))
             .route("/mcp/list", post(mcp_list))
             .route("/mcp/enable", post(mcp_enable))
             .route("/mcp/disable", post(mcp_disable))
@@ -155,6 +158,19 @@ async fn mcp_enable(
     });
     let (status, val) = st.behaviour.enable.clone();
     (status, axum::Json(val))
+}
+
+async fn mcp_self_grant(State(st): State<HonkSt>, headers: HeaderMap) -> impl IntoResponse {
+    let secret = headers
+        .get("x-secret-key")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    st.seen.lock().unwrap().push(SeenHonk {
+        path: "/mcp/self-grant".to_string(),
+        secret,
+        body: Value::Null,
+    });
+    st.behaviour.self_grant
 }
 
 async fn mcp_disable(

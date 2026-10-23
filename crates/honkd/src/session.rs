@@ -3308,6 +3308,10 @@ impl Session {
                 );
             }
             SessionMsg::McpSelfOp { op, reason, reply } => {
+                if reply.is_closed() {
+                    tracing::info!("dropping self-op whose caller timed out");
+                    return;
+                }
                 if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
                     if self.queued_msgs.len() >= 1024 {
                         let _ = reply.send(Err(crate::mcp::ops::OpError {
@@ -5733,5 +5737,54 @@ mod tests {
             v["error"]["message"],
             "MCP change timed out; run /mcp to see the current state"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_dropped_when_reply_closed() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_closed_reply_test", ActorState::Live).await;
+        Arc::get_mut(&mut session.hub).unwrap().mcp = Some(crate::mcp::McpConfig {
+            catalog_path: None,
+            policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
+            swarm: None,
+        });
+
+        // 1. Immediate McpSelfOp with closed reply
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        drop(reply_rx); // Caller timed out / disconnected
+
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        assert!(!session.mcp_op_running, "mcp_op_running must stay false");
+        assert!(session.rx.try_recv().is_err(), "no task should be spawned");
+
+        // 2. Drained from queued_msgs with closed reply
+        let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+        drop(reply_rx2); // Caller timed out while queued
+
+        session.state = ActorState::Rebuilding;
+        session.queued_msgs.push_back(SessionMsg::McpSelfOp {
+            op: McpOpKind::Enable {
+                names: vec!["local-test".to_string()],
+                confirm: vec![],
+            },
+            reason: None,
+            reply: reply_tx2,
+        });
+
+        session.state = ActorState::Live;
+        session.drain_queued_msgs().await;
+
+        assert!(!session.mcp_op_running, "mcp_op_running must stay false");
+        assert!(session.rx.try_recv().is_err(), "no task should be spawned");
     }
 }

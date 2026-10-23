@@ -224,7 +224,7 @@ When creating a new session with `honk chat --new`:
   - `mcp_list` (`swarm__mcp_list`): Lists catalog servers, their on/off status, `!` confirmation markers, read-only siblings, and unsupported reasons.
   - `mcp_enable` (`swarm__mcp_enable`): Enables one or more catalog servers. For servers marked `!`, agents append `!` to confirm (e.g. `slack!`) and provide a `reason` explaining write access.
   - `mcp_disable` (`swarm__mcp_disable`): Disables one or more servers. Disabling `swarm` itself is refused before any request.
-  New tools become available immediately in the same turn and are usable from the agent's next step.
+  The `swarm` MCP server probes `honkd` for self-grant support at startup (`GET /mcp/self-grant`); when `--mcp-self-grant` is off, these three tools are omitted from the tool list. Existing sessions see the tools after their swarm server is respawned (i.e. session reload or `/mcp disable swarm` followed by `/mcp enable swarm`). When enabled, new tools become available immediately in the same turn and are usable from the agent's next step.
 - **Session creation flags**: `honk chat --new --mcp <name>` enables catalog servers at creation time. Append `!` (e.g. `--mcp slack!`) to confirm servers that require confirmation (honkd decides which via `--mcp-no-confirm`). Pass `--no-swarm` to disable swarm MCP on the new session.
 - **Unsupported servers**: Remote MCP servers requiring OAuth or bearer tokens (such as Datadog or Notion) are listed as `n/a` and cannot be enabled in v1.
 

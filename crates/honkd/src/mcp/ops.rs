@@ -412,6 +412,13 @@ pub async fn enable_with_reason(
                         name, catalog, true,
                     )));
                 }
+                if let Some(r) = reason_opt
+                    && r.chars().count() > 500
+                {
+                    return Err(OpError::invalid_params(
+                        "reason too long (max 500 characters)",
+                    ));
+                }
             }
         }
     }

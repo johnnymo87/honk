@@ -824,3 +824,140 @@ async fn test_mcp_self_grant_mid_turn_live_e2e() {
         "goose tools_list must contain probe tool: {tools_now:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_swarm_mcp_self_grant_mid_turn_real_path_e2e() {
+    let Some(python3_bin) = find_python3() else {
+        eprintln!("skipping test: python3 not on PATH");
+        return;
+    };
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honk_bin) = find_honk_bin() else {
+        eprintln!(
+            "honk binary not found; skipping test_swarm_mcp_self_grant_mid_turn_real_path_e2e"
+        );
+        return;
+    };
+
+    // 1. Setup tempdir with MCP fixture and catalog JSON
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let fixture_path = temp_dir.path().join("fixture.py");
+    std::fs::write(&fixture_path, MCP_FIXTURE_PY).expect("write fixture.py");
+
+    let catalog_content = json!({
+        "mcp": {
+            "honktest": {
+                "type": "local",
+                "command": [python3_bin.to_str().unwrap(), fixture_path.to_str().unwrap()]
+            }
+        }
+    });
+    let catalog_path = temp_dir.path().join("opencode.json");
+    std::fs::write(&catalog_path, catalog_content.to_string()).expect("write opencode.json");
+
+    // 2. Spawn honkd with --mcp-catalog, --mcp-no-confirm honktest, --mcp-self-grant, and swarm config
+    let h = Honkd::spawn(
+        &g.url(),
+        g.secret_file(),
+        &[
+            "--mcp-catalog",
+            catalog_path.to_str().unwrap(),
+            "--mcp-no-confirm",
+            "honktest",
+            "--mcp-self-grant",
+            "--swarm-mcp-bin",
+            honk_bin.to_str().unwrap(),
+            "--swarm-pigeon-url",
+            "http://127.0.0.1:4731",
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+
+    v.call(
+        "session/load",
+        json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    v.wait_for(|f| {
+        f.get("method").and_then(Value::as_str) == Some(honk_wire::method::REPLAY_DONE)
+            && f.pointer("/params/epoch") == Some(&json!(1))
+    })
+    .await;
+
+    // 3. Enable built-in swarm entry
+    let enable_swarm_res = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": &sid,
+                "names": ["swarm"]
+            }),
+        )
+        .await;
+    assert!(
+        enable_swarm_res.get("error").is_none(),
+        "swarm enable error: {enable_swarm_res:?}"
+    );
+
+    // 4. Verify goose tools_list contains swarm__mcp_enable
+    let tools = g.tools_list(&sid).await;
+    assert!(
+        tools.iter().any(|t| t.ends_with("mcp_enable")),
+        "tools must include mcp_enable: {tools:?}"
+    );
+    let enable_tool = tools
+        .iter()
+        .find(|t| t.ends_with("mcp_enable"))
+        .unwrap()
+        .clone();
+
+    // 5. Model calls swarm__mcp_enable { names: ["honktest"] } and then honktest__probe in SAME turn
+    g.model().push([
+        Turn::ToolCall {
+            tool: enable_tool,
+            arguments: json!({ "names": ["honktest"] }),
+        },
+        Turn::ToolCall {
+            tool: "honktest__probe".into(),
+            arguments: json!({}),
+        },
+        Turn::Text(vec!["real path self grant done".into()]),
+    ]);
+
+    // 6. Send prompt to start the turn
+    let pid = v
+        .request(
+            "session/prompt",
+            prompt_params(
+                &sid,
+                "agent self-grant honktest and call probe",
+                Some("crid-agent-self-grant"),
+            ),
+        )
+        .await;
+
+    // 7. Verify honk-aware viewer receives _honk/mcp_changed with origin: "agent"
+    let changed_frame = v
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("_honk/mcp_changed")
+                && f.pointer("/params/origin").and_then(Value::as_str) == Some("agent")
+        })
+        .await;
+    assert_eq!(changed_frame["params"]["origin"], "agent");
+
+    let prompt_resp = v.response(&pid).await;
+    assert_eq!(prompt_resp["result"]["stopReason"], "end_turn");
+
+    // 8. Assert probe result in export
+    let export = g.export(&sid).await;
+    let export_str = export.to_string();
+    assert!(
+        export_str.contains("secret_len=") || export_str.contains("mode="),
+        "export must show probe tool was called in the turn: {export_str}"
+    );
+}

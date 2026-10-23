@@ -71,8 +71,22 @@ pub fn router(hub: Arc<Hub>, secret: String) -> Router {
     let state = Arc::new(DownstreamState { hub, secret });
     Router::new()
         .route("/acp", get(acp_handler))
+        .route("/mcp/self-grant", get(mcp_self_grant_handler))
         .route("/mcp/{op}", post(mcp_self_handler))
         .with_state(state)
+}
+
+async fn mcp_self_grant_handler(
+    State(state): State<Arc<DownstreamState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_secret_header(&state.secret, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.hub.args.mcp_self_grant {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn acp_handler(
@@ -143,6 +157,19 @@ async fn mcp_self_handler(
         .into_response();
     };
     let sid = sid.to_string();
+
+    if let Some(reason_val) = body_json.get("reason")
+        && let Some(r) = reason_val.as_str()
+        && r.chars().count() > 500
+    {
+        return Json(serde_json::json!({
+            "error": {
+                "code": -32602,
+                "message": "reason too long (max 500 characters)",
+            }
+        }))
+        .into_response();
+    }
 
     let (op_kind, reason, names_for_log) = match op.as_str() {
         "list" => (crate::session::McpOpKind::List, None, Vec::new()),

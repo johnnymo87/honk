@@ -939,9 +939,28 @@ async fn handle_mcp_disable(
     }
 }
 
-fn get_tools() -> Value {
-    json!([
-        {
+async fn probe_self_grant(client: &reqwest::Client, config: &SwarmMcpServerConfig) -> bool {
+    let Ok(url) = honk_mcp_url(&config.honk_url, "self-grant") else {
+        return false;
+    };
+    let Ok(secret) = read_honk_secret(config.honk_secret_file.as_deref()) else {
+        return false;
+    };
+    match client
+        .get(url)
+        .header("x-secret-key", secret)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status() == reqwest::StatusCode::NO_CONTENT,
+        Err(_) => false,
+    }
+}
+
+fn get_tools(self_grant: bool) -> Value {
+    let mut tools = vec![
+        json!({
             "name": "swarm_send",
             "description": "Send a swarm message to another session via pigeon. One substantial message beats several; no acks or heartbeats; reply only with decisions, evidence, or deliverables. The message payload must NOT contain the literal </swarm_message> tag, and do NOT write the <swarm_message> envelope yourself. The sender ('from') is filled in automatically. 'to' must be 'ses_…' (opencode) or 'gse_…' (goose).",
             "inputSchema": {
@@ -970,8 +989,8 @@ fn get_tools() -> Value {
                 },
                 "required": ["to", "message"]
             }
-        },
-        {
+        }),
+        json!({
             "name": "swarm_read",
             "description": "Read and drain incoming swarm messages from this session's pigeon mailbox. Each message is wrapped in a <swarm_message> envelope with message-economy reminders. Messages are acknowledged upon drain.",
             "inputSchema": {
@@ -983,8 +1002,8 @@ fn get_tools() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "swarm_list",
             "description": "List active sessions across all projects to discover peer session IDs for swarm_send. Identifies opencode sessions and goose sessions (noting whether a goose session has a mailbox).",
             "inputSchema": {
@@ -996,18 +1015,21 @@ fn get_tools() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+    ];
+
+    if self_grant {
+        tools.push(json!({
             "name": "mcp_list",
             "description": "List available MCP servers in the catalog, their on/off status, and whether they require confirmation. Prefer read-only servers (e.g. slack-ro over slack). Servers marked '!' can write or act.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
-        },
-        {
+        }));
+        tools.push(json!({
             "name": "mcp_enable",
-            "description": "Enable one or more MCP servers for this session. Turn on only what the task needs; prefer read-only siblings (e.g. slack-ro over slack). For a server marked '!' (it can write or act), add '!' to its name (e.g. 'slack!') and provide a 'reason' explaining what you will do with it. The human sees every change. If enabling fails, stop and report the error verbatim — do not call the service's API with environment tokens and do not call honkd or goose on loopback yourself. Turn servers off when done if the session lives on.",
+            "description": "Enable one or more MCP servers for this session. Turn on only what the task needs; prefer read-only siblings (e.g. slack-ro over slack). For a server marked '!' (it can write or act), add '!' to its name (e.g. 'slack!') and provide a one-sentence 'reason' explaining what you will do with it. Every change is logged with your reason and shown to anyone watching the session. If enabling fails, stop and report the error verbatim — do not call the service's API with environment tokens and do not call honkd or goose on loopback yourself. Turn servers off when done if the session lives on.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1018,13 +1040,13 @@ fn get_tools() -> Value {
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Required when confirming '!' servers: explain what you will do with write/action access."
+                        "description": "Required when confirming '!' servers: explain in one sentence what you will do with write/action access (max 500 characters)."
                     }
                 },
                 "required": ["names"]
             }
-        },
-        {
+        }));
+        tools.push(json!({
             "name": "mcp_disable",
             "description": "Disable one or more MCP servers for this session. Disabling 'swarm' is refused because it would remove these tools. If disabling fails, stop and report the error verbatim. Turn servers off when done if the session lives on.",
             "inputSchema": {
@@ -1038,8 +1060,10 @@ fn get_tools() -> Value {
                 },
                 "required": ["names"]
             }
-        }
-    ])
+        }));
+    }
+
+    Value::Array(tools)
 }
 
 pub async fn run_server<R, W>(
@@ -1054,6 +1078,7 @@ where
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
+    let mut self_grant_enabled: Option<bool> = None;
 
     let mut line = String::new();
     while reader.read_line(&mut line).await? != 0 {
@@ -1112,11 +1137,19 @@ where
                 })
             }
             Some("tools/list") => {
+                let enabled = match self_grant_enabled {
+                    Some(e) => e,
+                    None => {
+                        let e = probe_self_grant(&client, &config).await;
+                        self_grant_enabled = Some(e);
+                        e
+                    }
+                };
                 json!({
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "result": {
-                        "tools": get_tools()
+                        "tools": get_tools(enabled)
                     }
                 })
             }
@@ -1136,9 +1169,26 @@ where
                                 handle_swarm_read(&client, &config, arguments, cwd.as_deref()).await
                             }
                             "swarm_list" => handle_swarm_list(&client, &config, arguments).await,
-                            "mcp_list" => handle_mcp_list(&client, &config, arguments).await,
-                            "mcp_enable" => handle_mcp_enable(&client, &config, arguments).await,
-                            "mcp_disable" => handle_mcp_disable(&client, &config, arguments).await,
+                            "mcp_list" | "mcp_enable" | "mcp_disable" => {
+                                if self_grant_enabled == Some(false) {
+                                    tool_err(
+                                        "this honkd has no self-grant (too old, or --mcp-self-grant is off); ask the human for /mcp in honk chat",
+                                    )
+                                } else {
+                                    match tool_name {
+                                        "mcp_list" => {
+                                            handle_mcp_list(&client, &config, arguments).await
+                                        }
+                                        "mcp_enable" => {
+                                            handle_mcp_enable(&client, &config, arguments).await
+                                        }
+                                        "mcp_disable" => {
+                                            handle_mcp_disable(&client, &config, arguments).await
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                }
+                            }
                             other => tool_err(format!("unknown tool '{other}'")),
                         }
                     }

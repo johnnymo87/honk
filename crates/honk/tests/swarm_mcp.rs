@@ -101,18 +101,28 @@ async fn test_protocol_initialize_ping_and_unknown() {
 }
 
 #[tokio::test]
-async fn test_tools_list() {
+async fn test_tools_list_probe_204() {
     let (server_io, client_io) = duplex(4096);
     let (server_rx, server_tx) = tokio::io::split(server_io);
     let (client_rx, mut client_tx) = tokio::io::split(client_io);
     let mut client_rx = BufReader::new(client_rx);
 
+    let h = StubHonkd::start(HonkdBehaviour {
+        self_grant: StatusCode::NO_CONTENT,
+        ..Default::default()
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_path = tmp.path().join("secret");
+    std::fs::write(&secret_path, "honk-secret-key-1234").unwrap();
+
     let config = SwarmMcpServerConfig {
         session: "20261020_owner".into(),
         pigeon_url: "http://127.0.0.1:4731".into(),
         pigeon_token_file: None,
-        honk_url: "http://127.0.0.1:4280/acp".into(),
-        honk_secret_file: None,
+        honk_url: h.url,
+        honk_secret_file: Some(secret_path),
     };
 
     let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
@@ -159,6 +169,171 @@ async fn test_tools_list() {
     assert!(
         enable_desc.contains("reason"),
         "must mention reason: {enable_desc}"
+    );
+    assert!(
+        enable_desc.contains(
+            "Every change is logged with your reason and shown to anyone watching the session."
+        ),
+        "must have accurate visibility description: {enable_desc}"
+    );
+    assert!(
+        !enable_desc.contains("The human sees every change."),
+        "must not contain outdated wording: {enable_desc}"
+    );
+    assert!(
+        enable_desc.contains("one-sentence") || enable_desc.contains("one sentence"),
+        "must mention one sentence: {enable_desc}"
+    );
+    let reason_desc = enable_tool["inputSchema"]["properties"]["reason"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason_desc.contains("one sentence") || reason_desc.contains("one-sentence"),
+        "reason param must mention one sentence: {reason_desc}"
+    );
+    assert!(
+        reason_desc.contains("500"),
+        "reason param must mention 500 characters: {reason_desc}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_tools_list_probe_404() {
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let h = StubHonkd::start(HonkdBehaviour {
+        self_grant: StatusCode::NOT_FOUND,
+        ..Default::default()
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_path = tmp.path().join("secret");
+    std::fs::write(&secret_path, "honk-secret-key-1234").unwrap();
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: h.url,
+        honk_secret_file: Some(secret_path),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }),
+    )
+    .await;
+
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, vec!["swarm_send", "swarm_read", "swarm_list",]);
+
+    // Tool calls return the 404-style error
+    for (id, tool_name) in [(2, "mcp_list"), (3, "mcp_enable"), (4, "mcp_disable")] {
+        let call_resp = send_recv(
+            &mut client_tx,
+            &mut client_rx,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": { "names": ["slack"] },
+                    "_meta": { "agent-session-id": "20261020_owner" }
+                }
+            }),
+        )
+        .await;
+
+        let res = &call_resp["result"];
+        assert_eq!(res["isError"], true);
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            "this honkd has no self-grant (too old, or --mcp-self-grant is off); ask the human for /mcp in honk chat"
+        );
+    }
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_tools_list_probe_unreachable() {
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let secret_path = tmp.path().join("secret");
+    std::fs::write(&secret_path, "honk-secret-key-1234").unwrap();
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:1/acp".into(),
+        honk_secret_file: Some(secret_path),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }),
+    )
+    .await;
+
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, vec!["swarm_send", "swarm_read", "swarm_list",]);
+
+    // Tool call also returns 404 error
+    let call_resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_list",
+                "arguments": {},
+                "_meta": { "agent-session-id": "20261020_owner" }
+            }
+        }),
+    )
+    .await;
+
+    let res = &call_resp["result"];
+    assert_eq!(res["isError"], true);
+    let text = res["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        "this honkd has no self-grant (too old, or --mcp-self-grant is off); ask the human for /mcp in honk chat"
     );
 
     drop(client_tx);

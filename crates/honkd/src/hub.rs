@@ -105,6 +105,7 @@ pub fn format_honk_url(listen: std::net::SocketAddr) -> String {
 impl Hub {
     pub async fn start(
         args: Arc<Args>,
+        bound_addr: std::net::SocketAddr,
         state_store: StateStore,
         upstream_secret: String,
         turn_hook: Option<TurnHook>,
@@ -245,7 +246,7 @@ impl Hub {
                     bin: args.swarm_mcp_bin.clone().unwrap(),
                     pigeon_url: args.swarm_pigeon_url.clone().unwrap(),
                     pigeon_token_file: args.swarm_pigeon_token_file.clone(),
-                    honk_url: format_honk_url(args.listen),
+                    honk_url: format_honk_url(bound_addr),
                     honk_secret_file: state_dir.join("secret"),
                 })
             } else {

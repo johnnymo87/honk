@@ -231,7 +231,15 @@ async fn main() {
     };
 
     let args_arc = Arc::new(args);
-    let hub = match Hub::start(args_arc, state_store, upstream_secret, turn_hook).await {
+    let hub = match Hub::start(
+        args_arc,
+        bound_addr,
+        state_store,
+        upstream_secret,
+        turn_hook,
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
             eprintln!("honkd: {e:#}");
