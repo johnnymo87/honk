@@ -119,8 +119,8 @@ async fn mcp_self_handler(
         Err(_) => {
             return Json(serde_json::json!({
                 "error": {
-                    "code": -32602,
-                    "message": "Invalid JSON body",
+                    "code": -32700,
+                    "message": "Parse error",
                 }
             }))
             .into_response();
@@ -298,12 +298,24 @@ async fn mcp_self_handler(
         };
 
         match reply_rx.await {
-            Ok(Ok(crate::session::McpOpOutput::List(res))) => {
-                serde_json::to_value(res).unwrap_or_else(|_| serde_json::json!({}))
-            }
-            Ok(Ok(crate::session::McpOpOutput::Op(res))) => {
-                serde_json::to_value(res).unwrap_or_else(|_| serde_json::json!({}))
-            }
+            Ok(Ok(crate::session::McpOpOutput::List(res))) => serde_json::to_value(res)
+                .unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "error": {
+                            "code": -32603,
+                            "message": "Internal error: failed to serialize response",
+                        }
+                    })
+                }),
+            Ok(Ok(crate::session::McpOpOutput::Op(res))) => serde_json::to_value(res)
+                .unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "error": {
+                            "code": -32603,
+                            "message": "Internal error: failed to serialize response",
+                        }
+                    })
+                }),
             Ok(Err(err)) => {
                 serde_json::json!({
                     "error": {

@@ -27,4 +27,5 @@ honk = { path = "../honk" }
 honk-testgoose = { path = "../honk-testgoose" }
 reqwest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.30.0"

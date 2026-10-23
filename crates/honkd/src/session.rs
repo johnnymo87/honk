@@ -2463,10 +2463,11 @@ impl Session {
             tx: self_tx.clone(),
         };
 
-        let agent_reason: Option<Option<String>> = match &origin {
-            McpOpOrigin::Agent { reason } => Some(reason.clone()),
+        let agent_reason: Option<String> = match &origin {
+            McpOpOrigin::Agent { reason } => reason.clone(),
             McpOpOrigin::Viewer(_) => None,
         };
+        let is_agent = matches!(origin, McpOpOrigin::Agent { .. });
 
         let task = tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(60);
@@ -2487,6 +2488,11 @@ impl Session {
                         Ok(McpOpOutput::List(res))
                     }
                     McpOpKind::Enable { names, confirm } => {
+                        let reason_policy = if is_agent {
+                            crate::mcp::ops::ReasonPolicy::Required(agent_reason.as_deref())
+                        } else {
+                            crate::mcp::ops::ReasonPolicy::NotRequired
+                        };
                         let res = crate::mcp::ops::enable_with_reason(
                             &requester,
                             &catalog,
@@ -2494,7 +2500,7 @@ impl Session {
                             &sid,
                             &names,
                             &confirm,
-                            agent_reason.as_ref().map(|o| o.as_deref()),
+                            reason_policy,
                         )
                         .await?;
                         Ok(McpOpOutput::Op(res))
@@ -2516,9 +2522,14 @@ impl Session {
             let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
                 match tokio::time::timeout(budget, work).await {
                     Ok(res) => res,
-                    Err(_) => Err(crate::mcp::ops::OpError::request_failed(
-                        "MCP change timed out; run /mcp to see the current state",
-                    )),
+                    Err(_) => {
+                        let msg = if is_agent {
+                            "timed out; the change may still land; call mcp_list"
+                        } else {
+                            "MCP change timed out; run /mcp to see the current state"
+                        };
+                        Err(crate::mcp::ops::OpError::request_failed(msg))
+                    }
                 };
 
             match target {
@@ -3195,31 +3206,35 @@ impl Session {
                             },
                         )
                         .collect();
-                    for vid in viewers {
-                        let frame = match &origin {
-                            McpOpOrigin::Agent { reason } => {
-                                let mut params = json!({
-                                    "sessionId": self.sid,
-                                    "enabled": enabled,
-                                    "change": change,
-                                    "origin": "agent",
-                                });
-                                if let Some(r) = reason {
-                                    params["reason"] = json!(r);
-                                }
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "_honk/mcp_changed",
-                                    "params": params,
-                                })
+
+                    match &origin {
+                        McpOpOrigin::Agent { reason } => {
+                            let mut params = json!({
+                                "sessionId": self.sid,
+                                "enabled": enabled,
+                                "change": change,
+                                "origin": "agent",
+                            });
+                            if let Some(r) = reason {
+                                params["reason"] = json!(r);
                             }
-                            McpOpOrigin::Viewer(origin_viewer) => {
+                            let frame = json!({
+                                "jsonrpc": "2.0",
+                                "method": "_honk/mcp_changed",
+                                "params": params,
+                            });
+                            for vid in viewers {
+                                self.send_to_viewer(vid, frame.clone());
+                            }
+                        }
+                        McpOpOrigin::Viewer(origin_viewer) => {
+                            for vid in viewers {
                                 let origin_str = if Some(vid) == *origin_viewer {
                                     "you"
                                 } else {
                                     "other"
                                 };
-                                json!({
+                                let frame = json!({
                                     "jsonrpc": "2.0",
                                     "method": "_honk/mcp_changed",
                                     "params": {
@@ -3228,10 +3243,10 @@ impl Session {
                                         "change": change,
                                         "origin": origin_str,
                                     }
-                                })
+                                });
+                                self.send_to_viewer(vid, frame);
                             }
-                        };
-                        self.send_to_viewer(vid, frame);
+                        }
                     }
                 }
             }
@@ -5155,6 +5170,104 @@ mod tests {
             serde_json::from_str(f1_no_reason.to_text().unwrap()).unwrap();
         assert_eq!(f1_no_reason_json["params"]["origin"], "agent");
         assert!(f1_no_reason_json["params"].get("reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_task_timeout_message_agent_vs_viewer() {
+        tokio::time::pause();
+
+        let (mut session, _d, _fake) =
+            create_test_session("ses_timeout_msg_test", ActorState::Live).await;
+        let tmp_cat = tempfile::tempdir().unwrap();
+        let cat_path = tmp_cat.path().join("opencode.json");
+        std::fs::write(
+            &cat_path,
+            json!({
+                "mcp": {
+                    "local-test": {
+                        "type": "local",
+                        "command": ["echo"]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut session.hub).unwrap().mcp = Some(crate::mcp::McpConfig {
+            catalog_path: Some(cat_path),
+            policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
+            swarm: None,
+        });
+
+        // 1. Agent origin timeout
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = internal1 {
+            tokio::time::advance(Duration::from_secs(35)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _internal2 = session.rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        let err_agent = reply_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err_agent.code, -32603);
+        assert_eq!(
+            err_agent.message,
+            "timed out; the change may still land; call mcp_list"
+        );
+
+        let done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(done_msg).await;
+        assert!(!session.mcp_op_running);
+
+        // 2. Viewer origin timeout
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                id: json!(42),
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let v_internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = v_internal1 {
+            tokio::time::advance(Duration::from_secs(35)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _v_internal2 = session.rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        let frame = v_rx.recv().await.unwrap();
+        let frame_json: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame_json["error"]["code"], -32603);
+        assert_eq!(
+            frame_json["error"]["message"],
+            "MCP change timed out; run /mcp to see the current state"
+        );
     }
 
     #[tokio::test]

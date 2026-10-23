@@ -533,7 +533,21 @@ async fn test_mcp_self_grant_e2e() {
     let new_res = v.call("session/new", json!({ "cwd": "/tmp" })).await;
     let sid = new_res["result"]["sessionId"].as_str().unwrap().to_string();
 
-    // 2d. Invalid body -> HTTP 200 with -32602 error object
+    // 2d-1. Malformed JSON body -> HTTP 200 with -32700 "Parse error"
+    let res_malformed = client
+        .post(format!("http://{}/mcp/list", h.addr))
+        .header("x-secret-key", &secret)
+        .header("content-type", "application/json")
+        .body("not valid json {")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_malformed.status(), reqwest::StatusCode::OK);
+    let malformed_json: Value = res_malformed.json().await.unwrap();
+    assert_eq!(malformed_json["error"]["code"], -32700);
+    assert_eq!(malformed_json["error"]["message"], "Parse error");
+
+    // 2d-2. Invalid body (bad types) -> HTTP 200 with -32602 error object
     let res_bad_body = client
         .post(format!("http://{}/mcp/list", h.addr))
         .header("x-secret-key", &secret)
@@ -688,7 +702,7 @@ async fn test_mcp_self_grant_e2e() {
         .await;
 
     // 2l. Enable succeeds WHILE a turn is running
-    fake.set_run_announcement_delay(Some(Duration::from_millis(800)));
+    fake.set_run_announcement_delay(Some(Duration::from_secs(3)));
     let prompt_id = v
         .request(
             "session/prompt",
@@ -700,7 +714,23 @@ async fn test_mcp_self_grant_e2e() {
         )
         .await;
 
-    // Immediately while turn is running, call self-grant enable:
+    // Prove the turn is still running: viewer _honk/mcp/enable returns -32002 "session is busy"
+    let viewer_busy = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": sid,
+                "names": ["local-test"]
+            }),
+        )
+        .await;
+    assert_eq!(viewer_busy["error"]["code"], -32002);
+    assert_eq!(
+        viewer_busy["error"]["message"],
+        "session is busy; try after this turn"
+    );
+
+    // Call self-grant enable: succeeds while turn is running
     let res_mid_turn = client
         .post(format!("http://{}/mcp/enable", h.addr))
         .header("x-secret-key", &secret)

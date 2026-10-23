@@ -302,6 +302,13 @@ fn format_enable_summary(results: &[NameResult]) -> String {
 /// confirmation and `confirm` is false, returns an invalid params error guiding the user.
 ///
 /// If an exclusive sibling (e.g. `slack-ro` when enabling `slack`, or vice versa) is currently
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonPolicy<'a> {
+    NotRequired,
+    Required(Option<&'a str>),
+}
+
+/// Enable one or more servers by name. If a server has an exclusive sibling currently
 /// enabled with the marker, it is removed before adding the new server.
 pub async fn enable(
     req: &impl GooseRequester,
@@ -311,7 +318,16 @@ pub async fn enable(
     names: &[String],
     confirm: &[String],
 ) -> Result<OpResult, OpError> {
-    enable_with_reason(req, catalog, policy, session_id, names, confirm, None).await
+    enable_with_reason(
+        req,
+        catalog,
+        policy,
+        session_id,
+        names,
+        confirm,
+        ReasonPolicy::NotRequired,
+    )
+    .await
 }
 
 pub async fn enable_with_reason(
@@ -321,7 +337,7 @@ pub async fn enable_with_reason(
     session_id: &str,
     names: &[String],
     confirm: &[String],
-    agent_reason: Option<Option<&str>>,
+    reason_policy: ReasonPolicy<'_>,
 ) -> Result<OpResult, OpError> {
     if names.is_empty() {
         return Err(OpError::invalid_params("no MCP servers specified"));
@@ -372,7 +388,7 @@ pub async fn enable_with_reason(
                 return Err(OpError::invalid_params(msg));
             }
 
-            if let Some(reason_opt) = agent_reason {
+            if let ReasonPolicy::Required(reason_opt) = reason_policy {
                 let is_empty = reason_opt.map(|r| r.trim().is_empty()).unwrap_or(true);
                 if is_empty {
                     return Err(OpError::invalid_params(format!(
@@ -1152,7 +1168,7 @@ mod tests {
             "ses_123",
             &["slack".to_string()],
             &[],
-            Some(None),
+            ReasonPolicy::Required(None),
         )
         .await
         .unwrap_err();
@@ -1167,7 +1183,7 @@ mod tests {
             "ses_123",
             &["slack".to_string()],
             &["slack".to_string()],
-            Some(None),
+            ReasonPolicy::Required(None),
         )
         .await
         .unwrap_err();
@@ -1185,7 +1201,7 @@ mod tests {
             "ses_123",
             &["slack".to_string()],
             &["slack".to_string()],
-            Some(Some("   \t  ")),
+            ReasonPolicy::Required(Some("   \t  ")),
         )
         .await
         .unwrap_err();
@@ -1203,7 +1219,7 @@ mod tests {
             "ses_123",
             &["slack".to_string()],
             &["slack".to_string()],
-            Some(Some("investigate customer ticket")),
+            ReasonPolicy::Required(Some("investigate customer ticket")),
         )
         .await
         .unwrap();
@@ -1217,7 +1233,7 @@ mod tests {
             "ses_123",
             &["slack-ro".to_string()],
             &[],
-            Some(None),
+            ReasonPolicy::Required(None),
         )
         .await
         .unwrap();
