@@ -792,7 +792,7 @@ async fn test_swarm_default_lifecycle() {
             "--allow-unpatched-upstream",
             "--swarm-default",
             "--swarm-mcp-bin",
-            "/bin/echo",
+            "/bin/sh",
             "--swarm-pigeon-url",
             "http://127.0.0.1:4731",
             "--mcp-catalog",
@@ -936,5 +936,68 @@ async fn test_swarm_default_lifecycle() {
     assert!(
         enable_next.get("error").is_none(),
         "following /mcp op must succeed, not collide on mcp_op_running: {enable_next}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_immediate_enable_after_launch_and_op() {
+    let fake = FakeGoose::start().await;
+    let temp_cat_dir = tempfile::tempdir().unwrap();
+    let cat_path = temp_cat_dir.path().join("opencode.json");
+    std::fs::write(&cat_path, sample_catalog_content()).unwrap();
+    let cat_str = cat_path.to_str().unwrap();
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--swarm-default",
+            "--swarm-mcp-bin",
+            "/bin/sh",
+            "--swarm-pigeon-url",
+            "http://127.0.0.1:4731",
+            "--mcp-catalog",
+            cat_str,
+            "--mcp-no-confirm",
+            "local-test,slack-ro",
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    // 1. session/new with swarm-default
+    let res = v.call("session/new", json!({ "cwd": "/tmp" })).await;
+    assert_eq!(res["result"]["_meta"]["honk"]["swarm"]["enabled"], true);
+    let sid = res["result"]["sessionId"].as_str().unwrap();
+
+    // Immediately call _honk/mcp/enable: must succeed, never -32002
+    let enable1 = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": sid,
+                "names": ["local-test"]
+            }),
+        )
+        .await;
+    assert!(
+        enable1.get("error").is_none(),
+        "immediate enable after session/new must succeed, got: {enable1}"
+    );
+
+    // Immediately call another _honk/mcp/enable: must succeed, never -32002
+    let enable2 = v
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": sid,
+                "names": ["slack-ro"]
+            }),
+        )
+        .await;
+    assert!(
+        enable2.get("error").is_none(),
+        "immediate enable after enable must succeed, got: {enable2}"
     );
 }

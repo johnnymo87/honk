@@ -99,7 +99,7 @@ pub enum McpOpOrigin {
     Agent { reason: Option<String> },
 }
 
-enum McpTarget {
+pub enum McpTarget {
     Viewer {
         viewer: ViewerTx,
         id: Value,
@@ -112,6 +112,55 @@ enum McpTarget {
     SelfOp {
         reply: tokio::sync::oneshot::Sender<Result<McpOpOutput, crate::mcp::ops::OpError>>,
     },
+    None,
+}
+
+impl McpTarget {
+    pub fn deliver(self, outcome: Result<McpOpOutput, crate::mcp::ops::OpError>) {
+        match self {
+            McpTarget::Viewer { viewer, id } => {
+                let resp = match &outcome {
+                    Ok(McpOpOutput::List(res)) => {
+                        crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                    }
+                    Ok(McpOpOutput::Op(res)) => {
+                        crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                    }
+                    Err(err) => crate::rpc::error(id, err.code as i64, err.message.clone(), None),
+                };
+                let _ =
+                    viewer.send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
+            }
+            McpTarget::Launch { reply } => {
+                let res = match outcome.as_ref() {
+                    Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
+                    Ok(McpOpOutput::List(_)) => unreachable!(),
+                    Err(err) => Err(err.clone()),
+                };
+                let _ = reply.send(res);
+            }
+            McpTarget::SelfOp { reply } => {
+                let _ = reply.send(outcome);
+            }
+            McpTarget::None => {}
+        }
+    }
+
+    pub fn reply_error(self, code: i32, message: impl Into<String>) {
+        let err = crate::mcp::ops::OpError {
+            code,
+            message: message.into(),
+        };
+        self.deliver(Err(err));
+    }
+}
+
+pub struct QueuedMcpLaunch {
+    pub viewer_id: ViewerId,
+    pub names: Vec<String>,
+    pub confirm: Vec<String>,
+    pub reply:
+        tokio::sync::oneshot::Sender<Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>>,
 }
 
 pub struct ReactivationData {
@@ -197,6 +246,8 @@ pub enum SessionMsg {
         enabled: Vec<String>,
         change: String,
         changed: bool,
+        target: McpTarget,
+        outcome: Result<McpOpOutput, crate::mcp::ops::OpError>,
     },
     // from spawned recovery / helper tasks (I1)
     Reattached {
@@ -322,7 +373,7 @@ pub struct Session {
     pub last_started_upstream: Option<String>,
     pub last_usage: Option<honk_wire::Usage>,
     pub mcp_op_running: bool,
-    pub queued_mcp_launches: VecDeque<SessionMsg>,
+    pub queued_mcp_launches: VecDeque<QueuedMcpLaunch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2437,18 +2488,17 @@ impl Session {
         if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
             return;
         }
-        if let Some(SessionMsg::McpLaunch {
-            viewer_id,
-            names,
-            confirm,
-            reply,
-        }) = self.queued_mcp_launches.pop_front()
-        {
+        if let Some(launch) = self.queued_mcp_launches.pop_front() {
             self.mcp_op_running = true;
             self.spawn_mcp_task(
-                McpOpOrigin::Viewer(Some(viewer_id)),
-                McpOpKind::Enable { names, confirm },
-                McpTarget::Launch { reply },
+                McpOpOrigin::Viewer(Some(launch.viewer_id)),
+                McpOpKind::Enable {
+                    names: launch.names,
+                    confirm: launch.confirm,
+                },
+                McpTarget::Launch {
+                    reply: launch.reply,
+                },
             );
         }
     }
@@ -2465,20 +2515,8 @@ impl Session {
                     code: -32601,
                     message: "MCP catalog not configured (honkd --mcp-catalog)".to_string(),
                 };
-                match target {
-                    McpTarget::Viewer { viewer, id } => {
-                        let err_resp = crate::rpc::error(id, err.code as i64, err.message, None);
-                        let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                            err_resp.to_string().into(),
-                        ));
-                    }
-                    McpTarget::Launch { reply } => {
-                        let _ = reply.send(Err(err));
-                    }
-                    McpTarget::SelfOp { reply } => {
-                        let _ = reply.send(Err(err));
-                    }
-                }
+                target.deliver(Err(err));
+                self.check_queued_mcp_launches();
                 return;
             }
         };
@@ -2495,57 +2533,85 @@ impl Session {
         };
         let is_agent = matches!(origin, McpOpOrigin::Agent { .. });
 
-        let task = tokio::spawn(async move {
-            let budget = std::time::Duration::from_secs(60);
-            let work = async {
-                let mut catalog = match &mcp_config.catalog_path {
-                    Some(path) => crate::mcp::catalog::Catalog::load(path)
-                        .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
-                    None => crate::mcp::catalog::Catalog::default(),
+        if is_list {
+            tokio::spawn(async move {
+                let budget = std::time::Duration::from_secs(60);
+                let work = async {
+                    let mut catalog = match &mcp_config.catalog_path {
+                        Some(path) => crate::mcp::catalog::Catalog::load(path)
+                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
+                        None => crate::mcp::catalog::Catalog::default(),
+                    };
+                    if let Some(swarm) = &mcp_config.swarm {
+                        catalog.merge_swarm_entry(swarm, &sid);
+                    }
+                    let res = crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
+                        .await?;
+                    Ok(McpOpOutput::List(res))
                 };
-                if let Some(swarm) = &mcp_config.swarm {
-                    catalog.merge_swarm_entry(swarm, &sid);
-                }
-                match op {
-                    McpOpKind::List => {
-                        let res =
-                            crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
-                                .await?;
-                        Ok(McpOpOutput::List(res))
-                    }
-                    McpOpKind::Enable { names, confirm } => {
-                        let reason_policy = if is_agent {
-                            crate::mcp::ops::ReasonPolicy::Required(agent_reason.as_deref())
-                        } else {
-                            crate::mcp::ops::ReasonPolicy::NotRequired
-                        };
-                        let res = crate::mcp::ops::enable_with_reason(
-                            &requester,
-                            &catalog,
-                            &mcp_config.policy,
-                            &sid,
-                            &names,
-                            &confirm,
-                            reason_policy,
-                        )
-                        .await?;
-                        Ok(McpOpOutput::Op(res))
-                    }
-                    McpOpKind::Disable { names } => {
-                        let res = crate::mcp::ops::disable(
-                            &requester,
-                            &catalog,
-                            &mcp_config.policy,
-                            &sid,
-                            &names,
-                        )
-                        .await?;
-                        Ok(McpOpOutput::Op(res))
-                    }
-                }
-            };
+                let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
+                    match tokio::time::timeout(budget, work).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            let msg = if is_agent {
+                                "timed out; the change may still land; call mcp_list"
+                            } else {
+                                "MCP change timed out; run /mcp to see the current state"
+                            };
+                            Err(crate::mcp::ops::OpError::request_failed(msg))
+                        }
+                    };
+                target.deliver(outcome);
+            });
+            return;
+        }
 
-            let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
+        tokio::spawn(async move {
+            let work_task = tokio::spawn(async move {
+                let budget = std::time::Duration::from_secs(60);
+                let work = async {
+                    let mut catalog = match &mcp_config.catalog_path {
+                        Some(path) => crate::mcp::catalog::Catalog::load(path)
+                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
+                        None => crate::mcp::catalog::Catalog::default(),
+                    };
+                    if let Some(swarm) = &mcp_config.swarm {
+                        catalog.merge_swarm_entry(swarm, &sid);
+                    }
+                    match op {
+                        McpOpKind::List => unreachable!(),
+                        McpOpKind::Enable { names, confirm } => {
+                            let reason_policy = if is_agent {
+                                crate::mcp::ops::ReasonPolicy::Required(agent_reason.as_deref())
+                            } else {
+                                crate::mcp::ops::ReasonPolicy::NotRequired
+                            };
+                            let res = crate::mcp::ops::enable_with_reason(
+                                &requester,
+                                &catalog,
+                                &mcp_config.policy,
+                                &sid,
+                                &names,
+                                &confirm,
+                                reason_policy,
+                            )
+                            .await?;
+                            Ok(McpOpOutput::Op(res))
+                        }
+                        McpOpKind::Disable { names } => {
+                            let res = crate::mcp::ops::disable(
+                                &requester,
+                                &catalog,
+                                &mcp_config.policy,
+                                &sid,
+                                &names,
+                            )
+                            .await?;
+                            Ok(McpOpOutput::Op(res))
+                        }
+                    }
+                };
+
                 match tokio::time::timeout(budget, work).await {
                     Ok(res) => res,
                     Err(_) => {
@@ -2556,72 +2622,43 @@ impl Session {
                         };
                         Err(crate::mcp::ops::OpError::request_failed(msg))
                     }
-                };
-
-            match target {
-                McpTarget::Viewer { viewer, id } => {
-                    let resp = match &outcome {
-                        Ok(McpOpOutput::List(res)) => {
-                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
-                        }
-                        Ok(McpOpOutput::Op(res)) => {
-                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
-                        }
-                        Err(err) => {
-                            crate::rpc::error(id, err.code as i64, err.message.clone(), None)
-                        }
-                    };
-                    let _ = viewer
-                        .send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
-                }
-                McpTarget::Launch { reply } => {
-                    let res = match outcome.as_ref() {
-                        Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
-                        Ok(McpOpOutput::List(_)) => unreachable!(),
-                        Err(err) => Err(err.clone()),
-                    };
-                    let _ = reply.send(res);
-                }
-                McpTarget::SelfOp { reply } => {
-                    let _ = reply.send(outcome.clone());
-                }
-            }
-
-            if !is_list {
-                let (enabled, change, changed) = match &outcome {
-                    Ok(McpOpOutput::Op(res)) => {
-                        (res.enabled.clone(), res.summary.clone(), res.has_changes())
-                    }
-                    _ => (Vec::new(), String::new(), false),
-                };
-                let _ = self_tx
-                    .send(SessionMsg::McpOpDone {
-                        origin,
-                        enabled,
-                        change,
-                        changed,
-                    })
-                    .await;
-            }
-        });
-
-        if !is_list {
-            let watcher_tx = self.self_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = task.await
-                    && (e.is_panic() || e.is_cancelled())
-                {
-                    let _ = watcher_tx
-                        .send(SessionMsg::McpOpDone {
-                            origin: McpOpOrigin::Viewer(None),
-                            enabled: Vec::new(),
-                            change: String::new(),
-                            changed: false,
-                        })
-                        .await;
                 }
             });
-        }
+
+            let outcome = match work_task.await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!("MCP operation task panicked or was cancelled: {e}");
+                    Err(crate::mcp::ops::OpError::request_failed(
+                        "MCP operation failed unexpectedly",
+                    ))
+                }
+            };
+
+            let (enabled, change, changed) = match &outcome {
+                Ok(McpOpOutput::Op(res)) => {
+                    (res.enabled.clone(), res.summary.clone(), res.has_changes())
+                }
+                _ => (Vec::new(), String::new(), false),
+            };
+
+            if let Err(tokio::sync::mpsc::error::SendError(SessionMsg::McpOpDone {
+                target, ..
+            })) = self_tx
+                .send(SessionMsg::McpOpDone {
+                    origin,
+                    enabled,
+                    change,
+                    changed,
+                    target,
+                    outcome,
+                })
+                .await
+            {
+                // Session actor is gone; deliver error to target
+                target.reply_error(-32000, "session terminated");
+            }
+        });
     }
 
     async fn on_msg(&mut self, msg: SessionMsg) {
@@ -3182,7 +3219,7 @@ impl Session {
                             message: "Session message queue full".to_string(),
                         }));
                     } else {
-                        self.queued_mcp_launches.push_back(SessionMsg::McpLaunch {
+                        self.queued_mcp_launches.push_back(QueuedMcpLaunch {
                             viewer_id,
                             names,
                             confirm,
@@ -3237,6 +3274,8 @@ impl Session {
                 enabled,
                 change,
                 changed,
+                target,
+                outcome,
             } => {
                 self.mcp_op_running = false;
                 if changed {
@@ -3292,6 +3331,7 @@ impl Session {
                         }
                     }
                 }
+                target.deliver(outcome);
                 self.check_queued_mcp_launches();
             }
             SessionMsg::Reattached { outcome } => {
@@ -3676,13 +3716,11 @@ impl Session {
                 }
 
                 // Fail all queued mcp launches with -32000
-                for m in self.queued_mcp_launches.drain(..) {
-                    if let SessionMsg::McpLaunch { reply, .. } = m {
-                        let _ = reply.send(Err(crate::mcp::ops::OpError {
-                            code: -32000,
-                            message: format!("Session is gone: {reason}"),
-                        }));
-                    }
+                for launch in self.queued_mcp_launches.drain(..) {
+                    let _ = launch.reply.send(Err(crate::mcp::ops::OpError {
+                        code: -32000,
+                        message: format!("Session is gone: {reason}"),
+                    }));
                 }
 
                 // Notify honk-aware viewers with _honk/evicted
@@ -5088,6 +5126,14 @@ mod tests {
                 enabled: vec!["slack".to_string()],
                 change: "enabled slack".to_string(),
                 changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec!["slack".to_string()],
+                    summary: "enabled slack".to_string(),
+                })),
             })
             .await;
 
@@ -5188,6 +5234,14 @@ mod tests {
                 enabled: vec!["slack".to_string()],
                 change: "enabled slack".to_string(),
                 changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec!["slack".to_string()],
+                    summary: "enabled slack".to_string(),
+                })),
             })
             .await;
 
@@ -5218,6 +5272,14 @@ mod tests {
                 enabled: vec![],
                 change: "disabled slack".to_string(),
                 changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec![],
+                    summary: "disabled slack".to_string(),
+                })),
             })
             .await;
 
@@ -5280,16 +5342,16 @@ mod tests {
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
 
+        let done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(done_msg).await;
+        assert!(!session.mcp_op_running);
+
         let err_agent = reply_rx.try_recv().unwrap().unwrap_err();
         assert_eq!(err_agent.code, -32603);
         assert_eq!(
             err_agent.message,
             "timed out; the change may still land; call mcp_list"
         );
-
-        let done_msg = session.rx.recv().await.unwrap();
-        session.on_msg(done_msg).await;
-        assert!(!session.mcp_op_running);
 
         // 2. Viewer origin timeout
         let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
@@ -5316,6 +5378,10 @@ mod tests {
         let _v_internal2 = session.rx.recv().await.unwrap();
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
+
+        let v_done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(v_done_msg).await;
+        assert!(!session.mcp_op_running);
 
         let frame = v_rx.recv().await.unwrap();
         let frame_json: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
