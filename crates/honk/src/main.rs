@@ -568,6 +568,77 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_mcp_aligned_edge_cases() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // "" is rejected
+        let cli_empty = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "",
+        ])
+        .unwrap();
+        match cli_empty.command {
+            Commands::Chat(args) => {
+                assert!(resolve_chat_target(&args).is_err());
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // "!" is rejected
+        let cli_bang = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "!",
+        ])
+        .unwrap();
+        match cli_bang.command {
+            Commands::Chat(args) => {
+                assert!(resolve_chat_target(&args).is_err());
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // "slack!!" confirms slack
+        let cli_double_bang = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "slack!!",
+        ])
+        .unwrap();
+        match cli_double_bang.command {
+            Commands::Chat(args) => {
+                let target = resolve_chat_target(&args).unwrap();
+                match target {
+                    honk::chat::driver::Target::New { mcp, .. } => {
+                        assert_eq!(
+                            mcp,
+                            Some(honk::chat::driver::McpLaunchConfig {
+                                names: vec!["slack".into()],
+                                confirm: vec!["slack".into()],
+                            })
+                        );
+                    }
+                    _ => panic!("expected Target::New"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
     fn test_cli_parse_list_json() {
         let cli = Cli::try_parse_from(["honk", "list", "--json"]).unwrap();
         match cli.command {

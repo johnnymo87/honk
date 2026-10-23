@@ -716,6 +716,63 @@ async fn test_mcp_disable_swarm_refused_without_http() {
 }
 
 #[tokio::test]
+async fn test_mcp_enable_swarm_ro_refused_without_http() {
+    let h = StubHonkd::start(HonkdBehaviour::default()).await;
+    let secret_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(secret_file.path(), "test-secret\n").unwrap();
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261023_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: h.url.clone(),
+        honk_secret_file: Some(secret_file.path().to_path_buf()),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    // Try enabling "swarm-ro!"
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 109,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_enable",
+                "arguments": {
+                    "names": ["swarm-ro!"]
+                },
+                "_meta": {
+                    "agent-session-id": "20261023_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        "refused: 'swarm-ro' would replace swarm and remove these tools"
+    );
+
+    // ZERO HTTP calls made to honkd
+    assert_eq!(h.seen.lock().unwrap().len(), 0);
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
 async fn test_mcp_errors_404_401_error_body_transport_and_secret_file() {
     // 1. 404
     let h_404 = StubHonkd::start(HonkdBehaviour {

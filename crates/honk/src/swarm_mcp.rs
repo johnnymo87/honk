@@ -836,8 +836,11 @@ async fn handle_mcp_enable(
         Err(e) => return tool_err(e),
     };
 
-    // Note: exclusive sibling of swarm does not exist in honkd catalog (swarm has no -ro sibling),
-    // so checking siblings via /mcp/list is omitted to avoid an extra HTTP roundtrip.
+    if let Some(bad) = names.iter().find(|n| *n == "swarm-ro") {
+        return tool_err(format!(
+            "refused: '{bad}' would replace swarm and remove these tools"
+        ));
+    }
 
     let reason = args
         .get("reason")
