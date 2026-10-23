@@ -164,21 +164,22 @@ impl ChatCore {
                     )));
                     return;
                 }
-                let mut names = Vec::new();
-                let mut confirm = Vec::new();
-                for token in args_str.split_whitespace() {
-                    let stripped = token.trim_end_matches('!');
-                    if stripped.is_empty() {
+                let (names, confirm) = match crate::swarm_mcp::parse_enable_names(
+                    args_str.split_whitespace(),
+                ) {
+                    Ok((n, mut c)) => {
+                        if subcmd == "on!" {
+                            c = n.clone();
+                        }
+                        (n, c)
+                    }
+                    Err(_) => {
                         effects.push(Effect::Notice(Notice::warning(
-                            "usage: /mcp enable <name>... (append ! to confirm a server marked !, e.g. /mcp enable slack!)",
-                        )));
+                                "usage: /mcp enable <name>... (append ! to confirm a server marked !, e.g. /mcp enable slack!)",
+                            )));
                         return;
                     }
-                    names.push(stripped.to_string());
-                    if subcmd == "on!" || token.len() > stripped.len() {
-                        confirm.push(stripped.to_string());
-                    }
-                }
+                };
                 self.dispatch_mcp_enable(line, queued, names, confirm, effects);
             }
             "disable" | "off" => {
@@ -189,16 +190,16 @@ impl ChatCore {
                     return;
                 }
                 // `!` means nothing for disable; strip it so `/mcp disable slack!` works.
-                let names: Vec<String> = args_str
-                    .split_whitespace()
-                    .map(|t| t.trim_end_matches('!').to_string())
-                    .collect();
-                if names.iter().any(String::is_empty) {
-                    effects.push(Effect::Notice(Notice::warning(
-                        "usage: /mcp disable <name>...",
-                    )));
-                    return;
-                }
+                let names = match crate::swarm_mcp::strip_disable_names(args_str.split_whitespace())
+                {
+                    Ok(n) => n,
+                    Err(_) => {
+                        effects.push(Effect::Notice(Notice::warning(
+                            "usage: /mcp disable <name>...",
+                        )));
+                        return;
+                    }
+                };
                 self.dispatch_mcp_disable(line, queued, names, effects);
             }
             _ => {

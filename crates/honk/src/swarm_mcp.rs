@@ -584,16 +584,18 @@ async fn handle_swarm_list(
 
 /// Parses MCP server names for enable: returns `(names, confirm)`.
 /// Trailing `!` marks a server for confirmation and is stripped from the returned name.
+/// Whitespace is trimmed; whitespace-only inputs are errors.
 pub fn parse_enable_names<S: AsRef<str>>(
     items: impl IntoIterator<Item = S>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut names = Vec::new();
     let mut confirm = Vec::new();
     for item in items {
-        let s = item.as_ref();
+        let raw = item.as_ref();
+        let s = raw.trim();
         let stripped = s.trim_end_matches('!');
         if stripped.is_empty() {
-            return Err(format!("empty or invalid server name '{s}'"));
+            return Err(format!("empty or invalid server name '{raw}'"));
         }
         names.push(stripped.to_string());
         if s.len() > stripped.len() {
@@ -604,15 +606,17 @@ pub fn parse_enable_names<S: AsRef<str>>(
 }
 
 /// Parses MCP server names for disable: strips trailing `!`.
+/// Whitespace is trimmed; whitespace-only inputs are errors.
 pub fn strip_disable_names<S: AsRef<str>>(
     items: impl IntoIterator<Item = S>,
 ) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for item in items {
-        let s = item.as_ref();
+        let raw = item.as_ref();
+        let s = raw.trim();
         let stripped = s.trim_end_matches('!');
         if stripped.is_empty() {
-            return Err(format!("empty or invalid server name '{s}'"));
+            return Err(format!("empty or invalid server name '{raw}'"));
         }
         names.push(stripped.to_string());
     }
@@ -697,8 +701,11 @@ async fn mcp_post(
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|e| format!("honkd returned non-JSON (HTTP {status}): {e}"))?;
 
-    if let Some(err_obj) = parsed.get("error") {
-        let msg = err_obj
+    if let Some(err_val) = parsed.get("error") {
+        if let Some(msg) = err_val.as_str() {
+            return Err(msg.to_string());
+        }
+        let msg = err_val
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
@@ -756,7 +763,13 @@ fn format_mcp_list(result: &Value) -> String {
     lines.join("\n")
 }
 
-fn format_op_result(body: &Value, reason: Option<&str>) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum McpOp {
+    Enable,
+    Disable,
+}
+
+fn format_op_result(body: &Value, op: McpOp, reason: Option<&str>) -> (String, bool) {
     let mut lines = Vec::new();
 
     if let Some(summary) = body
@@ -767,10 +780,17 @@ fn format_op_result(body: &Value, reason: Option<&str>) -> String {
         lines.push(summary.to_string());
     }
 
+    let mut total_results = 0;
+    let mut any_ok = false;
+
     if let Some(results) = body.get("results").and_then(Value::as_array) {
+        total_results = results.len();
         for r in results {
             let name = r.get("name").and_then(Value::as_str).unwrap_or("");
             let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            if ok {
+                any_ok = true;
+            }
             let status = if ok { "ok" } else { "error" };
             let mut parts = Vec::new();
             if let Some(replaced) = r.get("replaced").and_then(Value::as_str) {
@@ -780,7 +800,7 @@ fn format_op_result(body: &Value, reason: Option<&str>) -> String {
                 parts.push(note.to_string());
             }
             if let Some(err) = r.get("error").and_then(Value::as_str) {
-                parts.push(format!("error: {err}"));
+                parts.push(err.to_string());
             }
             if parts.is_empty() {
                 lines.push(format!("- {name}: {status}"));
@@ -794,9 +814,19 @@ fn format_op_result(body: &Value, reason: Option<&str>) -> String {
         lines.push(format!("Reason: {r}"));
     }
 
-    lines.push("New tools are usable from your next step.".to_string());
+    if any_ok {
+        match op {
+            McpOp::Enable => {
+                lines.push("New tools are usable from your next step.".to_string());
+            }
+            McpOp::Disable => {
+                lines.push("Its tools are gone from your next step.".to_string());
+            }
+        }
+    }
 
-    lines.join("\n")
+    let is_ok = total_results == 0 || any_ok;
+    (lines.join("\n"), is_ok)
 }
 
 async fn handle_mcp_list(
@@ -858,7 +888,10 @@ async fn handle_mcp_enable(
     }
 
     match mcp_post(client, config, "enable", &body).await {
-        Ok(val) => tool_ok(format_op_result(&val, reason.as_deref())),
+        Ok(val) => {
+            let (text, is_ok) = format_op_result(&val, McpOp::Enable, reason.as_deref());
+            if is_ok { tool_ok(text) } else { tool_err(text) }
+        }
         Err(e) => tool_err(e),
     }
 }
@@ -898,7 +931,10 @@ async fn handle_mcp_disable(
     });
 
     match mcp_post(client, config, "disable", &body).await {
-        Ok(val) => tool_ok(format_op_result(&val, None)),
+        Ok(val) => {
+            let (text, is_ok) = format_op_result(&val, McpOp::Disable, None);
+            if is_ok { tool_ok(text) } else { tool_err(text) }
+        }
         Err(e) => tool_err(e),
     }
 }

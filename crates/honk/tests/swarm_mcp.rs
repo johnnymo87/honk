@@ -448,12 +448,24 @@ fn test_mcp_name_parsing_helpers() {
     assert_eq!(names, vec!["slack-ro", "slack", "atlassian"]);
     assert_eq!(confirm, vec!["slack", "atlassian"]);
 
+    // Whitespace trimming
+    let (names, confirm) = parse_enable_names(["  slack!  ", "  pagerduty  "]).unwrap();
+    assert_eq!(names, vec!["slack", "pagerduty"]);
+    assert_eq!(confirm, vec!["slack"]);
+
     assert!(parse_enable_names(["!"]).is_err());
     assert!(parse_enable_names([""]).is_err());
+    assert!(parse_enable_names(["   "]).is_err());
+    assert!(parse_enable_names(["  !  "]).is_err());
 
     let disabled = strip_disable_names(["slack!", "pagerduty"]).unwrap();
     assert_eq!(disabled, vec!["slack", "pagerduty"]);
+    let disabled_ws = strip_disable_names(["  slack!  ", "  pagerduty  "]).unwrap();
+    assert_eq!(disabled_ws, vec!["slack", "pagerduty"]);
     assert!(strip_disable_names(["!"]).is_err());
+    assert!(strip_disable_names([""]).is_err());
+    assert!(strip_disable_names(["   "]).is_err());
+    assert!(strip_disable_names(["  !  "]).is_err());
 }
 
 #[tokio::test]
@@ -643,7 +655,8 @@ async fn test_mcp_disable_strips_bang_and_success_output() {
         text.contains("disabled slack"),
         "must include summary: {text}"
     );
-    assert!(text.contains("New tools are usable from your next step."));
+    assert!(text.contains("Its tools are gone from your next step."));
+    assert!(!text.contains("New tools are usable from your next step."));
 
     {
         let seen = h.seen.lock().unwrap();
@@ -766,6 +779,229 @@ async fn test_mcp_enable_swarm_ro_refused_without_http() {
 
     // ZERO HTTP calls made to honkd
     assert_eq!(h.seen.lock().unwrap().len(), 0);
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_mcp_enable_all_failed_returns_tool_err_and_formats_cleanly() {
+    let h = StubHonkd::start(HonkdBehaviour {
+        enable: (
+            StatusCode::OK,
+            json!({
+                "summary": "failed to enable foo",
+                "results": [
+                    {
+                        "name": "foo",
+                        "ok": false,
+                        "error": "server not found",
+                        "changed": false
+                    }
+                ],
+                "servers": [],
+                "other": [],
+                "enabled": []
+            }),
+        ),
+        ..HonkdBehaviour::default()
+    })
+    .await;
+    let secret_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(secret_file.path(), "test-secret\n").unwrap();
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261023_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: h.url.clone(),
+        honk_secret_file: Some(secret_file.path().to_path_buf()),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 110,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_enable",
+                "arguments": {
+                    "names": ["foo"]
+                },
+                "_meta": {
+                    "agent-session-id": "20261023_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    // All failed -> tool_err (isError: true)
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    // No duplicated "error:" prefix
+    assert!(
+        text.contains("- foo: error (server not found)"),
+        "must format cleanly without duplicated error: {text}"
+    );
+    assert!(
+        !text.contains("error: error"),
+        "must not duplicate error: {text}"
+    );
+    assert!(
+        !text.contains("New tools are usable from your next step."),
+        "must not say tools are usable when all failed: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_mcp_enable_mixed_returns_tool_ok() {
+    let h = StubHonkd::start(HonkdBehaviour {
+        enable: (
+            StatusCode::OK,
+            json!({
+                "summary": "enabled foo, failed bar",
+                "results": [
+                    {
+                        "name": "foo",
+                        "ok": true,
+                        "changed": true
+                    },
+                    {
+                        "name": "bar",
+                        "ok": false,
+                        "error": "conflict with existing server",
+                        "changed": false
+                    }
+                ],
+                "servers": [],
+                "other": [],
+                "enabled": ["foo"]
+            }),
+        ),
+        ..HonkdBehaviour::default()
+    })
+    .await;
+    let secret_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(secret_file.path(), "test-secret\n").unwrap();
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261023_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: h.url.clone(),
+        honk_secret_file: Some(secret_file.path().to_path_buf()),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 111,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_enable",
+                "arguments": {
+                    "names": ["foo", "bar"]
+                },
+                "_meta": {
+                    "agent-session-id": "20261023_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    // Mixed -> tool_ok (isError is Null)
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("- foo: ok"), "must show ok item: {text}");
+    assert!(
+        text.contains("- bar: error (conflict with existing server)"),
+        "must show error item clearly: {text}"
+    );
+    assert!(text.contains("New tools are usable from your next step."));
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_mcp_error_string_format() {
+    let h = StubHonkd::start(HonkdBehaviour {
+        list: (
+            StatusCode::OK,
+            json!({
+                "error": "plain string error message"
+            }),
+        ),
+        ..HonkdBehaviour::default()
+    })
+    .await;
+    let secret_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(secret_file.path(), "test-secret\n").unwrap();
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261023_owner".into(),
+        pigeon_url: "http://127.0.0.1:4731".into(),
+        pigeon_token_file: None,
+        honk_url: h.url.clone(),
+        honk_secret_file: Some(secret_file.path().to_path_buf()),
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 112,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_list",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261023_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(
+        resp["result"]["content"][0]["text"].as_str().unwrap(),
+        "plain string error message"
+    );
 
     drop(client_tx);
     drop(client_rx);
