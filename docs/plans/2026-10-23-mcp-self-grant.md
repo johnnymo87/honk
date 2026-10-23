@@ -222,3 +222,31 @@ deploy (home-manager switch, `git pull` in eng-agent-platform, honkd restart).
 3. honk swarm-mcp: `mcp_list/enable/disable`. Tests.
 4. honk chat: `--no-swarm` → `_meta.honk.swarm:false`; render `origin:"agent"` notices.
    Docs (`docs/chat.md`, README flag list). Live goose test for mid-turn self-enable.
+
+## Changes made during implementation review
+
+- **The tools are hidden while self-grant is off.** honkd answers
+  `GET /mcp/self-grant` (secret header; 204 when on, 404 when off). swarm-mcp probes it
+  once at `tools/list` (2 s; any failure means off) and lists the `mcp_*` tools only when
+  it is on. So the honk PR deploys inertly even though production honkd already runs
+  swarm-mcp, and removing `--mcp-self-grant` hides the tools from every swarm server
+  spawned afterwards.
+- **Old self-ops are dropped.** A self-op that is still queued after its HTTP caller
+  timed out is dropped rather than run late.
+- **`reason` is capped** at 500 characters.
+- **Agents get their own refusal hint.** An agent asking for a `!` server without
+  confirming gets `call mcp_enable with "X!" and a reason ...`. Humans still get
+  `/mcp enable X!`.
+- **Timeouts are staggered.** Agent ops get a 55 s worker budget, inside the HTTP
+  handler's 60 s deadline.
+- **Replies arrive after `mcp_op_running` clears.** honkd now sends `/mcp` replies only
+  after clearing the flag, so a client's immediate follow-up `/mcp` call is never
+  refused as "in progress".
+- **swarm-mcp is pointed at the address honkd actually bound**, not the one in
+  `--listen`.
+- **honk chat no longer double-enables swarm.** It skips its own enable when the
+  `session/new` reply carries `_meta.honk.swarm`.
+- **The production goose must stay at patched-1.54.0.8 or later.** That release added
+  patch G1, the extension startup timeout. Below it, a self-granted server that hangs at
+  startup blocks the session's tool calls indefinitely, not for 25 s. CI pins .3, which
+  is fine for the stub servers in the tests.
