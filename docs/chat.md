@@ -220,6 +220,11 @@ When creating a new session with `honk chat --new`:
 - **Queued during active turns**: MCP changes are refused by `honkd` while a turn is in flight (`-32002`). When typed during an active turn, `honk chat` queues `/mcp enable|disable` locally (`queued: /mcp enable <name>`) and dispatches them automatically when the turn ends.
 - **Shared visibility**: Enabled MCP servers appear in the status bar (`mcp:slack-ro,atlassian`, falling back to `mcp:2` on narrower terminals and dropped on the narrowest). Changes made by another client connected to the same session trigger an informational notice (`mcp: <change> (by another client)`).
 - **Swarm MCP default**: When `honkd` is started with `--swarm-default` (requiring `--swarm-mcp-bin` and `--swarm-pigeon-url`), the built-in `swarm` server is enabled by default on `session/new` and reported under `_meta.honk.swarm` in the reply. Clients can opt out by sending `_meta.honk.swarm: false`.
+- **Agent self-grant tools (`mcp_list`, `mcp_enable`, `mcp_disable`)**: When `honkd` runs with `--mcp-self-grant` and the `swarm` MCP server is enabled, goose agents can turn MCP servers on and off for themselves via three tools:
+  - `mcp_list` (`swarm__mcp_list`): Lists catalog servers, their on/off status, `!` confirmation markers, read-only siblings, and unsupported reasons.
+  - `mcp_enable` (`swarm__mcp_enable`): Enables one or more catalog servers. For servers marked `!`, agents append `!` to confirm (e.g. `slack!`) and provide a `reason` explaining write access.
+  - `mcp_disable` (`swarm__mcp_disable`): Disables one or more servers. Disabling `swarm` itself is refused before any request.
+  New tools become available immediately in the same turn and are usable from the agent's next step.
 - **Session creation flag**: `honk chat --new --mcp <name>` enables catalog servers at creation time. Append `!` (e.g. `--mcp slack!`) to confirm servers that require confirmation (honkd decides which via `--mcp-no-confirm`).
 - **Unsupported servers**: Remote MCP servers requiring OAuth or bearer tokens (such as Datadog or Notion) are listed as `n/a` and cannot be enabled in v1.
 

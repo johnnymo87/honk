@@ -234,16 +234,8 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
         let mcp = if args.mcp.is_empty() {
             None
         } else {
-            let mut confirm = Vec::new();
-            let mut names = Vec::new();
-            for item in &args.mcp {
-                if let Some(stripped) = item.strip_suffix('!') {
-                    confirm.push(stripped.to_string());
-                    names.push(stripped.to_string());
-                } else {
-                    names.push(item.clone());
-                }
-            }
+            let (names, confirm) = honk::swarm_mcp::parse_enable_names(&args.mcp)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             Some(honk::chat::driver::McpLaunchConfig { names, confirm })
         };
         Ok(honk::chat::driver::Target::New {
