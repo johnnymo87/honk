@@ -87,9 +87,16 @@ impl crate::mcp::ops::GooseRequester for ActorRequester {
     }
 }
 
-enum McpOpOutput {
+#[derive(Debug, Clone)]
+pub enum McpOpOutput {
     List(crate::mcp::ops::ListResult),
     Op(crate::mcp::ops::OpResult),
+}
+
+#[derive(Debug, Clone)]
+pub enum McpOpOrigin {
+    Viewer(Option<ViewerId>),
+    Agent { reason: Option<String> },
 }
 
 enum McpTarget {
@@ -101,6 +108,9 @@ enum McpTarget {
         reply: tokio::sync::oneshot::Sender<
             Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
         >,
+    },
+    SelfOp {
+        reply: tokio::sync::oneshot::Sender<Result<McpOpOutput, crate::mcp::ops::OpError>>,
     },
 }
 
@@ -177,8 +187,13 @@ pub enum SessionMsg {
             Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
         >,
     },
+    McpSelfOp {
+        op: McpOpKind,
+        reason: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<McpOpOutput, crate::mcp::ops::OpError>>,
+    },
     McpOpDone {
-        origin_viewer: Option<ViewerId>,
+        origin: McpOpOrigin,
         enabled: Vec<String>,
         change: String,
         changed: bool,
@@ -2412,12 +2427,7 @@ impl Session {
         }
     }
 
-    fn spawn_mcp_task(
-        &mut self,
-        origin_viewer: Option<ViewerId>,
-        op: McpOpKind,
-        target: McpTarget,
-    ) {
+    fn spawn_mcp_task(&mut self, origin: McpOpOrigin, op: McpOpKind, target: McpTarget) {
         let is_list = matches!(op, McpOpKind::List);
         let mcp_config = match &self.hub.mcp {
             Some(cfg) => cfg.clone(),
@@ -2439,6 +2449,9 @@ impl Session {
                     McpTarget::Launch { reply } => {
                         let _ = reply.send(Err(err));
                     }
+                    McpTarget::SelfOp { reply } => {
+                        let _ = reply.send(Err(err));
+                    }
                 }
                 return;
             }
@@ -2448,6 +2461,11 @@ impl Session {
         let self_tx = self.self_tx.clone();
         let requester = ActorRequester {
             tx: self_tx.clone(),
+        };
+
+        let agent_reason: Option<Option<String>> = match &origin {
+            McpOpOrigin::Agent { reason } => Some(reason.clone()),
+            McpOpOrigin::Viewer(_) => None,
         };
 
         let task = tokio::spawn(async move {
@@ -2469,13 +2487,14 @@ impl Session {
                         Ok(McpOpOutput::List(res))
                     }
                     McpOpKind::Enable { names, confirm } => {
-                        let res = crate::mcp::ops::enable(
+                        let res = crate::mcp::ops::enable_with_reason(
                             &requester,
                             &catalog,
                             &mcp_config.policy,
                             &sid,
                             &names,
                             &confirm,
+                            agent_reason.as_ref().map(|o| o.as_deref()),
                         )
                         .await?;
                         Ok(McpOpOutput::Op(res))
@@ -2526,6 +2545,9 @@ impl Session {
                     };
                     let _ = reply.send(res);
                 }
+                McpTarget::SelfOp { reply } => {
+                    let _ = reply.send(outcome.clone());
+                }
             }
 
             if !is_list {
@@ -2537,7 +2559,7 @@ impl Session {
                 };
                 let _ = self_tx
                     .send(SessionMsg::McpOpDone {
-                        origin_viewer,
+                        origin,
                         enabled,
                         change,
                         changed,
@@ -2554,7 +2576,7 @@ impl Session {
                 {
                     let _ = watcher_tx
                         .send(SessionMsg::McpOpDone {
-                            origin_viewer: None,
+                            origin: McpOpOrigin::Viewer(None),
                             enabled: Vec::new(),
                             change: String::new(),
                             changed: false,
@@ -3087,7 +3109,11 @@ impl Session {
                     self.mcp_op_running = true;
                 }
 
-                self.spawn_mcp_task(Some(viewer_id), op, McpTarget::Viewer { viewer, id });
+                self.spawn_mcp_task(
+                    McpOpOrigin::Viewer(Some(viewer_id)),
+                    op,
+                    McpTarget::Viewer { viewer, id },
+                );
             }
             SessionMsg::McpLaunch {
                 viewer_id,
@@ -3114,13 +3140,46 @@ impl Session {
 
                 self.mcp_op_running = true;
                 self.spawn_mcp_task(
-                    Some(viewer_id),
+                    McpOpOrigin::Viewer(Some(viewer_id)),
                     McpOpKind::Enable { names, confirm },
                     McpTarget::Launch { reply },
                 );
             }
+            SessionMsg::McpSelfOp { op, reason, reply } => {
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    if self.queued_msgs.len() >= 1024 {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
+                        }));
+                    } else {
+                        self.queued_msgs
+                            .push_back(SessionMsg::McpSelfOp { op, reason, reply });
+                    }
+                    return;
+                }
+
+                let is_list = matches!(op, McpOpKind::List);
+                if !is_list {
+                    // No busy refusal for turn.run / turn.inflight (agent's own turn is running)
+                    if self.mcp_op_running {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32002,
+                            message: "another /mcp change is in progress".to_string(),
+                        }));
+                        return;
+                    }
+                    self.mcp_op_running = true;
+                }
+
+                self.spawn_mcp_task(
+                    McpOpOrigin::Agent { reason },
+                    op,
+                    McpTarget::SelfOp { reply },
+                );
+            }
             SessionMsg::McpOpDone {
-                origin_viewer,
+                origin,
                 enabled,
                 change,
                 changed,
@@ -3137,21 +3196,41 @@ impl Session {
                         )
                         .collect();
                     for vid in viewers {
-                        let origin = if Some(vid) == origin_viewer {
-                            "you"
-                        } else {
-                            "other"
-                        };
-                        let frame = json!({
-                            "jsonrpc": "2.0",
-                            "method": "_honk/mcp_changed",
-                            "params": {
-                                "sessionId": self.sid,
-                                "enabled": enabled,
-                                "change": change,
-                                "origin": origin,
+                        let frame = match &origin {
+                            McpOpOrigin::Agent { reason } => {
+                                let mut params = json!({
+                                    "sessionId": self.sid,
+                                    "enabled": enabled,
+                                    "change": change,
+                                    "origin": "agent",
+                                });
+                                if let Some(r) = reason {
+                                    params["reason"] = json!(r);
+                                }
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "_honk/mcp_changed",
+                                    "params": params,
+                                })
                             }
-                        });
+                            McpOpOrigin::Viewer(origin_viewer) => {
+                                let origin_str = if Some(vid) == *origin_viewer {
+                                    "you"
+                                } else {
+                                    "other"
+                                };
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "_honk/mcp_changed",
+                                    "params": {
+                                        "sessionId": self.sid,
+                                        "enabled": enabled,
+                                        "change": change,
+                                        "origin": origin_str,
+                                    }
+                                })
+                            }
+                        };
                         self.send_to_viewer(vid, frame);
                     }
                 }
@@ -3522,6 +3601,12 @@ impl Session {
                             let _ = reply.send(Err(format!("Session is gone: {reason}")));
                         }
                         SessionMsg::McpLaunch { reply, .. } => {
+                            let _ = reply.send(Err(crate::mcp::ops::OpError {
+                                code: -32000,
+                                message: format!("Session is gone: {reason}"),
+                            }));
+                        }
+                        SessionMsg::McpSelfOp { reply, .. } => {
                             let _ = reply.send(Err(crate::mcp::ops::OpError {
                                 code: -32000,
                                 message: format!("Session is gone: {reason}"),
@@ -4709,6 +4794,16 @@ mod tests {
             })
             .await;
         assert_eq!(session.queued_msgs.len(), 2);
+
+        let (self_reply_tx, _self_reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::List,
+                reason: None,
+                reply: self_reply_tx,
+            })
+            .await;
+        assert_eq!(session.queued_msgs.len(), 3);
     }
 
     #[tokio::test]
@@ -4918,7 +5013,7 @@ mod tests {
 
         session
             .on_msg(SessionMsg::McpOpDone {
-                origin_viewer: Some(1),
+                origin: McpOpOrigin::Viewer(Some(1)),
                 enabled: vec!["slack".to_string()],
                 change: "enabled slack".to_string(),
                 changed: true,
@@ -4945,6 +5040,121 @@ mod tests {
 
         // Viewer 3 (legacy) receives NOTHING
         assert!(v3_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_not_busy_during_turn() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_self_op_busy_test", ActorState::Live).await;
+
+        // Simulate active turn
+        session.turn.run = Some("run_active_456".to_string());
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["slack-ro".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        // Since hub.mcp is None in create_test_session, it proceeds past busy check and returns catalog unconfigured (-32601)
+        let res = reply_rx.await.unwrap();
+        assert_eq!(res.unwrap_err().code, -32601);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_refused_when_another_op_running() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_self_op_in_prog", ActorState::Live).await;
+        session.mcp_op_running = true;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["slack-ro".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        let res = reply_rx.await.unwrap();
+        let err = res.unwrap_err();
+        assert_eq!(err.code, -32002);
+        assert_eq!(err.message, "another /mcp change is in progress");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_op_done_fanout_agent_origin_and_reason() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_done_agent_test", ActorState::Live).await;
+        session.mcp_op_running = true;
+
+        let (v1_tx, mut v1_rx) = tokio::sync::mpsc::channel(10);
+        let (v2_tx, mut v2_rx) = tokio::sync::mpsc::channel(10);
+        let (v3_tx, mut v3_rx) = tokio::sync::mpsc::channel(10);
+
+        session.attach_live(1, test_viewer_tx(v1_tx), true);
+        session.attach_live(2, test_viewer_tx(v2_tx), true);
+        session.attach_live(3, test_viewer_tx(v3_tx), false);
+
+        // Drain synthetic session_info_update from legacy viewer v3
+        let _ = v3_rx.recv().await.unwrap();
+
+        // 1. With reason
+        session
+            .on_msg(SessionMsg::McpOpDone {
+                origin: McpOpOrigin::Agent {
+                    reason: Some("investigate incident".to_string()),
+                },
+                enabled: vec!["slack".to_string()],
+                change: "enabled slack".to_string(),
+                changed: true,
+            })
+            .await;
+
+        assert!(!session.mcp_op_running);
+
+        let f1 = v1_rx.recv().await.unwrap();
+        let f1_json: Value = serde_json::from_str(f1.to_text().unwrap()).unwrap();
+        assert_eq!(f1_json["method"], "_honk/mcp_changed");
+        assert_eq!(f1_json["params"]["origin"], "agent");
+        assert_eq!(f1_json["params"]["reason"], "investigate incident");
+        assert_eq!(f1_json["params"]["change"], "enabled slack");
+        assert_eq!(f1_json["params"]["enabled"], json!(["slack"]));
+
+        let f2 = v2_rx.recv().await.unwrap();
+        let f2_json: Value = serde_json::from_str(f2.to_text().unwrap()).unwrap();
+        assert_eq!(f2_json["method"], "_honk/mcp_changed");
+        assert_eq!(f2_json["params"]["origin"], "agent");
+        assert_eq!(f2_json["params"]["reason"], "investigate incident");
+
+        // Legacy viewer v3 receives nothing
+        assert!(v3_rx.try_recv().is_err());
+
+        // 2. Without reason
+        session.mcp_op_running = true;
+        session
+            .on_msg(SessionMsg::McpOpDone {
+                origin: McpOpOrigin::Agent { reason: None },
+                enabled: vec![],
+                change: "disabled slack".to_string(),
+                changed: true,
+            })
+            .await;
+
+        let f1_no_reason = v1_rx.recv().await.unwrap();
+        let f1_no_reason_json: Value =
+            serde_json::from_str(f1_no_reason.to_text().unwrap()).unwrap();
+        assert_eq!(f1_no_reason_json["params"]["origin"], "agent");
+        assert!(f1_no_reason_json["params"].get("reason").is_none());
     }
 
     #[tokio::test]

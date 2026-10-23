@@ -311,6 +311,18 @@ pub async fn enable(
     names: &[String],
     confirm: &[String],
 ) -> Result<OpResult, OpError> {
+    enable_with_reason(req, catalog, policy, session_id, names, confirm, None).await
+}
+
+pub async fn enable_with_reason(
+    req: &impl GooseRequester,
+    catalog: &Catalog,
+    policy: &Policy,
+    session_id: &str,
+    names: &[String],
+    confirm: &[String],
+    agent_reason: Option<Option<&str>>,
+) -> Result<OpResult, OpError> {
     if names.is_empty() {
         return Err(OpError::invalid_params("no MCP servers specified"));
     }
@@ -349,14 +361,25 @@ pub async fn enable(
             )));
         }
 
-        if !policy.no_confirm.contains(name) && !confirm.iter().any(|c| c == name) {
-            let mut msg = format!("'{name}' can write; use /mcp enable {name}! to confirm");
-            if let Some(sibling) = find_sibling(name, catalog)
-                && sibling.ends_with("-ro")
-            {
-                msg.push_str(&format!(" (or /mcp enable {sibling} for read-only)"));
+        if !policy.no_confirm.contains(name) {
+            if !confirm.iter().any(|c| c == name) {
+                let mut msg = format!("'{name}' can write; use /mcp enable {name}! to confirm");
+                if let Some(sibling) = find_sibling(name, catalog)
+                    && sibling.ends_with("-ro")
+                {
+                    msg.push_str(&format!(" (or /mcp enable {sibling} for read-only)"));
+                }
+                return Err(OpError::invalid_params(msg));
             }
-            return Err(OpError::invalid_params(msg));
+
+            if let Some(reason_opt) = agent_reason {
+                let is_empty = reason_opt.map(|r| r.trim().is_empty()).unwrap_or(true);
+                if is_empty {
+                    return Err(OpError::invalid_params(format!(
+                        "'{name}' can write; give a reason saying what you will do with it"
+                    )));
+                }
+            }
         }
     }
 
@@ -1113,6 +1136,92 @@ mod tests {
             err_default.message,
             "'figma' can write; use /mcp enable figma! to confirm"
         );
+    }
+
+    #[tokio::test]
+    async fn test_agent_enable_reason_requirements() {
+        let cat = sample_catalog();
+        let policy = sample_policy();
+        let req = FakeRequester::new(vec![]);
+
+        // 1. Without confirm, hint error is returned first (even if reason is missing)
+        let err1 = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string()],
+            &[],
+            Some(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err1.code, -32602);
+        assert!(err1.message.contains("use /mcp enable slack! to confirm"));
+
+        // 2. With confirm but no reason -> reason error
+        let err2 = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string()],
+            &["slack".to_string()],
+            Some(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err2.code, -32602);
+        assert_eq!(
+            err2.message,
+            "'slack' can write; give a reason saying what you will do with it"
+        );
+
+        // 3. With confirm but whitespace-only reason -> reason error
+        let err3 = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string()],
+            &["slack".to_string()],
+            Some(Some("   \t  ")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err3.code, -32602);
+        assert_eq!(
+            err3.message,
+            "'slack' can write; give a reason saying what you will do with it"
+        );
+
+        // 4. With confirm and valid reason -> OK
+        let res_ok = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack".to_string()],
+            &["slack".to_string()],
+            Some(Some("investigate customer ticket")),
+        )
+        .await
+        .unwrap();
+        assert!(res_ok.results[0].ok);
+
+        // 5. No-confirm server (slack-ro) needs neither confirm nor reason
+        let res_no_confirm = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["slack-ro".to_string()],
+            &[],
+            Some(None),
+        )
+        .await
+        .unwrap();
+        assert!(res_no_confirm.results[0].ok);
     }
 
     #[tokio::test]

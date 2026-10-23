@@ -49,6 +49,8 @@ pub struct Args {
     pub mcp_catalog: Option<PathBuf>,
     #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
     pub mcp_no_confirm: Vec<String>,
+    #[arg(long, help = "Allow agents to self-grant MCP servers via POST /mcp/*")]
+    pub mcp_self_grant: bool,
     #[arg(long)]
     pub swarm_mcp_bin: Option<PathBuf>,
     #[arg(long)]
@@ -132,6 +134,7 @@ mod tests {
             .expect("parse args");
         assert_eq!(args.mcp_catalog, None);
         assert!(args.mcp_no_confirm.is_empty());
+        assert!(!args.mcp_self_grant);
     }
 
     #[test]
@@ -146,10 +149,12 @@ mod tests {
             "slack-ro,figma",
             "--mcp-no-confirm",
             "local-test",
+            "--mcp-self-grant",
         ])
         .expect("parse args");
         assert_eq!(args.mcp_catalog, Some(PathBuf::from("/tmp/opencode.json")));
         assert_eq!(args.mcp_no_confirm, vec!["slack-ro", "figma", "local-test"]);
+        assert!(args.mcp_self_grant);
     }
 
     #[test]
