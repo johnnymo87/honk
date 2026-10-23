@@ -160,6 +160,26 @@ fn find_sibling(name: &str, catalog: &Catalog) -> Option<String> {
     None
 }
 
+fn confirm_refusal_hint(name: &str, catalog: &Catalog, is_agent: bool) -> String {
+    let mut msg = if is_agent {
+        format!(
+            "'{name}' can write; to confirm, call mcp_enable with \"{name}!\" and a reason saying what you will do with it"
+        )
+    } else {
+        format!("'{name}' can write; use /mcp enable {name}! to confirm")
+    };
+    if let Some(sibling) = find_sibling(name, catalog)
+        && sibling.ends_with("-ro")
+    {
+        if is_agent {
+            msg.push_str(&format!(" (or \"{sibling}\" for read-only)"));
+        } else {
+            msg.push_str(&format!(" (or /mcp enable {sibling} for read-only)"));
+        }
+    }
+    msg
+}
+
 struct GooseExtensionInfo {
     key: String,
     description: Option<String>,
@@ -378,21 +398,18 @@ pub async fn enable_with_reason(
         }
 
         if !policy.no_confirm.contains(name) {
+            let is_agent = matches!(reason_policy, ReasonPolicy::Required(_));
             if !confirm.iter().any(|c| c == name) {
-                let mut msg = format!("'{name}' can write; use /mcp enable {name}! to confirm");
-                if let Some(sibling) = find_sibling(name, catalog)
-                    && sibling.ends_with("-ro")
-                {
-                    msg.push_str(&format!(" (or /mcp enable {sibling} for read-only)"));
-                }
-                return Err(OpError::invalid_params(msg));
+                return Err(OpError::invalid_params(confirm_refusal_hint(
+                    name, catalog, is_agent,
+                )));
             }
 
             if let ReasonPolicy::Required(reason_opt) = reason_policy {
                 let is_empty = reason_opt.map(|r| r.trim().is_empty()).unwrap_or(true);
                 if is_empty {
-                    return Err(OpError::invalid_params(format!(
-                        "'{name}' can write; give a reason saying what you will do with it"
+                    return Err(OpError::invalid_params(confirm_refusal_hint(
+                        name, catalog, true,
                     )));
                 }
             }
@@ -1173,7 +1190,10 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err1.code, -32602);
-        assert!(err1.message.contains("use /mcp enable slack! to confirm"));
+        assert_eq!(
+            err1.message,
+            "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
+        );
 
         // 2. With confirm but no reason -> reason error
         let err2 = enable_with_reason(
@@ -1190,7 +1210,7 @@ mod tests {
         assert_eq!(err2.code, -32602);
         assert_eq!(
             err2.message,
-            "'slack' can write; give a reason saying what you will do with it"
+            "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
         );
 
         // 3. With confirm but whitespace-only reason -> reason error
@@ -1208,7 +1228,7 @@ mod tests {
         assert_eq!(err3.code, -32602);
         assert_eq!(
             err3.message,
-            "'slack' can write; give a reason saying what you will do with it"
+            "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
         );
 
         // 4. With confirm and valid reason -> OK
@@ -1238,6 +1258,24 @@ mod tests {
         .await
         .unwrap();
         assert!(res_no_confirm.results[0].ok);
+
+        // 6. Server without sibling (pagerduty) returns hint without "(or ...)"
+        let err_pd = enable_with_reason(
+            &req,
+            &cat,
+            &policy,
+            "ses_123",
+            &["pagerduty".to_string()],
+            &[],
+            ReasonPolicy::Required(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_pd.code, -32602);
+        assert_eq!(
+            err_pd.message,
+            "'pagerduty' can write; to confirm, call mcp_enable with \"pagerduty!\" and a reason saying what you will do with it"
+        );
     }
 
     #[tokio::test]

@@ -1120,7 +1120,7 @@ async fn test_mcp_errors_404_401_error_body_transport_and_secret_file() {
             json!({
                 "error": {
                     "code": -32602,
-                    "message": "'slack' can write; give a reason saying what you will do with it"
+                    "message": "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
                 }
             }),
         ),
@@ -1166,7 +1166,7 @@ async fn test_mcp_errors_404_401_error_body_transport_and_secret_file() {
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(
         resp["result"]["content"][0]["text"].as_str().unwrap(),
-        "'slack' can write; give a reason saying what you will do with it"
+        "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
     );
 
     drop(client_tx);

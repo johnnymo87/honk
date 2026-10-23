@@ -8,10 +8,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 use crate::hub::Hub;
 use crate::viewer::viewer_loop;
+
+pub const MCP_HTTP_DEADLINE: Duration = Duration::from_secs(60);
 
 pub struct DownstreamState {
     pub hub: Arc<Hub>,
@@ -335,7 +338,7 @@ async fn mcp_self_handler(
         }
     };
 
-    let res_body = match tokio::time::timeout(std::time::Duration::from_secs(60), work).await {
+    let res_body = match tokio::time::timeout(MCP_HTTP_DEADLINE, work).await {
         Ok(val) => val,
         Err(_) => {
             serde_json::json!({

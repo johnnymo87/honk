@@ -590,7 +590,7 @@ async fn test_mcp_self_grant_e2e() {
         hint_json["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("use /mcp enable slack! to confirm")
+            .contains("to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)")
     );
 
     // 2g. Enable confirm-class server with confirm but no reason -> reason error (-32602)
@@ -610,7 +610,7 @@ async fn test_mcp_self_grant_e2e() {
     assert_eq!(no_reason_json["error"]["code"], -32602);
     assert_eq!(
         no_reason_json["error"]["message"],
-        "'slack' can write; give a reason saying what you will do with it"
+        "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
     );
 
     // 2h. Enable confirm-class server with confirm and whitespace-only reason -> reason error (-32602)
@@ -629,6 +629,10 @@ async fn test_mcp_self_grant_e2e() {
     assert_eq!(res_ws_reason.status(), reqwest::StatusCode::OK);
     let ws_reason_json: Value = res_ws_reason.json().await.unwrap();
     assert_eq!(ws_reason_json["error"]["code"], -32602);
+    assert_eq!(
+        ws_reason_json["error"]["message"],
+        "'slack' can write; to confirm, call mcp_enable with \"slack!\" and a reason saying what you will do with it (or \"slack-ro\" for read-only)"
+    );
 
     // 2i. Enable confirm-class server with confirm + reason -> OK
     let res_ok_slack = client
