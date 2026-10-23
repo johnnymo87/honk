@@ -143,7 +143,7 @@ struct ChatArgs {
     #[arg(long = "no-telegram")]
     no_telegram: bool,
 
-    /// Do not enable the swarm MCP server by default on a new session
+    /// Do not enable the swarm MCP server by default on a new session (sends _meta.honk.swarm: false)
     #[arg(long = "no-swarm")]
     no_swarm: bool,
 

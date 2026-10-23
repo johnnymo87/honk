@@ -893,12 +893,20 @@ impl ChatCore {
                         self.maybe_refresh_mcp(effects, false);
                     }
 
-                    if origin == "other"
-                        && let Some(change) = params.get("change").and_then(Value::as_str)
-                    {
-                        effects.push(Effect::Notice(Notice::info(format!(
-                            "mcp: {change} (by another client)"
-                        ))));
+                    if let Some(change) = params.get("change").and_then(Value::as_str) {
+                        if origin == "other" {
+                            effects.push(Effect::Notice(Notice::info(format!(
+                                "mcp: {change} (by another client)"
+                            ))));
+                        } else if origin == "agent" {
+                            let text = match params.get("reason").and_then(Value::as_str) {
+                                Some(reason) if !reason.is_empty() => {
+                                    format!("mcp: {change} (by the agent: {reason})")
+                                }
+                                _ => format!("mcp: {change} (by the agent)"),
+                            };
+                            effects.push(Effect::Notice(Notice::info(text)));
+                        }
                     }
                 }
             }

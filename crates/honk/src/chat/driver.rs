@@ -559,6 +559,15 @@ async fn run_driver(
                     "confirm": mcp_cfg.confirm,
                 });
             }
+            if opts.no_swarm {
+                if params.get("_meta").is_none() {
+                    params["_meta"] = json!({});
+                }
+                if params["_meta"].get("honk").is_none() {
+                    params["_meta"]["honk"] = json!({});
+                }
+                params["_meta"]["honk"]["swarm"] = json!(false);
+            }
 
             if let Err(e) = conn.send_request(new_req_id, "session/new", params).await {
                 let _ = ui_tx.send(UiEvent::Fatal(format!(
@@ -622,6 +631,17 @@ async fn run_driver(
                 result: result.clone(),
             });
 
+            let mut reported_swarm_error = false;
+            if let Some(err_val) = result.pointer("/_meta/honk/swarm/error") {
+                let msg = err_val
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| err_val.as_str())
+                    .unwrap_or("failed to enable");
+                let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!("swarm: {msg}"))));
+                reported_swarm_error = true;
+            }
+
             if let Some(settings) = opts.pigeon.clone() {
                 let task = spawn_pigeon_registration(
                     settings,
@@ -652,9 +672,11 @@ async fn run_driver(
                     .send_request(mcp_req_id, "_honk/mcp/enable", mcp_params)
                     .await
                 {
-                    let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
-                        "swarm: failed to send enable: {e}"
-                    ))));
+                    if !reported_swarm_error {
+                        let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
+                            "swarm: failed to send enable: {e}"
+                        ))));
+                    }
                 } else {
                     let mcp_timeout = Duration::from_secs(5);
                     let mcp_res = tokio::time::timeout(mcp_timeout, async {
@@ -673,40 +695,48 @@ async fn run_driver(
 
                     match mcp_res {
                         Ok(Ok(frame)) => {
-                            if let Some(err) = frame.get("error") {
-                                let msg = err
-                                    .get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("enable failed");
-                                let _ = ui_tx
-                                    .send(UiEvent::Notice(Notice::info(format!("swarm: {msg}"))));
-                            } else if let Some(res) = frame.get("result")
-                                && let Some(results) = res.get("results").and_then(Value::as_array)
-                            {
-                                for r in results {
-                                    if r.get("name").and_then(Value::as_str) == Some("swarm")
-                                        && r.get("ok") == Some(&json!(false))
-                                    {
-                                        let err_msg = r
-                                            .get("error")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("failed to enable");
-                                        let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
-                                            "swarm: {err_msg}"
-                                        ))));
+                            if !reported_swarm_error {
+                                if let Some(err) = frame.get("error") {
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("enable failed");
+                                    let _ = ui_tx.send(UiEvent::Notice(Notice::info(format!(
+                                        "swarm: {msg}"
+                                    ))));
+                                } else if let Some(res) = frame.get("result")
+                                    && let Some(results) =
+                                        res.get("results").and_then(Value::as_array)
+                                {
+                                    for r in results {
+                                        if r.get("name").and_then(Value::as_str) == Some("swarm")
+                                            && r.get("ok") == Some(&json!(false))
+                                        {
+                                            let err_msg = r
+                                                .get("error")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("failed to enable");
+                                            let _ = ui_tx.send(UiEvent::Notice(Notice::info(
+                                                format!("swarm: {err_msg}"),
+                                            )));
+                                        }
                                     }
                                 }
                             }
                         }
                         Ok(Err(e)) => {
-                            let _ =
-                                ui_tx.send(UiEvent::Notice(Notice::info(format!("swarm: {e}"))));
+                            if !reported_swarm_error {
+                                let _ = ui_tx
+                                    .send(UiEvent::Notice(Notice::info(format!("swarm: {e}"))));
+                            }
                         }
                         Err(_) => {
-                            let _ = ui_tx.send(UiEvent::Notice(Notice::info(
-                                "swarm: enabling is still in progress; /mcp shows the result"
-                                    .to_string(),
-                            )));
+                            if !reported_swarm_error {
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::info(
+                                    "swarm: enabling is still in progress; /mcp shows the result"
+                                        .to_string(),
+                                )));
+                            }
                         }
                     }
                 }

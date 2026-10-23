@@ -4607,6 +4607,58 @@ fn test_mcp_changed_notification() {
 }
 
 #[test]
+fn test_mcp_changed_notification_agent_origin() {
+    let (mut core, _) = new_test_core();
+
+    // 1. From agent with reason
+    let effs1 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "enabled": ["slack", "atlassian"],
+            "change": "enabled slack",
+            "origin": "agent",
+            "reason": "needed for channel query"
+        }
+    })));
+    assert!(has_notice(
+        &effs1,
+        "mcp: enabled slack (by the agent: needed for channel query)"
+    ));
+    assert_eq!(core.mcp_enabled(), &["atlassian", "slack"]);
+
+    // 2. From agent without reason
+    let effs2 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "enabled": ["atlassian"],
+            "change": "disabled slack",
+            "origin": "agent"
+        }
+    })));
+    assert!(has_notice(&effs2, "mcp: disabled slack (by the agent)"));
+    assert_eq!(core.mcp_enabled(), &["atlassian"]);
+
+    // 3. From agent with empty reason
+    let effs3 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/mcp_changed",
+        "params": {
+            "sessionId": "test-session",
+            "enabled": ["atlassian", "slack-ro"],
+            "change": "enabled slack-ro",
+            "origin": "agent",
+            "reason": ""
+        }
+    })));
+    assert!(has_notice(&effs3, "mcp: enabled slack-ro (by the agent)"));
+    assert_eq!(core.mcp_enabled(), &["atlassian", "slack-ro"]);
+}
+
+#[test]
 fn test_mcp_disconnect_drains_mutations_with_notice_and_list_silently() {
     let (mut core, _) = new_test_core();
 
