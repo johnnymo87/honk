@@ -219,6 +219,7 @@ When creating a new session with `honk chat --new`:
   - `/mcp disable <names...>`: Disables one or more servers previously enabled by honk. Built-in platform extensions (e.g. `developer`) are never removed by `/mcp`.
 - **Queued during active turns**: MCP changes are refused by `honkd` while a turn is in flight (`-32002`). When typed during an active turn, `honk chat` queues `/mcp enable|disable` locally (`queued: /mcp enable <name>`) and dispatches them automatically when the turn ends.
 - **Shared visibility**: Enabled MCP servers appear in the status bar (`mcp:slack-ro,atlassian`, falling back to `mcp:2` on narrower terminals and dropped on the narrowest). Changes made by another client connected to the same session trigger an informational notice (`mcp: <change> (by another client)`).
+- **Swarm MCP default**: When `honkd` is started with `--swarm-default` (requiring `--swarm-mcp-bin` and `--swarm-pigeon-url`), the built-in `swarm` server is enabled by default on `session/new` and reported under `_meta.honk.swarm` in the reply. Clients can opt out by sending `_meta.honk.swarm: false`.
 - **Session creation flag**: `honk chat --new --mcp <name>` enables catalog servers at creation time. Append `!` (e.g. `--mcp slack!`) to confirm servers that require confirmation (honkd decides which via `--mcp-no-confirm`).
 - **Unsupported servers**: Remote MCP servers requiring OAuth or bearer tokens (such as Datadog or Notion) are listed as `n/a` and cannot be enabled in v1.
 

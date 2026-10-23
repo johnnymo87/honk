@@ -754,3 +754,187 @@ async fn test_mcp_self_grant_e2e() {
     let _ = v.response(&prompt_id).await;
     fake.set_run_announcement_delay(None);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_swarm_default_lifecycle() {
+    let fake = FakeGoose::start().await;
+
+    // 1. Startup error when --swarm-default without swarm config
+    let (code, stderr) =
+        Honkd::spawn_expect_exit(&fake.url(), fake.secret_file(), &["--swarm-default"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("--swarm-default requires both --swarm-mcp-bin and --swarm-pigeon-url"),
+        "stderr was: {stderr}"
+    );
+
+    // 2. Flag off -> unchanged reply (no _meta.honk.swarm in replies)
+    let h_off = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v_off = Viewer::connect(&h_off).await;
+    let res_off = v_off.call("session/new", json!({ "cwd": "/tmp" })).await;
+    assert!(res_off["result"].get("_meta").is_none());
+
+    // 3. Flag on with swarm config: session/new without meta -> swarm enabled, no _meta.honk.mcp
+    let temp_cat_dir = tempfile::tempdir().unwrap();
+    let cat_path = temp_cat_dir.path().join("opencode.json");
+    std::fs::write(&cat_path, sample_catalog_content()).unwrap();
+    let cat_str = cat_path.to_str().unwrap();
+
+    let h_on = Honkd::spawn_with_env(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--swarm-default",
+            "--swarm-mcp-bin",
+            "/bin/echo",
+            "--swarm-pigeon-url",
+            "http://127.0.0.1:4731",
+            "--mcp-catalog",
+            cat_str,
+        ],
+        &[("HONKD_TEST_SWARM_LAUNCH_TIMEOUT_MS", "200")],
+    )
+    .await;
+
+    let mut v_on = Viewer::connect(&h_on).await;
+    let res_on = v_on.call("session/new", json!({ "cwd": "/tmp" })).await;
+    assert_eq!(
+        res_on["result"]["_meta"]["honk"]["swarm"]["enabled"], true,
+        "swarm should be enabled: {res_on}"
+    );
+    assert!(
+        res_on["result"]["_meta"]["honk"].get("mcp").is_none(),
+        "no _meta.honk.mcp when client didn't send one: {res_on}"
+    );
+    let sid_on = res_on["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Verify list shows swarm enabled
+    let list_on = v_on
+        .call("_honk/mcp/list", json!({ "sessionId": sid_on }))
+        .await;
+    let srv_swarm = list_on["result"]["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "swarm")
+        .expect("swarm server present");
+    assert_eq!(srv_swarm["enabled"], true);
+
+    // 4. _meta.honk.swarm: false -> no swarm, no _meta.honk.swarm, goose never received the key
+    let res_opt_out = v_on
+        .call(
+            "session/new",
+            json!({
+                "cwd": "/tmp",
+                "_meta": {
+                    "honk": {
+                        "swarm": false
+                    }
+                }
+            }),
+        )
+        .await;
+    assert!(
+        res_opt_out["result"].pointer("/_meta/honk/swarm").is_none(),
+        "no _meta.honk.swarm when opted out: {res_opt_out}"
+    );
+    let sid_opt_out = res_opt_out["result"]["sessionId"].as_str().unwrap();
+    let exts_opt_out = fake.get_session_extensions(sid_opt_out);
+    assert!(
+        !exts_opt_out
+            .iter()
+            .any(|e| e.get("extensionKey").and_then(Value::as_str) == Some("swarm")),
+        "swarm should not be registered with goose on opt-out"
+    );
+
+    // Verify goose never received _meta.honk or swarm key
+    for f in fake.inbound() {
+        if f.get("method").and_then(Value::as_str) == Some("session/new") {
+            assert!(
+                f.pointer("/params/_meta/honk").is_none() && f.pointer("/_meta/honk").is_none(),
+                "goose must never receive _meta.honk: {f}"
+            );
+        }
+    }
+
+    // 5. Client _meta.honk.mcp with a confirm-class name lacking confirm -> _meta.honk.mcp.error, swarm still enabled
+    let res_client_mcp = v_on
+        .call(
+            "session/new",
+            json!({
+                "cwd": "/tmp",
+                "_meta": {
+                    "honk": {
+                        "mcp": {
+                            "names": ["slack"] // slack is confirm-class in sample_catalog_content()
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        res_client_mcp["result"]["_meta"]["honk"]["mcp"]["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        res_client_mcp["result"]["_meta"]["honk"]["swarm"]["enabled"], true,
+        "swarm still enabled despite client mcp error: {res_client_mcp}"
+    );
+    let sid_client_mcp = res_client_mcp["result"]["sessionId"].as_str().unwrap();
+    let list_client = v_on
+        .call("_honk/mcp/list", json!({ "sessionId": sid_client_mcp }))
+        .await;
+    let srv_swarm_client = list_client["result"]["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "swarm")
+        .expect("swarm server present");
+    assert_eq!(srv_swarm_client["enabled"], true);
+
+    // 6. Slow swarm launch (stub delay on extensions/add) -> reply within cap with pending:true;
+    // later swarm ends up enabled; mcp_op_running cleared (a following /mcp op succeeds).
+    fake.set_extension_add_delay(Some(Duration::from_millis(500)));
+    let res_slow = v_on.call("session/new", json!({ "cwd": "/tmp" })).await;
+    assert_eq!(
+        res_slow["result"]["_meta"]["honk"]["swarm"]["pending"], true,
+        "slow swarm launch must reply pending: true: {res_slow}"
+    );
+    let sid_slow = res_slow["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Swarm launch completes in the background; wait for _honk/mcp_changed
+    let changed_notif = v_on
+        .wait_for(|f| {
+            f.get("method").and_then(Value::as_str) == Some("_honk/mcp_changed")
+                && f.pointer("/params/sessionId").and_then(Value::as_str) == Some(&sid_slow)
+        })
+        .await;
+    assert_eq!(changed_notif["params"]["enabled"], json!(["swarm"]));
+
+    // Now a following /mcp op succeeds and mcp_op_running is false
+    fake.set_extension_add_delay(None);
+    let enable_next = v_on
+        .call(
+            "_honk/mcp/enable",
+            json!({
+                "sessionId": sid_slow,
+                "names": ["local-test"],
+                "confirm": ["local-test"]
+            }),
+        )
+        .await;
+    assert!(
+        enable_next.get("error").is_none(),
+        "following /mcp op must succeed, not collide on mcp_op_running: {enable_next}"
+    );
+}

@@ -322,6 +322,7 @@ pub struct Session {
     pub last_started_upstream: Option<String>,
     pub last_usage: Option<honk_wire::Usage>,
     pub mcp_op_running: bool,
+    pub queued_mcp_launches: VecDeque<SessionMsg>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1463,6 +1464,7 @@ impl Session {
         for m in msgs {
             Box::pin(self.on_msg(m)).await;
         }
+        self.check_queued_mcp_launches();
     }
 
     pub fn prune_closed_internal_requests(&mut self) {
@@ -1484,6 +1486,7 @@ impl Session {
             && self.pending_server_requests.is_empty()
             && self.pending_requests.is_empty()
             && self.queued_msgs.is_empty()
+            && self.queued_mcp_launches.is_empty()
             && self.active_probe_id.is_none()
             && !self.gap_synthesis_pending
             && self.state == ActorState::Live
@@ -2427,6 +2430,29 @@ impl Session {
         }
     }
 
+    fn check_queued_mcp_launches(&mut self) {
+        if self.mcp_op_running {
+            return;
+        }
+        if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+            return;
+        }
+        if let Some(SessionMsg::McpLaunch {
+            viewer_id,
+            names,
+            confirm,
+            reply,
+        }) = self.queued_mcp_launches.pop_front()
+        {
+            self.mcp_op_running = true;
+            self.spawn_mcp_task(
+                McpOpOrigin::Viewer(Some(viewer_id)),
+                McpOpKind::Enable { names, confirm },
+                McpTarget::Launch { reply },
+            );
+        }
+    }
+
     fn spawn_mcp_task(&mut self, origin: McpOpOrigin, op: McpOpKind, target: McpTarget) {
         let is_list = matches!(op, McpOpKind::List);
         let mcp_config = match &self.hub.mcp {
@@ -3149,6 +3175,23 @@ impl Session {
                     return;
                 }
 
+                if self.mcp_op_running {
+                    if self.queued_mcp_launches.len() >= 1024 {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
+                        }));
+                    } else {
+                        self.queued_mcp_launches.push_back(SessionMsg::McpLaunch {
+                            viewer_id,
+                            names,
+                            confirm,
+                            reply,
+                        });
+                    }
+                    return;
+                }
+
                 self.mcp_op_running = true;
                 self.spawn_mcp_task(
                     McpOpOrigin::Viewer(Some(viewer_id)),
@@ -3249,6 +3292,7 @@ impl Session {
                         }
                     }
                 }
+                self.check_queued_mcp_launches();
             }
             SessionMsg::Reattached { outcome } => {
                 self.on_reattached(outcome).await;
@@ -3628,6 +3672,16 @@ impl Session {
                             }));
                         }
                         _ => {}
+                    }
+                }
+
+                // Fail all queued mcp launches with -32000
+                for m in self.queued_mcp_launches.drain(..) {
+                    if let SessionMsg::McpLaunch { reply, .. } = m {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32000,
+                            message: format!("Session is gone: {reason}"),
+                        }));
                     }
                 }
 
@@ -4560,6 +4614,7 @@ mod tests {
             last_started_upstream: None,
             last_usage: seeded_usage,
             mcp_op_running: false,
+            queued_mcp_launches: VecDeque::new(),
         };
 
         // 1. Upstream frame with method != "session/update" must NOT update last_usage
@@ -4780,6 +4835,7 @@ mod tests {
             last_started_upstream: None,
             last_usage: None,
             mcp_op_running: false,
+            queued_mcp_launches: VecDeque::new(),
         };
         (session, d, fake)
     }
