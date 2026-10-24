@@ -238,6 +238,8 @@ pub enum WhichOutcome {
     Inherit { tag: String, root: String },
     /// No tag to inherit (`dir` or `auto` kind); silent.
     Skip,
+    /// Executable binary was not found.
+    NotFound(String),
     /// Query failed or tag was invalid.
     Failure(String),
 }
@@ -254,7 +256,7 @@ pub async fn query_launcher_tag(bin: &str, launcher: &str, timeout: Duration) ->
     let mut child = match child {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return WhichOutcome::Failure(format!("'{bin}' not found"));
+            return WhichOutcome::NotFound(bin.to_string());
         }
         Err(e) => return WhichOutcome::Failure(format!("could not run '{bin}': {e}")),
     };
@@ -335,6 +337,7 @@ pub async fn query_launcher_tag(bin: &str, launcher: &str, timeout: Duration) ->
 pub struct InheritSettings {
     pub launcher: String,
     pub bin: String,
+    pub custom_bin: bool,
     pub which_timeout: Duration,
     pub set_timeout: Duration,
 }
@@ -342,6 +345,10 @@ pub struct InheritSettings {
 impl InheritSettings {
     /// Uses `$HONK_OC_TAGS_BIN` when set and non-empty, else `oc-tags`.
     pub fn new(launcher: impl Into<String>) -> Self {
+        let custom_bin = std::env::var(BIN_ENV)
+            .ok()
+            .filter(|b| !b.is_empty())
+            .is_some();
         let bin = std::env::var(BIN_ENV)
             .ok()
             .filter(|b| !b.is_empty())
@@ -349,6 +356,7 @@ impl InheritSettings {
         Self {
             launcher: launcher.into(),
             bin,
+            custom_bin,
             which_timeout: DEFAULT_WHICH_TIMEOUT,
             set_timeout: DEFAULT_TIMEOUT,
         }
@@ -407,6 +415,16 @@ pub async fn run_tag_action(
                 .await
             {
                 WhichOutcome::Skip => None,
+                WhichOutcome::NotFound(bin) => {
+                    if !settings.custom_bin {
+                        None
+                    } else {
+                        Some(crate::chat::Notice::warning(format!(
+                            "Tag: tag not inherited from {launcher}: '{bin}' not found",
+                            launcher = settings.launcher
+                        )))
+                    }
+                }
                 WhichOutcome::Failure(reason) => Some(crate::chat::Notice::warning(format!(
                     "Tag: tag not inherited from {launcher}: {reason}",
                     launcher = settings.launcher
@@ -800,6 +818,7 @@ fi"#,
         let action = TagAction::Inherit(InheritSettings {
             launcher: "ses_parent".to_string(),
             bin,
+            custom_bin: true,
             which_timeout: Duration::from_secs(5),
             set_timeout: Duration::from_secs(5),
         });
@@ -831,6 +850,7 @@ fi"#,
         let action = TagAction::Inherit(InheritSettings {
             launcher: "ses_parent".to_string(),
             bin,
+            custom_bin: true,
             which_timeout: Duration::from_secs(5),
             set_timeout: Duration::from_secs(5),
         });
@@ -858,6 +878,7 @@ fi"#,
         let action = TagAction::Inherit(InheritSettings {
             launcher: "ses_parent".to_string(),
             bin,
+            custom_bin: true,
             which_timeout: Duration::from_secs(5),
             set_timeout: Duration::from_secs(5),
         });
@@ -869,5 +890,70 @@ fi"#,
         );
         let calls = std::fs::read_to_string(log).unwrap();
         assert_eq!(calls.trim(), "which");
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_inherit_default_bin_missing_skips_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp
+            .path()
+            .join("nonexistent-oc-tags")
+            .to_string_lossy()
+            .into_owned();
+        let action = TagAction::Inherit(InheritSettings {
+            launcher: "ses_parent".to_string(),
+            bin,
+            custom_bin: false,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await;
+        assert!(notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_inherit_custom_bin_missing_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp
+            .path()
+            .join("nonexistent-oc-tags")
+            .to_string_lossy()
+            .into_owned();
+        let action = TagAction::Inherit(InheritSettings {
+            launcher: "ses_parent".to_string(),
+            bin: bin.clone(),
+            custom_bin: true,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await.unwrap();
+        assert_eq!(notice.kind, NoticeKind::Warning);
+        assert_eq!(
+            notice.text,
+            format!("Tag: tag not inherited from ses_parent: '{bin}' not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_explicit_missing_bin_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp
+            .path()
+            .join("nonexistent-oc-tags")
+            .to_string_lossy()
+            .into_owned();
+        let action = TagAction::Explicit(TagSettings {
+            tag: "billing".to_string(),
+            bin: bin.clone(),
+            timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await.unwrap();
+        assert_eq!(notice.kind, NoticeKind::Warning);
+        assert_eq!(
+            notice.text,
+            format!(
+                "Tag: 'billing' not applied to goose:20261024_1: '{bin}' not found; apply it with: oc-tags set billing goose:20261024_1"
+            )
+        );
     }
 }

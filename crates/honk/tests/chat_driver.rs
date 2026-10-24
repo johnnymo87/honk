@@ -2810,6 +2810,7 @@ async fn test_new_session_inherits_launcher_tag() {
         honk::octags::InheritSettings {
             launcher: "ses_launcher".to_string(),
             bin,
+            custom_bin: true,
             which_timeout: Duration::from_secs(5),
             set_timeout: Duration::from_secs(10),
         },

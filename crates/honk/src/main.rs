@@ -297,6 +297,9 @@ fn chat_tag_settings_with_env(
         Some(honk::octags::TagArg::NoInherit) => None,
         None => {
             let launcher = honk::octags::resolve_launcher_from(&env_get)?;
+            let custom_bin = env_get(honk::octags::BIN_ENV)
+                .filter(|b| !b.is_empty())
+                .is_some();
             let bin = env_get(honk::octags::BIN_ENV)
                 .filter(|b| !b.is_empty())
                 .unwrap_or_else(|| honk::octags::DEFAULT_BIN.to_string());
@@ -304,6 +307,7 @@ fn chat_tag_settings_with_env(
                 honk::octags::InheritSettings {
                     launcher,
                     bin,
+                    custom_bin,
                     which_timeout: honk::octags::DEFAULT_WHICH_TIMEOUT,
                     set_timeout: honk::octags::DEFAULT_TIMEOUT,
                 },
