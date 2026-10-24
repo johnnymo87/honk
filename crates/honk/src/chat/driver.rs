@@ -43,7 +43,7 @@ pub struct DriverOpts {
     /// When set, a session created by `Target::New` is tagged in oc-tags as
     /// `goose:<id>`. Background and best-effort like `pigeon`; the outcome
     /// arrives as a `UiEvent::Notice` starting with `Tag:`.
-    pub tag: Option<crate::octags::TagSettings>,
+    pub tag: Option<crate::octags::TagAction>,
     /// When true, do not enable the swarm MCP server by default on a new session.
     pub no_swarm: bool,
 }
@@ -105,14 +105,14 @@ fn spawn_pigeon_registration(
 /// Tags a just-created session in oc-tags in the background and reports the
 /// outcome as a notice. Never fatal, like pigeon registration.
 fn spawn_tagging(
-    settings: crate::octags::TagSettings,
+    action: crate::octags::TagAction,
     goose_session_id: String,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let outcome = crate::octags::tag_session(&settings, &goose_session_id).await;
-        let notice = crate::octags::notice(&settings, &goose_session_id, &outcome);
-        let _ = ui_tx.send(UiEvent::Notice(notice));
+        if let Some(notice) = crate::octags::run_tag_action(&action, &goose_session_id).await {
+            let _ = ui_tx.send(UiEvent::Notice(notice));
+        }
     })
 }
 
@@ -656,9 +656,9 @@ async fn run_driver(
                 );
                 background.lock().unwrap().push((unconfirmed, task));
             }
-            if let Some(settings) = opts.tag.clone() {
-                let unconfirmed = crate::octags::unconfirmed_text(&settings, session_id);
-                let task = spawn_tagging(settings, session_id.to_string(), ui_tx.clone());
+            if let Some(action) = opts.tag.clone() {
+                let unconfirmed = crate::octags::unconfirmed_action_text(&action, session_id);
+                let task = spawn_tagging(action, session_id.to_string(), ui_tx.clone());
                 background.lock().unwrap().push((unconfirmed, task));
             }
 

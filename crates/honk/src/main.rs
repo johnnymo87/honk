@@ -268,10 +268,45 @@ fn chat_pigeon_settings(args: &ChatArgs) -> Option<honk::pigeon::PigeonSettings>
 }
 
 /// Only a session this invocation creates is tagged; `--tag` requires `--new`.
-fn chat_tag_settings(args: &ChatArgs) -> Option<honk::octags::TagSettings> {
+fn chat_tag_settings(args: &ChatArgs) -> Option<honk::octags::TagAction> {
+    chat_tag_settings_with_env(args, |k| std::env::var(k).ok())
+}
+
+fn chat_tag_settings_with_env(
+    args: &ChatArgs,
+    env_get: impl Fn(&str) -> Option<String>,
+) -> Option<honk::octags::TagAction> {
+    if !args.new {
+        return None;
+    }
     match &args.tag {
-        Some(honk::octags::TagArg::Explicit(t)) => Some(honk::octags::TagSettings::new(t)),
-        Some(honk::octags::TagArg::NoInherit) | None => None,
+        Some(honk::octags::TagArg::Explicit(t)) => {
+            let bin = env_get(honk::octags::BIN_ENV)
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| honk::octags::DEFAULT_BIN.to_string());
+            Some(honk::octags::TagAction::Explicit(
+                honk::octags::TagSettings {
+                    tag: t.clone(),
+                    bin,
+                    timeout: honk::octags::DEFAULT_TIMEOUT,
+                },
+            ))
+        }
+        Some(honk::octags::TagArg::NoInherit) => None,
+        None => {
+            let launcher = honk::octags::resolve_launcher_from(&env_get)?;
+            let bin = env_get(honk::octags::BIN_ENV)
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| honk::octags::DEFAULT_BIN.to_string());
+            Some(honk::octags::TagAction::Inherit(
+                honk::octags::InheritSettings {
+                    launcher,
+                    bin,
+                    which_timeout: honk::octags::DEFAULT_WHICH_TIMEOUT,
+                    set_timeout: honk::octags::DEFAULT_TIMEOUT,
+                },
+            ))
+        }
     }
 }
 
@@ -469,13 +504,82 @@ mod tests {
         match cli.command {
             Commands::Chat(args) => {
                 let tag = chat_tag_settings(&args).expect("tag settings");
-                assert_eq!(tag.tag, "honk");
+                match tag {
+                    honk::octags::TagAction::Explicit(s) => assert_eq!(s.tag, "honk"),
+                    _ => panic!("expected explicit tag"),
+                }
             }
             _ => panic!("expected chat command"),
         }
         let cli = Cli::try_parse_from(["honk", "chat", "--new"]).unwrap();
         match cli.command {
-            Commands::Chat(args) => assert!(chat_tag_settings(&args).is_none()),
+            Commands::Chat(args) => {
+                // Without launcher in env, returns None
+                let no_env = |_: &str| None;
+                assert!(chat_tag_settings_with_env(&args, no_env).is_none());
+
+                // With OPENCODE_SESSION_ID in env, inherits
+                let opencode_env = |k: &str| match k {
+                    honk::octags::OPENCODE_SESSION_ID_ENV => Some("ses_123".to_string()),
+                    _ => None,
+                };
+                match chat_tag_settings_with_env(&args, opencode_env).unwrap() {
+                    honk::octags::TagAction::Inherit(s) => assert_eq!(s.launcher, "ses_123"),
+                    _ => panic!("expected inherit"),
+                }
+
+                // With AGENT_SESSION_ID in env, inherits with goose: prefix
+                let goose_env = |k: &str| match k {
+                    honk::octags::AGENT_SESSION_ID_ENV => Some("456".to_string()),
+                    _ => None,
+                };
+                match chat_tag_settings_with_env(&args, goose_env).unwrap() {
+                    honk::octags::TagAction::Inherit(s) => assert_eq!(s.launcher, "goose:456"),
+                    _ => panic!("expected inherit"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // Explicit tag wins over launcher env
+        let cli = Cli::try_parse_from(["honk", "chat", "--new", "--tag", "honk"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                let env = |k: &str| match k {
+                    honk::octags::OPENCODE_SESSION_ID_ENV => Some("ses_123".to_string()),
+                    _ => None,
+                };
+                match chat_tag_settings_with_env(&args, env).unwrap() {
+                    honk::octags::TagAction::Explicit(s) => assert_eq!(s.tag, "honk"),
+                    _ => panic!("expected explicit"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // --tag auto opts out even with launcher env
+        let cli = Cli::try_parse_from(["honk", "chat", "--new", "--tag", "auto"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                let env = |k: &str| match k {
+                    honk::octags::OPENCODE_SESSION_ID_ENV => Some("ses_123".to_string()),
+                    _ => None,
+                };
+                assert!(chat_tag_settings_with_env(&args, env).is_none());
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // Attach never tags even with launcher env
+        let cli = Cli::try_parse_from(["honk", "chat", "20261024_1"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                let env = |k: &str| match k {
+                    honk::octags::OPENCODE_SESSION_ID_ENV => Some("ses_123".to_string()),
+                    _ => None,
+                };
+                assert!(chat_tag_settings_with_env(&args, env).is_none());
+            }
             _ => panic!("expected chat command"),
         }
     }
