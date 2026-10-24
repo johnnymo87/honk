@@ -175,6 +175,7 @@ struct FakeGooseInner {
     session_info_error: Mutex<Option<(i64, String)>>,
     session_extensions: Mutex<HashMap<String, Vec<Value>>>,
     extension_fail_command: Mutex<Option<(String, String)>>,
+    extension_add_delay: Mutex<Option<Duration>>,
 }
 
 pub struct FakeGoose {
@@ -236,6 +237,7 @@ impl FakeGoose {
             session_info_error: Mutex::new(None),
             session_extensions: Mutex::new(HashMap::new()),
             extension_fail_command: Mutex::new(None),
+            extension_add_delay: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -464,6 +466,10 @@ impl FakeGoose {
 
     pub fn set_export_commit_delay(&self, delay: Option<Duration>) {
         *self.state.export_commit_delay.lock().unwrap() = delay;
+    }
+
+    pub fn set_extension_add_delay(&self, delay: Option<Duration>) {
+        *self.state.extension_add_delay.lock().unwrap() = delay;
     }
 
     pub fn error_next_session_info(&self, code: i64, message: &str) {
@@ -1083,6 +1089,10 @@ async fn handle_post(
             StatusCode::ACCEPTED.into_response()
         }
         Some("_goose/unstable/session/extensions/add") => {
+            let add_delay = *state.extension_add_delay.lock().unwrap();
+            if let Some(delay) = add_delay {
+                tokio::time::sleep(delay).await;
+            }
             let sid = target_session
                 .as_deref()
                 .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))

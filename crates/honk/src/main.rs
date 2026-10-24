@@ -143,7 +143,7 @@ struct ChatArgs {
     #[arg(long = "no-telegram")]
     no_telegram: bool,
 
-    /// Do not enable the swarm MCP server by default on a new session
+    /// Do not enable the swarm MCP server by default on a new session (sends _meta.honk.swarm: false)
     #[arg(long = "no-swarm")]
     no_swarm: bool,
 
@@ -234,16 +234,8 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
         let mcp = if args.mcp.is_empty() {
             None
         } else {
-            let mut confirm = Vec::new();
-            let mut names = Vec::new();
-            for item in &args.mcp {
-                if let Some(stripped) = item.strip_suffix('!') {
-                    confirm.push(stripped.to_string());
-                    names.push(stripped.to_string());
-                } else {
-                    names.push(item.clone());
-                }
-            }
+            let (names, confirm) = honk::swarm_mcp::parse_enable_names(&args.mcp)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             Some(honk::chat::driver::McpLaunchConfig { names, confirm })
         };
         Ok(honk::chat::driver::Target::New {
@@ -573,6 +565,77 @@ mod tests {
     fn test_cli_parse_mcp_requires_new() {
         let res = Cli::try_parse_from(["honk", "chat", "ses_1", "--mcp", "slack-ro"]);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_mcp_aligned_edge_cases() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // "" is rejected
+        let cli_empty = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "",
+        ])
+        .unwrap();
+        match cli_empty.command {
+            Commands::Chat(args) => {
+                assert!(resolve_chat_target(&args).is_err());
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // "!" is rejected
+        let cli_bang = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "!",
+        ])
+        .unwrap();
+        match cli_bang.command {
+            Commands::Chat(args) => {
+                assert!(resolve_chat_target(&args).is_err());
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        // "slack!!" confirms slack
+        let cli_double_bang = Cli::try_parse_from([
+            "honk",
+            "chat",
+            "--new",
+            "--cwd",
+            temp.path().to_str().unwrap(),
+            "--mcp",
+            "slack!!",
+        ])
+        .unwrap();
+        match cli_double_bang.command {
+            Commands::Chat(args) => {
+                let target = resolve_chat_target(&args).unwrap();
+                match target {
+                    honk::chat::driver::Target::New { mcp, .. } => {
+                        assert_eq!(
+                            mcp,
+                            Some(honk::chat::driver::McpLaunchConfig {
+                                names: vec!["slack".into()],
+                                confirm: vec!["slack".into()],
+                            })
+                        );
+                    }
+                    _ => panic!("expected Target::New"),
+                }
+            }
+            _ => panic!("expected chat command"),
+        }
     }
 
     #[test]

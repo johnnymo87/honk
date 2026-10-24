@@ -62,6 +62,9 @@ pub struct Hub {
 }
 
 pub fn validate_swarm_args(args: &Args) -> anyhow::Result<()> {
+    if args.swarm_default && (args.swarm_mcp_bin.is_none() || args.swarm_pigeon_url.is_none()) {
+        anyhow::bail!("--swarm-default requires both --swarm-mcp-bin and --swarm-pigeon-url");
+    }
     if args.swarm_pigeon_token_file.is_some()
         && (args.swarm_mcp_bin.is_none() || args.swarm_pigeon_url.is_none())
     {
@@ -102,6 +105,7 @@ pub fn format_honk_url(listen: std::net::SocketAddr) -> String {
 impl Hub {
     pub async fn start(
         args: Arc<Args>,
+        bound_addr: std::net::SocketAddr,
         state_store: StateStore,
         upstream_secret: String,
         turn_hook: Option<TurnHook>,
@@ -242,7 +246,7 @@ impl Hub {
                     bin: args.swarm_mcp_bin.clone().unwrap(),
                     pigeon_url: args.swarm_pigeon_url.clone().unwrap(),
                     pigeon_token_file: args.swarm_pigeon_token_file.clone(),
-                    honk_url: format_honk_url(args.listen),
+                    honk_url: format_honk_url(bound_addr),
                     honk_secret_file: state_dir.join("secret"),
                 })
             } else {
@@ -452,6 +456,7 @@ impl Hub {
                 last_started_upstream: None,
                 last_usage,
                 mcp_op_running: false,
+                queued_mcp_launches: std::collections::VecDeque::new(),
             };
 
             tokio::spawn(session.run());
@@ -1341,6 +1346,7 @@ impl Hub {
             last_started_upstream: None,
             last_usage: None,
             mcp_op_running: false,
+            queued_mcp_launches: std::collections::VecDeque::new(),
         };
 
         tokio::spawn(session.run());
@@ -1725,6 +1731,7 @@ impl Hub {
                 last_started_upstream: None,
                 last_usage,
                 mcp_op_running: false,
+                queued_mcp_launches: std::collections::VecDeque::new(),
             };
 
             tokio::spawn(session.run());
@@ -1849,5 +1856,34 @@ mod tests {
         assert!(err2.contains(
             "--swarm-pigeon-token-file requires both --swarm-mcp-bin and --swarm-pigeon-url"
         ));
+    }
+
+    #[test]
+    fn test_validate_swarm_args_swarm_default() {
+        use clap::Parser;
+        let mut args =
+            crate::config::Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+                .unwrap();
+        args.swarm_default = true;
+        let err = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--swarm-default requires both --swarm-mcp-bin and --swarm-pigeon-url")
+        );
+
+        args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
+        let err2 = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(
+            err2.contains("--swarm-default requires both --swarm-mcp-bin and --swarm-pigeon-url")
+        );
+
+        args.swarm_mcp_bin = None;
+        args.swarm_pigeon_url = Some("http://127.0.0.1:4731".to_string());
+        let err3 = validate_swarm_args(&args).unwrap_err().to_string();
+        assert!(
+            err3.contains("--swarm-default requires both --swarm-mcp-bin and --swarm-pigeon-url")
+        );
+
+        args.swarm_mcp_bin = Some(PathBuf::from("/bin/honk"));
+        assert!(validate_swarm_args(&args).is_ok());
     }
 }

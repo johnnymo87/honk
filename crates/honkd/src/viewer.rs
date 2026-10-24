@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
 use crate::hub::Hub;
@@ -11,6 +12,213 @@ use crate::hub::Hub;
 pub type ViewerId = u64;
 
 static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1);
+
+const DEFAULT_SWARM_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn swarm_launch_timeout() -> Duration {
+    if let Ok(ms_str) = std::env::var("HONKD_TEST_SWARM_LAUNCH_TIMEOUT_MS")
+        && let Ok(ms) = ms_str.parse::<u64>()
+    {
+        Duration::from_millis(ms)
+    } else {
+        DEFAULT_SWARM_LAUNCH_TIMEOUT
+    }
+}
+
+fn ensure_honk_meta(val: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if val.get("_meta").is_none() {
+        val["_meta"] = json!({});
+    }
+    if val["_meta"].get("honk").is_none() {
+        val["_meta"]["honk"] = json!({});
+    }
+    val["_meta"]["honk"].as_object_mut().unwrap()
+}
+
+async fn handle_client_mcp_launch(
+    hub: &Arc<Hub>,
+    session_tx: Option<&mpsc::Sender<crate::session::SessionMsg>>,
+    viewer_id: ViewerId,
+    mcp_req: &Value,
+) -> Value {
+    if hub.mcp.is_none() {
+        return json!({
+            "error": {
+                "code": -32601,
+                "message": "MCP catalog not configured (honkd --mcp-catalog)"
+            }
+        });
+    }
+
+    let Some(tx) = session_tx else {
+        return json!({
+            "error": {
+                "code": -32000,
+                "message": "session actor unavailable"
+            }
+        });
+    };
+
+    let names_opt = mcp_req
+        .get("names")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .map(Value::as_str)
+                .map(|s| s.map(String::from))
+                .collect::<Option<Vec<_>>>()
+        });
+    let confirm = mcp_req
+        .get("confirm")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    match names_opt {
+        Some(names) => {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = tx
+                .send(crate::session::SessionMsg::McpLaunch {
+                    viewer_id,
+                    names,
+                    confirm,
+                    reply: reply_tx,
+                })
+                .await;
+            match reply_rx.await {
+                Ok(Ok(op_res)) => json!({
+                    "results": op_res.results,
+                    "servers": op_res.servers,
+                    "other": op_res.other,
+                }),
+                Ok(Err(op_err)) => json!({
+                    "error": {
+                        "code": op_err.code,
+                        "message": op_err.message,
+                    }
+                }),
+                Err(_) => json!({
+                    "error": {
+                        "code": -32603,
+                        "message": "failed to enable MCP servers",
+                    }
+                }),
+            }
+        }
+        None => json!({
+            "error": {
+                "code": -32602,
+                "message": "invalid names in _meta.honk.mcp"
+            }
+        }),
+    }
+}
+
+async fn handle_swarm_launch(
+    hub: &Arc<Hub>,
+    session_tx: Option<&mpsc::Sender<crate::session::SessionMsg>>,
+    viewer_id: ViewerId,
+    sid: &str,
+) -> Value {
+    if hub.mcp.is_none() {
+        tracing::warn!(
+            sessionId = sid,
+            "swarm launch failed: MCP config not present"
+        );
+        return json!({
+            "error": {
+                "code": -32601,
+                "message": "MCP not configured"
+            }
+        });
+    }
+
+    let Some(tx) = session_tx else {
+        tracing::warn!(
+            sessionId = sid,
+            "swarm launch failed: session actor unavailable"
+        );
+        return json!({
+            "error": {
+                "code": -32000,
+                "message": "session actor unavailable"
+            }
+        });
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = tx
+        .send(crate::session::SessionMsg::McpLaunch {
+            viewer_id,
+            names: vec!["swarm".to_string()],
+            confirm: Vec::new(),
+            reply: reply_tx,
+        })
+        .await;
+
+    let swarm_timeout = swarm_launch_timeout();
+    match tokio::time::timeout(swarm_timeout, reply_rx).await {
+        Ok(Ok(Ok(op_res))) => {
+            let all_ok = !op_res.results.is_empty() && op_res.results.iter().all(|r| r.ok);
+            if all_ok {
+                json!({
+                    "enabled": true
+                })
+            } else {
+                let err_msg = op_res
+                    .results
+                    .iter()
+                    .find_map(|r| r.error.as_deref())
+                    .unwrap_or("failed to enable swarm MCP");
+                tracing::warn!(sessionId = sid, "swarm launch failed to enable: {err_msg}");
+                json!({
+                    "error": {
+                        "code": -32603,
+                        "message": err_msg
+                    }
+                })
+            }
+        }
+        Ok(Ok(Err(op_err))) => {
+            tracing::warn!(
+                sessionId = sid,
+                "swarm launch returned error: {}: {}",
+                op_err.code,
+                op_err.message
+            );
+            json!({
+                "error": {
+                    "code": op_err.code,
+                    "message": op_err.message
+                }
+            })
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(sessionId = sid, "swarm launch sender dropped");
+            json!({
+                "error": {
+                    "code": -32603,
+                    "message": "failed to enable swarm MCP"
+                }
+            })
+        }
+        Err(_) => {
+            tracing::warn!(
+                sessionId = sid,
+                "swarm launch timed out after {:?}; returning pending: true",
+                swarm_timeout
+            );
+            json!({
+                "pending": true
+            })
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ViewerTx {
@@ -488,6 +696,10 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                 } else if method == Some("session/new") {
                     let mcp_launch_req = params.pointer("/_meta/honk/mcp").cloned();
+                    let swarm_opt_out =
+                        params.pointer("/_meta/honk/swarm").and_then(Value::as_bool) == Some(false);
+                    let should_launch_swarm = hub.args.swarm_default && !swarm_opt_out;
+
                     if let Some(mcp_req) = &mcp_launch_req
                         && let Some(conf_val) = mcp_req.get("confirm")
                     {
@@ -512,11 +724,15 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     }
                     match hub.create_session(params).await {
                         Ok(mut new_res) => {
-                            if let Some(sid) = new_res.get("sessionId").and_then(Value::as_str) {
-                                viewer.attached_sessions.insert(sid.to_string());
+                            let sid_opt = new_res
+                                .get("sessionId")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                            if let Some(sid) = sid_opt {
+                                viewer.attached_sessions.insert(sid.clone());
                                 let session_tx = {
                                     let sessions = hub.sessions.read().await;
-                                    sessions.get(sid).map(|h| h.tx.clone())
+                                    sessions.get(&sid).map(|h| h.tx.clone())
                                 };
 
                                 if let Some(tx) = &session_tx {
@@ -529,90 +745,28 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                         .await;
                                 }
 
-                                if let Some(mcp_req) = mcp_launch_req {
-                                    if new_res.get("_meta").is_none() {
-                                        new_res["_meta"] = json!({});
-                                    }
-                                    if new_res["_meta"].get("honk").is_none() {
-                                        new_res["_meta"]["honk"] = json!({});
-                                    }
+                                if let Some(mcp_req) = &mcp_launch_req {
+                                    let mcp_val = handle_client_mcp_launch(
+                                        &hub,
+                                        session_tx.as_ref(),
+                                        viewer.id,
+                                        mcp_req,
+                                    )
+                                    .await;
+                                    ensure_honk_meta(&mut new_res)
+                                        .insert("mcp".to_string(), mcp_val);
+                                }
 
-                                    if hub.mcp.is_none() {
-                                        new_res["_meta"]["honk"]["mcp"] = json!({
-                                            "error": {
-                                                "code": -32601,
-                                                "message": "MCP catalog not configured (honkd --mcp-catalog)"
-                                            }
-                                        });
-                                    } else if let Some(tx) = session_tx {
-                                        let names_opt = mcp_req
-                                            .get("names")
-                                            .and_then(Value::as_array)
-                                            .and_then(|arr| {
-                                                arr.iter()
-                                                    .map(Value::as_str)
-                                                    .map(|s| s.map(String::from))
-                                                    .collect::<Option<Vec<_>>>()
-                                            });
-                                        let confirm = mcp_req
-                                            .get("confirm")
-                                            .and_then(Value::as_array)
-                                            .map(|arr| {
-                                                arr.iter()
-                                                    .filter_map(Value::as_str)
-                                                    .map(String::from)
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default();
-
-                                        match names_opt {
-                                            Some(names) => {
-                                                let (reply_tx, reply_rx) =
-                                                    tokio::sync::oneshot::channel();
-                                                let _ = tx
-                                                    .send(crate::session::SessionMsg::McpLaunch {
-                                                        viewer_id: viewer.id,
-                                                        names,
-                                                        confirm,
-                                                        reply: reply_tx,
-                                                    })
-                                                    .await;
-                                                match reply_rx.await {
-                                                    Ok(Ok(op_res)) => {
-                                                        new_res["_meta"]["honk"]["mcp"] = json!({
-                                                            "results": op_res.results,
-                                                            "servers": op_res.servers,
-                                                            "other": op_res.other,
-                                                        });
-                                                    }
-                                                    Ok(Err(op_err)) => {
-                                                        new_res["_meta"]["honk"]["mcp"] = json!({
-                                                            "error": {
-                                                                "code": op_err.code,
-                                                                "message": op_err.message,
-                                                            }
-                                                        });
-                                                    }
-                                                    Err(_) => {
-                                                        new_res["_meta"]["honk"]["mcp"] = json!({
-                                                            "error": {
-                                                                "code": -32603,
-                                                                "message": "failed to enable MCP servers",
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                new_res["_meta"]["honk"]["mcp"] = json!({
-                                                    "error": {
-                                                        "code": -32602,
-                                                        "message": "invalid names in _meta.honk.mcp"
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    }
+                                if should_launch_swarm {
+                                    let swarm_val = handle_swarm_launch(
+                                        &hub,
+                                        session_tx.as_ref(),
+                                        viewer.id,
+                                        &sid,
+                                    )
+                                    .await;
+                                    ensure_honk_meta(&mut new_res)
+                                        .insert("swarm".to_string(), swarm_val);
                                 }
                             }
                             let resp_frame = crate::rpc::response(id, new_res);

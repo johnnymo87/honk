@@ -2372,11 +2372,10 @@ async fn test_driver_forwards_known_cwd_to_session_list() {
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/new");
-            let new_id = v["id"].clone();
             ws.send(Message::Text(
                 json!({
                     "jsonrpc": "2.0",
-                    "id": new_id,
+                    "id": v["id"],
                     "result": {
                         "sessionId": "s_new",
                         "cwd": "/test/known/driver/cwd"
@@ -3301,6 +3300,7 @@ async fn test_new_session_no_swarm_flag_skips_enable() {
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/new");
+            assert_eq!(v["params"]["_meta"]["honk"]["swarm"], false);
             ws.send(Message::Text(
                 json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
                     .to_string()
@@ -3455,6 +3455,319 @@ async fn test_new_session_swarm_enable_timeout_surfaces_in_progress_notice() {
     assert!(
         notice_seen,
         "expected notice: swarm: enabling is still in progress; /mcp shows the result"
+    );
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_swarm_meta_error_skips_enable_and_surfaces_notice() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new with _meta.honk.swarm.error
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_new",
+                        "_meta": {
+                            "honk": {
+                                "swarm": {
+                                    "error": {
+                                        "code": -32603,
+                                        "message": "swarm init failed"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/load (MUST skip _honk/mcp/enable because _meta.honk.swarm was present)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut swarm_notices = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("swarm:") {
+                        swarm_notices.push(n.text);
+                    }
+                }
+                UiEvent::Attached { .. } => {
+                    break;
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        swarm_notices,
+        vec!["swarm: swarm init failed".to_string()],
+        "should surface swarm failure notice from _meta.honk.swarm.error"
+    );
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_swarm_meta_enabled_skips_enable() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new with _meta.honk.swarm.enabled
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_new",
+                        "_meta": {
+                            "honk": {
+                                "swarm": {
+                                    "enabled": true
+                                }
+                            }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/load (MUST skip _honk/mcp/enable because _meta.honk.swarm was present)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut swarm_notices = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("swarm:") {
+                        swarm_notices.push(n.text);
+                    }
+                }
+                UiEvent::Attached { .. } => {
+                    break;
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        swarm_notices.is_empty(),
+        "expected no swarm notices when swarm was enabled by honkd: {swarm_notices:?}"
+    );
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_swarm_meta_pending_skips_enable_and_shows_no_error() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new with _meta.honk.swarm.pending
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_new",
+                        "_meta": {
+                            "honk": {
+                                "swarm": {
+                                    "pending": true
+                                }
+                            }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/load (MUST skip _honk/mcp/enable because _meta.honk.swarm was present)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut swarm_notices = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("swarm:") {
+                        swarm_notices.push(n.text);
+                    }
+                }
+                UiEvent::Attached { .. } => {
+                    break;
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        swarm_notices.is_empty(),
+        "expected no error notice for pending swarm: {swarm_notices:?}"
     );
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;

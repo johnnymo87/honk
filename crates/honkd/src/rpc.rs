@@ -304,6 +304,40 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_honk_meta_swarm() {
+        let mut val = json!({
+            "cwd": "/tmp",
+            "_meta": {
+                "honk": {
+                    "swarm": false,
+                    "mcp": {
+                        "names": ["local-test"]
+                    }
+                }
+            }
+        });
+        strip_honk_meta(&mut val);
+        assert!(val.get("_meta").is_none());
+
+        let mut val_sibling = json!({
+            "params": {
+                "_meta": {
+                    "honk": {
+                        "swarm": false
+                    },
+                    "other": 123
+                }
+            }
+        });
+        strip_honk_meta(&mut val_sibling);
+        assert!(val_sibling.pointer("/params/_meta/honk").is_none());
+        assert_eq!(
+            val_sibling.pointer("/params/_meta/other"),
+            Some(&json!(123))
+        );
+    }
+
+    #[test]
     fn test_strip_honk_meta_removes_empty_meta() {
         let mut val = json!({
             "_meta": {

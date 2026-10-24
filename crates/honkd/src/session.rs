@@ -87,12 +87,22 @@ impl crate::mcp::ops::GooseRequester for ActorRequester {
     }
 }
 
-enum McpOpOutput {
+pub const MCP_VIEWER_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
+pub const MCP_AGENT_WORKER_TIMEOUT: Duration = Duration::from_secs(55);
+
+#[derive(Debug, Clone)]
+pub enum McpOpOutput {
     List(crate::mcp::ops::ListResult),
     Op(crate::mcp::ops::OpResult),
 }
 
-enum McpTarget {
+#[derive(Debug, Clone)]
+pub enum McpOpOrigin {
+    Viewer(Option<ViewerId>),
+    Agent { reason: Option<String> },
+}
+
+pub enum McpTarget {
     Viewer {
         viewer: ViewerTx,
         id: Value,
@@ -102,6 +112,58 @@ enum McpTarget {
             Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
         >,
     },
+    SelfOp {
+        reply: tokio::sync::oneshot::Sender<Result<McpOpOutput, crate::mcp::ops::OpError>>,
+    },
+    None,
+}
+
+impl McpTarget {
+    pub fn deliver(self, outcome: Result<McpOpOutput, crate::mcp::ops::OpError>) {
+        match self {
+            McpTarget::Viewer { viewer, id } => {
+                let resp = match &outcome {
+                    Ok(McpOpOutput::List(res)) => {
+                        crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                    }
+                    Ok(McpOpOutput::Op(res)) => {
+                        crate::rpc::response(id, serde_json::to_value(res).unwrap())
+                    }
+                    Err(err) => crate::rpc::error(id, err.code as i64, err.message.clone(), None),
+                };
+                let _ =
+                    viewer.send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
+            }
+            McpTarget::Launch { reply } => {
+                let res = match outcome.as_ref() {
+                    Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
+                    Ok(McpOpOutput::List(_)) => unreachable!(),
+                    Err(err) => Err(err.clone()),
+                };
+                let _ = reply.send(res);
+            }
+            McpTarget::SelfOp { reply } => {
+                let _ = reply.send(outcome);
+            }
+            McpTarget::None => {}
+        }
+    }
+
+    pub fn reply_error(self, code: i32, message: impl Into<String>) {
+        let err = crate::mcp::ops::OpError {
+            code,
+            message: message.into(),
+        };
+        self.deliver(Err(err));
+    }
+}
+
+pub struct QueuedMcpLaunch {
+    pub viewer_id: ViewerId,
+    pub names: Vec<String>,
+    pub confirm: Vec<String>,
+    pub reply:
+        tokio::sync::oneshot::Sender<Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>>,
 }
 
 pub struct ReactivationData {
@@ -177,11 +239,18 @@ pub enum SessionMsg {
             Result<crate::mcp::ops::OpResult, crate::mcp::ops::OpError>,
         >,
     },
+    McpSelfOp {
+        op: McpOpKind,
+        reason: Option<String>,
+        reply: tokio::sync::oneshot::Sender<Result<McpOpOutput, crate::mcp::ops::OpError>>,
+    },
     McpOpDone {
-        origin_viewer: Option<ViewerId>,
+        origin: McpOpOrigin,
         enabled: Vec<String>,
         change: String,
         changed: bool,
+        target: McpTarget,
+        outcome: Result<McpOpOutput, crate::mcp::ops::OpError>,
     },
     // from spawned recovery / helper tasks (I1)
     Reattached {
@@ -307,6 +376,7 @@ pub struct Session {
     pub last_started_upstream: Option<String>,
     pub last_usage: Option<honk_wire::Usage>,
     pub mcp_op_running: bool,
+    pub queued_mcp_launches: VecDeque<QueuedMcpLaunch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,6 +877,47 @@ impl Session {
         }
     }
 
+    fn fail_queued_on_gone(&mut self, reason: &str) {
+        // Fail all queued msgs with -32000
+        let msgs = std::mem::take(&mut self.queued_msgs);
+        for m in msgs {
+            match m {
+                SessionMsg::Prompt { viewer_id, id, .. }
+                | SessionMsg::Steer { viewer_id, id, .. }
+                | SessionMsg::Forward { viewer_id, id, .. }
+                | SessionMsg::McpOp { viewer_id, id, .. } => {
+                    let err_resp =
+                        crate::rpc::error(id, -32000, format!("Session is gone: {reason}"), None);
+                    self.send_to_viewer(viewer_id, err_resp);
+                }
+                SessionMsg::Internal { reply, .. } => {
+                    let _ = reply.send(Err(format!("Session is gone: {reason}")));
+                }
+                SessionMsg::McpLaunch { reply, .. } => {
+                    let _ = reply.send(Err(crate::mcp::ops::OpError {
+                        code: -32000,
+                        message: format!("Session is gone: {reason}"),
+                    }));
+                }
+                SessionMsg::McpSelfOp { reply, .. } => {
+                    let _ = reply.send(Err(crate::mcp::ops::OpError {
+                        code: -32000,
+                        message: format!("Session is gone: {reason}"),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        // Fail all queued mcp launches with -32000
+        for launch in self.queued_mcp_launches.drain(..) {
+            let _ = launch.reply.send(Err(crate::mcp::ops::OpError {
+                code: -32000,
+                message: format!("Session is gone: {reason}"),
+            }));
+        }
+    }
+
     async fn handle_gone(&mut self) {
         if self.state == ActorState::Gone || self.reactivating {
             tracing::warn!(
@@ -875,6 +986,7 @@ impl Session {
                 "Session {} has no attached viewers; retiring session for lazy re-activation",
                 self.sid
             );
+            self.fail_queued_on_gone("upstream_gone");
             let sid = self.sid.clone();
             let epoch = self.log.head().epoch;
             {
@@ -1448,6 +1560,7 @@ impl Session {
         for m in msgs {
             Box::pin(self.on_msg(m)).await;
         }
+        self.check_queued_mcp_launches();
     }
 
     pub fn prune_closed_internal_requests(&mut self) {
@@ -1469,6 +1582,7 @@ impl Session {
             && self.pending_server_requests.is_empty()
             && self.pending_requests.is_empty()
             && self.queued_msgs.is_empty()
+            && self.queued_mcp_launches.is_empty()
             && self.active_probe_id.is_none()
             && !self.gap_synthesis_pending
             && self.state == ActorState::Live
@@ -1571,7 +1685,8 @@ impl Session {
                         match msg {
                             SessionMsg::Prompt { viewer, id, .. }
                             | SessionMsg::Steer { viewer, id, .. }
-                            | SessionMsg::Forward { viewer, id, .. } => {
+                            | SessionMsg::Forward { viewer, id, .. }
+                            | SessionMsg::McpOp { viewer, id, .. } => {
                                 let err_frame =
                                     crate::rpc::error(id, e.code, e.message.clone(), None);
                                 let _ = viewer.send_frame(axum::extract::ws::Message::Text(
@@ -1584,6 +1699,23 @@ impl Session {
                                 let _ = viewer.send_frame(axum::extract::ws::Message::Text(
                                     err_frame.to_string().into(),
                                 ));
+                            }
+                            SessionMsg::McpOpDone {
+                                target, outcome, ..
+                            } => {
+                                target.deliver(outcome);
+                            }
+                            SessionMsg::McpLaunch { reply, .. } => {
+                                let _ = reply.send(Err(crate::mcp::ops::OpError {
+                                    code: e.code as i32,
+                                    message: e.message.clone(),
+                                }));
+                            }
+                            SessionMsg::McpSelfOp { reply, .. } => {
+                                let _ = reply.send(Err(crate::mcp::ops::OpError {
+                                    code: e.code as i32,
+                                    message: e.message.clone(),
+                                }));
                             }
                             _ => {}
                         }
@@ -2412,12 +2544,29 @@ impl Session {
         }
     }
 
-    fn spawn_mcp_task(
-        &mut self,
-        origin_viewer: Option<ViewerId>,
-        op: McpOpKind,
-        target: McpTarget,
-    ) {
+    fn check_queued_mcp_launches(&mut self) {
+        if self.mcp_op_running {
+            return;
+        }
+        if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+            return;
+        }
+        if let Some(launch) = self.queued_mcp_launches.pop_front() {
+            self.mcp_op_running = true;
+            self.spawn_mcp_task(
+                McpOpOrigin::Viewer(Some(launch.viewer_id)),
+                McpOpKind::Enable {
+                    names: launch.names,
+                    confirm: launch.confirm,
+                },
+                McpTarget::Launch {
+                    reply: launch.reply,
+                },
+            );
+        }
+    }
+
+    fn spawn_mcp_task(&mut self, origin: McpOpOrigin, op: McpOpKind, target: McpTarget) {
         let is_list = matches!(op, McpOpKind::List);
         let mcp_config = match &self.hub.mcp {
             Some(cfg) => cfg.clone(),
@@ -2429,17 +2578,8 @@ impl Session {
                     code: -32601,
                     message: "MCP catalog not configured (honkd --mcp-catalog)".to_string(),
                 };
-                match target {
-                    McpTarget::Viewer { viewer, id } => {
-                        let err_resp = crate::rpc::error(id, err.code as i64, err.message, None);
-                        let _ = viewer.send_frame(axum::extract::ws::Message::Text(
-                            err_resp.to_string().into(),
-                        ));
-                    }
-                    McpTarget::Launch { reply } => {
-                        let _ = reply.send(Err(err));
-                    }
-                }
+                target.deliver(Err(err));
+                self.check_queued_mcp_launches();
                 return;
             }
         };
@@ -2450,119 +2590,146 @@ impl Session {
             tx: self_tx.clone(),
         };
 
-        let task = tokio::spawn(async move {
-            let budget = std::time::Duration::from_secs(60);
-            let work = async {
-                let mut catalog = match &mcp_config.catalog_path {
-                    Some(path) => crate::mcp::catalog::Catalog::load(path)
-                        .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
-                    None => crate::mcp::catalog::Catalog::default(),
+        let agent_reason: Option<String> = match &origin {
+            McpOpOrigin::Agent { reason } => reason.clone(),
+            McpOpOrigin::Viewer(_) => None,
+        };
+        let is_agent = matches!(origin, McpOpOrigin::Agent { .. });
+
+        if is_list {
+            tokio::spawn(async move {
+                let budget = if is_agent {
+                    MCP_AGENT_WORKER_TIMEOUT
+                } else {
+                    MCP_VIEWER_WORKER_TIMEOUT
                 };
-                if let Some(swarm) = &mcp_config.swarm {
-                    catalog.merge_swarm_entry(swarm, &sid);
+                let work = async {
+                    let mut catalog = match &mcp_config.catalog_path {
+                        Some(path) => crate::mcp::catalog::Catalog::load(path)
+                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
+                        None => crate::mcp::catalog::Catalog::default(),
+                    };
+                    if let Some(swarm) = &mcp_config.swarm {
+                        catalog.merge_swarm_entry(swarm, &sid);
+                    }
+                    let res = crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
+                        .await?;
+                    Ok(McpOpOutput::List(res))
+                };
+                let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
+                    match tokio::time::timeout(budget, work).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            let msg = if is_agent {
+                                "timed out; the change may still land; call mcp_list"
+                            } else {
+                                "MCP change timed out; run /mcp to see the current state"
+                            };
+                            Err(crate::mcp::ops::OpError::request_failed(msg))
+                        }
+                    };
+                target.deliver(outcome);
+            });
+            return;
+        }
+
+        tokio::spawn(async move {
+            let work_task = tokio::spawn(async move {
+                let budget = if is_agent {
+                    MCP_AGENT_WORKER_TIMEOUT
+                } else {
+                    MCP_VIEWER_WORKER_TIMEOUT
+                };
+                let work = async {
+                    let mut catalog = match &mcp_config.catalog_path {
+                        Some(path) => crate::mcp::catalog::Catalog::load(path)
+                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
+                        None => crate::mcp::catalog::Catalog::default(),
+                    };
+                    if let Some(swarm) = &mcp_config.swarm {
+                        catalog.merge_swarm_entry(swarm, &sid);
+                    }
+                    match op {
+                        McpOpKind::List => unreachable!(),
+                        McpOpKind::Enable { names, confirm } => {
+                            let reason_policy = if is_agent {
+                                crate::mcp::ops::ReasonPolicy::Required(agent_reason.as_deref())
+                            } else {
+                                crate::mcp::ops::ReasonPolicy::NotRequired
+                            };
+                            let res = crate::mcp::ops::enable_with_reason(
+                                &requester,
+                                &catalog,
+                                &mcp_config.policy,
+                                &sid,
+                                &names,
+                                &confirm,
+                                reason_policy,
+                            )
+                            .await?;
+                            Ok(McpOpOutput::Op(res))
+                        }
+                        McpOpKind::Disable { names } => {
+                            let res = crate::mcp::ops::disable(
+                                &requester,
+                                &catalog,
+                                &mcp_config.policy,
+                                &sid,
+                                &names,
+                            )
+                            .await?;
+                            Ok(McpOpOutput::Op(res))
+                        }
+                    }
+                };
+
+                match tokio::time::timeout(budget, work).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        let msg = if is_agent {
+                            "timed out; the change may still land; call mcp_list"
+                        } else {
+                            "MCP change timed out; run /mcp to see the current state"
+                        };
+                        Err(crate::mcp::ops::OpError::request_failed(msg))
+                    }
                 }
-                match op {
-                    McpOpKind::List => {
-                        let res =
-                            crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
-                                .await?;
-                        Ok(McpOpOutput::List(res))
-                    }
-                    McpOpKind::Enable { names, confirm } => {
-                        let res = crate::mcp::ops::enable(
-                            &requester,
-                            &catalog,
-                            &mcp_config.policy,
-                            &sid,
-                            &names,
-                            &confirm,
-                        )
-                        .await?;
-                        Ok(McpOpOutput::Op(res))
-                    }
-                    McpOpKind::Disable { names } => {
-                        let res = crate::mcp::ops::disable(
-                            &requester,
-                            &catalog,
-                            &mcp_config.policy,
-                            &sid,
-                            &names,
-                        )
-                        .await?;
-                        Ok(McpOpOutput::Op(res))
-                    }
+            });
+
+            let outcome = match work_task.await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!("MCP operation task panicked or was cancelled: {e}");
+                    Err(crate::mcp::ops::OpError::request_failed(
+                        "MCP operation failed unexpectedly",
+                    ))
                 }
             };
 
-            let outcome: Result<McpOpOutput, crate::mcp::ops::OpError> =
-                match tokio::time::timeout(budget, work).await {
-                    Ok(res) => res,
-                    Err(_) => Err(crate::mcp::ops::OpError::request_failed(
-                        "MCP change timed out; run /mcp to see the current state",
-                    )),
-                };
-
-            match target {
-                McpTarget::Viewer { viewer, id } => {
-                    let resp = match &outcome {
-                        Ok(McpOpOutput::List(res)) => {
-                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
-                        }
-                        Ok(McpOpOutput::Op(res)) => {
-                            crate::rpc::response(id, serde_json::to_value(res).unwrap())
-                        }
-                        Err(err) => {
-                            crate::rpc::error(id, err.code as i64, err.message.clone(), None)
-                        }
-                    };
-                    let _ = viewer
-                        .send_frame(axum::extract::ws::Message::Text(resp.to_string().into()));
+            let (enabled, change, changed) = match &outcome {
+                Ok(McpOpOutput::Op(res)) => {
+                    (res.enabled.clone(), res.summary.clone(), res.has_changes())
                 }
-                McpTarget::Launch { reply } => {
-                    let res = match outcome.as_ref() {
-                        Ok(McpOpOutput::Op(res)) => Ok(res.clone()),
-                        Ok(McpOpOutput::List(_)) => unreachable!(),
-                        Err(err) => Err(err.clone()),
-                    };
-                    let _ = reply.send(res);
-                }
-            }
+                _ => (Vec::new(), String::new(), false),
+            };
 
-            if !is_list {
-                let (enabled, change, changed) = match &outcome {
-                    Ok(McpOpOutput::Op(res)) => {
-                        (res.enabled.clone(), res.summary.clone(), res.has_changes())
-                    }
-                    _ => (Vec::new(), String::new(), false),
-                };
-                let _ = self_tx
-                    .send(SessionMsg::McpOpDone {
-                        origin_viewer,
-                        enabled,
-                        change,
-                        changed,
-                    })
-                    .await;
+            if let Err(tokio::sync::mpsc::error::SendError(SessionMsg::McpOpDone {
+                target, ..
+            })) = self_tx
+                .send(SessionMsg::McpOpDone {
+                    origin,
+                    enabled,
+                    change,
+                    changed,
+                    target,
+                    outcome,
+                })
+                .await
+            {
+                // Session actor is gone; deliver error to target
+                target.reply_error(-32000, "session terminated");
             }
         });
-
-        if !is_list {
-            let watcher_tx = self.self_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = task.await
-                    && (e.is_panic() || e.is_cancelled())
-                {
-                    let _ = watcher_tx
-                        .send(SessionMsg::McpOpDone {
-                            origin_viewer: None,
-                            enabled: Vec::new(),
-                            change: String::new(),
-                            changed: false,
-                        })
-                        .await;
-                }
-            });
-        }
     }
 
     async fn on_msg(&mut self, msg: SessionMsg) {
@@ -3087,7 +3254,11 @@ impl Session {
                     self.mcp_op_running = true;
                 }
 
-                self.spawn_mcp_task(Some(viewer_id), op, McpTarget::Viewer { viewer, id });
+                self.spawn_mcp_task(
+                    McpOpOrigin::Viewer(Some(viewer_id)),
+                    op,
+                    McpTarget::Viewer { viewer, id },
+                );
             }
             SessionMsg::McpLaunch {
                 viewer_id,
@@ -3112,18 +3283,74 @@ impl Session {
                     return;
                 }
 
+                if self.mcp_op_running {
+                    if self.queued_mcp_launches.len() >= 1024 {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
+                        }));
+                    } else {
+                        self.queued_mcp_launches.push_back(QueuedMcpLaunch {
+                            viewer_id,
+                            names,
+                            confirm,
+                            reply,
+                        });
+                    }
+                    return;
+                }
+
                 self.mcp_op_running = true;
                 self.spawn_mcp_task(
-                    Some(viewer_id),
+                    McpOpOrigin::Viewer(Some(viewer_id)),
                     McpOpKind::Enable { names, confirm },
                     McpTarget::Launch { reply },
                 );
             }
+            SessionMsg::McpSelfOp { op, reason, reply } => {
+                if reply.is_closed() {
+                    tracing::info!("dropping self-op whose caller timed out");
+                    return;
+                }
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    if self.queued_msgs.len() >= 1024 {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32603,
+                            message: "Session message queue full".to_string(),
+                        }));
+                    } else {
+                        self.queued_msgs
+                            .push_back(SessionMsg::McpSelfOp { op, reason, reply });
+                    }
+                    return;
+                }
+
+                let is_list = matches!(op, McpOpKind::List);
+                if !is_list {
+                    // No busy refusal for turn.run / turn.inflight (agent's own turn is running)
+                    if self.mcp_op_running {
+                        let _ = reply.send(Err(crate::mcp::ops::OpError {
+                            code: -32002,
+                            message: "another /mcp change is in progress".to_string(),
+                        }));
+                        return;
+                    }
+                    self.mcp_op_running = true;
+                }
+
+                self.spawn_mcp_task(
+                    McpOpOrigin::Agent { reason },
+                    op,
+                    McpTarget::SelfOp { reply },
+                );
+            }
             SessionMsg::McpOpDone {
-                origin_viewer,
+                origin,
                 enabled,
                 change,
                 changed,
+                target,
+                outcome,
             } => {
                 self.mcp_op_running = false;
                 if changed {
@@ -3136,25 +3363,51 @@ impl Session {
                             },
                         )
                         .collect();
-                    for vid in viewers {
-                        let origin = if Some(vid) == origin_viewer {
-                            "you"
-                        } else {
-                            "other"
-                        };
-                        let frame = json!({
-                            "jsonrpc": "2.0",
-                            "method": "_honk/mcp_changed",
-                            "params": {
+
+                    match &origin {
+                        McpOpOrigin::Agent { reason } => {
+                            let mut params = json!({
                                 "sessionId": self.sid,
                                 "enabled": enabled,
                                 "change": change,
-                                "origin": origin,
+                                "origin": "agent",
+                            });
+                            if let Some(r) = reason {
+                                params["reason"] = json!(r);
                             }
-                        });
-                        self.send_to_viewer(vid, frame);
+                            let frame = json!({
+                                "jsonrpc": "2.0",
+                                "method": "_honk/mcp_changed",
+                                "params": params,
+                            });
+                            for vid in viewers {
+                                self.send_to_viewer(vid, frame.clone());
+                            }
+                        }
+                        McpOpOrigin::Viewer(origin_viewer) => {
+                            for vid in viewers {
+                                let origin_str = if Some(vid) == *origin_viewer {
+                                    "you"
+                                } else {
+                                    "other"
+                                };
+                                let frame = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "_honk/mcp_changed",
+                                    "params": {
+                                        "sessionId": self.sid,
+                                        "enabled": enabled,
+                                        "change": change,
+                                        "origin": origin_str,
+                                    }
+                                });
+                                self.send_to_viewer(vid, frame);
+                            }
+                        }
                     }
                 }
+                target.deliver(outcome);
+                self.check_queued_mcp_launches();
             }
             SessionMsg::Reattached { outcome } => {
                 self.on_reattached(outcome).await;
@@ -3502,34 +3755,7 @@ impl Session {
                     }
                 }
 
-                // Fail all queued msgs with -32000
-                let msgs = std::mem::take(&mut self.queued_msgs);
-                for m in msgs {
-                    match m {
-                        SessionMsg::Prompt { viewer_id, id, .. }
-                        | SessionMsg::Steer { viewer_id, id, .. }
-                        | SessionMsg::Forward { viewer_id, id, .. }
-                        | SessionMsg::McpOp { viewer_id, id, .. } => {
-                            let err_resp = crate::rpc::error(
-                                id,
-                                -32000,
-                                format!("Session is gone: {reason}"),
-                                None,
-                            );
-                            self.send_to_viewer(viewer_id, err_resp);
-                        }
-                        SessionMsg::Internal { reply, .. } => {
-                            let _ = reply.send(Err(format!("Session is gone: {reason}")));
-                        }
-                        SessionMsg::McpLaunch { reply, .. } => {
-                            let _ = reply.send(Err(crate::mcp::ops::OpError {
-                                code: -32000,
-                                message: format!("Session is gone: {reason}"),
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
+                self.fail_queued_on_gone(&reason);
 
                 // Notify honk-aware viewers with _honk/evicted
                 let evicted_frame = json!({
@@ -4460,6 +4686,7 @@ mod tests {
             last_started_upstream: None,
             last_usage: seeded_usage,
             mcp_op_running: false,
+            queued_mcp_launches: VecDeque::new(),
         };
 
         // 1. Upstream frame with method != "session/update" must NOT update last_usage
@@ -4606,42 +4833,44 @@ mod tests {
         .unwrap();
         let (up_handle, event_rx) = up.split();
 
+        let hub = Arc::new(crate::hub::Hub {
+            args: Arc::new(
+                crate::config::Args::try_parse_from([
+                    "honkd",
+                    "--upstream-secret-file",
+                    fake.secret_file().to_str().unwrap(),
+                ])
+                .unwrap(),
+            ),
+            state: state_store.clone(),
+            state_dir: d.path().to_path_buf(),
+            upstream_url: fake.url(),
+            upstream_secret: fake.secret().to_string(),
+            turn_hook: None,
+            control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
+            control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
+            is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control_connected_notify: Arc::new(tokio::sync::Notify::new()),
+            control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
+            pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            self_weak: std::sync::RwLock::new(None),
+            activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            mcp: None,
+        });
+
         let session = Session {
             sid: sid.to_string(),
             state_dir: d.path().to_path_buf(),
             state_store: state_store.clone(),
-            hub: Arc::new(crate::hub::Hub {
-                args: Arc::new(
-                    crate::config::Args::try_parse_from([
-                        "honkd",
-                        "--upstream-secret-file",
-                        fake.secret_file().to_str().unwrap(),
-                    ])
-                    .unwrap(),
-                ),
-                state: state_store.clone(),
-                state_dir: d.path().to_path_buf(),
-                upstream_url: fake.url(),
-                upstream_secret: fake.secret().to_string(),
-                turn_hook: None,
-                control: Arc::new(tokio::sync::RwLock::new(up_handle.clone())),
-                control_init_result: Arc::new(std::sync::RwLock::new(json!({}))),
-                is_control_connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                upstream_unpatched_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                control_connected_notify: Arc::new(tokio::sync::Notify::new()),
-                control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
-                upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
-                pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-                running_sessions: Arc::new(std::sync::RwLock::new(HashSet::new())),
-                self_weak: std::sync::RwLock::new(None),
-                activating: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                evicting: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                mcp: None,
-            }),
+            hub,
             up: up_handle,
             events: event_rx,
             rx,
@@ -4680,6 +4909,7 @@ mod tests {
             last_started_upstream: None,
             last_usage: None,
             mcp_op_running: false,
+            queued_mcp_launches: VecDeque::new(),
         };
         (session, d, fake)
     }
@@ -4709,6 +4939,16 @@ mod tests {
             })
             .await;
         assert_eq!(session.queued_msgs.len(), 2);
+
+        let (self_reply_tx, _self_reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::List,
+                reason: None,
+                reply: self_reply_tx,
+            })
+            .await;
+        assert_eq!(session.queued_msgs.len(), 3);
     }
 
     #[tokio::test]
@@ -4918,10 +5158,18 @@ mod tests {
 
         session
             .on_msg(SessionMsg::McpOpDone {
-                origin_viewer: Some(1),
+                origin: McpOpOrigin::Viewer(Some(1)),
                 enabled: vec!["slack".to_string()],
                 change: "enabled slack".to_string(),
                 changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec!["slack".to_string()],
+                    summary: "enabled slack".to_string(),
+                })),
             })
             .await;
 
@@ -4945,6 +5193,239 @@ mod tests {
 
         // Viewer 3 (legacy) receives NOTHING
         assert!(v3_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_not_busy_during_turn() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_self_op_busy_test", ActorState::Live).await;
+
+        // Simulate active turn
+        session.turn.run = Some("run_active_456".to_string());
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["slack-ro".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        // Since hub.mcp is None in create_test_session, it proceeds past busy check and returns catalog unconfigured (-32601)
+        let res = reply_rx.await.unwrap();
+        assert_eq!(res.unwrap_err().code, -32601);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_refused_when_another_op_running() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_self_op_in_prog", ActorState::Live).await;
+        session.mcp_op_running = true;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["slack-ro".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        let res = reply_rx.await.unwrap();
+        let err = res.unwrap_err();
+        assert_eq!(err.code, -32002);
+        assert_eq!(err.message, "another /mcp change is in progress");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_op_done_fanout_agent_origin_and_reason() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_mcp_done_agent_test", ActorState::Live).await;
+        session.mcp_op_running = true;
+
+        let (v1_tx, mut v1_rx) = tokio::sync::mpsc::channel(10);
+        let (v2_tx, mut v2_rx) = tokio::sync::mpsc::channel(10);
+        let (v3_tx, mut v3_rx) = tokio::sync::mpsc::channel(10);
+
+        session.attach_live(1, test_viewer_tx(v1_tx), true);
+        session.attach_live(2, test_viewer_tx(v2_tx), true);
+        session.attach_live(3, test_viewer_tx(v3_tx), false);
+
+        // Drain synthetic session_info_update from legacy viewer v3
+        let _ = v3_rx.recv().await.unwrap();
+
+        // 1. With reason
+        session
+            .on_msg(SessionMsg::McpOpDone {
+                origin: McpOpOrigin::Agent {
+                    reason: Some("investigate incident".to_string()),
+                },
+                enabled: vec!["slack".to_string()],
+                change: "enabled slack".to_string(),
+                changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec!["slack".to_string()],
+                    summary: "enabled slack".to_string(),
+                })),
+            })
+            .await;
+
+        assert!(!session.mcp_op_running);
+
+        let f1 = v1_rx.recv().await.unwrap();
+        let f1_json: Value = serde_json::from_str(f1.to_text().unwrap()).unwrap();
+        assert_eq!(f1_json["method"], "_honk/mcp_changed");
+        assert_eq!(f1_json["params"]["origin"], "agent");
+        assert_eq!(f1_json["params"]["reason"], "investigate incident");
+        assert_eq!(f1_json["params"]["change"], "enabled slack");
+        assert_eq!(f1_json["params"]["enabled"], json!(["slack"]));
+
+        let f2 = v2_rx.recv().await.unwrap();
+        let f2_json: Value = serde_json::from_str(f2.to_text().unwrap()).unwrap();
+        assert_eq!(f2_json["method"], "_honk/mcp_changed");
+        assert_eq!(f2_json["params"]["origin"], "agent");
+        assert_eq!(f2_json["params"]["reason"], "investigate incident");
+
+        // Legacy viewer v3 receives nothing
+        assert!(v3_rx.try_recv().is_err());
+
+        // 2. Without reason
+        session.mcp_op_running = true;
+        session
+            .on_msg(SessionMsg::McpOpDone {
+                origin: McpOpOrigin::Agent { reason: None },
+                enabled: vec![],
+                change: "disabled slack".to_string(),
+                changed: true,
+                target: McpTarget::None,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec![],
+                    summary: "disabled slack".to_string(),
+                })),
+            })
+            .await;
+
+        let f1_no_reason = v1_rx.recv().await.unwrap();
+        let f1_no_reason_json: Value =
+            serde_json::from_str(f1_no_reason.to_text().unwrap()).unwrap();
+        assert_eq!(f1_no_reason_json["params"]["origin"], "agent");
+        assert!(f1_no_reason_json["params"].get("reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_task_timeout_message_agent_vs_viewer() {
+        tokio::time::pause();
+
+        let (mut session, _d, _fake) =
+            create_test_session("ses_timeout_msg_test", ActorState::Live).await;
+        let tmp_cat = tempfile::tempdir().unwrap();
+        let cat_path = tmp_cat.path().join("opencode.json");
+        std::fs::write(
+            &cat_path,
+            json!({
+                "mcp": {
+                    "local-test": {
+                        "type": "local",
+                        "command": ["echo"]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut session.hub).unwrap().mcp = Some(crate::mcp::McpConfig {
+            catalog_path: Some(cat_path),
+            policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
+            swarm: None,
+        });
+
+        // 1. Agent origin timeout
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = internal1 {
+            tokio::time::advance(Duration::from_secs(35)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _internal2 = session.rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        let done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(done_msg).await;
+        assert!(!session.mcp_op_running);
+
+        let err_agent = reply_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err_agent.code, -32603);
+        assert_eq!(
+            err_agent.message,
+            "timed out; the change may still land; call mcp_list"
+        );
+
+        // 2. Viewer origin timeout
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                id: json!(42),
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let v_internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = v_internal1 {
+            tokio::time::advance(Duration::from_secs(35)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _v_internal2 = session.rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        let v_done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(v_done_msg).await;
+        assert!(!session.mcp_op_running);
+
+        let frame = v_rx.recv().await.unwrap();
+        let frame_json: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame_json["error"]["code"], -32603);
+        assert_eq!(
+            frame_json["error"]["message"],
+            "MCP change timed out; run /mcp to see the current state"
+        );
     }
 
     #[tokio::test]
@@ -4980,5 +5461,330 @@ mod tests {
         let err = reply_rx.await.unwrap().unwrap_err();
         assert!(err.contains("Internal error"));
         assert!(err.contains("cannot read /path/to/secret"));
+    }
+
+    #[tokio::test]
+    async fn test_return_undelivered_to_hub_mcp_messages() {
+        let (mut session, _d, fake) =
+            create_test_session("ses_undelivered_mcp", ActorState::Live).await;
+        *session.hub.self_weak.write().unwrap() = Some(Arc::downgrade(&session.hub));
+
+        // Drop fake server so get_or_activate_session will fail
+        drop(fake);
+
+        // 1. McpOpDone: target should receive the computed outcome
+        let (done_reply_tx, done_reply_rx) = tokio::sync::oneshot::channel();
+        let done_target = McpTarget::SelfOp {
+            reply: done_reply_tx,
+        };
+        session
+            .self_tx
+            .send(SessionMsg::McpOpDone {
+                origin: McpOpOrigin::Viewer(Some(1)),
+                enabled: vec![],
+                change: "".to_string(),
+                changed: false,
+                target: done_target,
+                outcome: Ok(McpOpOutput::Op(crate::mcp::ops::OpResult {
+                    results: vec![],
+                    servers: vec![],
+                    other: vec![],
+                    enabled: vec![],
+                    summary: "ok".to_string(),
+                })),
+            })
+            .await
+            .unwrap();
+
+        // 2. McpOp: viewer should receive an error frame
+        let (viewer_tx, mut viewer_rx) = tokio::sync::mpsc::channel(10);
+        let vtx = test_viewer_tx(viewer_tx);
+        session
+            .self_tx
+            .send(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: vtx,
+                id: json!(99),
+                op: McpOpKind::List,
+            })
+            .await
+            .unwrap();
+
+        // 3. McpLaunch: reply oneshot should receive Err(OpError)
+        let (launch_tx, launch_rx) = tokio::sync::oneshot::channel();
+        session
+            .self_tx
+            .send(SessionMsg::McpLaunch {
+                viewer_id: 1,
+                names: vec!["slack".to_string()],
+                confirm: vec![],
+                reply: launch_tx,
+            })
+            .await
+            .unwrap();
+
+        // 4. McpSelfOp: reply oneshot should receive Err(OpError)
+        let (self_op_tx, self_op_rx) = tokio::sync::oneshot::channel();
+        session
+            .self_tx
+            .send(SessionMsg::McpSelfOp {
+                op: McpOpKind::List,
+                reason: None,
+                reply: self_op_tx,
+            })
+            .await
+            .unwrap();
+
+        // Call return_undelivered_to_hub
+        session.return_undelivered_to_hub();
+
+        // Verify done_reply_rx got Ok outcome
+        let done_res = tokio::time::timeout(Duration::from_secs(5), done_reply_rx)
+            .await
+            .expect("timeout waiting for done_reply_rx")
+            .expect("done_reply_rx channel closed");
+        assert!(done_res.is_ok());
+
+        // Verify viewer got error frame
+        let frame = tokio::time::timeout(Duration::from_secs(5), viewer_rx.recv())
+            .await
+            .expect("timeout waiting for viewer_rx")
+            .expect("viewer_rx closed");
+        let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(v["id"], 99);
+        assert!(v.get("error").is_some());
+
+        // Verify launch_rx got Err(OpError)
+        let launch_res = tokio::time::timeout(Duration::from_secs(5), launch_rx)
+            .await
+            .expect("timeout waiting for launch_rx")
+            .expect("launch_rx channel closed");
+        assert!(launch_res.is_err());
+
+        // Verify self_op_rx got Err(OpError)
+        let self_op_res = tokio::time::timeout(Duration::from_secs(5), self_op_rx)
+            .await
+            .expect("timeout waiting for self_op_rx")
+            .expect("self_op_rx channel closed");
+        assert!(self_op_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_gone_no_viewers_drains_queued_mcp() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_gone_no_viewers", ActorState::Live).await;
+
+        // No viewers attached
+        assert!(session.viewers.is_empty());
+
+        // Queue McpLaunch in queued_mcp_launches
+        let (launch_tx, launch_rx) = tokio::sync::oneshot::channel();
+        session.queued_mcp_launches.push_back(QueuedMcpLaunch {
+            viewer_id: 1,
+            names: vec!["slack".to_string()],
+            confirm: vec![],
+            reply: launch_tx,
+        });
+
+        // Queue McpSelfOp in queued_msgs
+        let (self_op_tx, self_op_rx) = tokio::sync::oneshot::channel();
+        session.queued_msgs.push_back(SessionMsg::McpSelfOp {
+            op: McpOpKind::List,
+            reason: None,
+            reply: self_op_tx,
+        });
+
+        // Trigger handle_gone
+        session.handle_gone().await;
+
+        assert_eq!(session.state, ActorState::Gone);
+
+        // Verify launch_rx received -32000 "Session is gone: upstream_gone"
+        let launch_err = tokio::time::timeout(Duration::from_millis(500), launch_rx)
+            .await
+            .expect("timeout waiting for launch_rx")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(launch_err.code, -32000);
+        assert_eq!(launch_err.message, "Session is gone: upstream_gone");
+
+        // Verify self_op_rx received -32000 "Session is gone: upstream_gone"
+        let self_op_err = tokio::time::timeout(Duration::from_millis(500), self_op_rx)
+            .await
+            .expect("timeout waiting for self_op_rx")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(self_op_err.code, -32000);
+        assert_eq!(self_op_err.message, "Session is gone: upstream_gone");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_staggered_timeouts() {
+        assert_eq!(MCP_AGENT_WORKER_TIMEOUT, Duration::from_secs(55));
+        assert_eq!(MCP_VIEWER_WORKER_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(
+            crate::downstream::MCP_HTTP_DEADLINE,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_staggered_timeout_agent_fires_before_viewer() {
+        tokio::time::pause();
+
+        let (mut session, _d, _fake) =
+            create_test_session("ses_stagger_timeout_test", ActorState::Live).await;
+        let tmp_cat = tempfile::tempdir().unwrap();
+        let cat_path = tmp_cat.path().join("opencode.json");
+        std::fs::write(
+            &cat_path,
+            json!({
+                "mcp": {
+                    "local-test": {
+                        "type": "local",
+                        "command": ["echo"]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut session.hub).unwrap().mcp = Some(crate::mcp::McpConfig {
+            catalog_path: Some(cat_path),
+            policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
+            swarm: None,
+        });
+
+        // 1. Agent origin op
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = internal1 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _internal2 = session.rx.recv().await.unwrap();
+        // Advance 26s (total 56s > 55s agent budget)
+        tokio::time::advance(Duration::from_secs(26)).await;
+        tokio::task::yield_now().await;
+
+        // Session receives McpOpDone from the timed out task
+        let done_msg = session.rx.recv().await.unwrap();
+        session.on_msg(done_msg).await;
+
+        let err_agent = reply_rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(err_agent.code, -32603);
+        assert_eq!(
+            err_agent.message,
+            "timed out; the change may still land; call mcp_list"
+        );
+
+        // 2. Viewer origin op
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::McpOp {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                id: json!(42),
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+            })
+            .await;
+
+        tokio::task::yield_now().await;
+        let v_internal1 = session.rx.recv().await.unwrap();
+        if let SessionMsg::Internal { reply, .. } = v_internal1 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            let _ = reply.send(Ok(json!([])));
+        }
+
+        tokio::task::yield_now().await;
+        let _v_internal2 = session.rx.recv().await.unwrap();
+        // Advance 26s (total 56s < 60s viewer budget, so it must NOT have timed out yet)
+        tokio::time::advance(Duration::from_secs(26)).await;
+        tokio::task::yield_now().await;
+
+        // No McpOpDone in session.rx yet because 56s < 60s
+        assert!(session.rx.try_recv().is_err());
+        assert!(session.mcp_op_running);
+
+        // Advance another 5 seconds (total 61s > 60s)
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        // Now viewer McpOpDone arrives
+        let v_done = session.rx.recv().await.unwrap();
+        session.on_msg(v_done).await;
+        assert!(!session.mcp_op_running);
+        let frame = v_rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "MCP change timed out; run /mcp to see the current state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_self_op_dropped_when_reply_closed() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_closed_reply_test", ActorState::Live).await;
+        Arc::get_mut(&mut session.hub).unwrap().mcp = Some(crate::mcp::McpConfig {
+            catalog_path: None,
+            policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
+            swarm: None,
+        });
+
+        // 1. Immediate McpSelfOp with closed reply
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        drop(reply_rx); // Caller timed out / disconnected
+
+        session
+            .on_msg(SessionMsg::McpSelfOp {
+                op: McpOpKind::Enable {
+                    names: vec!["local-test".to_string()],
+                    confirm: vec![],
+                },
+                reason: None,
+                reply: reply_tx,
+            })
+            .await;
+
+        assert!(!session.mcp_op_running, "mcp_op_running must stay false");
+        assert!(session.rx.try_recv().is_err(), "no task should be spawned");
+
+        // 2. Drained from queued_msgs with closed reply
+        let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+        drop(reply_rx2); // Caller timed out while queued
+
+        session.state = ActorState::Rebuilding;
+        session.queued_msgs.push_back(SessionMsg::McpSelfOp {
+            op: McpOpKind::Enable {
+                names: vec!["local-test".to_string()],
+                confirm: vec![],
+            },
+            reason: None,
+            reply: reply_tx2,
+        });
+
+        session.state = ActorState::Live;
+        session.drain_queued_msgs().await;
+
+        assert!(!session.mcp_op_running, "mcp_op_running must stay false");
+        assert!(session.rx.try_recv().is_err(), "no task should be spawned");
     }
 }

@@ -49,11 +49,18 @@ pub struct Args {
     pub mcp_catalog: Option<PathBuf>,
     #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
     pub mcp_no_confirm: Vec<String>,
-    #[arg(long)]
+    #[arg(long, help = "Allow agents to self-grant MCP servers via POST /mcp/*")]
+    pub mcp_self_grant: bool,
+    #[arg(
+        long,
+        help = "Enable swarm MCP by default on session/new (requires --swarm-mcp-bin and --swarm-pigeon-url)"
+    )]
+    pub swarm_default: bool,
+    #[arg(long, help = "Path to honk binary for built-in swarm MCP server")]
     pub swarm_mcp_bin: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Pigeon daemon base URL for swarm MCP")]
     pub swarm_pigeon_url: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Path to pigeon auth token file for swarm MCP")]
     pub swarm_pigeon_token_file: Option<PathBuf>,
 }
 
@@ -132,6 +139,7 @@ mod tests {
             .expect("parse args");
         assert_eq!(args.mcp_catalog, None);
         assert!(args.mcp_no_confirm.is_empty());
+        assert!(!args.mcp_self_grant);
     }
 
     #[test]
@@ -146,10 +154,12 @@ mod tests {
             "slack-ro,figma",
             "--mcp-no-confirm",
             "local-test",
+            "--mcp-self-grant",
         ])
         .expect("parse args");
         assert_eq!(args.mcp_catalog, Some(PathBuf::from("/tmp/opencode.json")));
         assert_eq!(args.mcp_no_confirm, vec!["slack-ro", "figma", "local-test"]);
+        assert!(args.mcp_self_grant);
     }
 
     #[test]
@@ -159,6 +169,7 @@ mod tests {
         assert_eq!(args.swarm_mcp_bin, None);
         assert_eq!(args.swarm_pigeon_url, None);
         assert_eq!(args.swarm_pigeon_token_file, None);
+        assert!(!args.swarm_default);
     }
 
     #[test]
@@ -167,6 +178,7 @@ mod tests {
             "honkd",
             "--upstream-secret-file",
             "/tmp/secret",
+            "--swarm-default",
             "--swarm-mcp-bin",
             "/etc/profiles/per-user/dev/bin/honk",
             "--swarm-pigeon-url",
@@ -175,6 +187,7 @@ mod tests {
             "/tmp/pigeon-token",
         ])
         .expect("parse args");
+        assert!(args.swarm_default);
         assert_eq!(
             args.swarm_mcp_bin,
             Some(PathBuf::from("/etc/profiles/per-user/dev/bin/honk"))
