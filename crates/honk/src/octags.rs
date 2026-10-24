@@ -1,11 +1,9 @@
-//! Tagging a new goose session in oc-tags, so it shows up under its program.
+//! Tagging a new goose session in oc-tags.
 //!
-//! oc-tags (a workstation tool) keeps a sidecar database of session -> tag. The
-//! nvim stall-watch picker (`,fp`) lists a program's sessions with
-//! `oc-tags sessions <tag>`, and spend reports group by the same tags. Goose
-//! sessions are stored there as `goose:<id>`, the same id the pickers use for
-//! their rows. `honk chat --new --tag <tag>` writes that tag when it creates the
-//! session, as `opencode-launch --tag` does for opencode sessions.
+//! oc-tags keeps a sidecar database of session -> tag. Goose sessions are
+//! stored there as `goose:<id>`. `honk chat --new` tags the new session,
+//! either explicitly with `--tag <tag>` or by inheriting the launching
+//! session's tag when unset.
 //!
 //! Tagging is bookkeeping, so it is best-effort: it runs in the background, it
 //! is time-bounded, and a failure is a warning that says how to apply the tag

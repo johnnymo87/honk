@@ -147,8 +147,10 @@ struct ChatArgs {
     #[arg(long = "no-swarm")]
     no_swarm: bool,
 
-    /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag),
-    /// so it is listed under that program. Runs $HONK_OC_TAGS_BIN or oc-tags.
+    /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag).
+    /// Inherits the launching session's tag by default if set; pass --tag <tag>
+    /// to set explicitly, or --tag auto to opt out of inheritance. Runs
+    /// $HONK_OC_TAGS_BIN or oc-tags.
     #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag_arg)]
     tag: Option<honk::octags::TagArg>,
 
