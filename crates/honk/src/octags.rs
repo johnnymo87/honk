@@ -19,6 +19,8 @@ pub const BIN_ENV: &str = "HONK_OC_TAGS_BIN";
 pub const DEFAULT_BIN: &str = "oc-tags";
 /// How long `oc-tags set` may take before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `oc-tags which` may take before it is killed.
+pub const DEFAULT_WHICH_TIMEOUT: Duration = Duration::from_secs(4);
 /// Environment variable indicating an opencode launcher session.
 pub const OPENCODE_SESSION_ID_ENV: &str = "OPENCODE_SESSION_ID";
 /// Environment variable indicating an agent launcher session (prefixed with goose:).
@@ -200,20 +202,232 @@ pub fn unconfirmed_text(settings: &TagSettings, goose_session_id: &str) -> Strin
     )
 }
 
-/// The chat notice for a tagging outcome.
-pub fn notice(
+/// The chat notice for a tagging outcome, with an optional suffix.
+pub fn notice_with_suffix(
     settings: &TagSettings,
     goose_session_id: &str,
     outcome: &anyhow::Result<String>,
+    suffix: Option<&str>,
 ) -> crate::chat::Notice {
     match outcome {
-        Ok(line) => crate::chat::Notice::info(format!("Tag: {line}")),
+        Ok(line) => {
+            let s = suffix.unwrap_or("");
+            crate::chat::Notice::info(format!("Tag: {line}{s}"))
+        }
         Err(e) => {
             let id = tagged_id(goose_session_id);
             crate::chat::Notice::warning(format!(
                 "Tag: '{tag}' not applied to {id}: {e:#}; apply it with: oc-tags set {tag} {id}",
                 tag = settings.tag
             ))
+        }
+    }
+}
+
+/// The chat notice for a tagging outcome.
+pub fn notice(
+    settings: &TagSettings,
+    goose_session_id: &str,
+    outcome: &anyhow::Result<String>,
+) -> crate::chat::Notice {
+    notice_with_suffix(settings, goose_session_id, outcome, None)
+}
+
+/// The outcome of querying the launcher session via `oc-tags which`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WhichOutcome {
+    /// Eligible session tag to inherit, with the root session id for attribution.
+    Inherit { tag: String, root: String },
+    /// No tag to inherit (`dir` or `auto` kind); silent.
+    Skip,
+    /// Query failed or tag was invalid.
+    Failure(String),
+}
+
+/// Queries `<bin> which -- <launcher>` to discover the launching session's tag.
+pub async fn query_launcher_tag(bin: &str, launcher: &str, timeout: Duration) -> WhichOutcome {
+    use tokio::io::AsyncReadExt;
+    let child = tokio::process::Command::new(bin)
+        .args(["which", "--", launcher])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return WhichOutcome::Failure(format!("'{bin}' not found"));
+        }
+        Err(e) => return WhichOutcome::Failure(format!("could not run '{bin}': {e}")),
+    };
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let run = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let read_out = async {
+            match stdout.as_mut() {
+                Some(s) => s.read_to_end(&mut out).await.map(|_| ()),
+                None => Ok(()),
+            }
+        };
+        let read_err = async {
+            match stderr.as_mut() {
+                Some(s) => s.read_to_end(&mut err).await.map(|_| ()),
+                None => Ok(()),
+            }
+        };
+        tokio::try_join!(read_out, read_err)?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    };
+    let res = tokio::time::timeout(timeout, run).await;
+    let (status, out, _err) = match res {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return WhichOutcome::Failure(format!("could not run '{bin}': {e}")),
+        Err(_) => {
+            let _ = child.start_kill();
+            return WhichOutcome::Failure(format!(
+                "'oc-tags which' failed (timed out after {timeout:?})"
+            ));
+        }
+    };
+    if !status.success() {
+        let reason = match status.code() {
+            Some(c) => format!("exit {c}"),
+            None => "killed by signal".to_string(),
+        };
+        return WhichOutcome::Failure(format!("'oc-tags which' failed ({reason})"));
+    }
+    let line = String::from_utf8_lossy(&out)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 4 || parts[3].is_empty() {
+        return WhichOutcome::Failure("'oc-tags which' printed no kind column".to_string());
+    }
+    let w_tag = parts[0];
+    let w_root = parts[2];
+    let w_kind = parts[3];
+    match w_kind {
+        "session" => match parse_tag(w_tag) {
+            Ok(valid_tag) => {
+                let root = if w_root.is_empty() {
+                    launcher.to_string()
+                } else {
+                    w_root.to_string()
+                };
+                WhichOutcome::Inherit {
+                    tag: valid_tag,
+                    root,
+                }
+            }
+            Err(_) => WhichOutcome::Failure(format!("its tag '{w_tag}' is not a valid launch tag")),
+        },
+        "dir" | "auto" => WhichOutcome::Skip,
+        unknown => WhichOutcome::Failure(format!("unknown tag kind '{unknown}'")),
+    }
+}
+
+/// Settings for querying and inheriting the launching session's tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InheritSettings {
+    pub launcher: String,
+    pub bin: String,
+    pub which_timeout: Duration,
+    pub set_timeout: Duration,
+}
+
+impl InheritSettings {
+    /// Uses `$HONK_OC_TAGS_BIN` when set and non-empty, else `oc-tags`.
+    pub fn new(launcher: impl Into<String>) -> Self {
+        let bin = std::env::var(BIN_ENV)
+            .ok()
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| DEFAULT_BIN.to_string());
+        Self {
+            launcher: launcher.into(),
+            bin,
+            which_timeout: DEFAULT_WHICH_TIMEOUT,
+            set_timeout: DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+/// What tagging action to take when a new session is created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagAction {
+    /// Explicit tag passed via `--tag <tag>`.
+    Explicit(TagSettings),
+    /// Inherit tag from the launching session if set.
+    Inherit(InheritSettings),
+}
+
+impl From<TagSettings> for TagAction {
+    fn from(settings: TagSettings) -> Self {
+        TagAction::Explicit(settings)
+    }
+}
+
+impl From<InheritSettings> for TagAction {
+    fn from(settings: InheritSettings) -> Self {
+        TagAction::Inherit(settings)
+    }
+}
+
+/// The warning for an unconfirmed tag action when honk exited.
+pub fn unconfirmed_action_text(action: &TagAction, goose_session_id: &str) -> String {
+    match action {
+        TagAction::Explicit(settings) => unconfirmed_text(settings, goose_session_id),
+        TagAction::Inherit(_) => {
+            let id = tagged_id(goose_session_id);
+            format!(
+                "Tag: tag for {id} was not confirmed before exit; check with: oc-tags which {id}"
+            )
+        }
+    }
+}
+
+/// Executes the specified tag action for a newly created session.
+///
+/// Returns `Some(Notice)` if a notice should be displayed in chat, or `None` if
+/// no tagging was performed (e.g. the launcher had kind `dir` or `auto`).
+pub async fn run_tag_action(
+    action: &TagAction,
+    goose_session_id: &str,
+) -> Option<crate::chat::Notice> {
+    match action {
+        TagAction::Explicit(settings) => {
+            let outcome = tag_session(settings, goose_session_id).await;
+            Some(notice(settings, goose_session_id, &outcome))
+        }
+        TagAction::Inherit(settings) => {
+            match query_launcher_tag(&settings.bin, &settings.launcher, settings.which_timeout)
+                .await
+            {
+                WhichOutcome::Skip => None,
+                WhichOutcome::Failure(reason) => Some(crate::chat::Notice::warning(format!(
+                    "Tag: tag not inherited from {launcher}: {reason}",
+                    launcher = settings.launcher
+                ))),
+                WhichOutcome::Inherit { tag, root } => {
+                    let set_settings = TagSettings {
+                        tag,
+                        bin: settings.bin.clone(),
+                        timeout: settings.set_timeout,
+                    };
+                    let outcome = tag_session(&set_settings, goose_session_id).await;
+                    Some(notice_with_suffix(
+                        &set_settings,
+                        goose_session_id,
+                        &outcome,
+                        Some(&format!(" (inherited from {root})")),
+                    ))
+                }
+            }
         }
     }
 }
@@ -446,5 +660,216 @@ mod tests {
             n.text,
             "Tag: 'Honk' not applied to goose:1_1: timed out after 10s; apply it with: oc-tags set Honk goose:1_1"
         );
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_session_inherits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            "printf 'Billing-Job\\tsession\\tses_root\\tsession\\n'",
+        );
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            WhichOutcome::Inherit {
+                tag: "Billing-Job".to_string(),
+                root: "ses_root".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_empty_root_uses_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            "printf 'Billing-Job\\tsession\\t\\tsession\\n'",
+        );
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            WhichOutcome::Inherit {
+                tag: "Billing-Job".to_string(),
+                root: "ses_parent".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_auto_and_dir_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            "printf 'auto:honk\\tdir\\t\\tauto\\n'",
+        );
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(outcome, WhichOutcome::Skip);
+
+        let bin2 = script(tmp.path(), "oc-tags2", "printf 'honk\\tdir\\t\\tdir\\n'");
+        let outcome2 = query_launcher_tag(&bin2, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(outcome2, WhichOutcome::Skip);
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_missing_kind_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            "printf 'Billing-Job\\tsession\\tses_root\\n'",
+        );
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            WhichOutcome::Failure("'oc-tags which' printed no kind column".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(tmp.path(), "oc-tags", "sleep 30");
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_millis(100)).await;
+        assert_eq!(
+            outcome,
+            WhichOutcome::Failure("'oc-tags which' failed (timed out after 100ms)".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn query_launcher_tag_invalid_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            "printf 'auto:honk\\tsession\\tses_root\\tsession\\n'",
+        );
+        let outcome = query_launcher_tag(&bin, "ses_parent", Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            WhichOutcome::Failure("its tag 'auto:honk' is not a valid launch tag".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_explicit_skips_which() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls.log");
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            &format!(
+                "echo \"$1\" >> '{}'\nif [ \"$1\" = 'set' ]; then echo \"Tagged session '$4' as '$3'\"; fi",
+                log.display()
+            ),
+        );
+        let action = TagAction::Explicit(TagSettings {
+            tag: "billing".to_string(),
+            bin,
+            timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await.unwrap();
+        assert_eq!(notice.kind, NoticeKind::Info);
+        assert_eq!(
+            notice.text,
+            "Tag: Tagged session 'goose:20261024_1' as 'billing'"
+        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.trim(), "set");
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_inherit_session_calls_which_then_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls.log");
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            &format!(
+                r#"echo "$1" >> '{}'
+if [ "$1" = 'which' ]; then
+  printf 'Billing-Job\tsession\tses_root\tsession\n'
+elif [ "$1" = 'set' ]; then
+  echo "Tagged session '$4' as '$3'"
+fi"#,
+                log.display()
+            ),
+        );
+        let action = TagAction::Inherit(InheritSettings {
+            launcher: "ses_parent".to_string(),
+            bin,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await.unwrap();
+        assert_eq!(notice.kind, NoticeKind::Info);
+        assert_eq!(
+            notice.text,
+            "Tag: Tagged session 'goose:20261024_1' as 'Billing-Job' (inherited from ses_root)"
+        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls, "which\nset\n");
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_inherit_auto_skips_set_and_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls.log");
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            &format!(
+                r#"echo "$1" >> '{}'
+if [ "$1" = 'which' ]; then
+  printf 'auto:honk\tdir\t\tauto\n'
+fi"#,
+                log.display()
+            ),
+        );
+        let action = TagAction::Inherit(InheritSettings {
+            launcher: "ses_parent".to_string(),
+            bin,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await;
+        assert!(notice.is_none());
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.trim(), "which");
+    }
+
+    #[tokio::test]
+    async fn run_tag_action_inherit_failure_returns_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls.log");
+        let bin = script(
+            tmp.path(),
+            "oc-tags",
+            &format!(
+                r#"echo "$1" >> '{}'
+if [ "$1" = 'which' ]; then
+  exit 1
+fi"#,
+                log.display()
+            ),
+        );
+        let action = TagAction::Inherit(InheritSettings {
+            launcher: "ses_parent".to_string(),
+            bin,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        });
+        let notice = run_tag_action(&action, "20261024_1").await.unwrap();
+        assert_eq!(notice.kind, NoticeKind::Warning);
+        assert_eq!(
+            notice.text,
+            "Tag: tag not inherited from ses_parent: 'oc-tags which' failed (exit 1)"
+        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.trim(), "which");
     }
 }
