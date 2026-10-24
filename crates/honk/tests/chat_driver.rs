@@ -2964,6 +2964,154 @@ async fn test_quit_with_slow_oc_tags_waits_only_the_grace_and_says_unconfirmed()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_quit_with_slow_which_waits_only_the_grace_and_says_unconfirmed_inheritance() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, _argv) = fake_oc_tags(tmp.path(), "30");
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagAction::Inherit(
+        honk::octags::InheritSettings {
+            launcher: "ses_launcher".to_string(),
+            bin,
+            custom_bin: true,
+            which_timeout: Duration::from_secs(10),
+            set_timeout: Duration::from_secs(10),
+        },
+    ));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let sid = loop {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for SessionNew")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { result } => {
+                break result["sessionId"].as_str().unwrap().to_string();
+            }
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    };
+    let quit_at = Instant::now();
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(8), handle.join())
+        .await
+        .expect("driver waited past the grace for a slow oc-tags which")
+        .expect("driver task panicked");
+    assert!(
+        quit_at.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        quit_at.elapsed()
+    );
+    let mut unconfirmed = None;
+    while let Ok(evt) = rx.try_recv() {
+        if let UiEvent::Notice(n) = evt
+            && n.text.starts_with("Tag:")
+        {
+            unconfirmed = Some(n);
+        }
+    }
+    let n = unconfirmed.expect("an unconfirmed-inheritance warning after join");
+    assert_eq!(n.kind, honk::chat::NoticeKind::Warning, "{n:?}");
+    assert_eq!(
+        n.text,
+        format!(
+            "Tag: tag inheritance from ses_launcher did not finish before exit; to apply it: oc-tags which ses_launcher, then oc-tags set -- <tag> goose:{sid}"
+        )
+    );
+}
+
+fn fake_oc_tags_with_skip(dir: &Path) -> (String, PathBuf) {
+    use std::io::Write;
+    let argv = dir.join("argv");
+    let bin = dir.join("oc-tags");
+    let body = format!(
+        r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >> '{}'
+if [ "$1" = 'which' ]; then
+  printf 'auto:honk\tdir\t\tauto\n'
+fi
+"#,
+        argv.display()
+    );
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&bin)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(body.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    (bin.to_string_lossy().into_owned(), argv)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quit_after_inheritance_skip_says_nothing() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, _argv) = fake_oc_tags_with_skip(tmp.path());
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagAction::Inherit(
+        honk::octags::InheritSettings {
+            launcher: "ses_launcher".to_string(),
+            bin,
+            custom_bin: true,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(5),
+        },
+    ));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for SessionNew")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { .. } => break,
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    }
+    // Let driver finish the which query (which takes a couple ms)
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(8), handle.join())
+        .await
+        .expect("driver did not stop")
+        .expect("driver task panicked");
+    let mut tag_notices = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if let UiEvent::Notice(n) = evt
+            && n.text.starts_with("Tag:")
+        {
+            tag_notices.push(n);
+        }
+    }
+    assert!(
+        tag_notices.is_empty(),
+        "expected no tag notices, got: {tag_notices:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
     let Some(g) = StubGoose::start_or_skip().await else {
         eprintln!("skipping test: StubGoose unset");

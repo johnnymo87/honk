@@ -384,15 +384,20 @@ impl From<InheritSettings> for TagAction {
     }
 }
 
+/// The warning when tag inheritance from a launcher did not finish before exit.
+pub fn unconfirmed_inherit_text(launcher: &str, goose_session_id: &str) -> String {
+    let id = tagged_id(goose_session_id);
+    format!(
+        "Tag: tag inheritance from {launcher} did not finish before exit; to apply it: oc-tags which {launcher}, then oc-tags set -- <tag> {id}"
+    )
+}
+
 /// The warning for an unconfirmed tag action when honk exited.
 pub fn unconfirmed_action_text(action: &TagAction, goose_session_id: &str) -> String {
     match action {
         TagAction::Explicit(settings) => unconfirmed_text(settings, goose_session_id),
-        TagAction::Inherit(_) => {
-            let id = tagged_id(goose_session_id);
-            format!(
-                "Tag: tag for {id} was not confirmed before exit; check with: oc-tags which {id}"
-            )
+        TagAction::Inherit(settings) => {
+            unconfirmed_inherit_text(&settings.launcher, goose_session_id)
         }
     }
 }
@@ -405,17 +410,38 @@ pub async fn run_tag_action(
     action: &TagAction,
     goose_session_id: &str,
 ) -> Option<crate::chat::Notice> {
+    run_tag_action_with_unconfirmed(action, goose_session_id, None).await
+}
+
+/// Executes the specified tag action, updating the pending unconfirmed exit notice
+/// as the inheritance and tagging steps progress.
+pub async fn run_tag_action_with_unconfirmed(
+    action: &TagAction,
+    goose_session_id: &str,
+    unconfirmed: Option<&std::sync::Mutex<Option<String>>>,
+) -> Option<crate::chat::Notice> {
     match action {
         TagAction::Explicit(settings) => {
             let outcome = tag_session(settings, goose_session_id).await;
+            if let Some(u) = unconfirmed {
+                *u.lock().unwrap() = None;
+            }
             Some(notice(settings, goose_session_id, &outcome))
         }
         TagAction::Inherit(settings) => {
             match query_launcher_tag(&settings.bin, &settings.launcher, settings.which_timeout)
                 .await
             {
-                WhichOutcome::Skip => None,
+                WhichOutcome::Skip => {
+                    if let Some(u) = unconfirmed {
+                        *u.lock().unwrap() = None;
+                    }
+                    None
+                }
                 WhichOutcome::NotFound(bin) => {
+                    if let Some(u) = unconfirmed {
+                        *u.lock().unwrap() = None;
+                    }
                     if !settings.custom_bin {
                         None
                     } else {
@@ -425,17 +451,29 @@ pub async fn run_tag_action(
                         )))
                     }
                 }
-                WhichOutcome::Failure(reason) => Some(crate::chat::Notice::warning(format!(
-                    "Tag: tag not inherited from {launcher}: {reason}",
-                    launcher = settings.launcher
-                ))),
+                WhichOutcome::Failure(reason) => {
+                    if let Some(u) = unconfirmed {
+                        *u.lock().unwrap() = None;
+                    }
+                    Some(crate::chat::Notice::warning(format!(
+                        "Tag: tag not inherited from {launcher}: {reason}",
+                        launcher = settings.launcher
+                    )))
+                }
                 WhichOutcome::Inherit { tag, root } => {
                     let set_settings = TagSettings {
                         tag,
                         bin: settings.bin.clone(),
                         timeout: settings.set_timeout,
                     };
+                    if let Some(u) = unconfirmed {
+                        *u.lock().unwrap() =
+                            Some(unconfirmed_text(&set_settings, goose_session_id));
+                    }
                     let outcome = tag_session(&set_settings, goose_session_id).await;
+                    if let Some(u) = unconfirmed {
+                        *u.lock().unwrap() = None;
+                    }
                     Some(notice_with_suffix(
                         &set_settings,
                         goose_session_id,
@@ -581,6 +619,14 @@ mod tests {
             _ => None,
         };
         assert_eq!(resolve_launcher_from(env), None);
+    }
+
+    #[test]
+    fn unconfirmed_inherit_text_format() {
+        assert_eq!(
+            unconfirmed_inherit_text("ses_launcher", "20261024_1"),
+            "Tag: tag inheritance from ses_launcher did not finish before exit; to apply it: oc-tags which ses_launcher, then oc-tags set -- <tag> goose:20261024_1"
+        );
     }
 
     #[test]
