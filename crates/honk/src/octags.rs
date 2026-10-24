@@ -71,6 +71,27 @@ pub fn parse_tag(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Parsed value of a `--tag` CLI argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagArg {
+    /// An explicit tag to assign to the new session.
+    Explicit(String),
+    /// An opt-out from tagging and inheritance (`--tag auto`).
+    NoInherit,
+}
+
+/// Parses the `--tag` CLI argument.
+///
+/// A bare `auto` (case-insensitive) opts out of inheritance and tagging.
+/// All other values must pass [`parse_tag`].
+pub fn parse_tag_arg(s: &str) -> Result<TagArg, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        Ok(TagArg::NoInherit)
+    } else {
+        parse_tag(s).map(TagArg::Explicit)
+    }
+}
+
 /// Runs `<bin> set -- <tag> goose:<id>` and returns oc-tags' own success line.
 ///
 /// The line is returned rather than rebuilt from the tag because oc-tags
@@ -247,6 +268,20 @@ mod tests {
         ] {
             assert!(parse_tag(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn parse_tag_arg_recognizes_bare_auto_as_opt_out() {
+        for auto in ["auto", "AUTO", "Auto", "aUtO"] {
+            assert_eq!(parse_tag_arg(auto), Ok(TagArg::NoInherit), "{auto}");
+        }
+        for bad in ["auto:honk", "AUTO:honk", "auto:x", "-x", ""] {
+            assert!(parse_tag_arg(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(
+            parse_tag_arg("honk"),
+            Ok(TagArg::Explicit("honk".to_string()))
+        );
     }
 
     #[test]

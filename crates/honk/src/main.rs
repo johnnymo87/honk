@@ -149,8 +149,8 @@ struct ChatArgs {
 
     /// Tag the new session in oc-tags as goose:<id> (like opencode-launch --tag),
     /// so it is listed under that program. Runs $HONK_OC_TAGS_BIN or oc-tags.
-    #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag)]
-    tag: Option<String>,
+    #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag_arg)]
+    tag: Option<honk::octags::TagArg>,
 
     #[command(flatten)]
     pigeon: PigeonArgs,
@@ -269,7 +269,10 @@ fn chat_pigeon_settings(args: &ChatArgs) -> Option<honk::pigeon::PigeonSettings>
 
 /// Only a session this invocation creates is tagged; `--tag` requires `--new`.
 fn chat_tag_settings(args: &ChatArgs) -> Option<honk::octags::TagSettings> {
-    args.tag.clone().map(honk::octags::TagSettings::new)
+    match &args.tag {
+        Some(honk::octags::TagArg::Explicit(t)) => Some(honk::octags::TagSettings::new(t)),
+        Some(honk::octags::TagArg::NoInherit) | None => None,
+    }
 }
 
 #[tokio::main]
@@ -497,11 +500,22 @@ mod tests {
         assert!(Cli::try_parse_from(["honk", "chat", "20261020_3", "--tag", "honk"]).is_err());
         assert!(Cli::try_parse_from(["honk", "chat", "--tag", "honk"]).is_err());
         // A bad tag is refused before any session exists.
-        for bad in ["auto:x", "auto", "has space", "-x", ""] {
+        for bad in ["auto:x", "AUTO:x", "has space", "-x", ""] {
             assert!(
                 Cli::try_parse_from(["honk", "chat", "--new", "--tag", bad]).is_err(),
                 "{bad:?}"
             );
+        }
+        // Bare auto opts out.
+        for auto in ["auto", "AUTO", "Auto"] {
+            let cli = Cli::try_parse_from(["honk", "chat", "--new", "--tag", auto]).unwrap();
+            match cli.command {
+                Commands::Chat(args) => {
+                    assert_eq!(args.tag, Some(honk::octags::TagArg::NoInherit));
+                    assert!(chat_tag_settings(&args).is_none());
+                }
+                _ => panic!("expected chat command"),
+            }
         }
     }
 
