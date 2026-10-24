@@ -3111,6 +3111,103 @@ async fn test_quit_after_inheritance_skip_says_nothing() {
     );
 }
 
+fn fake_oc_tags_which_immediate_set_sleeps(dir: &Path) -> (String, PathBuf) {
+    use std::io::Write;
+    let argv = dir.join("argv");
+    let bin = dir.join("oc-tags");
+    let body = format!(
+        r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >> '{}'
+if [ "$1" = 'which' ]; then
+  printf 'honk\tsession\tses_root\tsession\n'
+elif [ "$1" = 'set' ]; then
+  sleep 30
+  echo "Tagged session '$4' as '$3'"
+fi
+"#,
+        argv.display()
+    );
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&bin)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(body.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    (bin.to_string_lossy().into_owned(), argv)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quit_with_slow_set_during_inheritance_says_unconfirmed_explicit_tag() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let Some(honkd_bin) = find_honkd_bin() else {
+        return;
+    };
+    let h = HonkdHarness::spawn(&honkd_bin, &g.url(), g.secret_file(), None).await;
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let (bin, _argv) = fake_oc_tags_which_immediate_set_sleeps(tmp.path());
+
+    let mut opts = DriverOpts::new(h.ws_url(), h.secret(), new_target(tmp.path()));
+    opts.tag = Some(honk::octags::TagAction::Inherit(
+        honk::octags::InheritSettings {
+            launcher: "ses_launcher".to_string(),
+            bin,
+            custom_bin: true,
+            which_timeout: Duration::from_secs(5),
+            set_timeout: Duration::from_secs(10),
+        },
+    ));
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let sid = loop {
+        let evt = tokio::time::timeout_at(deadline.into(), rx.recv())
+            .await
+            .expect("timed out waiting for SessionNew")
+            .expect("driver stream ended");
+        match evt {
+            UiEvent::SessionNew { result } => {
+                break result["sessionId"].as_str().unwrap().to_string();
+            }
+            UiEvent::Fatal(f) => panic!("fatal: {f}"),
+            _ => {}
+        }
+    };
+    // Wait briefly so which finishes and set begins sleeping
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let quit_at = Instant::now();
+    handle.send(UiCommand::Shutdown).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(8), handle.join())
+        .await
+        .expect("driver waited past the grace for a slow set")
+        .expect("driver task panicked");
+    assert!(
+        quit_at.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        quit_at.elapsed()
+    );
+    let mut unconfirmed = None;
+    while let Ok(evt) = rx.try_recv() {
+        if let UiEvent::Notice(n) = evt
+            && n.text.starts_with("Tag:")
+        {
+            unconfirmed = Some(n);
+        }
+    }
+    let n = unconfirmed.expect("an unconfirmed-tag warning after join");
+    assert_eq!(n.kind, honk::chat::NoticeKind::Warning, "{n:?}");
+    assert_eq!(
+        n.text,
+        format!(
+            "Tag: 'honk' for goose:{sid} was not confirmed before exit; check with: oc-tags which goose:{sid}"
+        )
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_self_compact_ownership_stays_own_and_no_steer_warning() {
     let Some(g) = StubGoose::start_or_skip().await else {
