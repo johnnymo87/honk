@@ -19,6 +19,29 @@ pub const BIN_ENV: &str = "HONK_OC_TAGS_BIN";
 pub const DEFAULT_BIN: &str = "oc-tags";
 /// How long `oc-tags set` may take before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Environment variable indicating an opencode launcher session.
+pub const OPENCODE_SESSION_ID_ENV: &str = "OPENCODE_SESSION_ID";
+/// Environment variable indicating an agent launcher session (prefixed with goose:).
+pub const AGENT_SESSION_ID_ENV: &str = "AGENT_SESSION_ID";
+
+/// Resolves the launching session id from environment lookup.
+///
+/// Precedence:
+/// 1. `$OPENCODE_SESSION_ID` if set and non-empty: used as-is.
+/// 2. `$AGENT_SESSION_ID` if set and non-empty: used as `goose:<id>`.
+/// 3. Otherwise `None`.
+pub fn resolve_launcher_from(env_get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(id) = env_get(OPENCODE_SESSION_ID_ENV).filter(|s| !s.is_empty()) {
+        return Some(id);
+    }
+    let agent = env_get(AGENT_SESSION_ID_ENV).filter(|s| !s.is_empty());
+    agent.map(|id| format!("goose:{id}"))
+}
+
+/// Resolves the launcher session from the process environment.
+pub fn launcher_from_env() -> Option<String> {
+    resolve_launcher_from(|k| std::env::var(k).ok())
+}
 
 /// What to tag a new session with, and which oc-tags to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,6 +305,52 @@ mod tests {
             parse_tag_arg("honk"),
             Ok(TagArg::Explicit("honk".to_string()))
         );
+    }
+
+    #[test]
+    fn resolve_launcher_precedence_and_fallback() {
+        // OPENCODE_SESSION_ID takes precedence and is used as-is
+        let env = |k: &str| match k {
+            OPENCODE_SESSION_ID_ENV => Some("ses_opencode_123".to_string()),
+            AGENT_SESSION_ID_ENV => Some("agent_456".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_launcher_from(env).as_deref(),
+            Some("ses_opencode_123")
+        );
+
+        // AGENT_SESSION_ID fallback uses goose: prefix
+        let env = |k: &str| match k {
+            AGENT_SESSION_ID_ENV => Some("20261024_1".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_launcher_from(env).as_deref(),
+            Some("goose:20261024_1")
+        );
+
+        // Empty OPENCODE_SESSION_ID falls back to AGENT_SESSION_ID
+        let env = |k: &str| match k {
+            OPENCODE_SESSION_ID_ENV => Some("".to_string()),
+            AGENT_SESSION_ID_ENV => Some("20261024_2".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_launcher_from(env).as_deref(),
+            Some("goose:20261024_2")
+        );
+
+        // Neither set
+        assert_eq!(resolve_launcher_from(|_| None), None);
+
+        // Both empty
+        let env = |k: &str| match k {
+            OPENCODE_SESSION_ID_ENV => Some("".to_string()),
+            AGENT_SESSION_ID_ENV => Some("".to_string()),
+            _ => None,
+        };
+        assert_eq!(resolve_launcher_from(env), None);
     }
 
     #[test]
