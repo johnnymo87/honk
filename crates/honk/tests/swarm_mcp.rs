@@ -1829,11 +1829,18 @@ async fn test_swarm_list_marks_you_and_does_not_call_mailbox() {
         text.contains("gse_me (you)"),
         "owner marked with (you): {text}"
     );
-    assert!(text.contains("goose: mailbox"), "owner has mailbox: {text}");
-    assert!(text.contains("gse_other"), "other session present: {text}");
+    // goose-acp sessions are pushed to by pigeon, so no mailbox distinction is shown.
     assert!(
-        text.contains("goose: no mailbox"),
-        "other goose session has no mailbox: {text}"
+        text.contains("gse_me (you)  goose  "),
+        "owner is a goose session: {text}"
+    );
+    assert!(
+        text.contains("gse_other  goose  "),
+        "other goose session present: {text}"
+    );
+    assert!(
+        !text.contains("mailbox"),
+        "no mailbox label for goose-acp: {text}"
     );
     assert!(
         !text.contains("gse_other (you)"),
