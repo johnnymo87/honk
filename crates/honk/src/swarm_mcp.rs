@@ -550,7 +550,10 @@ async fn handle_swarm_list(
         let you = if is_you { " (you)" } else { "" };
 
         let kind = match backend_kind {
-            Some("goose-acp") | Some("goose-pull") => {
+            // pigeon pushes swarm mail into a goose-acp session as a turn, as it
+            // does for opencode; only a goose-pull identity collects it from a mailbox.
+            Some("goose-acp") => "goose",
+            Some("goose-pull") => {
                 if pull_sources.contains(&"swarm") {
                     "goose: mailbox"
                 } else {
@@ -962,7 +965,7 @@ fn get_tools(self_grant: bool) -> Value {
     let mut tools = vec![
         json!({
             "name": "swarm_send",
-            "description": "Send a swarm message to another session via pigeon. One substantial message beats several; no acks or heartbeats; reply only with decisions, evidence, or deliverables. The message payload must NOT contain the literal </swarm_message> tag, and do NOT write the <swarm_message> envelope yourself. The sender ('from') is filled in automatically. 'to' must be 'ses_…' (opencode) or 'gse_…' (goose).",
+            "description": "Send a swarm message to another session via pigeon. One substantial message beats several; no acks or heartbeats; reply only with decisions, evidence, or deliverables. The message payload must NOT contain the literal </swarm_message> tag, and do NOT write the <swarm_message> envelope yourself. The sender ('from') is filled in automatically. 'to' must be 'ses_…' (opencode) or 'gse_…' (goose). The recipient is woken and spends a turn on it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -992,7 +995,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_read",
-            "description": "Read and drain incoming swarm messages from this session's pigeon mailbox. Each message is wrapped in a <swarm_message> envelope with message-economy reminders. Messages are acknowledged upon drain.",
+            "description": "Read and drain swarm messages left in this session's pigeon mailbox. Mail to this session normally arrives as its own turn, pushed by pigeon; use this only when told messages are waiting. Each message is wrapped in a <swarm_message> envelope with message-economy reminders. Messages are acknowledged upon drain.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1005,7 +1008,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_list",
-            "description": "List active sessions across all projects to discover peer session IDs for swarm_send. Identifies opencode sessions and goose sessions (noting whether a goose session has a mailbox).",
+            "description": "List active sessions across all projects to discover peer session IDs for swarm_send. Identifies opencode and goose sessions; both are woken by a message. A 'goose-pull' identity is marked by whether it has a mailbox it polls.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
