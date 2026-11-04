@@ -97,6 +97,8 @@ pub enum Reason {
     NewChat,
     /// `honk telegram` for an existing session.
     Existing,
+    /// `honk launch` just created the session and is about to prompt it.
+    Launch,
 }
 
 /// The outcome of a successful registration.
@@ -151,6 +153,7 @@ fn announcement(reg: &Registration) -> String {
     let what = match reg.reason {
         Reason::NewChat => "New honk chat session",
         Reason::Existing => "honk session",
+        Reason::Launch => "Launched goose session",
     };
     format!(
         "{what} {} in {}. Reply here to prompt it.",
@@ -164,11 +167,24 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// its topic. pigeon reuses its row for the same goose id but overwrites it
 /// wholesale; see [`find_registered`].
 pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<Registered> {
-    let http = reqwest::Client::builder()
+    let pigeon_id = register_row(cfg, reg).await?;
+    announce(cfg, &pigeon_id, reg)
+        .await
+        .context("session registered, but announcing it failed")
+}
+
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(TIMEOUT)
         .build()
-        .context("building HTTP client")?;
+        .context("building HTTP client")
+}
 
+/// `POST /goose/sessions`: creates (or refreshes) pigeon's row for the session,
+/// with `notify` on and `reg.endpoint` as its `backend_endpoint`, and returns
+/// pigeon's id for it (`gse_…`). No topic exists until [`announce`].
+pub async fn register_row(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<String> {
+    let http = http_client()?;
     let body = json!({
         "session_id": reg.goose_session_id,
         "endpoint": reg.endpoint,
@@ -180,7 +196,16 @@ pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<
     let Some(pigeon_id) = res.get("session_id").and_then(Value::as_str) else {
         bail!("pigeon /goose/sessions response has no session_id: {res}");
     };
+    Ok(pigeon_id.to_string())
+}
 
+/// Posts the one notification that makes pigeon create the session's topic.
+pub async fn announce(
+    cfg: &PigeonConfig,
+    pigeon_id: &str,
+    reg: &Registration,
+) -> anyhow::Result<Registered> {
+    let http = http_client()?;
     let mut stop = json!({
         "session_id": pigeon_id,
         "event": "Notification",
@@ -189,9 +214,7 @@ pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<
     if let Some(t) = reg.title.as_deref().filter(|t| !t.trim().is_empty()) {
         stop["title"] = json!(t);
     }
-    let res = post(&http, cfg, "/stop", &stop)
-        .await
-        .context("session registered, but announcing it failed")?;
+    let res = post(&http, cfg, "/stop", &stop).await?;
     let announced = res.get("notified") != Some(&json!(false));
     let not_announced_reason = if announced {
         None
@@ -218,10 +241,27 @@ pub async fn find_registered(
     cfg: &PigeonConfig,
     goose_session_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    let http = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .context("building HTTP client")?;
+    let rows = fetch_sessions(cfg).await?;
+    let found = rows
+        .iter()
+        .find(|s| {
+            let id = |k: &str| s.get(k).and_then(Value::as_str);
+            // Rows from before pigeon minted its own ids carry goose's id as
+            // `session_id` and no `backend_session_id`. Swarm mailbox-only rows
+            // have `notify: false` and are skipped so `honk telegram` can upgrade them.
+            s.get("notify") != Some(&Value::Bool(false))
+                && id("backend_kind") == Some("goose-acp")
+                && (id("backend_session_id") == Some(goose_session_id)
+                    || id("session_id") == Some(goose_session_id))
+        })
+        .and_then(|s| s.get("session_id").and_then(Value::as_str))
+        .map(str::to_string);
+    Ok(found)
+}
+
+/// Every row of pigeon's `GET /sessions`.
+pub async fn fetch_sessions(cfg: &PigeonConfig) -> anyhow::Result<Vec<Value>> {
+    let http = http_client()?;
     let mut req = http.get(format!("{}/sessions", cfg.url));
     if let Some(t) = &cfg.token {
         req = req.bearer_auth(t);
@@ -238,24 +278,48 @@ pub async fn find_registered(
         .json()
         .await
         .context("pigeon /sessions returned non-JSON")?;
-    let found = v
-        .get("sessions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|s| {
+    let Some(rows) = v.get("sessions").and_then(Value::as_array) else {
+        bail!("pigeon /sessions response has no sessions array");
+    };
+    Ok(rows.clone())
+}
+
+/// The prefix of the named topic stall-watch binds to a program's coordinator:
+/// pigeon `bound_topic_key = 'stallwatch:<program tag>'`.
+pub const PROGRAM_TOPIC_PREFIX: &str = "stallwatch:";
+
+/// Whether pigeon's rows say anything about bound topics at all. A pigeon too
+/// old to report `bound_topic_key` cannot tell a coordinator from a worker.
+pub fn reports_bound_topics(rows: &[Value]) -> bool {
+    rows.iter().any(|s| s.get("bound_topic_key").is_some())
+}
+
+/// The program tag of the stall-watch coordinator `launcher` is, if it is one.
+///
+/// `launcher` is an oc-tags key: `ses_…` for an opencode session (matched on
+/// pigeon's `session_id`), or `goose:<goose id>` for a goose session (matched
+/// on `backend_session_id`, or on `session_id` for a legacy row whose pigeon id
+/// is goose's id). A row bound to `stallwatch:<tag>` makes it the coordinator
+/// of program `<tag>`; `stallwatch:_notices` and other non-tag keys do not.
+pub fn coordinator_program(rows: &[Value], launcher: &str) -> Option<String> {
+    let goose = launcher.strip_prefix("goose:");
+    rows.iter()
+        .filter(|s| {
             let id = |k: &str| s.get(k).and_then(Value::as_str);
-            // Rows from before pigeon minted its own ids carry goose's id as
-            // `session_id` and no `backend_session_id`. Swarm mailbox-only rows
-            // have `notify: false` and are skipped so `honk telegram` can upgrade them.
-            s.get("notify") != Some(&Value::Bool(false))
-                && id("backend_kind") == Some("goose-acp")
-                && (id("backend_session_id") == Some(goose_session_id)
-                    || id("session_id") == Some(goose_session_id))
+            match goose {
+                Some(g) => {
+                    id("backend_kind") == Some("goose-acp")
+                        && (id("backend_session_id") == Some(g)
+                            || (id("backend_session_id").is_none() && id("session_id") == Some(g)))
+                }
+                None => {
+                    id("backend_kind") != Some("goose-acp") && id("session_id") == Some(launcher)
+                }
+            }
         })
-        .and_then(|s| s.get("session_id").and_then(Value::as_str))
-        .map(str::to_string);
-    Ok(found)
+        .filter_map(|s| s.get("bound_topic_key").and_then(Value::as_str))
+        .filter_map(|k| k.strip_prefix(PROGRAM_TOPIC_PREFIX))
+        .find_map(|t| crate::octags::parse_tag(t).ok())
 }
 
 async fn post(
@@ -351,6 +415,37 @@ mod tests {
         .load()
         .unwrap_err();
         assert!(err.to_string().contains("pigeon token file"), "{err}");
+    }
+
+    #[test]
+    fn coordinator_program_matches_the_launcher_row_only() {
+        let rows = vec![
+            json!({"session_id": "gse_a", "backend_kind": "goose-acp",
+                   "backend_session_id": "20261021_40", "bound_topic_key": "stallwatch:honk"}),
+            json!({"session_id": "20261001_3", "backend_kind": "goose-acp",
+                   "backend_session_id": null, "bound_topic_key": "stallwatch:legacy"}),
+            json!({"session_id": "ses_coord", "backend_kind": "opencode",
+                   "bound_topic_key": "stallwatch:oc-prog"}),
+            json!({"session_id": "gse_n", "backend_kind": "goose-acp",
+                   "backend_session_id": "20261021_41", "bound_topic_key": "stallwatch:_notices"}),
+            json!({"session_id": "gse_x", "backend_kind": "goose-acp",
+                   "backend_session_id": "20261021_42", "bound_topic_key": "other:thing"}),
+            json!({"session_id": "gse_w", "backend_kind": "goose-acp",
+                   "backend_session_id": "20261021_43", "bound_topic_key": null}),
+        ];
+        let p = |l: &str| coordinator_program(&rows, l);
+        assert_eq!(p("goose:20261021_40").as_deref(), Some("honk"));
+        assert_eq!(p("goose:20261001_3").as_deref(), Some("legacy"));
+        assert_eq!(p("ses_coord").as_deref(), Some("oc-prog"));
+        // A pigeon id is not an oc-tags key for a goose session.
+        assert_eq!(p("gse_a"), None);
+        assert_eq!(p("20261021_40"), None);
+        assert_eq!(p("goose:20261021_41"), None, "_notices is not a program");
+        assert_eq!(p("goose:20261021_42"), None);
+        assert_eq!(p("goose:20261021_43"), None);
+        assert_eq!(p("goose:nope"), None);
+        assert!(reports_bound_topics(&rows));
+        assert!(!reports_bound_topics(&[json!({"session_id": "gse_a"})]));
     }
 
     #[test]

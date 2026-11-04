@@ -66,6 +66,39 @@ impl TagSettings {
     }
 }
 
+/// The tool's current name. workstation#779 renamed `oc-tags` to
+/// `session-tags` and kept `oc-tags` as an alias.
+pub const SESSION_TAGS_BIN: &str = "session-tags";
+
+/// Which session-tags executable to run: `$HONK_OC_TAGS_BIN` when set and
+/// non-empty, else `session-tags` when `on_path` finds it, else `oc-tags`.
+pub fn resolve_bin_from(
+    env_get: impl Fn(&str) -> Option<String>,
+    on_path: impl Fn(&str) -> bool,
+) -> String {
+    if let Some(b) = env_get(BIN_ENV).filter(|b| !b.is_empty()) {
+        return b;
+    }
+    if on_path(SESSION_TAGS_BIN) {
+        SESSION_TAGS_BIN.to_string()
+    } else {
+        DEFAULT_BIN.to_string()
+    }
+}
+
+/// Whether an executable file named `name` is in a `$PATH` directory.
+pub fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|d| {
+        std::fs::metadata(d.join(name))
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
 /// The oc-tags id of a goose session: `goose:<id>`.
 pub fn tagged_id(goose_session_id: &str) -> String {
     format!("goose:{goose_session_id}")
@@ -627,6 +660,25 @@ mod tests {
             unconfirmed_inherit_text("ses_launcher", "20261024_1"),
             "Tag: tag inheritance from ses_launcher did not finish before exit; to apply it: oc-tags which ses_launcher, then oc-tags set -- <tag> goose:20261024_1"
         );
+    }
+
+    #[test]
+    fn resolve_bin_prefers_env_then_session_tags_then_oc_tags() {
+        let env = |k: &str| (k == BIN_ENV).then(|| "/x/tags".to_string());
+        assert_eq!(resolve_bin_from(env, |_| true), "/x/tags");
+        let empty = |k: &str| (k == BIN_ENV).then(String::new);
+        assert_eq!(resolve_bin_from(empty, |_| true), "session-tags");
+        assert_eq!(
+            resolve_bin_from(|_| None, |n| n == "session-tags"),
+            "session-tags"
+        );
+        assert_eq!(resolve_bin_from(|_| None, |_| false), "oc-tags");
+    }
+
+    #[test]
+    fn on_path_finds_sh_and_not_nonsense() {
+        assert!(on_path("sh"));
+        assert!(!on_path("definitely-not-a-binary-xyz"));
     }
 
     #[test]
