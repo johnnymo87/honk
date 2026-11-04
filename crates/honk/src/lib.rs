@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod client;
 pub mod conn;
+pub mod launch;
 pub mod octags;
 pub mod pigeon;
 pub mod render;

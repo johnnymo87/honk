@@ -29,6 +29,160 @@ enum Commands {
     /// Run the swarm MCP server over stdio for goose
     #[command(name = "swarm-mcp")]
     SwarmMcp(SwarmMcpArgs),
+    /// Start a goose session headlessly: tag, register with pigeon, prompt, detach
+    #[command(long_about = LAUNCH_LONG_ABOUT)]
+    Launch(LaunchArgs),
+}
+
+const LAUNCH_LONG_ABOUT: &str = "\
+Start a goose session headlessly, the goose analogue of opencode-launch.
+
+Creates the session through honkd with swarm tools on, tags it in session-tags \
+as goose:<id>, registers it with pigeon (a Telegram topic, notify on, honkd as \
+its push endpoint, so swarm_send reaches it), sends the prompt, and exits while \
+the turn runs.
+
+Tag: --tag <tag> wins. Without --tag the launching session's tag is inherited \
+($OPENCODE_SESSION_ID, or goose:$AGENT_SESSION_ID); a launcher that is a \
+stall-watch coordinator gives its program's tag, never its own \
+'stall-watcher-runs'. --tag auto applies no tag.
+
+Output: on stdout, exactly one line once a session exists:
+  native=<goose id> gse=<pigeon id or -> tag=<tag or ->
+Everything else goes to stderr.
+
+Exit codes:
+  0  launched: tagged as asked, registered, prompted, turn started
+  1  no session was created (bad input, tag undecidable, honkd/pigeon \
+unreachable before session/new; a session/new timeout may still have created \
+one, see `honk list`). No stdout line.
+  2  usage error
+  3  the session exists but a later step failed (swarm, title, tag, pigeon, \
+prompt). The stdout line is printed; the session is not prompted unless the \
+failure was confirming the prompt.";
+
+#[derive(Args, Debug)]
+struct LaunchArgs {
+    /// Working directory for the session
+    dir: PathBuf,
+
+    /// The first prompt; `-` reads it from stdin
+    prompt: String,
+
+    /// Tag the session in session-tags (goose:<id>); `auto` for no tag.
+    /// Default: inherit the launching session's tag.
+    #[arg(long, value_parser = honk::octags::parse_tag_arg)]
+    tag: Option<honk::octags::TagArg>,
+
+    /// Session title, set before the first prompt (also names the Telegram topic)
+    #[arg(long)]
+    title: Option<String>,
+
+    /// pigeon daemon URL
+    #[arg(
+        long = "pigeon-url",
+        default_value = "http://127.0.0.1:4731",
+        env = "HONK_PIGEON_URL"
+    )]
+    pigeon_url: String,
+
+    /// File holding pigeon's bearer token, if the daemon requires one
+    #[arg(long = "pigeon-token-file", env = "HONK_PIGEON_TOKEN_FILE")]
+    pigeon_token_file: Option<PathBuf>,
+
+    /// honkd WebSocket or HTTP endpoint
+    #[arg(long, default_value = "http://127.0.0.1:4280/acp", env = "HONK_URL")]
+    url: String,
+
+    /// Secret auth token (defaults to $HONK_SECRET or state file)
+    #[arg(long)]
+    secret: Option<String>,
+}
+
+fn launch_opts(
+    args: LaunchArgs,
+    env_get: impl Fn(&str) -> Option<String>,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+) -> anyhow::Result<honk::launch::LaunchOpts> {
+    let dir = args
+        .dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("invalid dir {}: {e}", args.dir.display()))?;
+    if !dir.is_dir() {
+        anyhow::bail!("{} is not a directory", dir.display());
+    }
+    let prompt = if args.prompt == "-" {
+        read_stdin().map_err(|e| anyhow::anyhow!("reading the prompt from stdin: {e}"))?
+    } else {
+        args.prompt
+    };
+    if prompt.trim().is_empty() {
+        anyhow::bail!("the prompt is empty");
+    }
+    let title = match args.title {
+        Some(t) if t.trim().is_empty() => anyhow::bail!("--title is empty"),
+        Some(t) => Some(t.trim().to_string()),
+        None => None,
+    };
+    let tag = match args.tag {
+        None => honk::launch::TagRequest::Inherit,
+        Some(honk::octags::TagArg::NoInherit) => honk::launch::TagRequest::Off,
+        Some(honk::octags::TagArg::Explicit(t)) => honk::launch::TagRequest::Explicit(t),
+    };
+    let pigeon = honk::pigeon::PigeonSettings {
+        url: args.pigeon_url,
+        token_file: args.pigeon_token_file,
+    }
+    .load()?;
+    let secret = resolve_secret(args.secret.as_deref())?;
+    Ok(honk::launch::LaunchOpts {
+        dir,
+        prompt,
+        title,
+        tag,
+        launcher: honk::octags::resolve_launcher_from(&env_get),
+        tags_bin: honk::octags::resolve_bin_from(&env_get, honk::octags::on_path),
+        honk_url: args.url,
+        secret,
+        pigeon,
+        timeouts: honk::launch::Timeouts::default(),
+    })
+}
+
+async fn run_launch(args: LaunchArgs) -> i32 {
+    let opts = match launch_opts(
+        args,
+        |k| std::env::var(k).ok(),
+        || std::io::read_to_string(std::io::stdin()),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("honk launch: {e:#}");
+            return honk::launch::EXIT_NOT_CREATED;
+        }
+    };
+    match honk::launch::run(&opts).await {
+        Ok(launched) => {
+            println!("{}", launched.line());
+            honk::launch::EXIT_OK
+        }
+        Err(e) => {
+            let code = e.exit_code();
+            match e {
+                honk::launch::LaunchError::NotCreated(err) => {
+                    eprintln!("honk launch: {err:#}");
+                }
+                honk::launch::LaunchError::Partial { launched, error } => {
+                    println!("{}", launched.line());
+                    eprintln!(
+                        "honk launch: session {} created, but {error:#}",
+                        launched.native
+                    );
+                }
+            }
+            code
+        }
+    }
 }
 
 /// Where the pigeon daemon is. Registration is off unless a URL is given.
@@ -440,6 +594,12 @@ async fn main() -> anyhow::Result<()> {
                 honk_secret_file: args.honk_secret_file,
             };
             honk::swarm_mcp::run_stdio(config).await?;
+        }
+        Commands::Launch(args) => {
+            let code = run_launch(args).await;
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
         }
     }
     Ok(())
@@ -899,6 +1059,99 @@ mod tests {
             }
             _ => panic!("expected swarm-mcp command"),
         }
+    }
+
+    fn launch(argv: &[&str]) -> Result<LaunchArgs, clap::Error> {
+        let mut full = vec!["honk", "launch"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full).map(|c| match c.command {
+            Commands::Launch(a) => a,
+            _ => panic!("expected launch command"),
+        })
+    }
+
+    fn launch_env(k: &str) -> Option<String> {
+        match k {
+            honk::octags::AGENT_SESSION_ID_ENV => Some("20261104_1".into()),
+            honk::octags::BIN_ENV => Some("/bin/tags".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_launch_parses_dir_prompt_and_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let d = temp.path().to_str().unwrap();
+        let a = launch(&[
+            d,
+            "--tag",
+            "honk",
+            "--title",
+            " Fix it ",
+            "--secret",
+            "s",
+            "--pigeon-url",
+            "http://p",
+            "do it",
+        ])
+        .unwrap();
+        let o = launch_opts(a, launch_env, || unreachable!()).unwrap();
+        assert_eq!(o.dir, temp.path().canonicalize().unwrap());
+        assert_eq!(o.prompt, "do it");
+        assert_eq!(o.title.as_deref(), Some("Fix it"));
+        assert_eq!(o.tag, honk::launch::TagRequest::Explicit("honk".into()));
+        assert_eq!(o.launcher.as_deref(), Some("goose:20261104_1"));
+        assert_eq!(o.tags_bin, "/bin/tags");
+        assert_eq!(o.pigeon.url, "http://p");
+        assert_eq!(o.secret, "s");
+    }
+
+    #[test]
+    fn test_launch_tag_defaults_and_auto() {
+        let temp = tempfile::tempdir().unwrap();
+        let d = temp.path().to_str().unwrap();
+        let o = launch_opts(
+            launch(&[d, "--secret", "s", "p"]).unwrap(),
+            launch_env,
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(o.tag, honk::launch::TagRequest::Inherit);
+        let o = launch_opts(
+            launch(&[d, "--tag", "auto", "--secret", "s", "p"]).unwrap(),
+            launch_env,
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(o.tag, honk::launch::TagRequest::Off);
+        assert!(launch(&[d, "--tag", "auto:x", "p"]).is_err());
+    }
+
+    #[test]
+    fn test_launch_prompt_from_stdin_and_refusals() {
+        let temp = tempfile::tempdir().unwrap();
+        let d = temp.path().to_str().unwrap();
+        let o = launch_opts(
+            launch(&[d, "--secret", "s", "-"]).unwrap(),
+            launch_env,
+            || Ok("from stdin\n".into()),
+        )
+        .unwrap();
+        assert_eq!(o.prompt, "from stdin\n");
+
+        assert!(launch(&[d]).is_err(), "prompt is required");
+        let err = |argv: &[&str], stdin: &'static str| {
+            launch_opts(launch(argv).unwrap(), launch_env, || Ok(stdin.into()))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(&[d, "--secret", "s", "  "], "").contains("prompt is empty"));
+        assert!(err(&[d, "--secret", "s", "-"], "\n").contains("prompt is empty"));
+        assert!(err(&[d, "--secret", "s", "--title", " ", "p"], "").contains("--title"));
+        assert!(err(&["/nonexistent_xyz_123", "--secret", "s", "p"], "").contains("invalid dir"));
+        let f = temp.path().join("file");
+        std::fs::write(&f, "").unwrap();
+        assert!(err(&[f.to_str().unwrap(), "--secret", "s", "p"], "").contains("not a directory"));
     }
 
     #[test]
