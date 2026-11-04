@@ -23,6 +23,119 @@ pub const ECONOMY_FOOTER: &str = "[pigeon] Message economy — the unit of cost 
     progress is the healthy state. If you have several things to say, hold them \
     and send ONE message at your next checkpoint instead of a back-and-forth.";
 
+pub const DEFAULT_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+    Duration::from_millis(4000),
+    Duration::from_millis(8000),
+];
+
+fn get_backoff(schedule: &[Duration], attempt: usize) -> Duration {
+    if attempt == 0 {
+        Duration::ZERO
+    } else {
+        schedule
+            .get(attempt - 1)
+            .copied()
+            .unwrap_or_else(|| *schedule.last().unwrap_or(&Duration::from_millis(8000)))
+    }
+}
+
+fn to_base36(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    const CHARS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(CHARS[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+fn random_hex_8() -> String {
+    let mut bytes = [0u8; 4];
+    let _ = getrandom::fill(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn make_launch_id(now_ms: u64) -> String {
+    format!("rl_{}_{}", to_base36(now_ms), random_hex_8())
+}
+
+fn make_msg_id(now_ms: u64) -> String {
+    format!("msg_{}_{}", to_base36(now_ms), random_hex_8())
+}
+
+fn format_iso_time(ms: i64) -> String {
+    if ms <= 0 {
+        return "1970-01-01T00:00:00.000Z".to_string();
+    }
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = total_secs / 86400;
+    let day_secs = total_secs % 86400;
+    let hours = day_secs / 3600;
+    let rem = day_secs % 3600;
+    let mins = rem / 60;
+    let secs = rem % 60;
+
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1024 + doe / 1460 - doe / 36524) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
+}
+
+fn format_schedule_result(
+    msg_id: &str,
+    to: &str,
+    deliver_at: i64,
+    expires_at: i64,
+    attempts: usize,
+    already_banked: bool,
+) -> String {
+    let deliver_iso = format_iso_time(deliver_at);
+    let expires_iso = format_iso_time(expires_at);
+    let base = format!(
+        "Scheduled {msg_id} for {to}. Delivery at {deliver_iso} (expires at {expires_iso})."
+    );
+    if already_banked {
+        format!("{base} (Already banked by an earlier attempt.)")
+    } else if attempts > 1 {
+        format!(
+            "{base} (Accepted after {attempts} attempts — transient daemon errors were retried.)"
+        )
+    } else {
+        base
+    }
+}
+
+fn is_connection_refused(err: &reqwest::Error) -> bool {
+    use std::error::Error;
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            return true;
+        }
+        source = s.source();
+    }
+    let msg = err.to_string();
+    msg.contains("Connection refused") || msg.contains("ECONNREFUSED")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmMcpServerConfig {
     pub session: String,
@@ -481,6 +594,10 @@ async fn handle_swarm_list(
     config: &SwarmMcpServerConfig,
     args: &Value,
 ) -> Value {
+    if args.get("remote").and_then(Value::as_bool) == Some(true) {
+        return handle_swarm_list_remote(client, config, args).await;
+    }
+
     let limit = args.get("limit").and_then(Value::as_u64);
 
     let pigeon_token = read_token(config.pigeon_token_file.as_deref());
@@ -583,6 +700,720 @@ async fn handle_swarm_list(
     }
 
     tool_ok(lines.join("\n"))
+}
+
+const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+fn explain_relay(
+    status: &str,
+    machine: &str,
+    self_machine: &str,
+    last_poll_at: Option<i64>,
+    now_ms: i64,
+) -> String {
+    match status {
+        "available" => "available".to_string(),
+        "not_accepted" => {
+            format!("not_accepted ({machine} does not accept relays from {self_machine})")
+        }
+        "not_retired" => format!(
+            "not_retired ({machine} still accepts the shared worker key, so it cannot receive relays)"
+        ),
+        "offline" => match last_poll_at {
+            None => format!("offline ({machine} is not polling the worker; asleep or down)"),
+            Some(poll_at) => {
+                let ts_ms = if poll_at < 10_000_000_000 {
+                    poll_at * 1000
+                } else {
+                    poll_at
+                };
+                let age_ms = now_ms.saturating_sub(ts_ms);
+                let age = format_relative_time(ts_ms, now_ms);
+                if age_ms <= SEVEN_DAYS_MS {
+                    format!(
+                        "offline ({machine} last polled {age} ago; a message sent now is held up to 24h and delivered if it wakes in time)"
+                    )
+                } else {
+                    format!("offline ({machine} has not polled for {age}; sends are refused)")
+                }
+            }
+        },
+        "unknown" => "unknown (the worker's relay schema is not applied)".to_string(),
+        other => other.to_string(),
+    }
+}
+
+async fn handle_swarm_list_remote(
+    client: &reqwest::Client,
+    config: &SwarmMcpServerConfig,
+    args: &Value,
+) -> Value {
+    let limit = args.get("limit").and_then(Value::as_u64);
+
+    let pigeon_token = read_token(config.pigeon_token_file.as_deref());
+    let url = format!(
+        "{}/swarm/remote-sessions",
+        config.pigeon_url.trim_end_matches('/')
+    );
+    let mut req = client.get(&url);
+    if let Some(l) = limit {
+        req = req.query(&[("limit", l.to_string())]);
+    }
+    if let Some(tok) = &pigeon_token {
+        req = req.bearer_auth(tok);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return tool_err(format!("pigeon /swarm/remote-sessions unreachable: {e}")),
+    };
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return tool_err(format!("swarm_list remote failed: {status} {text}"));
+    }
+
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return tool_err(format!("pigeon returned non-JSON: {e}")),
+    };
+
+    let machine_id = body
+        .get("machine_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let sessions = body
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let machines = body
+        .get("machines")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let truncated = body
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let relay_send = body
+        .get("relay_send")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    if sessions.is_empty() {
+        return tool_ok(format!(
+            "No sessions on other machines were active in the last 7 days (asked from {machine_id})."
+        ));
+    }
+
+    let mut out = Vec::new();
+    out.push(format!("Sessions on machines other than {machine_id}:"));
+    out.push("ID  SEEN  MACHINE  LABEL".to_string());
+
+    for s in &sessions {
+        let session_id = s.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let updated_at = s.get("updated_at").and_then(Value::as_i64).unwrap_or(0);
+        let ts_ms = if updated_at < 10_000_000_000 {
+            updated_at * 1000
+        } else {
+            updated_at
+        };
+        let m_id = s.get("machine_id").and_then(Value::as_str).unwrap_or("");
+        let label = s.get("label").and_then(Value::as_str);
+        let label_str = if let Some(l) = label {
+            format!("  {}", serde_json::to_string(l).unwrap_or_default())
+        } else {
+            String::new()
+        };
+        let seen = format_relative_time(ts_ms, now_ms);
+        out.push(
+            format!("{session_id}  {seen}  {m_id}{label_str}")
+                .trim_end()
+                .to_string(),
+        );
+    }
+
+    if truncated {
+        out.push(
+            "(more sessions matched; pass a larger limit, up to 500, to see them)".to_string(),
+        );
+    }
+
+    out.push(String::new());
+    out.push(format!(
+        "Relay from {machine_id} (what swarm_send to each machine would get now; \"available\" and \"offline\" (within 7 days) are queued by the worker, and the receiving session may still refuse it):"
+    ));
+
+    for m in &machines {
+        let m_id = m.get("machine_id").and_then(Value::as_str).unwrap_or("");
+        let relay = m.get("relay").and_then(Value::as_str).unwrap_or("");
+        let last_poll_at = m.get("last_poll_at").and_then(Value::as_i64);
+        let expl = explain_relay(relay, m_id, machine_id, last_poll_at, now_ms);
+        out.push(format!("  {m_id}: {expl}"));
+    }
+
+    if !relay_send {
+        out.push(String::new());
+        out.push(format!(
+            "WARNING: {machine_id} does not relay (PIGEON_SWARM_RELAY_SEND is not set on its daemon), so swarm_send to any session above fails with delivery.failed."
+        ));
+    }
+
+    tool_ok(out.join("\n"))
+}
+
+async fn handle_swarm_launch(
+    client: &reqwest::Client,
+    config: &SwarmMcpServerConfig,
+    args: &Value,
+    cwd: Option<&str>,
+    backoff_schedule: &[Duration],
+) -> Value {
+    let machine = match args.get("machine").and_then(Value::as_str) {
+        Some(m) if !m.trim().is_empty() => m.trim(),
+        _ => return tool_err("missing or empty 'machine' argument"),
+    };
+    let directory = match args.get("directory").and_then(Value::as_str) {
+        Some(d) if !d.trim().is_empty() => d.trim(),
+        _ => return tool_err("missing or empty 'directory' argument"),
+    };
+    let prompt = match args.get("prompt").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return tool_err("missing or empty 'prompt' argument"),
+    };
+    let tag = args
+        .get("tag")
+        .and_then(Value::as_str)
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty());
+
+    let from = match ensure_mailbox(client, config, cwd).await {
+        Ok(f) => f,
+        Err(e) => return tool_err(e),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let launch_id = make_launch_id(now_ms);
+
+    let mut body = json!({
+        "launch_id": &launch_id,
+        "from": &from,
+        "machine": machine,
+        "directory": directory,
+        "prompt": prompt,
+    });
+    if let Some(t) = tag {
+        body["tag"] = json!(t);
+    }
+
+    let url = format!("{}/swarm/launch", config.pigeon_url.trim_end_matches('/'));
+
+    let pending_message = |id: &str| -> String {
+        format!(
+            "Launch {id} is pending (the worker did not answer). The result arrives as a launch.result swarm message. Do NOT call swarm_launch again for this."
+        )
+    };
+
+    let mut saw_ambiguous_failure = false;
+    let mut last_error: Option<String> = None;
+
+    for attempt in 1..=6 {
+        let is_last = attempt == 6;
+
+        let pigeon_token = read_token(config.pigeon_token_file.as_deref());
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30))
+            .json(&body);
+        if let Some(tok) = &pigeon_token {
+            req = req.bearer_auth(tok);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(err) => {
+                if !is_connection_refused(&err) {
+                    saw_ambiguous_failure = true;
+                }
+                last_error = Some(err.to_string());
+                if is_last {
+                    if saw_ambiguous_failure {
+                        return tool_ok(pending_message(&launch_id));
+                    }
+                    let detail = last_error.map(|m| format!(" ({m})")).unwrap_or_default();
+                    return tool_err(format!("swarm_launch failed: daemon unreachable{detail}"));
+                }
+                tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            let data: Value = resp.json().await.unwrap_or(Value::Null);
+            let returned_id = data
+                .get("launch_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&launch_id);
+            if data.get("status").and_then(Value::as_str) == Some("accepted") {
+                let to_machine = data
+                    .get("to_machine")
+                    .and_then(Value::as_str)
+                    .unwrap_or(machine);
+                return tool_ok(format!(
+                    "Launch {returned_id} accepted for {to_machine}. The result arrives as a launch.result swarm message."
+                ));
+            }
+            return tool_ok(pending_message(returned_id));
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<Value>(&text).ok();
+        let code = parsed.as_ref().and_then(|p| {
+            p.get("error")
+                .or_else(|| p.get("code"))
+                .and_then(Value::as_str)
+        });
+        let detail = parsed
+            .as_ref()
+            .and_then(|p| p.get("detail").and_then(Value::as_str));
+
+        let format_error = |fallback: &str| -> String {
+            match (code, detail) {
+                (Some(c), Some(d)) => format!("{c}: {d}"),
+                (Some(c), None) => c.to_string(),
+                (None, Some(d)) => d.to_string(),
+                (None, None) => fallback.to_string(),
+            }
+        };
+
+        if status == reqwest::StatusCode::NOT_FOUND && code.is_none() {
+            return tool_err("pigeon on this machine is too old for swarm_launch");
+        }
+
+        let status_u16 = status.as_u16();
+        if (400..500).contains(&status_u16) && status_u16 != 429 {
+            return tool_err(format_error(&format!(
+                "swarm_launch failed: {status} {text}"
+            )));
+        }
+
+        if status_u16 == 429 && code.is_some_and(|c| c == "queue_full" || c == "rate_limited") {
+            return tool_err(format_error(&format!("swarm_launch failed: 429 {text}")));
+        }
+
+        if status_u16 == 503
+            && code.is_some_and(|c| {
+                c == "target_offline" || c == "launch_unavailable" || c == "no_worker"
+            })
+        {
+            return tool_err(format_error(&format!("swarm_launch failed: 503 {text}")));
+        }
+
+        if status_u16 >= 500 {
+            saw_ambiguous_failure = true;
+        }
+
+        if is_last {
+            if saw_ambiguous_failure {
+                return tool_ok(pending_message(&launch_id));
+            }
+            return tool_err(format!("swarm_launch failed: {status} {text}"));
+        }
+
+        tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
+    }
+
+    let detail = last_error.map(|m| format!(" ({m})")).unwrap_or_default();
+    tool_err(format!("swarm_launch failed: daemon unreachable{detail}"))
+}
+
+async fn handle_swarm_schedule(
+    client: &reqwest::Client,
+    config: &SwarmMcpServerConfig,
+    args: &Value,
+    cwd: Option<&str>,
+    backoff_schedule: &[Duration],
+) -> Value {
+    let message = match args.get("message").and_then(Value::as_str) {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => return tool_err("missing or empty 'message' argument"),
+    };
+    let at = args
+        .get("at")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    let after = args
+        .get("after")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    let has_at = at.is_some();
+    let has_after = after.is_some();
+    if (has_at && has_after) || (!has_at && !has_after) {
+        return tool_err("Exactly one of 'at' or 'after' must be provided.");
+    }
+
+    let from = match ensure_mailbox(client, config, cwd).await {
+        Ok(f) => f,
+        Err(e) => return tool_err(e),
+    };
+
+    let to = args
+        .get("to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&from);
+    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("chat");
+    let priority = args
+        .get("priority")
+        .and_then(Value::as_str)
+        .unwrap_or("normal");
+    let expires_in = args.get("expires_in").and_then(Value::as_str);
+    let ref_str = args.get("ref").and_then(Value::as_str);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let msg_id = make_msg_id(now_ms);
+
+    let mut body = json!({
+        "from": &from,
+        "to": to,
+        "kind": kind,
+        "priority": priority,
+        "payload": message,
+        "msg_id": &msg_id,
+    });
+    if let Some(a) = at {
+        body["at"] = json!(a);
+    }
+    if let Some(af) = after {
+        body["after"] = json!(af);
+    }
+    if let Some(exp) = expires_in {
+        body["expires_in"] = json!(exp);
+    }
+    if let Some(r) = ref_str {
+        body["ref"] = json!(r);
+    }
+
+    let url = format!("{}/swarm/schedule", config.pigeon_url.trim_end_matches('/'));
+
+    for attempt in 1..=6 {
+        let is_last = attempt == 6;
+
+        let pigeon_token = read_token(config.pigeon_token_file.as_deref());
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if let Some(tok) = &pigeon_token {
+            req = req.bearer_auth(tok);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(err) => {
+                if is_last {
+                    return tool_err(format!(
+                        "swarm_schedule failed after {attempt} attempts (daemon unreachable): {err}"
+                    ));
+                }
+                tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            let data: Value = resp.json().await.unwrap_or(Value::Null);
+            let ret_msg_id = data
+                .get("msg_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&msg_id);
+            let deliver_at = data.get("deliver_at").and_then(Value::as_i64).unwrap_or(0);
+            let expires_at = data.get("expires_at").and_then(Value::as_i64).unwrap_or(0);
+            return tool_ok(format_schedule_result(
+                ret_msg_id, to, deliver_at, expires_at, attempt, false,
+            ));
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let daemon_error = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|p| p.get("error").and_then(Value::as_str).map(String::from))
+                .unwrap_or(text);
+            return tool_err(format!(
+                "swarm_schedule REJECTED — the wake was NOT scheduled and will never fire: {daemon_error}"
+            ));
+        }
+
+        if status == reqwest::StatusCode::CONFLICT && attempt >= 2 {
+            let parsed: Option<Value> = serde_json::from_str(&text).ok();
+            let returned_msg_id = parsed
+                .as_ref()
+                .and_then(|p| p.get("msg_id").and_then(Value::as_str));
+            let deliver_at = parsed
+                .as_ref()
+                .and_then(|p| p.get("deliver_at").and_then(Value::as_i64))
+                .unwrap_or(0);
+            let expires_at = parsed
+                .as_ref()
+                .and_then(|p| p.get("expires_at").and_then(Value::as_i64))
+                .unwrap_or(0);
+            if returned_msg_id.is_none() || returned_msg_id == Some(&msg_id) {
+                let ret_id = returned_msg_id.unwrap_or(&msg_id);
+                return tool_ok(format_schedule_result(
+                    ret_id, to, deliver_at, expires_at, attempt, true,
+                ));
+            }
+        }
+
+        let status_u16 = status.as_u16();
+        let is_transient = (status_u16 >= 500 && status_u16 != 503) || status_u16 == 429;
+        if is_transient {
+            if is_last {
+                return tool_err(format!(
+                    "swarm_schedule failed after {attempt} attempts: {status} {text}"
+                ));
+            }
+            tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
+            continue;
+        }
+
+        return tool_err(format!("swarm_schedule failed: {status} {text}"));
+    }
+
+    tool_err("swarm_schedule failed: exhausted retries")
+}
+
+fn format_scheduled_duration(ms: i64) -> String {
+    let total_secs = ms / 1000;
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins < 60 {
+        return if secs > 0 {
+            format!("{mins}m{secs}s")
+        } else {
+            format!("{mins}m")
+        };
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return if rem_mins > 0 {
+            format!("{hours}h{rem_mins}m")
+        } else {
+            format!("{hours}h")
+        };
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    if rem_hours > 0 {
+        format!("{days}d{rem_hours}h")
+    } else {
+        format!("{days}d")
+    }
+}
+
+fn format_scheduled_relative_time(deliver_at: i64, now_ms: i64, state: &str) -> String {
+    let diff_ms = deliver_at - now_ms;
+    if diff_ms > 0 {
+        format!("in {}", format_scheduled_duration(diff_ms))
+    } else {
+        let ago_ms = diff_ms.abs();
+        if state == "queued" {
+            format!("overdue by {}", format_scheduled_duration(ago_ms))
+        } else {
+            format!("{} ago", format_scheduled_duration(ago_ms))
+        }
+    }
+}
+
+fn format_scheduled_list(messages: &[Value], session_id: &str, now_ms: i64) -> String {
+    if messages.is_empty() {
+        return "No scheduled messages found.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for m in messages {
+        let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
+        let from = m.get("from").and_then(Value::as_str).unwrap_or("");
+        let to = m.get("to").and_then(Value::as_str).unwrap_or("");
+        let state = m.get("state").and_then(Value::as_str).unwrap_or("");
+        let deliver_at = m.get("deliver_at").and_then(Value::as_i64).unwrap_or(0);
+        let ref_str = m.get("ref").and_then(Value::as_str);
+        let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
+
+        let rel_time = format_scheduled_relative_time(deliver_at, now_ms, state);
+        let abs_time = format_iso_time(deliver_at);
+
+        let mut dir_str = String::new();
+        if from != to {
+            if from == session_id {
+                dir_str = format!(" [to: {to}]");
+            } else if to == session_id {
+                dir_str = format!(" [from: {from}]");
+            } else {
+                dir_str = format!(" [{from} -> {to}]");
+            }
+        }
+
+        let ref_part = ref_str.map(|r| format!(" [ref: {r}]")).unwrap_or_default();
+
+        let collapsed: String = payload.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = if collapsed.len() > 60 {
+            format!("{}...", &collapsed[..57])
+        } else {
+            collapsed
+        };
+
+        lines.push(format!(
+            "{msg_id} [{state}] deliver: {abs_time} ({rel_time}){dir_str}{ref_part} - \"{preview}\""
+        ));
+    }
+
+    lines.join("\n")
+}
+
+async fn handle_swarm_scheduled(
+    client: &reqwest::Client,
+    config: &SwarmMcpServerConfig,
+    args: &Value,
+    cwd: Option<&str>,
+) -> Value {
+    let action = match args.get("action").and_then(Value::as_str) {
+        Some("list") => "list",
+        Some("cancel") => "cancel",
+        Some(other) => {
+            return tool_err(format!(
+                "Invalid action '{other}': expected 'list' or 'cancel'"
+            ));
+        }
+        None => return tool_err("missing or empty 'action' argument"),
+    };
+
+    let session_id = match ensure_mailbox(client, config, cwd).await {
+        Ok(s) => s,
+        Err(e) => return tool_err(e),
+    };
+
+    let pigeon_token = read_token(config.pigeon_token_file.as_deref());
+
+    if action == "cancel" {
+        let msg_id = match args.get("msg_id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.trim(),
+            _ => return tool_err("msg_id is required when action is 'cancel'"),
+        };
+
+        let encoded_id: String = url::form_urlencoded::byte_serialize(msg_id.as_bytes()).collect();
+        let url = format!(
+            "{}/swarm/scheduled/{encoded_id}/cancel",
+            config.pigeon_url.trim_end_matches('/')
+        );
+
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&json!({ "from": session_id }));
+        if let Some(tok) = &pigeon_token {
+            req = req.bearer_auth(tok);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return tool_err(format!("pigeon /swarm/scheduled cancel unreachable: {e}")),
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            return tool_ok(format!("Cancelled scheduled message {msg_id}."));
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return tool_err(format!(
+                "Failed to cancel {msg_id}: no such scheduled message."
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return tool_err(format!(
+                "Failed to cancel {msg_id}: only the original sender may cancel it."
+            ));
+        }
+        if status == reqwest::StatusCode::CONFLICT {
+            let state_str = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|j| j.get("state").and_then(Value::as_str).map(String::from));
+            if let Some(state) = state_str {
+                return tool_err(format!(
+                    "Failed to cancel {msg_id}: cannot cancel message in state '{state}'."
+                ));
+            }
+            return tool_err(format!(
+                "Failed to cancel {msg_id}: message is already in a terminal state."
+            ));
+        }
+
+        return tool_err(format!("swarm_scheduled cancel failed: {status} {text}"));
+    }
+
+    // Action == "list"
+    let url = format!(
+        "{}/swarm/scheduled",
+        config.pigeon_url.trim_end_matches('/')
+    );
+    let mut req = client.get(&url).query(&[("session", &session_id)]);
+    if let Some(tok) = &pigeon_token {
+        req = req.bearer_auth(tok);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return tool_err(format!("pigeon /swarm/scheduled list unreachable: {e}")),
+    };
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return tool_err(format!("swarm_scheduled list failed: {status} {text}"));
+    }
+
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => return tool_err(format!("pigeon returned non-JSON: {e}")),
+    };
+
+    let messages = body
+        .get("scheduled")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    tool_ok(format_scheduled_list(&messages, &session_id, now_ms))
 }
 
 /// Parses MCP server names for enable: returns `(names, confirm)`.
@@ -1008,15 +1839,105 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_list",
-            "description": "List active sessions across all projects to discover peer session IDs for swarm_send. Identifies opencode and goose sessions; both are woken by a message. A 'goose-pull' identity is marked by whether it has a mailbox it polls.",
+            "description": "List local opencode sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of sessions to return."
+                        "description": "Max sessions to return (default 100)."
+                    },
+                    "remote": {
+                        "type": "boolean",
+                        "description": "List sessions on other machines (active in the last 7 days) instead of local ones."
                     }
                 }
+            }
+        }),
+        json!({
+            "name": "swarm_launch",
+            "description": "Start a FRESH session on another machine via the pigeon daemon. Off unless this machine's daemon has PIGEON_REMOTE_LAUNCH_SEND=1 (errors with launch_send_disabled); target must list this machine in PIGEON_REMOTE_LAUNCH_FROM. Call ONCE per launch; the result arrives as a launch.result swarm message. 'pending' means do not call again; a pool restart on that machine kills the launched session (see the cross-device-deployment skill).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "machine": {
+                        "type": "string",
+                        "description": "Target machine id to launch the session on (e.g. 'devbox', 'cloudbox')."
+                    },
+                    "directory": {
+                        "type": "string",
+                        "description": "Working directory for the new session on the target machine: absolute path, ~/..., or a bare project name expanded to that machine's project root (~/projects/<name> on Linux, ~/Code/<name> on macOS)."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Initial prompt for the launched session."
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional tag for oc-tags cost attribution."
+                    }
+                },
+                "required": ["machine", "directory", "prompt"]
+            }
+        }),
+        json!({
+            "name": "swarm_schedule",
+            "description": "Schedule a swarm message for future delivery. The dominant use is waking yourself later at a scheduled time or after a delay. The message MUST be self-contained and carry a durable pointer (such as a beads ID, PR number, or file path) — do NOT write vague messages like 'continue what you were doing', because the receiving session may have compacted away the context that motivated the wake. Prefer `after` (a relative delay like '13h') — it is unambiguous and needs no timezone reasoning. Example: after: '13h', message: 'Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.'. Use `at` only for a true wall-clock deadline, and note it requires a FULL RFC3339 timestamp with an offset or 'Z' (e.g. '2026-08-02T09:00:00-04:00'); a bare time like '09:00' is REJECTED. Messages under 40 chars are rejected. A scheduled message expires if undelivered, defaulting to 6 hours after its delivery time (override with expires_in). Use ref as an optional durable pointer rendered as an envelope attribute (e.g. bd:pigeon-mx2).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Self-contained raw message text (minimum 40 chars). Must include durable pointers (beads ID, PR#, file path). Do NOT include <swarm_message> tags."
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient opencode session id (defaults to calling session for self-wake)."
+                    },
+                    "at": {
+                        "type": "string",
+                        "description": "Absolute delivery time as a FULL RFC3339 timestamp with a mandatory UTC offset or 'Z' (e.g. '2026-08-02T09:00:00-04:00' or '2026-08-02T13:00:00Z'). A bare wall-clock time like '09:00' is rejected as ambiguous — use 'after' instead for relative delays. Exactly one of 'at' or 'after' is required."
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Relative delay spec for delivery (e.g. '30m', '2h', '1d'). Exactly one of 'at' or 'after' is required."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Message kind (default 'chat')."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "Priority: 'urgent', 'normal' (default), or 'low'."
+                    },
+                    "expires_in": {
+                        "type": "string",
+                        "description": "Expiration duration after delivery time (default '6h', e.g. '12h')."
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "Optional durable pointer rendered as envelope attribute (e.g. 'bd:pigeon-mx2')."
+                    }
+                },
+                "required": ["message"]
+            }
+        }),
+        json!({
+            "name": "swarm_scheduled",
+            "description": "Manage scheduled swarm messages. Use action 'list' to view pending (queued) and recent terminal scheduled messages (expired, failed, cancelled) for the current session. Note: successfully delivered wakes (handed_off) do not appear in this list, so absence of a past scheduled wake implies it was delivered. Use action 'cancel' with `msg_id` to cancel a pending queued scheduled message before it fires.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action to perform: 'list' or 'cancel'."
+                    },
+                    "msg_id": {
+                        "type": "string",
+                        "description": "Message ID to cancel (required when action is 'cancel')."
+                    }
+                },
+                "required": ["action"]
             }
         }),
     ];
@@ -1071,8 +1992,21 @@ fn get_tools(self_grant: bool) -> Value {
 
 pub async fn run_server<R, W>(
     config: SwarmMcpServerConfig,
+    reader: R,
+    writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    run_server_with_backoff(config, reader, writer, DEFAULT_BACKOFF.to_vec()).await
+}
+
+pub async fn run_server_with_backoff<R, W>(
+    config: SwarmMcpServerConfig,
     mut reader: R,
     mut writer: W,
+    backoff_schedule: Vec<Duration>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -1172,6 +2106,30 @@ where
                                 handle_swarm_read(&client, &config, arguments, cwd.as_deref()).await
                             }
                             "swarm_list" => handle_swarm_list(&client, &config, arguments).await,
+                            "swarm_launch" => {
+                                handle_swarm_launch(
+                                    &client,
+                                    &config,
+                                    arguments,
+                                    cwd.as_deref(),
+                                    &backoff_schedule,
+                                )
+                                .await
+                            }
+                            "swarm_schedule" => {
+                                handle_swarm_schedule(
+                                    &client,
+                                    &config,
+                                    arguments,
+                                    cwd.as_deref(),
+                                    &backoff_schedule,
+                                )
+                                .await
+                            }
+                            "swarm_scheduled" => {
+                                handle_swarm_scheduled(&client, &config, arguments, cwd.as_deref())
+                                    .await
+                            }
                             "mcp_list" | "mcp_enable" | "mcp_disable" => {
                                 if self_grant_enabled == Some(false) {
                                     tool_err(

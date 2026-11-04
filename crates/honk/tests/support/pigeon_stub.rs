@@ -15,6 +15,8 @@ use tokio::net::TcpListener;
 pub struct Seen {
     pub path: String,
     pub auth: Option<String>,
+    pub content_type: Option<String>,
+    pub origin: Option<String>,
     pub body: Value,
 }
 
@@ -29,6 +31,13 @@ pub struct Behaviour {
     pub pull_drain: (StatusCode, Value),
     pub pull_ack: (StatusCode, Value),
     pub pull_pending: (StatusCode, Value),
+    pub swarm_launch: (StatusCode, Value),
+    pub swarm_launch_responses: Arc<Mutex<Vec<(StatusCode, Value)>>>,
+    pub swarm_schedule: (StatusCode, Value),
+    pub swarm_schedule_responses: Arc<Mutex<Vec<(StatusCode, Value)>>>,
+    pub swarm_scheduled: (StatusCode, Value),
+    pub swarm_scheduled_cancel: (StatusCode, Value),
+    pub swarm_remote_sessions: (StatusCode, Value),
 }
 
 impl Default for Behaviour {
@@ -63,6 +72,31 @@ impl Default for Behaviour {
                 StatusCode::OK,
                 json!({"ok": true, "session_id": "gse_stub", "session_known": true, "backend_kind": "goose-acp", "pending": 0, "by_source": {"swarm": 0}}),
             ),
+            swarm_launch: (
+                StatusCode::OK,
+                json!({"status": "accepted", "launch_id": "rl_stub_1", "to_machine": "cloudbox"}),
+            ),
+            swarm_launch_responses: Arc::new(Mutex::new(Vec::new())),
+            swarm_schedule: (
+                StatusCode::ACCEPTED,
+                json!({"accepted": true, "msg_id": "msg_stub_sched_1", "deliver_at": 1730736000000_i64, "expires_at": 1730757600000_i64}),
+            ),
+            swarm_schedule_responses: Arc::new(Mutex::new(Vec::new())),
+            swarm_scheduled: (StatusCode::OK, json!({"scheduled": []})),
+            swarm_scheduled_cancel: (
+                StatusCode::OK,
+                json!({"cancelled": true, "msg_id": "msg_stub_1"}),
+            ),
+            swarm_remote_sessions: (
+                StatusCode::OK,
+                json!({
+                    "machine_id": "devbox",
+                    "sessions": [],
+                    "machines": [],
+                    "truncated": false,
+                    "relay_send": true
+                }),
+            ),
         }
     }
 }
@@ -76,6 +110,7 @@ struct St {
 pub struct StubPigeon {
     pub url: String,
     pub seen: Arc<Mutex<Vec<Seen>>>,
+    pub behaviour: Behaviour,
 }
 
 impl StubPigeon {
@@ -83,7 +118,7 @@ impl StubPigeon {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let st = St {
             seen: seen.clone(),
-            behaviour,
+            behaviour: behaviour.clone(),
         };
         let app = Router::new()
             .route("/goose/sessions", post(register))
@@ -91,6 +126,14 @@ impl StubPigeon {
             .route("/sessions", axum::routing::get(sessions))
             .route("/goose/swarm-mailbox", post(swarm_mailbox))
             .route("/swarm/send", post(swarm_send))
+            .route("/swarm/launch", post(swarm_launch))
+            .route("/swarm/schedule", post(swarm_schedule))
+            .route("/swarm/scheduled", axum::routing::get(swarm_scheduled))
+            .route("/swarm/scheduled/{id}/cancel", post(swarm_scheduled_cancel))
+            .route(
+                "/swarm/remote-sessions",
+                axum::routing::get(swarm_remote_sessions),
+            )
             .route("/pull/drain", post(pull_drain))
             .route("/pull/ack", post(pull_ack))
             .route("/pull/pending", axum::routing::get(pull_pending))
@@ -103,11 +146,20 @@ impl StubPigeon {
         Self {
             url: format!("http://{addr}"),
             seen,
+            behaviour,
         }
     }
 
     pub fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
+    }
+
+    pub fn launch_responses(&self) -> std::sync::MutexGuard<'_, Vec<(StatusCode, Value)>> {
+        self.behaviour.swarm_launch_responses.lock().unwrap()
+    }
+
+    pub fn schedule_responses(&self) -> std::sync::MutexGuard<'_, Vec<(StatusCode, Value)>> {
+        self.behaviour.swarm_schedule_responses.lock().unwrap()
     }
 }
 
@@ -116,6 +168,14 @@ fn record(st: &St, path: &str, headers: &HeaderMap, body: Value) {
         path: path.into(),
         auth: headers
             .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        content_type: headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        origin: headers
+            .get("origin")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
         body,
@@ -199,5 +259,85 @@ async fn pull_pending(
         serde_json::to_value(params).unwrap_or(Value::Null),
     );
     let (s, v) = st.behaviour.pull_pending.clone();
+    (s, axum::Json(v))
+}
+
+async fn swarm_launch(
+    State(st): State<St>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> impl IntoResponse {
+    record(&st, "/swarm/launch", &headers, body);
+    let resp = {
+        let mut list = st.behaviour.swarm_launch_responses.lock().unwrap();
+        if !list.is_empty() {
+            list.remove(0)
+        } else {
+            st.behaviour.swarm_launch.clone()
+        }
+    };
+    (resp.0, axum::Json(resp.1))
+}
+
+async fn swarm_schedule(
+    State(st): State<St>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> impl IntoResponse {
+    record(&st, "/swarm/schedule", &headers, body);
+    let resp = {
+        let mut list = st.behaviour.swarm_schedule_responses.lock().unwrap();
+        if !list.is_empty() {
+            list.remove(0)
+        } else {
+            st.behaviour.swarm_schedule.clone()
+        }
+    };
+    (resp.0, axum::Json(resp.1))
+}
+
+async fn swarm_scheduled(
+    State(st): State<St>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    record(
+        &st,
+        "/swarm/scheduled",
+        &headers,
+        serde_json::to_value(params).unwrap_or(Value::Null),
+    );
+    let (s, v) = st.behaviour.swarm_scheduled.clone();
+    (s, axum::Json(v))
+}
+
+async fn swarm_scheduled_cancel(
+    State(st): State<St>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> impl IntoResponse {
+    record(
+        &st,
+        &format!("/swarm/scheduled/{id}/cancel"),
+        &headers,
+        body,
+    );
+    let (s, v) = st.behaviour.swarm_scheduled_cancel.clone();
+    (s, axum::Json(v))
+}
+
+async fn swarm_remote_sessions(
+    State(st): State<St>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    record(
+        &st,
+        "/swarm/remote-sessions",
+        &headers,
+        serde_json::to_value(params).unwrap_or(Value::Null),
+    );
+    let (s, v) = st.behaviour.swarm_remote_sessions.clone();
     (s, axum::Json(v))
 }

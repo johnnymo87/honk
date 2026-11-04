@@ -941,6 +941,7 @@ dependencies = [
  "crossterm",
  "edtui",
  "futures",
+ "getrandom 0.3.4",
  "honk-testgoose",
  "honk-wire",
  "indexmap",
