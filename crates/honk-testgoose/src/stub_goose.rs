@@ -523,12 +523,22 @@ pub fn extract_turn_text(export: &serde_json::Value) -> String {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
             && let Some(contents) = msg.get("content").and_then(|c| c.as_array())
         {
+            let mut step = String::new();
             for item in contents {
                 if item.get("type").and_then(|t| t.as_str()) == Some("text")
                     && let Some(text) = item.get("text").and_then(|t| t.as_str())
                 {
-                    out.push_str(text);
+                    step.push_str(text);
                 }
+            }
+            // Same rule as honk_wire::export::turn_text: one blank line between
+            // assistant messages that have text.
+            if !step.is_empty() {
+                if !out.is_empty() {
+                    let trailing = out.chars().rev().take(2).take_while(|c| *c == '\n').count();
+                    out.push_str(&"\n".repeat(2 - trailing));
+                }
+                out.push_str(&step);
             }
         }
     }

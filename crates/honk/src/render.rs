@@ -6,8 +6,10 @@
 //! When `text_only` is true, only agent message text chunks (`agent_message_chunk` /
 //! `BlockKey::Text`) are emitted. User messages (`> ...`), tool calls (`▸ ...`),
 //! tool status marks (` ✓`/` ✗`), thoughts, and transcript rebuild markers
-//! (`\n[honk: transcript rebuilt]\n`) are suppressed. This produces output that
-//! exactly matches the turn text returned in export.
+//! (`\n[honk: transcript rebuilt]\n`) are suppressed. This produces the turn
+//! text returned in export except for step breaks: export puts a blank line
+//! between assistant messages (honk-iks), while text-only output streams their
+//! chunks with nothing between them.
 
 use honk_wire::BlockKey;
 use serde_json::Value;

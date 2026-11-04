@@ -391,6 +391,28 @@ pub fn turn_text(export: &Value, user_text: &str) -> Option<String> {
     extract_assistant_text_after(conversation, idx)
 }
 
+/// Appends one assistant message's text to a turn's text. Each assistant
+/// message is one step of the turn (narration before a tool call, then the
+/// answer), and goose's text blocks carry no separator of their own, so steps
+/// are parted by a blank line: glued together they read "…worker.Both are…".
+/// A textless step adds nothing; newlines the previous step already ends with
+/// count toward the blank line.
+fn push_step(out: &mut String, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        let trailing = out
+            .bytes()
+            .rev()
+            .take(2)
+            .take_while(|b| *b == b'\n')
+            .count();
+        out.push_str(&"\n".repeat(2 - trailing));
+    }
+    out.push_str(segment);
+}
+
 fn extract_assistant_text_after(conversation: &[Value], idx: usize) -> Option<String> {
     let mut out = String::new();
     for msg in &conversation[idx + 1..] {
@@ -423,6 +445,7 @@ fn extract_assistant_text_after(conversation: &[Value], idx: usize) -> Option<St
             let Some(content) = msg.get("content").and_then(Value::as_array) else {
                 continue;
             };
+            let mut segment = String::new();
             for block in content {
                 if !is_content_user_visible(block) {
                     continue;
@@ -430,9 +453,10 @@ fn extract_assistant_text_after(conversation: &[Value], idx: usize) -> Option<St
                 if block.get("type").and_then(Value::as_str) == Some("text")
                     && let Some(t) = block.get("text").and_then(Value::as_str)
                 {
-                    out.push_str(t);
+                    segment.push_str(t);
                 }
             }
+            push_step(&mut out, &segment);
         }
     }
 
