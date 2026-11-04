@@ -188,7 +188,10 @@ fn test_turn_text_equals_live_agent_chunks() {
         .expect("canonical prompt");
 
     let live_frames = load_jsonl(LIVE_PATH);
+    // Live chunks joined within a message, and messages (by goose messageId)
+    // separated by a blank line: what a reader of the stream sees as separate steps.
     let mut live_agent_text = String::new();
+    let mut last_message_id: Option<String> = None;
     for row in &live_frames {
         let frame = row.get("frame").unwrap_or(row);
         let Some(u) = frame.pointer("/params/update") else {
@@ -197,9 +200,18 @@ fn test_turn_text_equals_live_agent_chunks() {
         if u.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk")
             && let Some(t) = u.pointer("/content/text").and_then(Value::as_str)
         {
+            let message_id = u
+                .pointer("/_meta/goose/messageId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if !live_agent_text.is_empty() && message_id != last_message_id {
+                live_agent_text.push_str("\n\n");
+            }
+            last_message_id = message_id;
             live_agent_text.push_str(t);
         }
     }
+    assert!(live_agent_text.matches("\n\n").count() >= 2);
 
     let computed_turn_text = turn_text(&export, canonical_prompt);
     assert_eq!(
@@ -319,7 +331,7 @@ fn test_client_prompts_skips_steers_and_turn_text_stops_at_next_prompt() {
 
     // Turn 1 text includes text before and after the steer, but stops before Turn 2 prompt!
     let text1 = turn_text(&session, "turn 1 prompt");
-    assert_eq!(text1.as_deref(), Some("turn 1 part 1 turn 1 part 2"));
+    assert_eq!(text1.as_deref(), Some("turn 1 part 1 \n\nturn 1 part 2"));
 
     let text2 = turn_text(&session, "turn 2 prompt");
     assert_eq!(text2.as_deref(), Some("turn 2 reply"));
@@ -948,11 +960,73 @@ fn test_self_compact_export_fixture() {
         text.contains("after"),
         "turn text must include 'after', got: {text}"
     );
-    assert_eq!(text, "Context self-compacted.after");
+    assert_eq!(text, "Context self-compacted.\n\nafter");
 
     // Also assert turn_text(&export, "P1") matches
     assert_eq!(
         turn_text(&export, "P1"),
-        Some("Context self-compacted.after".to_string())
+        Some("Context self-compacted.\n\nafter".to_string())
+    );
+}
+
+fn step_session(assistant_msgs: Vec<Value>) -> Value {
+    let mut conversation = vec![serde_json::json!({
+        "role": "user",
+        "metadata": { "userVisible": true },
+        "content": [{ "type": "text", "text": "prompt" }]
+    })];
+    for (i, content) in assistant_msgs.into_iter().enumerate() {
+        if i > 0 {
+            conversation.push(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "toolResponse", "id": format!("t{i}") }]
+            }));
+        }
+        conversation.push(serde_json::json!({ "role": "assistant", "content": content }));
+    }
+    serde_json::json!({ "conversation": conversation })
+}
+
+#[test]
+fn test_turn_text_separates_assistant_messages_with_blank_line() {
+    // Narration before a tool call, then the answer: two assistant messages.
+    // Glued together they read "…to the WD worker.Both are moving" (honk-iks).
+    let session = step_session(vec![
+        serde_json::json!([
+            { "type": "text", "text": "Now the routing to the WD worker." },
+            { "type": "toolRequest", "id": "t1" }
+        ]),
+        serde_json::json!([{ "type": "text", "text": "Both are moving." }]),
+    ]);
+    assert_eq!(
+        turn_text(&session, "prompt").as_deref(),
+        Some("Now the routing to the WD worker.\n\nBoth are moving.")
+    );
+}
+
+#[test]
+fn test_turn_text_keeps_blocks_of_one_message_together() {
+    let session = step_session(vec![serde_json::json!([
+        { "type": "text", "text": "Hello " },
+        { "type": "text", "text": "world" }
+    ])]);
+    assert_eq!(
+        turn_text(&session, "prompt").as_deref(),
+        Some("Hello world")
+    );
+}
+
+#[test]
+fn test_turn_text_separator_skips_textless_messages_and_tops_up_newlines() {
+    let session = step_session(vec![
+        serde_json::json!([{ "type": "text", "text": "first\n" }, { "type": "toolRequest" }]),
+        serde_json::json!([{ "type": "toolRequest" }]),
+        serde_json::json!([{ "type": "text", "text": "" }, { "type": "toolRequest" }]),
+        serde_json::json!([{ "type": "text", "text": "second\n\n" }, { "type": "toolRequest" }]),
+        serde_json::json!([{ "type": "text", "text": "third" }]),
+    ]);
+    assert_eq!(
+        turn_text(&session, "prompt").as_deref(),
+        Some("first\n\nsecond\n\nthird")
     );
 }
