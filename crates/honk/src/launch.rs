@@ -3,7 +3,8 @@
 //!
 //! In order, each step a precondition of the next:
 //!
-//! 1. Decide the tag, before anything exists: an explicit `--tag` wins; else
+//! 1. Preflight, before anything exists: pigeon reachable with our token, and
+//!    the tag decided: an explicit `--tag` wins; else
 //!    the launching session's (`$OPENCODE_SESSION_ID`, or `goose:` +
 //!    `$AGENT_SESSION_ID`). A launcher that is a stall-watch coordinator (pigeon
 //!    `bound_topic_key = 'stallwatch:<tag>'`) gives its program `<tag>`, never
@@ -19,9 +20,11 @@
 //! 6. `session/prompt`, wait until honkd shows the turn started, and disconnect.
 //!    A viewer leaving does not cancel a turn in honkd.
 //!
-//! Any failure stops the launch there. Once the session exists, a failure
-//! still reports its ids ([`LaunchError::Partial`]) and the session is left
-//! unprompted (unless the failure is in confirming the prompt itself).
+//! A failure stops the launch there, except a tag failure, which is reported
+//! after the prompt (the caller can repair a tag, but not resume a launch).
+//! Once the session exists a failure still reports its ids
+//! ([`LaunchError::Partial`]); the line's `prompt=` field says whether it was
+//! prompted.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,9 +44,34 @@ pub const COORDINATOR_OWN_TAG: &str = "stall-watcher-runs";
 pub const EXIT_OK: i32 = 0;
 /// Exit code: failed before any session was created.
 pub const EXIT_NOT_CREATED: i32 = 1;
-/// Exit code: the session exists but a later step failed (the ids line is
-/// still printed).
+/// Exit code: the session exists but a step failed; the line is printed and
+/// its `gse=`, `tag=` and `prompt=` fields say how far the launch got.
 pub const EXIT_PARTIAL: i32 = 3;
+/// Exit code: as [`EXIT_PARTIAL`], but the prompt was sent and its outcome is
+/// unknown (`prompt=unknown`): the turn may be running. Do not relaunch.
+pub const EXIT_PROMPT_UNKNOWN: i32 = 4;
+
+/// Whether the session was prompted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptState {
+    /// Not prompted (never sent, or honkd refused it).
+    #[default]
+    No,
+    /// goose started the turn.
+    Ok,
+    /// Sent, but the turn was not seen to start.
+    Unknown,
+}
+
+impl PromptState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptState::No => "no",
+            PromptState::Ok => "ok",
+            PromptState::Unknown => "unknown",
+        }
+    }
+}
 
 /// What `--tag` asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +86,7 @@ pub enum TagRequest {
 
 #[derive(Clone, Debug)]
 pub struct Timeouts {
+    pub connect: Duration,
     pub session_new: Duration,
     pub swarm_enable: Duration,
     pub rename: Duration,
@@ -69,6 +98,7 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
+            connect: Duration::from_secs(10),
             session_new: Duration::from_secs(30),
             swarm_enable: Duration::from_secs(30),
             rename: Duration::from_secs(10),
@@ -123,18 +153,21 @@ pub struct Launched {
     pub gse: Option<String>,
     /// The tag applied, as session-tags stores it (lowercased).
     pub tag: Option<String>,
+    pub prompt: PromptState,
 }
 
 impl Launched {
-    /// The machine-readable line: `native=<id> gse=<gse_…|-> tag=<tag|->`.
+    /// The machine-readable line:
+    /// `native=<id> gse=<gse_…|-> tag=<tag|-> prompt=<ok|no|unknown>`.
     /// No field contains whitespace: goose ids are `YYYYMMDD_N`, pigeon ids are
     /// `gse_<uuid>`, and tags are validated by [`octags::parse_tag`].
     pub fn line(&self) -> String {
         format!(
-            "native={} gse={} tag={}",
+            "native={} gse={} tag={} prompt={}",
             self.native,
             self.gse.as_deref().unwrap_or("-"),
-            self.tag.as_deref().unwrap_or("-")
+            self.tag.as_deref().unwrap_or("-"),
+            self.prompt.as_str()
         )
     }
 }
@@ -154,14 +187,17 @@ impl LaunchError {
     pub fn exit_code(&self) -> i32 {
         match self {
             LaunchError::NotCreated(_) => EXIT_NOT_CREATED,
+            LaunchError::Partial { launched, .. } if launched.prompt == PromptState::Unknown => {
+                EXIT_PROMPT_UNKNOWN
+            }
             LaunchError::Partial { .. } => EXIT_PARTIAL,
         }
     }
 }
 
 /// Decides the tag before any session exists, so a tag that cannot be decided
-/// creates nothing.
-pub async fn resolve_tag(opts: &LaunchOpts) -> anyhow::Result<Option<String>> {
+/// creates nothing. `rows` is pigeon's `GET /sessions`.
+pub async fn resolve_tag(opts: &LaunchOpts, rows: &[Value]) -> anyhow::Result<Option<String>> {
     let launcher = match (&opts.tag, &opts.launcher) {
         (TagRequest::Off, _) => return Ok(None),
         (TagRequest::Explicit(t), _) => return Ok(Some(t.clone())),
@@ -169,19 +205,14 @@ pub async fn resolve_tag(opts: &LaunchOpts) -> anyhow::Result<Option<String>> {
         (TagRequest::Inherit, Some(l)) => l,
     };
 
-    let rows = pigeon::fetch_sessions(&opts.pigeon)
-        .await
-        .with_context(|| {
-            format!("cannot check whether the launching session {launcher} is a stall-watch coordinator; pass --tag")
-        })?;
-    if let Some(program) = pigeon::coordinator_program(&rows, launcher) {
+    if let Some(program) = pigeon::coordinator_program(rows, launcher) {
         return Ok(Some(program));
     }
 
     match octags::query_launcher_tag(&opts.tags_bin, launcher, opts.timeouts.which).await {
         WhichOutcome::Inherit { tag, .. } => {
             if tag.eq_ignore_ascii_case(COORDINATOR_OWN_TAG) {
-                let why = if pigeon::reports_bound_topics(&rows) {
+                let why = if pigeon::reports_bound_topics(rows) {
                     "but pigeon has no program topic bound to it"
                 } else {
                     "and this pigeon does not report bound topics, so its program is unknown"
@@ -202,14 +233,52 @@ pub async fn resolve_tag(opts: &LaunchOpts) -> anyhow::Result<Option<String>> {
     }
 }
 
+/// Whether `bin` names an executable: a path to a file, or a name on `$PATH`.
+fn bin_exists(bin: &str) -> bool {
+    if bin.contains('/') {
+        std::path::Path::new(bin).is_file()
+    } else {
+        octags::on_path(bin)
+    }
+}
+
+/// Everything checkable before a session exists: pigeon reachable and
+/// accepting our token, the tag decided, session-tags present.
+async fn preflight(opts: &LaunchOpts) -> anyhow::Result<(Option<String>, String)> {
+    let rows = pigeon::fetch_sessions(&opts.pigeon).await.context(
+        "pigeon preflight failed (is HONK_PIGEON_TOKEN_FILE / --pigeon-token-file set?)",
+    )?;
+    let tag = resolve_tag(opts, &rows).await?;
+    if tag.is_some() && !bin_exists(&opts.tags_bin) {
+        bail!(
+            "'{}' not found, so the session could not be tagged; set {}",
+            opts.tags_bin,
+            octags::BIN_ENV
+        );
+    }
+    let endpoint = pigeon::acp_endpoint(&opts.honk_url)?;
+    Ok((tag, endpoint))
+}
+
 /// Runs the whole launch. On success the session is prompted and detached.
 pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
-    let tag = resolve_tag(opts).await.map_err(LaunchError::NotCreated)?;
-    let endpoint = pigeon::acp_endpoint(&opts.honk_url).map_err(LaunchError::NotCreated)?;
+    let (tag, endpoint) = preflight(opts).await.map_err(LaunchError::NotCreated)?;
 
-    let mut client = Client::connect(&opts.honk_url, &opts.secret)
-        .await
-        .map_err(LaunchError::NotCreated)?;
+    let mut client = match tokio::time::timeout(
+        opts.timeouts.connect,
+        Client::connect(&opts.honk_url, &opts.secret),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(LaunchError::NotCreated)?,
+        Err(_) => {
+            return Err(LaunchError::NotCreated(anyhow!(
+                "connecting to honkd at {} timed out after {:?}",
+                opts.honk_url,
+                opts.timeouts.connect
+            )));
+        }
+    };
     let NewSession {
         id: native,
         swarm_meta,
@@ -247,21 +316,26 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
         );
     }
 
+    // A tag failure does not stop the launch: the worker is still worth
+    // running, and the caller can repair the tag (sw launch verifies and
+    // repairs, as for opencode). It still makes the exit non-zero.
+    let mut tag_error = None;
     if let Some(t) = &tag {
         let settings = TagSettings {
             tag: t.clone(),
             bin: opts.tags_bin.clone(),
             timeout: opts.timeouts.set,
         };
-        step!(
-            octags::tag_session(&settings, &native).await,
-            format!(
-                "tagging failed; apply it with: {} set -- {t} {}",
-                opts.tags_bin,
-                octags::tagged_id(&native)
-            )
-        );
-        launched.tag = Some(t.to_ascii_lowercase());
+        match octags::tag_session(&settings, &native).await {
+            Ok(_) => launched.tag = Some(t.to_ascii_lowercase()),
+            Err(e) => {
+                tag_error = Some(e.context(format!(
+                    "tagging failed; apply it with: {} set -- {t} {}",
+                    opts.tags_bin,
+                    octags::tagged_id(&native)
+                )))
+            }
+        }
     }
 
     let reg = Registration {
@@ -291,19 +365,30 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
         );
     }
 
-    step!(
-        prompt(
-            &mut client,
-            &native,
-            &opts.prompt,
-            opts.timeouts.prompt_confirm
-        )
-        .await,
-        "prompting failed"
-    );
+    let sent = prompt(
+        &mut client,
+        &native,
+        &opts.prompt,
+        opts.timeouts.prompt_confirm,
+    )
+    .await;
     // Dropping the socket detaches this viewer; honkd keeps the turn running.
     drop(client);
-    Ok(launched)
+    match sent {
+        Ok(()) => launched.prompt = PromptState::Ok,
+        Err((state, error)) => {
+            launched.prompt = state;
+            let error = match tag_error {
+                Some(t) => error.context(format!("{t:#}; and prompting failed")),
+                None => error.context("prompting failed"),
+            };
+            return Err(LaunchError::Partial { launched, error });
+        }
+    }
+    match tag_error {
+        Some(error) => Err(LaunchError::Partial { launched, error }),
+        None => Ok(launched),
+    }
 }
 
 async fn call_with_timeout(
@@ -444,7 +529,7 @@ async fn prompt(
     sid: &str,
     text: &str,
     timeout: Duration,
-) -> anyhow::Result<()> {
+) -> Result<(), (PromptState, anyhow::Error)> {
     let crid = client_req_id(sid);
     let id = client
         .request(
@@ -455,15 +540,34 @@ async fn prompt(
                 "_meta": {"honk": {"client_req_id": crid}},
             }),
         )
-        .await?;
+        .await
+        .map_err(|e| (PromptState::No, e))?;
+    let unknown = |what: String| {
+        (
+            PromptState::Unknown,
+            anyhow!(
+                "{what}; the prompt was sent and the turn may still run (client_req_id {crid}; check with: honk tail {sid}). Do not relaunch the same task"
+            ),
+        )
+    };
     let wait = async {
         loop {
-            let Some(frame) = client.next_frame().await? else {
-                bail!("honkd closed the connection before the turn started");
+            let frame = match client.next_frame().await {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    return Err(unknown(
+                        "honkd closed the connection before the turn started".into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(unknown(format!(
+                        "lost honkd before the turn started: {e:#}"
+                    )));
+                }
             };
-            if frame.get("id") == Some(&json!(id)) {
+            if frame.get("id") == Some(&json!(id)) && frame.get("method").is_none() {
                 if let Some(e) = rpc_error(&frame) {
-                    bail!("session/prompt refused: {e}");
+                    return Err((PromptState::No, anyhow!("session/prompt refused: {e}")));
                 }
                 return Ok(());
             }
@@ -474,9 +578,9 @@ async fn prompt(
     };
     match tokio::time::timeout(timeout, wait).await {
         Ok(r) => r,
-        Err(_) => bail!(
-            "the prompt was sent but goose had not started the turn after {timeout:?}; it may still start (check with: honk tail {sid})"
-        ),
+        Err(_) => Err(unknown(format!(
+            "goose had not started the turn after {timeout:?}"
+        ))),
     }
 }
 
@@ -503,13 +607,14 @@ mod tests {
             native: "20261104_7".into(),
             gse: Some("gse_abc".into()),
             tag: Some("honk".into()),
+            prompt: PromptState::Ok,
         };
-        assert_eq!(l.line(), "native=20261104_7 gse=gse_abc tag=honk");
+        assert_eq!(l.line(), "native=20261104_7 gse=gse_abc tag=honk prompt=ok");
         let l = Launched {
             native: "20261104_7".into(),
             ..Default::default()
         };
-        assert_eq!(l.line(), "native=20261104_7 gse=- tag=-");
+        assert_eq!(l.line(), "native=20261104_7 gse=- tag=- prompt=no");
     }
 
     #[test]

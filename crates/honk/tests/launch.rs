@@ -260,7 +260,10 @@ async fn happy_path_tags_registers_then_prompts_and_disconnects() {
     assert_eq!(out.native, SID);
     assert_eq!(out.gse.as_deref(), Some("gse_test"));
     assert_eq!(out.tag.as_deref(), Some("honk"), "session-tags lowercases");
-    assert_eq!(out.line(), "native=20261104_9 gse=gse_test tag=honk");
+    assert_eq!(
+        out.line(),
+        "native=20261104_9 gse=gse_test tag=honk prompt=ok"
+    );
 
     assert_eq!(
         methods(&r),
@@ -294,15 +297,18 @@ async fn happy_path_tags_registers_then_prompts_and_disconnects() {
         p.tags_log_then
     );
     assert_eq!(
-        p.pigeon_seen_then, 2,
-        "registered and announced before the prompt"
+        p.pigeon_seen_then, 3,
+        "preflight, registered and announced before the prompt"
     );
 
     // Explicit tag wins: no `which` for the launcher.
     assert_eq!(tags_log(&r), format!("set -- Honk goose:{SID}\n"));
 
     let seen = r.pigeon.seen();
-    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[0].path, "/sessions", "preflight checks pigeon first");
+    assert_eq!(seen[0].auth.as_deref(), Some("Bearer ptok"));
+    let seen = &seen[1..];
     assert_eq!(seen[0].path, "/goose/sessions");
     assert_eq!(seen[0].auth.as_deref(), Some("Bearer ptok"));
     assert_eq!(seen[0].body["session_id"], SID);
@@ -358,30 +364,37 @@ async fn swarm_failure_is_partial_and_nothing_else_happens() {
     let LaunchError::Partial { launched, error } = err else {
         panic!("expected partial")
     };
-    assert_eq!(launched.line(), format!("native={SID} gse=- tag=-"));
+    assert_eq!(
+        launched.line(),
+        format!("native={SID} gse=- tag=- prompt=no")
+    );
     let msg = format!("{error:#}");
     assert!(msg.contains("swarm tools are not on"), "{msg}");
     assert!(msg.contains("MCP not configured"), "{msg}");
     assert!(!methods(&r).contains(&"session/prompt".to_string()));
-    assert!(r.pigeon.seen().is_empty());
+    assert_eq!(r.pigeon.seen().len(), 1, "only the preflight");
     assert_eq!(tags_log(&r), "");
 }
 
 #[tokio::test]
-async fn tag_failure_is_partial_before_registration() {
+async fn tag_failure_still_registers_and_prompts_but_exits_3() {
     let r = rig(Script::default(), Behaviour::default(), "", 1).await;
     let err = run(&opts(&r, TagRequest::Explicit("honk".into()), None, None))
         .await
         .unwrap_err();
+    assert_eq!(err.exit_code(), 3);
     let LaunchError::Partial { launched, error } = err else {
         panic!("expected partial")
     };
-    assert_eq!(launched.line(), format!("native={SID} gse=- tag=-"));
+    assert_eq!(
+        launched.line(),
+        format!("native={SID} gse=gse_test tag=- prompt=ok")
+    );
     let msg = format!("{error:#}");
     assert!(msg.contains("tagging failed"), "{msg}");
     assert!(msg.contains("tags.db is locked"), "{msg}");
-    assert!(r.pigeon.seen().is_empty());
-    assert!(!methods(&r).contains(&"session/prompt".to_string()));
+    assert_eq!(r.pigeon.seen().len(), 3, "preflight, register, announce");
+    assert!(methods(&r).contains(&"session/prompt".to_string()));
 }
 
 #[tokio::test]
@@ -397,7 +410,10 @@ async fn pigeon_refusal_is_partial_and_unprompted() {
     let LaunchError::Partial { launched, error } = err else {
         panic!("expected partial")
     };
-    assert_eq!(launched.line(), format!("native={SID} gse=- tag=honk"));
+    assert_eq!(
+        launched.line(),
+        format!("native={SID} gse=- tag=honk prompt=no")
+    );
     assert!(format!("{error:#}").contains("registering with pigeon failed"));
     assert!(!methods(&r).contains(&"session/prompt".to_string()));
 }
@@ -432,8 +448,12 @@ async fn prompt_refused_is_partial() {
     let LaunchError::Partial { launched, error } = err else {
         panic!("expected partial")
     };
-    assert_eq!(launched.line(), format!("native={SID} gse=gse_test tag=-"));
+    assert_eq!(
+        launched.line(),
+        format!("native={SID} gse=gse_test tag=- prompt=no")
+    );
     assert!(format!("{error:#}").contains("session/prompt refused: busy"));
+    assert_eq!(launched.prompt, honk::launch::PromptState::No);
 }
 
 #[tokio::test]
@@ -447,14 +467,17 @@ async fn unconfirmed_prompt_is_partial_and_ignores_foreign_echoes() {
         let err = run(&opts(&r, TagRequest::Off, None, None))
             .await
             .unwrap_err();
-        assert_eq!(err.exit_code(), 3);
-        let LaunchError::Partial { error, .. } = err else {
+        assert_eq!(err.exit_code(), 4);
+        let LaunchError::Partial { launched, error } = err else {
             panic!("expected partial")
         };
-        assert!(
-            format!("{error:#}").contains("had not started the turn"),
-            "{error:#}"
+        assert_eq!(
+            launched.line(),
+            format!("native={SID} gse=gse_test tag=- prompt=unknown")
         );
+        let msg = format!("{error:#}");
+        assert!(msg.contains("had not started the turn"), "{msg}");
+        assert!(msg.contains("Do not relaunch"), "{msg}");
     }
 }
 
@@ -614,4 +637,36 @@ async fn undecidable_inheritance_creates_nothing() {
     let err = run(&o).await.unwrap_err();
     assert_eq!(err.exit_code(), 1);
     assert!(methods(&r).is_empty());
+}
+
+#[tokio::test]
+async fn preflight_failures_create_nothing_even_with_an_explicit_tag() {
+    // pigeon refusing our token.
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Explicit("honk".into()), None, None);
+    o.pigeon.url = "http://127.0.0.1:1".into();
+    let err = run(&o).await.unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    let LaunchError::NotCreated(e) = err else {
+        panic!()
+    };
+    assert!(
+        format!("{e:#}").contains("pigeon preflight failed"),
+        "{e:#}"
+    );
+    assert!(methods(&r).is_empty());
+
+    // session-tags missing while a tag is wanted.
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Explicit("honk".into()), None, None);
+    o.tags_bin = r.dir.join("nope").to_string_lossy().into_owned();
+    let err = run(&o).await.unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(methods(&r).is_empty());
+
+    // ...but not needed for --tag auto.
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.tags_bin = r.dir.join("nope").to_string_lossy().into_owned();
+    run(&o).await.expect("launch");
 }

@@ -48,18 +48,21 @@ stall-watch coordinator gives its program's tag, never its own \
 'stall-watcher-runs'. --tag auto applies no tag.
 
 Output: on stdout, exactly one line once a session exists:
-  native=<goose id> gse=<pigeon id or -> tag=<tag or ->
-Everything else goes to stderr.
+  native=<goose id> gse=<pigeon id or -> tag=<tag or -> prompt=<ok|no|unknown>
+Everything else goes to stderr. Put `--` before <dir> if the prompt may start \
+with `-`, or pass `-` and the prompt on stdin.
 
 Exit codes:
   0  launched: tagged as asked, registered, prompted, turn started
-  1  no session was created (bad input, tag undecidable, honkd/pigeon \
-unreachable before session/new; a session/new timeout may still have created \
-one, see `honk list`). No stdout line.
+  1  no session was created (bad input, pigeon unreachable or refusing the \
+token, tag undecidable, session-tags missing, honkd unreachable; a session/new \
+timeout may still have created one, see `honk list`). No stdout line.
   2  usage error
-  3  the session exists but a later step failed (swarm, title, tag, pigeon, \
-prompt). The stdout line is printed; the session is not prompted unless the \
-failure was confirming the prompt.";
+  3  the session exists but a step failed (swarm, title, tag, pigeon, prompt \
+refused); the line says how far it got. A tag failure does not stop the launch: \
+it may be prompt=ok with tag=-.
+  4  as 3, but the prompt was sent and not seen to start (prompt=unknown): the \
+turn may be running. Do not relaunch the same task.";
 
 #[derive(Args, Debug)]
 struct LaunchArgs {
@@ -86,7 +89,7 @@ struct LaunchArgs {
     )]
     pigeon_url: String,
 
-    /// File holding pigeon's bearer token, if the daemon requires one
+    /// File holding pigeon's bearer token [default: /run/secrets/pigeon_daemon_auth_token, if it exists]
     #[arg(long = "pigeon-token-file", env = "HONK_PIGEON_TOKEN_FILE")]
     pigeon_token_file: Option<PathBuf>,
 
@@ -98,6 +101,11 @@ struct LaunchArgs {
     #[arg(long)]
     secret: Option<String>,
 }
+
+/// Where cloudbox keeps pigeon's daemon token (honkd reads the same file). The
+/// session variable naming it reaches login shells only, not goose's or
+/// opencode's tool shells, which is where `honk launch` runs.
+const DEFAULT_PIGEON_TOKEN_FILE: &str = "/run/secrets/pigeon_daemon_auth_token";
 
 fn launch_opts(
     args: LaunchArgs,
@@ -129,9 +137,13 @@ fn launch_opts(
         Some(honk::octags::TagArg::NoInherit) => honk::launch::TagRequest::Off,
         Some(honk::octags::TagArg::Explicit(t)) => honk::launch::TagRequest::Explicit(t),
     };
+    let token_file = args.pigeon_token_file.or_else(|| {
+        let p = PathBuf::from(DEFAULT_PIGEON_TOKEN_FILE);
+        p.is_file().then_some(p)
+    });
     let pigeon = honk::pigeon::PigeonSettings {
         url: args.pigeon_url,
-        token_file: args.pigeon_token_file,
+        token_file,
     }
     .load()?;
     let secret = resolve_secret(args.secret.as_deref())?;
