@@ -56,6 +56,11 @@ pub struct Args {
         help = "Enable swarm MCP by default on session/new (requires --swarm-mcp-bin and --swarm-pigeon-url)"
     )]
     pub swarm_default: bool,
+    #[arg(
+        long,
+        help = "Enable the session cwd's opencode.json MCP servers on session/new (loopback remote servers only)"
+    )]
+    pub project_mcp: bool,
     #[arg(long, help = "Path to honk binary for built-in swarm MCP server")]
     pub swarm_mcp_bin: Option<PathBuf>,
     #[arg(long, help = "Pigeon daemon base URL for swarm MCP")]
@@ -140,6 +145,20 @@ mod tests {
         assert_eq!(args.mcp_catalog, None);
         assert!(args.mcp_no_confirm.is_empty());
         assert!(!args.mcp_self_grant);
+        assert!(!args.project_mcp);
+    }
+
+    #[test]
+    fn parsed_project_mcp_flag() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--project-mcp",
+        ])
+        .expect("parse args");
+        assert!(args.project_mcp);
+        assert_eq!(args.mcp_catalog, None);
     }
 
     #[test]

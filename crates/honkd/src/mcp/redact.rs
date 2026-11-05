@@ -5,8 +5,30 @@
 //! entry's `{file:}` secret files and redacts any occurrences of those secrets before
 //! returning the error to viewers.
 
-use crate::mcp::catalog::{EnvVarSpec, GooseExtensionSpec};
-use std::collections::BTreeSet;
+use crate::mcp::catalog::{EnvVarSpec, GooseExtensionSpec, Transport};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The parts of `url` that must not be echoed: the whole query string, each
+/// query value, and a password, in both their raw and decoded forms.
+/// (A catalog never accepts a URL with userinfo; the password is belt and braces.)
+fn url_secrets(url: &str) -> Vec<String> {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(q) = parsed.query().filter(|q| !q.is_empty()) {
+        out.push(q.to_string());
+    }
+    for (_, value) in parsed.query_pairs() {
+        if value.chars().count() >= 4 {
+            out.push(value.into_owned());
+        }
+    }
+    if let Some(pw) = parsed.password().filter(|p| !p.is_empty()) {
+        out.push(pw.to_string());
+    }
+    out
+}
 
 /// Redacts any `{file:}` secret values found in `err`, and caps the result to
 /// its last 2000 characters (prefixed with '…' if truncated).
@@ -16,7 +38,18 @@ use std::collections::BTreeSet;
 pub fn redact_mcp_error(err: &str, spec: &GooseExtensionSpec) -> String {
     let mut needles = BTreeSet::new();
 
-    for var in spec.env.values() {
+    // An http spec holds no secret files (headers are unsupported). Its URL
+    // may still carry a token in the query string, and goose echoes URLs in
+    // its errors, so that is what gets redacted.
+    let no_env = BTreeMap::new();
+    let env = match &spec.transport {
+        Transport::Stdio { env, .. } => env,
+        Transport::Http { url } => {
+            needles.extend(url_secrets(url));
+            &no_env
+        }
+    };
+    for var in env.values() {
         if let EnvVarSpec::File(path) = var
             && let Ok(content) = std::fs::read_to_string(path)
         {
@@ -55,7 +88,6 @@ pub fn redact_mcp_error(err: &str, spec: &GooseExtensionSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn make_spec_with_files(files: Vec<(&str, PathBuf)>) -> GooseExtensionSpec {
@@ -65,8 +97,10 @@ mod tests {
         }
         GooseExtensionSpec {
             name: "test-server".to_string(),
-            command: vec!["test-cmd".to_string()],
-            env,
+            transport: Transport::Stdio {
+                command: vec!["test-cmd".to_string()],
+                env,
+            },
         }
     }
 
@@ -153,5 +187,59 @@ mod tests {
         assert_eq!(redacted.chars().count(), 2001); // '…' + 2000 chars
         assert!(redacted.contains("[redacted] end"));
         assert!(!redacted.contains("secret12345"));
+    }
+
+    fn http_spec(url: &str) -> GooseExtensionSpec {
+        GooseExtensionSpec {
+            name: "remote".to_string(),
+            transport: Transport::Http {
+                url: url.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_http_spec_redacts_query_string_and_values() {
+        let spec = http_spec("http://localhost:4006/mcp?token=s3cr3tvalue&mode=a%20b%20c&x=1");
+        let err = "error sending request for url (http://localhost:4006/mcp?token=s3cr3tvalue&mode=a%20b%20c&x=1): refused; saw s3cr3tvalue and a b c";
+        let redacted = redact_mcp_error(err, &spec);
+        assert_eq!(
+            redacted,
+            "error sending request for url (http://localhost:4006/mcp?[redacted]): refused; saw [redacted] and [redacted]"
+        );
+
+        // The value alone, as goose may print it in a header or a body.
+        let redacted = redact_mcp_error("401 for token s3cr3tvalue", &spec);
+        assert_eq!(redacted, "401 for token [redacted]");
+
+        // Short values are left (they would match everywhere); the query is not.
+        assert_eq!(
+            redact_mcp_error("path /mcp?x=1 and 1", &http_spec("http://h/mcp?x=1")),
+            "path /mcp?[redacted] and 1"
+        );
+    }
+
+    #[test]
+    fn test_http_spec_redacts_a_password() {
+        let spec = http_spec("http://user:hunter22@localhost:4006/mcp");
+        let redacted = redact_mcp_error("failed http://user:hunter22@localhost:4006/mcp", &spec);
+        assert!(!redacted.contains("hunter22"), "{redacted}");
+        assert!(redacted.contains("localhost:4006/mcp"), "{redacted}");
+    }
+
+    #[test]
+    fn test_http_spec_only_caps() {
+        let spec = GooseExtensionSpec {
+            name: "remote".to_string(),
+            transport: Transport::Http {
+                url: "http://localhost:4006/mcp".to_string(),
+            },
+        };
+        assert_eq!(
+            redact_mcp_error("connection refused", &spec),
+            "connection refused"
+        );
+        let long = "b".repeat(3000);
+        assert_eq!(redact_mcp_error(&long, &spec).chars().count(), 2001);
     }
 }

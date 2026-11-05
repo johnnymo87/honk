@@ -107,3 +107,10 @@ M0 merged into main via PR #1 (squash) on 2026-10-12. CI = `.github/workflows/ci
 - Known limits carried into M1b: --max-sessions 16 with no LRU (M1c) — check how many goose sessions pigeon holds open before cutover; logs not compacted (M1c); state.json is rewritten+fsynced several times per turn under one lock; boot-time restored-inflight check awaits export inline.
 - B3 complete: added packages.honkd to flake.nix (packages.default = honkd; builds honkd + honk via pinned toolchain and lib.fileset src filtering) and wrote cutover operator runbook docs/plans/2026-10-11-honk-m1-cutover.md.
 - Turn mirror (Part B) complete: honkd reports turn.started and turn.ended to --turn-hook-url with bearer auth, retries, and deduplication (B1-B3); documented in docs/turn-hook.md (B4).
+
+## Project MCP servers (2026-11-05) — branch `project-mcp`
+- A goose session started in a repo gets the MCP servers that repo declares for opencode (`opencode.json[c]`), remote ones included. Plan: `docs/plans/2026-11-05-project-mcp.md`. Behaviour: `docs/chat.md`, "Project servers".
+- Pieces: remote catalog entries, project discovery and the user-wins overlay (`mcp/catalog.rs`, `mcp/project.rs`); the reachability/OAuth probe (`mcp/probe.rs`); trust and disable-by-marker (`mcp/ops.rs`); `--project-mcp` and `_meta.honk.projectMcp` on `session/new` (`viewer.rs`); the stderr line in `honk launch`.
+- Deploy is separate and needs the author's go: bump honk in the workstation flake, add `--project-mcp` to honkd's ExecStart, restart honkd (running sessions keep going; only new sessions get project servers). Optionally set `GOOSE_OAUTH_CALLBACK_TIMEOUT_SECONDS` low in goose-serve's environment, as a backstop for servers added outside honkd.
+- Not done: re-adding failed project servers on reactivation, remote headers and auth, `.opencode/` directories, detecting the same server loaded twice (honkd plus a goose plugin `.mcp.json`).
+

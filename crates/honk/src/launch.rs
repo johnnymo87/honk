@@ -10,7 +10,9 @@
 //!    `bound_topic_key = 'stallwatch:<tag>'`) gives its program `<tag>`, never
 //!    its own spend tag ([`COORDINATOR_OWN_TAG`]).
 //! 2. `session/new` through honkd, with swarm on (honkd `--swarm-default`, or an
-//!    explicit `_honk/mcp/enable` when honkd did not do it).
+//!    explicit `_honk/mcp/enable` when honkd did not do it). With honkd
+//!    `--project-mcp`, the project's own MCP servers are enabled there too, and
+//!    one stderr line says which ([`project_mcp_line`]); that never fails the launch.
 //! 3. `--title`: rename the session before its first prompt, so goose's
 //!    auto-namer leaves it alone (the route pigeon#209 uses).
 //! 4. `session-tags set -- <tag> goose:<id>`.
@@ -282,9 +284,14 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
     let NewSession {
         id: native,
         swarm_meta,
+        project_mcp,
     } = new_session(&mut client, opts)
         .await
         .map_err(LaunchError::NotCreated)?;
+
+    if let Some(line) = project_mcp.as_ref().and_then(project_mcp_line) {
+        eprintln!("{line}");
+    }
 
     let mut launched = Launched {
         native: native.clone(),
@@ -432,6 +439,7 @@ async fn new_session(client: &mut Client, opts: &LaunchOpts) -> anyhow::Result<N
     Ok(NewSession {
         id: sid.to_string(),
         swarm_meta: result.pointer("/_meta/honk/swarm").cloned(),
+        project_mcp: result.pointer("/_meta/honk/projectMcp").cloned(),
     })
 }
 
@@ -439,6 +447,57 @@ struct NewSession {
     id: String,
     /// `_meta.honk.swarm` of the `session/new` reply, if honkd sent one.
     swarm_meta: Option<Value>,
+    /// `_meta.honk.projectMcp` of the `session/new` reply, if honkd sent one.
+    project_mcp: Option<Value>,
+}
+
+/// One line for the launcher's stderr about the project's MCP servers, from
+/// honkd's `_meta.honk.projectMcp`: what is on, what failed and why, what was
+/// left alone and why. `None` when there is nothing to say. Never fatal.
+fn project_mcp_line(meta: &Value) -> Option<String> {
+    let list = |key: &str| -> Vec<&Value> {
+        meta.get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default()
+    };
+    let text = |v: &Value, key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+
+    let mut on = Vec::new();
+    let mut parts = Vec::new();
+    for s in list("servers") {
+        let name = text(s, "name");
+        if s.get("ok").and_then(Value::as_bool) == Some(true) {
+            on.push(name);
+        } else {
+            let pending = s.get("pending").and_then(Value::as_bool) == Some(true);
+            let what = if pending { "pending" } else { "failed" };
+            parts.push(format!("{what} {name}: {}", text(s, "error")));
+        }
+    }
+    if !on.is_empty() {
+        parts.insert(0, format!("enabled {}", on.join(", ")));
+    }
+    for s in list("skipped") {
+        parts.push(format!(
+            "skipped {}: {}",
+            text(s, "name"),
+            text(s, "reason")
+        ));
+    }
+    for p in list("problems") {
+        parts.push(format!("problem {}", p.as_str().unwrap_or("?")));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("honk launch: project MCP: {}", parts.join("; ")))
+    }
 }
 
 /// honkd `--swarm-default` enables swarm before replying to `session/new` and
@@ -615,6 +674,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(l.line(), "native=20261104_7 gse=- tag=- prompt=no");
+    }
+
+    #[test]
+    fn project_mcp_line_reports_enabled_failed_and_skipped() {
+        let meta = json!({
+            "servers": [
+                {"name": "tec", "source": "project:opencode.json", "ok": true},
+                {"name": "dev", "source": "project:opencode.json", "ok": false,
+                 "error": "not reachable at http://127.0.0.1:9/mcp: Connection refused"},
+                {"name": "slow", "source": "project:opencode.json", "ok": false,
+                 "pending": true, "error": "pending; may still land; run /mcp"}
+            ],
+            "skipped": [
+                {"name": "far", "reason": "not a loopback url; enable with /mcp enable far!"}
+            ],
+            "problems": ["opencode.json: expected value at line 1"]
+        });
+        assert_eq!(
+            project_mcp_line(&meta).unwrap(),
+            "honk launch: project MCP: enabled tec; \
+             failed dev: not reachable at http://127.0.0.1:9/mcp: Connection refused; \
+             pending slow: pending; may still land; run /mcp; \
+             skipped far: not a loopback url; enable with /mcp enable far!; \
+             problem opencode.json: expected value at line 1"
+        );
+    }
+
+    #[test]
+    fn project_mcp_line_is_silent_when_there_is_nothing_to_say() {
+        assert_eq!(project_mcp_line(&json!({})), None);
+        assert_eq!(
+            project_mcp_line(&json!({"servers": [], "skipped": [], "problems": []})),
+            None
+        );
     }
 
     #[test]
