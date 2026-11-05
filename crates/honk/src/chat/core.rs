@@ -1163,6 +1163,13 @@ fn format_mcp_list_block(result: &Value) -> String {
                 if conflict {
                     line.push_str(" (conflict)");
                 }
+                let from_project = s
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|src| src.starts_with("project:"));
+                if from_project {
+                    line.push_str(" (project)");
+                }
                 lines.push(line);
             }
         }

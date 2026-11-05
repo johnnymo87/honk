@@ -4367,6 +4367,7 @@ fn test_mcp_list_response_rendering() {
             "servers": [
                 { "name": "slack", "enabled": false, "supported": true, "confirm": true },
                 { "name": "slack-ro", "enabled": true, "supported": true, "confirm": false },
+                { "name": "tec", "enabled": false, "supported": true, "confirm": false, "source": "project:opencode.json" },
                 { "name": "other-conflict", "enabled": false, "supported": true, "confirm": false, "conflict": true },
                 { "name": "datadog", "enabled": false, "supported": false, "reason": "remote MCP servers not supported yet", "confirm": false }
             ],
@@ -4388,6 +4389,7 @@ fn test_mcp_list_response_rendering() {
 
     assert!(notice.contains("off slack !"));
     assert!(notice.contains("on slack-ro"));
+    assert!(notice.contains("off tec (project)"));
     assert!(notice.contains("off other-conflict (conflict)"));
     assert!(notice.contains("n/a datadog — remote MCP servers not supported yet"));
     assert!(notice.contains("other: developer, analyze"));
