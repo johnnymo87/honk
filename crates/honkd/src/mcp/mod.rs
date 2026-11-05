@@ -90,10 +90,139 @@ impl McpConfig {
     }
 }
 
+/// What `session/new` does about a project's MCP servers, and what it tells
+/// the client about the ones it leaves alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectLaunchPlan {
+    /// Entries to enable now: `(name, source label)`.
+    pub eligible: Vec<(String, String)>,
+    /// Project entries left alone, as `(name, reason)`.
+    pub skipped: Vec<(String, String)>,
+    /// Config files that could not be used.
+    pub problems: Vec<String>,
+}
+
+impl SessionCatalog {
+    /// Sorts the project's entries into those to enable at once (trusted, see
+    /// [`catalog::CatalogEntry::auto_eligible`]) and those to leave to a person.
+    /// `None` when the session has no project config worth mentioning: no
+    /// project lookup, no entries and no problems.
+    pub fn project_launch_plan(&self) -> Option<ProjectLaunchPlan> {
+        let project = self.project.as_ref()?;
+        if project.entries.is_empty() && project.problems.is_empty() {
+            return None;
+        }
+        let mut plan = ProjectLaunchPlan {
+            problems: project.problems.clone(),
+            ..Default::default()
+        };
+        for entry in &project.entries {
+            let name = entry.name.clone();
+            if self.shadowed.contains(&name) {
+                plan.skipped
+                    .push((name, "shadowed by user catalog".to_string()));
+            } else if !entry.enabled {
+                plan.skipped
+                    .push((name, "disabled in project config".to_string()));
+            } else if let Err(reason) = &entry.supported {
+                plan.skipped.push((name, reason.clone()));
+            } else if entry.auto_eligible() {
+                plan.eligible.push((name, entry.source.label()));
+            } else {
+                let reason = format!("not a loopback url; enable with /mcp enable {name}!");
+                plan.skipped.push((name, reason));
+            }
+        }
+        Some(plan)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mcp::catalog::EntrySource;
+
+    #[tokio::test]
+    async fn launch_plan_sorts_entries_by_trust() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join(".git")).unwrap();
+        std::fs::write(
+            td.path().join("opencode.json"),
+            r#"{"mcp":{
+                "tec":{"type":"remote","url":"http://localhost:4006/mcp"},
+                "far":{"type":"remote","url":"https://example.com/mcp"},
+                "off":{"type":"remote","url":"http://127.0.0.1:1/mcp","enabled":false},
+                "authed":{"type":"remote","url":"http://127.0.0.1:2/mcp","headers":{"A":"b"}},
+                "cmd":{"type":"local","command":["x"]},
+                "mine":{"type":"remote","url":"http://127.0.0.1:3/mcp"}
+            }}"#,
+        )
+        .unwrap();
+        let user = td.path().join("user.json");
+        std::fs::write(
+            &user,
+            r#"{"mcp":{"mine":{"type":"local","command":["y"]}}}"#,
+        )
+        .unwrap();
+        let mut cfg = McpConfig {
+            catalog_path: Some(user),
+            policy: Policy::default(),
+            swarm: None,
+            project: true,
+        };
+        let sc = cfg
+            .session_catalog(Some(td.path().to_str().unwrap()), "s")
+            .await
+            .unwrap();
+        let plan = sc.project_launch_plan().unwrap();
+
+        assert_eq!(plan.eligible.len(), 1);
+        assert_eq!(plan.eligible[0].0, "tec");
+        assert!(plan.eligible[0].1.starts_with("project:"));
+        let reason = |n: &str| {
+            plan.skipped
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, r)| r.as_str())
+                .unwrap_or_else(|| panic!("{n} not skipped: {:?}", plan.skipped))
+        };
+        assert_eq!(
+            reason("far"),
+            "not a loopback url; enable with /mcp enable far!"
+        );
+        assert_eq!(reason("off"), "disabled in project config");
+        assert!(reason("authed").contains("headers"), "{}", reason("authed"));
+        assert!(reason("cmd").contains("stdio"), "{}", reason("cmd"));
+        assert_eq!(reason("mine"), "shadowed by user catalog");
+        assert!(plan.problems.is_empty());
+
+        // No project entries and no problems: nothing to say.
+        let empty = tempfile::tempdir().unwrap();
+        cfg.catalog_path = None;
+        let sc = cfg
+            .session_catalog(Some(empty.path().to_str().unwrap()), "s")
+            .await
+            .unwrap();
+        assert_eq!(sc.project_launch_plan(), None);
+
+        // A bad file alone is worth a mention.
+        std::fs::write(empty.path().join("opencode.json"), "{ nope").unwrap();
+        let sc = cfg
+            .session_catalog(Some(empty.path().to_str().unwrap()), "s")
+            .await
+            .unwrap();
+        let plan = sc.project_launch_plan().unwrap();
+        assert!(plan.eligible.is_empty() && plan.skipped.is_empty());
+        assert_eq!(plan.problems.len(), 1);
+
+        // Project MCP off: no plan.
+        cfg.project = false;
+        let sc = cfg
+            .session_catalog(Some(empty.path().to_str().unwrap()), "s")
+            .await
+            .unwrap();
+        assert_eq!(sc.project_launch_plan(), None);
+    }
 
     const TEC: &str = r#"{"mcp":{"tec":{"type":"remote","url":"http://127.0.0.1:4006/mcp"}}}"#;
 

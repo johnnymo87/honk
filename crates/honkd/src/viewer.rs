@@ -14,15 +14,29 @@ pub type ViewerId = u64;
 static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_SWARM_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Room for a few remote servers to be probed and added; `honk launch` gives
+/// `session/new` 30 s in all, and the swarm wait comes first.
+const DEFAULT_PROJECT_MCP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(12);
+
+fn env_timeout(var: &str, default: Duration) -> Duration {
+    match std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => default,
+    }
+}
 
 fn swarm_launch_timeout() -> Duration {
-    if let Ok(ms_str) = std::env::var("HONKD_TEST_SWARM_LAUNCH_TIMEOUT_MS")
-        && let Ok(ms) = ms_str.parse::<u64>()
-    {
-        Duration::from_millis(ms)
-    } else {
-        DEFAULT_SWARM_LAUNCH_TIMEOUT
-    }
+    env_timeout(
+        "HONKD_TEST_SWARM_LAUNCH_TIMEOUT_MS",
+        DEFAULT_SWARM_LAUNCH_TIMEOUT,
+    )
+}
+
+fn project_mcp_launch_timeout() -> Duration {
+    env_timeout(
+        "HONKD_TEST_PROJECT_MCP_LAUNCH_TIMEOUT_MS",
+        DEFAULT_PROJECT_MCP_LAUNCH_TIMEOUT,
+    )
 }
 
 fn ensure_honk_meta(val: &mut Value) -> &mut serde_json::Map<String, Value> {
@@ -218,6 +232,107 @@ async fn handle_swarm_launch(
             })
         }
     }
+}
+
+/// Enables the session cwd's trusted project MCP servers and reports the outcome
+/// as `_meta.honk.projectMcp`. Never fails `session/new`: every problem ends up
+/// in the returned value. `None` when the project has nothing to report.
+async fn handle_project_mcp_launch(
+    hub: &Arc<Hub>,
+    session_tx: Option<&mpsc::Sender<crate::session::SessionMsg>>,
+    viewer_id: ViewerId,
+    sid: &str,
+    cwd: &str,
+) -> Option<Value> {
+    let cfg = hub.mcp.as_ref()?;
+    let plan = match cfg.session_catalog(Some(cwd), sid).await {
+        Ok(sc) => sc.project_launch_plan()?,
+        Err(e) => {
+            tracing::warn!(sessionId = sid, "project MCP: {e}");
+            return Some(json!({
+                "servers": [],
+                "skipped": [],
+                "problems": [e.message],
+            }));
+        }
+    };
+
+    let skipped: Vec<Value> = plan
+        .skipped
+        .iter()
+        .map(|(name, reason)| json!({"name": name, "reason": reason}))
+        .collect();
+    let failed_all = |error: &str, pending: bool| -> Vec<Value> {
+        plan.eligible
+            .iter()
+            .map(|(name, source)| {
+                let mut v = json!({"name": name, "source": source, "ok": false, "error": error});
+                if pending {
+                    v["pending"] = json!(true);
+                }
+                v
+            })
+            .collect()
+    };
+
+    let servers: Vec<Value> = if plan.eligible.is_empty() {
+        Vec::new()
+    } else if let Some(tx) = session_tx {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let names: Vec<String> = plan.eligible.iter().map(|(n, _)| n.clone()).collect();
+        let _ = tx
+            .send(crate::session::SessionMsg::McpLaunch {
+                viewer_id,
+                names,
+                confirm: Vec::new(),
+                reply: reply_tx,
+            })
+            .await;
+        let wait = project_mcp_launch_timeout();
+        match tokio::time::timeout(wait, reply_rx).await {
+            Ok(Ok(Ok(op_res))) => plan
+                .eligible
+                .iter()
+                .map(
+                    |(name, source)| match op_res.results.iter().find(|r| &r.name == name) {
+                        Some(r) if r.ok => json!({"name": name, "source": source, "ok": true}),
+                        Some(r) => json!({
+                            "name": name,
+                            "source": source,
+                            "ok": false,
+                            "error": r.error.as_deref().unwrap_or("failed to enable"),
+                        }),
+                        None => json!({
+                            "name": name,
+                            "source": source,
+                            "ok": false,
+                            "error": "no result",
+                        }),
+                    },
+                )
+                .collect(),
+            Ok(Ok(Err(op_err))) => {
+                tracing::warn!(sessionId = sid, "project MCP launch: {}", op_err.message);
+                failed_all(&op_err.message, false)
+            }
+            Ok(Err(_)) => failed_all("failed to enable project MCP servers", false),
+            Err(_) => {
+                tracing::warn!(
+                    sessionId = sid,
+                    "project MCP launch timed out after {wait:?}; reporting pending"
+                );
+                failed_all("pending; may still land; run /mcp", true)
+            }
+        }
+    } else {
+        failed_all("session actor unavailable", false)
+    };
+
+    Some(json!({
+        "servers": servers,
+        "skipped": skipped,
+        "problems": plan.problems,
+    }))
 }
 
 #[derive(Clone)]
@@ -699,6 +814,13 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     let swarm_opt_out =
                         params.pointer("/_meta/honk/swarm").and_then(Value::as_bool) == Some(false);
                     let should_launch_swarm = hub.args.swarm_default && !swarm_opt_out;
+                    let project_opt_out = params
+                        .pointer("/_meta/honk/projectMcp")
+                        .and_then(Value::as_bool)
+                        == Some(false);
+                    let project_mcp_cwd = (hub.args.project_mcp && !project_opt_out)
+                        .then(|| params.get("cwd").and_then(Value::as_str).map(String::from))
+                        .flatten();
 
                     if let Some(mcp_req) = &mcp_launch_req
                         && let Some(conf_val) = mcp_req.get("confirm")
@@ -767,6 +889,20 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                     .await;
                                     ensure_honk_meta(&mut new_res)
                                         .insert("swarm".to_string(), swarm_val);
+                                }
+
+                                if let Some(cwd) = &project_mcp_cwd
+                                    && let Some(project_val) = handle_project_mcp_launch(
+                                        &hub,
+                                        session_tx.as_ref(),
+                                        viewer.id,
+                                        &sid,
+                                        cwd,
+                                    )
+                                    .await
+                                {
+                                    ensure_honk_meta(&mut new_res)
+                                        .insert("projectMcp".to_string(), project_val);
                                 }
                             }
                             let resp_frame = crate::rpc::response(id, new_res);
