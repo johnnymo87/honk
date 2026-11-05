@@ -313,16 +313,11 @@ async fn swarm_scheduled(
 
 async fn swarm_scheduled_cancel(
     State(st): State<St>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    record(
-        &st,
-        &format!("/swarm/scheduled/{id}/cancel"),
-        &headers,
-        body,
-    );
+    record(&st, uri.path(), &headers, body);
     let (s, v) = st.behaviour.swarm_scheduled_cancel.clone();
     (s, axum::Json(v))
 }

@@ -186,6 +186,13 @@ async fn test_tools_list_probe_204() {
         schedule_desc.contains("Prefer `after`"),
         "schedule must prefer after: {schedule_desc}"
     );
+    let schedule_to_desc = schedule_tool["inputSchema"]["properties"]["to"]["description"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        schedule_to_desc,
+        "Recipient session id ('ses_' for opencode or 'gse_' for goose); defaults to this session for a self-wake."
+    );
 
     let scheduled_tool = tools
         .iter()
@@ -196,9 +203,15 @@ async fn test_tools_list_probe_204() {
         scheduled_desc.contains("action 'list'"),
         "scheduled must describe list: {scheduled_desc}"
     );
+    let scheduled_action = &scheduled_tool["inputSchema"]["properties"]["action"];
+    assert_eq!(scheduled_action["enum"], json!(["list", "cancel"]));
 
     let list_tool = tools.iter().find(|t| t["name"] == "swarm_list").unwrap();
     let list_desc = list_tool["description"].as_str().unwrap();
+    assert!(
+        list_desc.starts_with("List local sessions across all projects"),
+        "list description must not say 'local opencode sessions': {list_desc}"
+    );
     assert!(
         list_desc.contains("remote: true"),
         "list must describe remote: {list_desc}"
@@ -1059,6 +1072,66 @@ async fn test_swarm_launch_pending_after_repeated_5xx() {
 }
 
 #[tokio::test]
+async fn test_swarm_launch_pigeon_unreachable_connection_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: format!("http://127.0.0.1:{port}"),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server_with_backoff(
+        config,
+        BufReader::new(server_rx),
+        server_tx,
+        vec![Duration::from_millis(1); 5],
+    ));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_launch",
+                "arguments": {
+                    "machine": "cloudbox",
+                    "directory": "~/projects/my-project",
+                    "prompt": "Investigate bug #123"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("daemon unreachable"),
+        "expected daemon unreachable error, got: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
 async fn test_swarm_schedule_success() {
     let p = StubPigeon::start(Behaviour {
         swarm_mailbox: (
@@ -1503,6 +1576,88 @@ async fn test_swarm_scheduled_list_and_cancel() {
 }
 
 #[tokio::test]
+async fn test_swarm_scheduled_list_multibyte_utf8() {
+    let payload = "🚀🦀🎉 Hello world from Rust! Multi-byte characters: ü, é, ñ, 中文 and some more emojis 🔥🌟💫✨ that definitely exceed sixty characters in length!";
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_launcher1",
+                "backend_session_id": "20261020_owner",
+                "created": false,
+                "notify": false,
+            }),
+        ),
+        swarm_scheduled: (
+            StatusCode::OK,
+            json!({
+                "scheduled": [
+                    {
+                        "msg_id": "msg_emoji_1",
+                        "from": "gse_launcher1",
+                        "to": "gse_launcher1",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "payload": payload,
+                        "state": "queued",
+                        "deliver_at": 1730736000000_i64,
+                        "expires_at": 1730757600000_i64,
+                        "created_at": 1730730000000_i64,
+                    }
+                ]
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_scheduled",
+                "arguments": {
+                    "action": "list"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"].as_bool(), None);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("msg_emoji_1 [queued] deliver:"));
+    assert!(text.ends_with("...\""));
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
 async fn test_swarm_scheduled_cancel_errors() {
     let p = StubPigeon::start(Behaviour {
         swarm_mailbox: (
@@ -1562,6 +1717,84 @@ async fn test_swarm_scheduled_cancel_errors() {
     assert_eq!(
         text,
         "Failed to cancel msg_nonexistent: no such scheduled message."
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_scheduled_cancel_path_segment_percent_encoding() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_launcher1",
+                "backend_session_id": "20261020_owner",
+                "created": false,
+                "notify": false,
+            }),
+        ),
+        swarm_scheduled_cancel: (
+            StatusCode::OK,
+            json!({
+                "cancelled": true,
+                "msg_id": "msg with spaces"
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_scheduled",
+                "arguments": {
+                    "action": "cancel",
+                    "msg_id": "msg with spaces"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"].as_bool(), None);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "Cancelled scheduled message msg with spaces.");
+
+    let seen = p.seen();
+    let cancel_seen = seen.iter().find(|s| s.path.contains("/cancel"));
+    assert!(cancel_seen.is_some(), "expected cancel in {seen:?}");
+    assert!(
+        cancel_seen.unwrap().path.contains("msg%20with%20spaces"),
+        "expected %20 in path segment, got: {}",
+        cancel_seen.unwrap().path
     );
 
     drop(client_tx);

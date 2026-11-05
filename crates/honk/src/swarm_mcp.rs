@@ -136,6 +136,69 @@ fn is_connection_refused(err: &reqwest::Error) -> bool {
     msg.contains("Connection refused") || msg.contains("ECONNREFUSED")
 }
 
+struct PigeonError {
+    code: Option<String>,
+    detail: Option<String>,
+    fallback: String,
+}
+
+impl PigeonError {
+    fn parse(text: &str) -> Self {
+        let parsed = serde_json::from_str::<Value>(text).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|p| {
+                p.get("error")
+                    .or_else(|| p.get("code"))
+                    .and_then(Value::as_str)
+            })
+            .map(String::from);
+        let detail = parsed
+            .as_ref()
+            .and_then(|p| p.get("detail").and_then(Value::as_str))
+            .map(String::from);
+        let fallback = if text.trim().is_empty() {
+            String::new()
+        } else {
+            text.chars().take(200).collect()
+        };
+        Self {
+            code,
+            detail,
+            fallback,
+        }
+    }
+
+    fn formatted(&self, fallback_prefix: &str) -> String {
+        match (&self.code, &self.detail) {
+            (Some(c), Some(d)) => format!("{c}: {d}"),
+            (Some(c), None) => c.clone(),
+            (None, Some(d)) => d.clone(),
+            (None, None) => {
+                if self.fallback.is_empty() {
+                    fallback_prefix.to_string()
+                } else {
+                    format!("{fallback_prefix} {}", self.fallback)
+                }
+            }
+        }
+    }
+
+    fn message(&self) -> &str {
+        self.code
+            .as_deref()
+            .or(self.detail.as_deref())
+            .unwrap_or(&self.fallback)
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwarmMcpServerConfig {
     pub session: String,
@@ -270,12 +333,10 @@ async fn ensure_mailbox(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let err_msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
-            .unwrap_or_else(|| text.chars().take(200).collect());
+        let err = PigeonError::parse(&text);
         return Err(format!(
-            "pigeon /goose/swarm-mailbox failed (HTTP {status}): {err_msg}"
+            "pigeon /goose/swarm-mailbox failed (HTTP {status}): {}",
+            err.message()
         ));
     }
 
@@ -351,11 +412,8 @@ async fn handle_swarm_send(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let err_msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return tool_err(err_msg);
+        let err = PigeonError::parse(&text);
+        return tool_err(err.message());
     }
 
     let send_res: Value = match serde_json::from_str(&text) {
@@ -446,11 +504,8 @@ async fn handle_swarm_read(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let err_msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return tool_err(err_msg);
+        let err = PigeonError::parse(&text);
+        return tool_err(err.message());
     }
 
     let drain_res: Value = match serde_json::from_str(&text) {
@@ -619,11 +674,8 @@ async fn handle_swarm_list(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let err_msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return tool_err(err_msg);
+        let err = PigeonError::parse(&text);
+        return tool_err(err.message());
     }
 
     let body: Value = match serde_json::from_str(&text) {
@@ -771,7 +823,8 @@ async fn handle_swarm_list_remote(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return tool_err(format!("swarm_list remote failed: {status} {text}"));
+        let err = PigeonError::parse(&text);
+        return tool_err(err.formatted(&format!("swarm_list remote failed: {status}")));
     }
 
     let body: Value = match serde_json::from_str(&text) {
@@ -896,7 +949,7 @@ async fn handle_swarm_launch(
 
     let from = match ensure_mailbox(client, config, cwd).await {
         Ok(f) => f,
-        Err(e) => return tool_err(e),
+        Err(e) => return tool_err(format!("swarm_launch failed: daemon unreachable ({e})")),
     };
 
     let now_ms = std::time::SystemTime::now()
@@ -979,46 +1032,32 @@ async fn handle_swarm_launch(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<Value>(&text).ok();
-        let code = parsed.as_ref().and_then(|p| {
-            p.get("error")
-                .or_else(|| p.get("code"))
-                .and_then(Value::as_str)
-        });
-        let detail = parsed
-            .as_ref()
-            .and_then(|p| p.get("detail").and_then(Value::as_str));
+        let err = PigeonError::parse(&text);
 
-        let format_error = |fallback: &str| -> String {
-            match (code, detail) {
-                (Some(c), Some(d)) => format!("{c}: {d}"),
-                (Some(c), None) => c.to_string(),
-                (None, Some(d)) => d.to_string(),
-                (None, None) => fallback.to_string(),
-            }
-        };
-
-        if status == reqwest::StatusCode::NOT_FOUND && code.is_none() {
+        if status == reqwest::StatusCode::NOT_FOUND && err.code.is_none() {
             return tool_err("pigeon on this machine is too old for swarm_launch");
         }
 
         let status_u16 = status.as_u16();
         if (400..500).contains(&status_u16) && status_u16 != 429 {
-            return tool_err(format_error(&format!(
-                "swarm_launch failed: {status} {text}"
-            )));
+            return tool_err(err.formatted(&format!("swarm_launch failed: {status}")));
         }
 
-        if status_u16 == 429 && code.is_some_and(|c| c == "queue_full" || c == "rate_limited") {
-            return tool_err(format_error(&format!("swarm_launch failed: 429 {text}")));
+        if status_u16 == 429
+            && err
+                .code
+                .as_deref()
+                .is_some_and(|c| c == "queue_full" || c == "rate_limited")
+        {
+            return tool_err(err.formatted("swarm_launch failed: 429"));
         }
 
         if status_u16 == 503
-            && code.is_some_and(|c| {
+            && err.code.as_deref().is_some_and(|c| {
                 c == "target_offline" || c == "launch_unavailable" || c == "no_worker"
             })
         {
-            return tool_err(format_error(&format!("swarm_launch failed: 503 {text}")));
+            return tool_err(err.formatted("swarm_launch failed: 503"));
         }
 
         if status_u16 >= 500 {
@@ -1029,7 +1068,7 @@ async fn handle_swarm_launch(
             if saw_ambiguous_failure {
                 return tool_ok(pending_message(&launch_id));
             }
-            return tool_err(format!("swarm_launch failed: {status} {text}"));
+            return tool_err(err.formatted(&format!("swarm_launch failed: {status}")));
         }
 
         tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
@@ -1152,14 +1191,12 @@ async fn handle_swarm_schedule(
         }
 
         let text = resp.text().await.unwrap_or_default();
+        let err = PigeonError::parse(&text);
 
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            let daemon_error = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|p| p.get("error").and_then(Value::as_str).map(String::from))
-                .unwrap_or(text);
             return tool_err(format!(
-                "swarm_schedule REJECTED — the wake was NOT scheduled and will never fire: {daemon_error}"
+                "swarm_schedule REJECTED — the wake was NOT scheduled and will never fire: {}",
+                err.message()
             ));
         }
 
@@ -1188,15 +1225,15 @@ async fn handle_swarm_schedule(
         let is_transient = (status_u16 >= 500 && status_u16 != 503) || status_u16 == 429;
         if is_transient {
             if is_last {
-                return tool_err(format!(
-                    "swarm_schedule failed after {attempt} attempts: {status} {text}"
-                ));
+                return tool_err(err.formatted(&format!(
+                    "swarm_schedule failed after {attempt} attempts: {status}"
+                )));
             }
             tokio::time::sleep(get_backoff(backoff_schedule, attempt)).await;
             continue;
         }
 
-        return tool_err(format!("swarm_schedule failed: {status} {text}"));
+        return tool_err(err.formatted(&format!("swarm_schedule failed: {status}")));
     }
 
     tool_err("swarm_schedule failed: exhausted retries")
@@ -1280,8 +1317,8 @@ fn format_scheduled_list(messages: &[Value], session_id: &str, now_ms: i64) -> S
         let ref_part = ref_str.map(|r| format!(" [ref: {r}]")).unwrap_or_default();
 
         let collapsed: String = payload.split_whitespace().collect::<Vec<_>>().join(" ");
-        let preview = if collapsed.len() > 60 {
-            format!("{}...", &collapsed[..57])
+        let preview = if collapsed.chars().count() > 60 {
+            format!("{}...", truncate_chars(&collapsed, 57))
         } else {
             collapsed
         };
@@ -1324,14 +1361,25 @@ async fn handle_swarm_scheduled(
             _ => return tool_err("msg_id is required when action is 'cancel'"),
         };
 
-        let encoded_id: String = url::form_urlencoded::byte_serialize(msg_id.as_bytes()).collect();
-        let url = format!(
-            "{}/swarm/scheduled/{encoded_id}/cancel",
-            config.pigeon_url.trim_end_matches('/')
-        );
+        let mut cancel_url = match url::Url::parse(&config.pigeon_url) {
+            Ok(u) => u,
+            Err(e) => return tool_err(format!("invalid pigeon URL {}: {e}", config.pigeon_url)),
+        };
+        if let Ok(mut segments) = cancel_url.path_segments_mut() {
+            segments.pop_if_empty();
+            segments.push("swarm");
+            segments.push("scheduled");
+            segments.push(msg_id);
+            segments.push("cancel");
+        } else {
+            return tool_err(format!(
+                "cannot set path segments on URL {}",
+                config.pigeon_url
+            ));
+        }
 
         let mut req = client
-            .post(&url)
+            .post(cancel_url)
             .header("Content-Type", "application/json")
             .json(&json!({ "from": session_id }));
         if let Some(tok) = &pigeon_token {
@@ -1349,6 +1397,7 @@ async fn handle_swarm_scheduled(
         }
 
         let text = resp.text().await.unwrap_or_default();
+        let err = PigeonError::parse(&text);
         if status == reqwest::StatusCode::NOT_FOUND {
             return tool_err(format!(
                 "Failed to cancel {msg_id}: no such scheduled message."
@@ -1373,7 +1422,7 @@ async fn handle_swarm_scheduled(
             ));
         }
 
-        return tool_err(format!("swarm_scheduled cancel failed: {status} {text}"));
+        return tool_err(err.formatted(&format!("swarm_scheduled cancel failed: {status}")));
     }
 
     // Action == "list"
@@ -1394,7 +1443,8 @@ async fn handle_swarm_scheduled(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return tool_err(format!("swarm_scheduled list failed: {status} {text}"));
+        let err = PigeonError::parse(&text);
+        return tool_err(err.formatted(&format!("swarm_scheduled list failed: {status}")));
     }
 
     let body: Value = match serde_json::from_str(&text) {
@@ -1839,7 +1889,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_list",
-            "description": "List local opencode sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now.",
+            "description": "List local sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1892,7 +1942,7 @@ fn get_tools(self_grant: bool) -> Value {
                     },
                     "to": {
                         "type": "string",
-                        "description": "Recipient opencode session id (defaults to calling session for self-wake)."
+                        "description": "Recipient session id ('ses_' for opencode or 'gse_' for goose); defaults to this session for a self-wake."
                     },
                     "at": {
                         "type": "string",
@@ -1930,6 +1980,7 @@ fn get_tools(self_grant: bool) -> Value {
                 "properties": {
                     "action": {
                         "type": "string",
+                        "enum": ["list", "cancel"],
                         "description": "Action to perform: 'list' or 'cancel'."
                     },
                     "msg_id": {
