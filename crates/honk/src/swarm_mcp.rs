@@ -23,6 +23,12 @@ pub const ECONOMY_FOOTER: &str = "[pigeon] Message economy — the unit of cost 
     progress is the healthy state. If you have several things to say, hold them \
     and send ONE message at your next checkpoint instead of a back-and-forth.";
 
+// Goose's default stdio extension timeout is 300 s. The worst case of
+// swarm_launch (6 attempts × 30 s request timeout + 15.5 s total backoff ≈ 195.5 s)
+// stays comfortably under that budget.
+pub const SWARM_LAUNCH_MAX_ATTEMPTS: usize = 6;
+pub const SWARM_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub const DEFAULT_BACKOFF: [Duration; 5] = [
     Duration::from_millis(500),
     Duration::from_millis(1000),
@@ -980,14 +986,14 @@ async fn handle_swarm_launch(
     let mut saw_ambiguous_failure = false;
     let mut last_error: Option<String> = None;
 
-    for attempt in 1..=6 {
-        let is_last = attempt == 6;
+    for attempt in 1..=SWARM_LAUNCH_MAX_ATTEMPTS {
+        let is_last = attempt == SWARM_LAUNCH_MAX_ATTEMPTS;
 
         let pigeon_token = read_token(config.pigeon_token_file.as_deref());
         let mut req = client
             .post(&url)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(30))
+            .timeout(SWARM_LAUNCH_TIMEOUT)
             .json(&body);
         if let Some(tok) = &pigeon_token {
             req = req.bearer_auth(tok);
@@ -1200,25 +1206,27 @@ async fn handle_swarm_schedule(
             ));
         }
 
-        if status == reqwest::StatusCode::CONFLICT && attempt >= 2 {
-            let parsed: Option<Value> = serde_json::from_str(&text).ok();
-            let returned_msg_id = parsed
-                .as_ref()
-                .and_then(|p| p.get("msg_id").and_then(Value::as_str));
-            let deliver_at = parsed
-                .as_ref()
-                .and_then(|p| p.get("deliver_at").and_then(Value::as_i64))
-                .unwrap_or(0);
-            let expires_at = parsed
-                .as_ref()
-                .and_then(|p| p.get("expires_at").and_then(Value::as_i64))
-                .unwrap_or(0);
-            if returned_msg_id.is_none() || returned_msg_id == Some(&msg_id) {
-                let ret_id = returned_msg_id.unwrap_or(&msg_id);
-                return tool_ok(format_schedule_result(
-                    ret_id, to, deliver_at, expires_at, attempt, true,
-                ));
+        if status == reqwest::StatusCode::CONFLICT {
+            if attempt >= 2 {
+                let parsed: Option<Value> = serde_json::from_str(&text).ok();
+                let returned_msg_id = parsed
+                    .as_ref()
+                    .and_then(|p| p.get("msg_id").and_then(Value::as_str));
+                let deliver_at = parsed
+                    .as_ref()
+                    .and_then(|p| p.get("deliver_at").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                let expires_at = parsed
+                    .as_ref()
+                    .and_then(|p| p.get("expires_at").and_then(Value::as_i64))
+                    .unwrap_or(0);
+                if returned_msg_id == Some(&msg_id) {
+                    return tool_ok(format_schedule_result(
+                        &msg_id, to, deliver_at, expires_at, attempt, true,
+                    ));
+                }
             }
+            return tool_err(err.formatted("swarm_schedule failed: 409"));
         }
 
         let status_u16 = status.as_u16();
@@ -1889,7 +1897,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_list",
-            "description": "List local sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now.",
+            "description": "List local sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now. Note: goose sessions on other machines are not listed; a remote goose session's id comes from the message or launch that named it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1899,14 +1907,14 @@ fn get_tools(self_grant: bool) -> Value {
                     },
                     "remote": {
                         "type": "boolean",
-                        "description": "List sessions on other machines (active in the last 7 days) instead of local ones."
+                        "description": "List sessions on other machines (active in the last 7 days) instead of local ones (goose sessions on other machines are not listed; their ids come from messages or launches that named them)."
                     }
                 }
             }
         }),
         json!({
             "name": "swarm_launch",
-            "description": "Start a FRESH session on another machine via the pigeon daemon. Off unless this machine's daemon has PIGEON_REMOTE_LAUNCH_SEND=1 (errors with launch_send_disabled); target must list this machine in PIGEON_REMOTE_LAUNCH_FROM. Call ONCE per launch; the result arrives as a launch.result swarm message. 'pending' means do not call again; a pool restart on that machine kills the launched session (see the cross-device-deployment skill).",
+            "description": "Start a FRESH session on another machine via the pigeon daemon. The launched session is an opencode session and is told to report back to this session with swarm_send. Off unless this machine's daemon has PIGEON_REMOTE_LAUNCH_SEND=1 (errors with launch_send_disabled); target must list this machine in PIGEON_REMOTE_LAUNCH_FROM. Call ONCE per launch; the result arrives as a launch.result swarm message. 'pending' means do not call again; a pool restart on the target machine kills the launched session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1974,7 +1982,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_scheduled",
-            "description": "Manage scheduled swarm messages. Use action 'list' to view pending (queued) and recent terminal scheduled messages (expired, failed, cancelled) for the current session. Note: successfully delivered wakes (handed_off) do not appear in this list, so absence of a past scheduled wake implies it was delivered. Use action 'cancel' with `msg_id` to cancel a pending queued scheduled message before it fires.",
+            "description": "Manage scheduled swarm messages. Use action 'list' to view pending (queued) and recent terminal scheduled messages (expired, failed, cancelled) for the current session. Note: successfully delivered wakes (handed_off) do not appear in this list, so absence of a past scheduled wake implies it was delivered (for a wake to a session on another machine, delivery means it was handed to the relay; a refusal arrives later as a delivery.failed swarm message). Use action 'cancel' with `msg_id` to cancel a pending queued scheduled message before it fires.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

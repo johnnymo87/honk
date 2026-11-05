@@ -172,6 +172,14 @@ async fn test_tools_list_probe_204() {
         launch_desc.contains("Call ONCE per launch"),
         "launch must mention once: {launch_desc}"
     );
+    assert!(
+        launch_desc.contains("opencode session"),
+        "launch must mention opencode session: {launch_desc}"
+    );
+    assert!(
+        !launch_desc.contains("cross-device-deployment"),
+        "launch must not mention cross-device-deployment: {launch_desc}"
+    );
 
     let schedule_tool = tools
         .iter()
@@ -203,6 +211,10 @@ async fn test_tools_list_probe_204() {
         scheduled_desc.contains("action 'list'"),
         "scheduled must describe list: {scheduled_desc}"
     );
+    assert!(
+        scheduled_desc.contains("delivery means it was handed to the relay"),
+        "scheduled must describe remote delivery: {scheduled_desc}"
+    );
     let scheduled_action = &scheduled_tool["inputSchema"]["properties"]["action"];
     assert_eq!(scheduled_action["enum"], json!(["list", "cancel"]));
 
@@ -215,6 +227,10 @@ async fn test_tools_list_probe_204() {
     assert!(
         list_desc.contains("remote: true"),
         "list must describe remote: {list_desc}"
+    );
+    assert!(
+        list_desc.contains("goose sessions on other machines are not listed"),
+        "list must describe remote goose sessions: {list_desc}"
     );
     assert!(
         list_tool["inputSchema"]["properties"]["remote"].is_object(),
@@ -1379,6 +1395,7 @@ async fn test_swarm_schedule_409_on_retry_is_success() {
             StatusCode::CONFLICT,
             json!({
                 "error": "message with msg_id already exists",
+                "msg_id": "$REQ_MSG_ID",
                 "deliver_at": 1730736000000_i64,
                 "expires_at": 1730757600000_i64,
             }),
@@ -1438,6 +1455,98 @@ async fn test_swarm_schedule_409_on_retry_is_success() {
         seen.len(),
         3,
         "expected 1 mailbox + 2 schedule calls: {seen:?}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_schedule_409_no_matching_msg_id_is_terminal_error() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_launcher1",
+                "backend_session_id": "20261020_owner",
+                "created": false,
+                "notify": false,
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    {
+        let mut list = p.schedule_responses();
+        list.push((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "network hiccup"}),
+        ));
+        list.push((
+            StatusCode::CONFLICT,
+            json!({
+                "error": "no goose session gse_unknown",
+            }),
+        ));
+    }
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server_with_backoff(
+        config,
+        BufReader::new(server_rx),
+        server_tx,
+        vec![Duration::from_millis(1); 5],
+    ));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_schedule",
+                "arguments": {
+                    "message": "Resume pigeon-c68: run bd show pigeon-c68, then continue W4 in .worktrees/wake-w4.",
+                    "after": "13h"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("no goose session gse_unknown"),
+        "expected pigeon error text, got: {text}"
+    );
+
+    let seen = p.seen();
+    // 1 mailbox + 2 schedule calls (attempt 1 500, attempt 2 409 terminal -> stopped, no attempt 3!)
+    assert_eq!(
+        seen.len(),
+        3,
+        "expected 1 mailbox + 2 schedule calls (no further retries): {seen:?}"
     );
 
     drop(client_tx);

@@ -284,8 +284,8 @@ async fn swarm_schedule(
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> impl IntoResponse {
-    record(&st, "/swarm/schedule", &headers, body);
-    let resp = {
+    record(&st, "/swarm/schedule", &headers, body.clone());
+    let mut resp = {
         let mut list = st.behaviour.swarm_schedule_responses.lock().unwrap();
         if !list.is_empty() {
             list.remove(0)
@@ -293,6 +293,11 @@ async fn swarm_schedule(
             st.behaviour.swarm_schedule.clone()
         }
     };
+    if resp.1.get("msg_id") == Some(&json!("$REQ_MSG_ID"))
+        && let Some(req_id) = body.get("msg_id")
+    {
+        resp.1["msg_id"] = req_id.clone();
+    }
     (resp.0, axum::Json(resp.1))
 }
 
