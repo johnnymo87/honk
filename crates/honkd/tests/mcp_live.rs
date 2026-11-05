@@ -961,3 +961,197 @@ async fn test_swarm_mcp_self_grant_mid_turn_real_path_e2e() {
         "export must show probe tool was called in the turn: {export_str}"
     );
 }
+
+/// A streamable-HTTP MCP server on loopback, stdlib only. Prints its port as
+/// the first stdout line.
+const HTTP_MCP_FIXTURE_PY: &str = r#"import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, status, body=None, headers=None):
+        data = b"" if body is None else json.dumps(body).encode()
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        if body is not None:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        if self.path != "/mcp":
+            return self._send(404)
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._send(400)
+        if not isinstance(req, dict) or req.get("id") is None:
+            return self._send(202)
+        rid = req["id"]
+        method = req.get("method")
+        headers = {}
+        if method == "initialize":
+            pv = (req.get("params") or {}).get("protocolVersion", "2025-03-26")
+            result = {
+                "protocolVersion": pv,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "projtest", "version": "0"},
+            }
+            headers["Mcp-Session-Id"] = "projtest-session"
+        elif method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "projtest_ping",
+                        "description": "Ping the project test server",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ]
+            }
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "pong"}], "isError": False}
+        else:
+            return self._send(
+                200,
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "error": {"code": -32601, "message": "method not found"},
+                },
+                headers,
+            )
+        self._send(200, {"jsonrpc": "2.0", "id": rid, "result": result}, headers)
+
+    def do_GET(self):
+        self._send(405)
+
+    def do_DELETE(self):
+        self._send(200)
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+sys.stdout.write(str(server.server_address[1]) + "\n")
+sys.stdout.flush()
+server.serve_forever()
+"#;
+
+/// Kills the fixture server when the test ends, pass or fail.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_project_mcp_http_live_e2e() {
+    use std::io::BufRead;
+
+    let Some(python3_bin) = find_python3() else {
+        eprintln!("skipping test: python3 not on PATH");
+        return;
+    };
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+
+    // The fixture MCP server, on a port it picks itself.
+    let fixture_dir = tempfile::tempdir().expect("create fixture dir");
+    let fixture_path = fixture_dir.path().join("http_fixture.py");
+    std::fs::write(&fixture_path, HTTP_MCP_FIXTURE_PY).expect("write http fixture");
+    let mut child = std::process::Command::new(&python3_bin)
+        .arg("-u")
+        .arg(&fixture_path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn http fixture");
+    let stdout = child.stdout.take().expect("fixture stdout");
+    let _fixture = KillOnDrop(child);
+    let mut port_line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut port_line)
+        .expect("read fixture port");
+    let port: u16 = port_line
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("fixture printed no port: {port_line:?}"));
+
+    // A git project that declares the server for opencode.
+    let project = tempfile::tempdir().expect("create project dir");
+    std::fs::create_dir(project.path().join(".git")).expect("create .git");
+    std::fs::write(
+        project.path().join("opencode.json"),
+        json!({"mcp": {"projtest": {
+            "type": "remote",
+            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "enabled": true,
+        }}})
+        .to_string(),
+    )
+    .expect("write project opencode.json");
+
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &["--project-mcp"]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    let res = v
+        .call(
+            "session/new",
+            json!({
+                "cwd": project.path().to_str().unwrap(),
+                "mcpServers": [],
+                "_meta": {"enabledExtensions": [{"type": "platform", "name": "developer"}]},
+            }),
+        )
+        .await;
+    assert!(res.get("error").is_none(), "session/new failed: {res}");
+    let sid = res["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // honkd's own outcome report.
+    let meta = &res["result"]["_meta"]["honk"]["projectMcp"];
+    let server = meta["servers"]
+        .as_array()
+        .and_then(|a| a.iter().find(|s| s["name"] == "projtest"))
+        .unwrap_or_else(|| panic!("projtest missing from projectMcp servers: {res}"));
+    assert_eq!(server["ok"], true, "{res}");
+    assert!(
+        server["source"].as_str().unwrap().starts_with("project:"),
+        "{res}"
+    );
+
+    // /mcp list: on, from the project.
+    let list = v.call("_honk/mcp/list", json!({ "sessionId": &sid })).await;
+    assert!(list.get("error").is_none(), "{list}");
+    let entry = list["result"]["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "projtest")
+        .unwrap_or_else(|| panic!("projtest not listed: {list}"));
+    assert_eq!(entry["enabled"], true, "{list}");
+    assert!(
+        entry["source"].as_str().unwrap().starts_with("project:"),
+        "{list}"
+    );
+
+    // And the real goose really loaded it: the tool is there.
+    let tools = g.tools_list(&sid).await;
+    let ping = tools
+        .iter()
+        .find(|t| t.contains("projtest_ping"))
+        .unwrap_or_else(|| panic!("goose has no projtest_ping tool: {tools:?}"));
+    println!("Goose project MCP tool name: {ping}");
+}
