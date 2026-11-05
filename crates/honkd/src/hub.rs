@@ -240,7 +240,7 @@ impl Hub {
 
         let has_catalog = args.mcp_catalog.is_some();
         let has_swarm = args.swarm_mcp_bin.is_some() && args.swarm_pigeon_url.is_some();
-        let mcp = if has_catalog || has_swarm {
+        let mcp = if has_catalog || has_swarm || args.project_mcp {
             let swarm = if has_swarm {
                 Some(crate::mcp::SwarmMcpConfig {
                     bin: args.swarm_mcp_bin.clone().unwrap(),
@@ -260,6 +260,7 @@ impl Hub {
                 catalog_path: args.mcp_catalog.clone(),
                 policy,
                 swarm,
+                project: args.project_mcp,
             })
         } else {
             None

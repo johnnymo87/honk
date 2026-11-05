@@ -87,6 +87,23 @@ impl crate::mcp::ops::GooseRequester for ActorRequester {
     }
 }
 
+/// The catalog an MCP operation on session `sid` works from: the user catalog,
+/// the project overlay for the cwd honkd holds for the session, and `swarm`.
+/// A session without a stored cwd has no project config.
+async fn session_mcp_catalog(
+    hub: &Hub,
+    cfg: &crate::mcp::McpConfig,
+    sid: &str,
+) -> Result<crate::mcp::catalog::Catalog, crate::mcp::ops::OpError> {
+    let cwd = if cfg.project {
+        let state = hub.state.lock().await;
+        state.sessions.get(sid).map(|h| h.cwd.clone())
+    } else {
+        None
+    };
+    Ok(cfg.session_catalog(cwd.as_deref(), sid).await?.catalog)
+}
+
 pub const MCP_VIEWER_WORKER_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MCP_AGENT_WORKER_TIMEOUT: Duration = Duration::from_secs(55);
 
@@ -2585,6 +2602,7 @@ impl Session {
         };
 
         let sid = self.sid.clone();
+        let hub = self.hub.clone();
         let self_tx = self.self_tx.clone();
         let requester = ActorRequester {
             tx: self_tx.clone(),
@@ -2604,14 +2622,7 @@ impl Session {
                     MCP_VIEWER_WORKER_TIMEOUT
                 };
                 let work = async {
-                    let mut catalog = match &mcp_config.catalog_path {
-                        Some(path) => crate::mcp::catalog::Catalog::load(path)
-                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
-                        None => crate::mcp::catalog::Catalog::default(),
-                    };
-                    if let Some(swarm) = &mcp_config.swarm {
-                        catalog.merge_swarm_entry(swarm, &sid);
-                    }
+                    let catalog = session_mcp_catalog(&hub, &mcp_config, &sid).await?;
                     let res = crate::mcp::ops::list(&requester, &catalog, &mcp_config.policy, &sid)
                         .await?;
                     Ok(McpOpOutput::List(res))
@@ -2641,14 +2652,7 @@ impl Session {
                     MCP_VIEWER_WORKER_TIMEOUT
                 };
                 let work = async {
-                    let mut catalog = match &mcp_config.catalog_path {
-                        Some(path) => crate::mcp::catalog::Catalog::load(path)
-                            .map_err(crate::mcp::ops::OpError::catalog_unreadable)?,
-                        None => crate::mcp::catalog::Catalog::default(),
-                    };
-                    if let Some(swarm) = &mcp_config.swarm {
-                        catalog.merge_swarm_entry(swarm, &sid);
-                    }
+                    let catalog = session_mcp_catalog(&hub, &mcp_config, &sid).await?;
                     match op {
                         McpOpKind::List => unreachable!(),
                         McpOpKind::Enable { names, confirm } => {
@@ -2659,6 +2663,7 @@ impl Session {
                             };
                             let res = crate::mcp::ops::enable_with_reason(
                                 &requester,
+                                &crate::mcp::probe::HttpProbe,
                                 &catalog,
                                 &mcp_config.policy,
                                 &sid,
@@ -5351,6 +5356,7 @@ mod tests {
             catalog_path: Some(cat_path),
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
+            project: false,
         });
 
         // 1. Agent origin timeout
@@ -5653,6 +5659,7 @@ mod tests {
             catalog_path: Some(cat_path),
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
+            project: false,
         });
 
         // 1. Agent origin op
@@ -5747,6 +5754,7 @@ mod tests {
             catalog_path: None,
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
+            project: false,
         });
 
         // 1. Immediate McpSelfOp with closed reply

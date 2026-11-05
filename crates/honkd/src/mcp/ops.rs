@@ -5,7 +5,8 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 
-use crate::mcp::catalog::Catalog;
+use crate::mcp::catalog::{Catalog, CatalogEntry, EntrySource, Transport, marker};
+use crate::mcp::probe::RemoteProbe;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestError {
@@ -100,6 +101,10 @@ pub struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub confirm: bool,
+    /// Where the entry came from: `user`, `project:<file>` or `builtin`.
+    /// Absent from replies of older honkd versions.
+    #[serde(default)]
+    pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +163,24 @@ fn find_sibling(name: &str, catalog: &Catalog) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether enabling `entry` needs the person's `name!` confirmation.
+///
+/// A project entry is judged by what it is, never by its name: only a
+/// loopback remote entry is trusted, so a repo cannot borrow a name the user
+/// listed in `--mcp-no-confirm`. Everything else follows the configured policy.
+fn needs_confirm(entry: &CatalogEntry, policy: &Policy) -> bool {
+    match entry.source {
+        EntrySource::Project(_) => !entry.auto_eligible(),
+        _ => !policy.no_confirm.contains(&entry.name),
+    }
+}
+
+fn project_refusal_hint(name: &str) -> String {
+    format!(
+        "'{name}' comes from this project's config and is not a loopback server; only a person can enable it, with /mcp enable {name}!"
+    )
 }
 
 fn confirm_refusal_hint(name: &str, catalog: &Catalog, is_agent: bool) -> String {
@@ -250,7 +273,7 @@ pub async fn list(
 
     for entry in &catalog.entries {
         let name = &entry.name;
-        let expected_marker = crate::mcp::catalog::marker(name);
+        let expected_marker = marker(name);
 
         let goose_match = goose_exts.iter().find(|e| &e.key == name);
         let (enabled, conflict) = match goose_match {
@@ -268,7 +291,7 @@ pub async fn list(
 
         let supported = entry.supported.is_ok();
         let reason = entry.supported.as_ref().err().cloned();
-        let confirm = !policy.no_confirm.contains(name);
+        let confirm = needs_confirm(entry, policy);
         let sibling = find_sibling(name, catalog);
 
         servers.push(ServerInfo {
@@ -277,6 +300,7 @@ pub async fn list(
             supported,
             reason,
             confirm,
+            source: entry.source.label(),
             conflict,
             sibling,
         });
@@ -316,42 +340,30 @@ fn format_enable_summary(results: &[NameResult]) -> String {
     }
 }
 
-/// Enables the specified MCP servers in the given goose session.
-///
-/// Validates all server names before executing any requests. If any server name requires
-/// confirmation and `confirm` is false, returns an invalid params error guiding the user.
-///
-/// If an exclusive sibling (e.g. `slack-ro` when enabling `slack`, or vice versa) is currently
+/// Whether the caller must justify a confirmed enable: an agent must give a
+/// reason, a person typing `/mcp enable name!` need not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonPolicy<'a> {
     NotRequired,
     Required(Option<&'a str>),
 }
 
-/// Enable one or more servers by name. If a server has an exclusive sibling currently
+/// Enables the specified MCP servers in the given goose session.
+///
+/// Validates all server names before executing any requests. If any server name requires
+/// confirmation and `confirm` does not list it, returns an invalid params error guiding
+/// the user. An agent cannot enable a project-declared server that is not trusted
+/// ([`CatalogEntry::auto_eligible`]); only a person can.
+///
+/// If an exclusive sibling (e.g. `slack-ro` when enabling `slack`, or vice versa) is currently
 /// enabled with the marker, it is removed before adding the new server.
-pub async fn enable(
-    req: &impl GooseRequester,
-    catalog: &Catalog,
-    policy: &Policy,
-    session_id: &str,
-    names: &[String],
-    confirm: &[String],
-) -> Result<OpResult, OpError> {
-    enable_with_reason(
-        req,
-        catalog,
-        policy,
-        session_id,
-        names,
-        confirm,
-        ReasonPolicy::NotRequired,
-    )
-    .await
-}
-
+///
+/// A remote (http) server is probed first; one that is down, or that wants OAuth,
+/// is reported as a failed name and left alone (see [`crate::mcp::probe`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn enable_with_reason(
     req: &impl GooseRequester,
+    probe: &impl RemoteProbe,
     catalog: &Catalog,
     policy: &Policy,
     session_id: &str,
@@ -397,8 +409,12 @@ pub async fn enable_with_reason(
             )));
         }
 
-        if !policy.no_confirm.contains(name) {
-            let is_agent = matches!(reason_policy, ReasonPolicy::Required(_));
+        let is_agent = matches!(reason_policy, ReasonPolicy::Required(_));
+        if is_agent && matches!(entry.source, EntrySource::Project(_)) && !entry.auto_eligible() {
+            return Err(OpError::invalid_params(project_refusal_hint(name)));
+        }
+
+        if needs_confirm(entry, policy) {
             if !confirm.iter().any(|c| c == name) {
                 return Err(OpError::invalid_params(confirm_refusal_hint(
                     name, catalog, is_agent,
@@ -427,7 +443,7 @@ pub async fn enable_with_reason(
 
     let mut results = Vec::new();
     for name in &unique_names {
-        let expected_marker = crate::mcp::catalog::marker(name);
+        let expected_marker = marker(name);
         let existing = goose_exts.iter().find(|e| &e.key == name);
 
         if let Some(ext) = existing {
@@ -458,10 +474,27 @@ pub async fn enable_with_reason(
             }
         }
 
+        // A remote server that is down or wants OAuth must not reach goose, and
+        // must not cost the session a working sibling.
+        let spec = catalog.get(name).unwrap().supported.as_ref().unwrap();
+        if let Transport::Http { url } = &spec.transport
+            && let Err(reason) = probe.probe(url).await
+        {
+            results.push(NameResult {
+                name: name.clone(),
+                ok: false,
+                error: Some(reason),
+                note: None,
+                replaced: None,
+                changed: false,
+            });
+            continue;
+        }
+
         // Check if sibling is currently enabled WITH marker
         let mut replaced = None;
         if let Some(sibling) = find_sibling(name, catalog) {
-            let sibling_marker = crate::mcp::catalog::marker(&sibling);
+            let sibling_marker = marker(&sibling);
             let sibling_enabled = goose_exts
                 .iter()
                 .any(|e| e.key == sibling && e.description.as_deref() == Some(&sibling_marker));
@@ -498,7 +531,6 @@ pub async fn enable_with_reason(
         }
 
         // Add extension
-        let spec = catalog.get(name).unwrap().supported.as_ref().unwrap();
         let ext_json = spec.to_add_extension_json();
         let add_res = req
             .request(
@@ -583,7 +615,8 @@ fn format_disable_summary(results: &[NameResult]) -> String {
 
 /// Disables the specified MCP servers in the given goose session.
 ///
-/// Only removes extensions carrying the `honk-mcp:<name>` marker. Builtin and platform
+/// Only removes extensions carrying the `honk-mcp:<name>` marker, whether or not the
+/// catalog still has the name. Builtin and platform
 /// extensions (like `developer`) and un-marked extensions are never removed by this function,
 /// ensuring other clients' extensions remain protected.
 pub async fn disable(
@@ -605,19 +638,24 @@ pub async fn disable(
         }
     }
 
+    let mut goose_exts = fetch_goose_extensions(req, session_id).await?;
+
+    // A name the catalog no longer has (its project file changed, say) is still
+    // known when goose holds an extension honk marked with that name.
     for name in &unique_names {
-        if catalog.get(name).is_none() {
+        let marked = goose_exts
+            .iter()
+            .any(|e| &e.key == name && e.description.as_deref() == Some(&marker(name)));
+        if catalog.get(name).is_none() && !marked {
             return Err(OpError::invalid_params(format!(
                 "unknown MCP server '{name}'; /mcp lists them"
             )));
         }
     }
 
-    let mut goose_exts = fetch_goose_extensions(req, session_id).await?;
-
     let mut results = Vec::new();
     for name in &unique_names {
-        let expected_marker = crate::mcp::catalog::marker(name);
+        let expected_marker = marker(name);
         let existing = goose_exts.iter().find(|e| &e.key == name);
 
         match existing {
@@ -788,6 +826,56 @@ mod tests {
                 _ => Err(RequestError::new(format!("unknown method {method}"))),
             }
         }
+    }
+
+    /// A probe that answers from a table: a url in `down` fails with its reason.
+    #[derive(Default)]
+    struct FakeProbe {
+        down: Mutex<std::collections::HashMap<String, String>>,
+        probed: Mutex<Vec<String>>,
+    }
+
+    impl FakeProbe {
+        fn failing(url: &str, reason: &str) -> Self {
+            let p = Self::default();
+            p.down.lock().unwrap().insert(url.into(), reason.into());
+            p
+        }
+
+        fn probed(&self) -> Vec<String> {
+            self.probed.lock().unwrap().clone()
+        }
+    }
+
+    impl RemoteProbe for FakeProbe {
+        async fn probe(&self, url: &str) -> Result<(), String> {
+            self.probed.lock().unwrap().push(url.to_string());
+            match self.down.lock().unwrap().get(url) {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    async fn enable(
+        req: &impl GooseRequester,
+        catalog: &Catalog,
+        policy: &Policy,
+        session_id: &str,
+        names: &[String],
+        confirm: &[String],
+    ) -> Result<OpResult, OpError> {
+        enable_with_reason(
+            req,
+            &FakeProbe::default(),
+            catalog,
+            policy,
+            session_id,
+            names,
+            confirm,
+            ReasonPolicy::NotRequired,
+        )
+        .await
     }
 
     fn sample_catalog() -> Catalog {
@@ -1187,6 +1275,7 @@ mod tests {
         // 1. Without confirm, hint error is returned first (even if reason is missing)
         let err1 = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1205,6 +1294,7 @@ mod tests {
         // 2. With confirm but no reason -> reason error
         let err2 = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1223,6 +1313,7 @@ mod tests {
         // 3. With confirm but whitespace-only reason -> reason error
         let err3 = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1241,6 +1332,7 @@ mod tests {
         // 4. With confirm and valid reason -> OK
         let res_ok = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1255,6 +1347,7 @@ mod tests {
         // 5. No-confirm server (slack-ro) needs neither confirm nor reason
         let res_no_confirm = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1269,6 +1362,7 @@ mod tests {
         // 6. Server without sibling (pagerduty) returns hint without "(or ...)"
         let err_pd = enable_with_reason(
             &req,
+            &FakeProbe::default(),
             &cat,
             &policy,
             "ses_123",
@@ -1510,5 +1604,293 @@ mod tests {
         assert_eq!(args[0], "swarm-mcp");
         assert_eq!(args[1], "--session");
         assert_eq!(args[2], "ses_goose_1");
+    }
+
+    fn project_catalog(json: &str) -> Catalog {
+        let mut cat = Catalog::load_from_str(json, None).unwrap();
+        for e in &mut cat.entries {
+            e.source = EntrySource::Project("opencode.json".into());
+        }
+        cat
+    }
+
+    const LOOPBACK_TEC: &str =
+        r#"{"mcp":{"tec":{"type":"remote","url":"http://127.0.0.1:4006/mcp"}}}"#;
+    const REMOTE_TEC: &str =
+        r#"{"mcp":{"tec":{"type":"remote","url":"https://tec.example.com/mcp"}}}"#;
+
+    fn add_calls(req: &FakeRequester) -> Vec<Value> {
+        req.calls()
+            .into_iter()
+            .filter(|(m, _)| m == "_goose/unstable/session/extensions/add")
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_remote_enable_adds_http_extension_after_probe() {
+        let cat = Catalog::load_from_str(LOOPBACK_TEC, None).unwrap();
+        let policy = Policy::new(["tec".to_string()]);
+        let req = FakeRequester::new(vec![]);
+        let probe = FakeProbe::default();
+
+        let res = enable_with_reason(
+            &req,
+            &probe,
+            &cat,
+            &policy,
+            "ses_1",
+            &["tec".to_string()],
+            &[],
+            ReasonPolicy::NotRequired,
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok, "{:?}", res.results[0]);
+        assert_eq!(probe.probed(), vec!["http://127.0.0.1:4006/mcp"]);
+        let adds = add_calls(&req);
+        assert_eq!(adds.len(), 1);
+        assert_eq!(adds[0]["extension"]["server"]["type"], "http");
+        assert_eq!(adds[0]["extension"]["description"], "honk-mcp:tec");
+    }
+
+    #[tokio::test]
+    async fn test_probe_failure_is_a_failed_name_not_a_failed_op() {
+        let json = r#"{"mcp":{
+            "remote-a":{"type":"remote","url":"http://127.0.0.1:1/mcp"},
+            "local-b":{"type":"local","command":["b-mcp"]}
+        }}"#;
+        let cat = Catalog::load_from_str(json, None).unwrap();
+        let policy = Policy::new(["remote-a".to_string(), "local-b".to_string()]);
+        let req = FakeRequester::new(vec![]);
+        let probe = FakeProbe::failing("http://127.0.0.1:1/mcp", "not reachable at x: refused");
+
+        let res = enable_with_reason(
+            &req,
+            &probe,
+            &cat,
+            &policy,
+            "ses_1",
+            &["remote-a".to_string(), "local-b".to_string()],
+            &[],
+            ReasonPolicy::NotRequired,
+        )
+        .await
+        .unwrap();
+
+        assert!(!res.results[0].ok);
+        assert_eq!(
+            res.results[0].error.as_deref(),
+            Some("not reachable at x: refused")
+        );
+        assert!(!res.results[0].changed);
+        assert!(res.results[1].ok, "the other name still lands");
+        // Only the remote one was probed, and only the local one was added.
+        assert_eq!(probe.probed(), vec!["http://127.0.0.1:1/mcp"]);
+        let adds = add_calls(&req);
+        assert_eq!(adds.len(), 1);
+        assert_eq!(adds[0]["extension"]["server"]["name"], "local-b");
+    }
+
+    #[tokio::test]
+    async fn test_already_on_remote_is_not_probed() {
+        let cat = Catalog::load_from_str(LOOPBACK_TEC, None).unwrap();
+        let policy = Policy::new(["tec".to_string()]);
+        let req = FakeRequester::new(vec![serde_json::json!({
+            "extensionKey": "tec",
+            "extension": {"type": "mcp", "description": "honk-mcp:tec", "server": {"name": "tec"}}
+        })]);
+        let probe = FakeProbe::failing("http://127.0.0.1:4006/mcp", "down");
+        let res = enable_with_reason(
+            &req,
+            &probe,
+            &cat,
+            &policy,
+            "ses_1",
+            &["tec".to_string()],
+            &[],
+            ReasonPolicy::NotRequired,
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok);
+        assert_eq!(res.results[0].note.as_deref(), Some("already on"));
+        assert!(probe.probed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_loopback_project_entry_needs_no_confirm_or_reason() {
+        let cat = project_catalog(LOOPBACK_TEC);
+        let policy = Policy::default();
+
+        // A person, no confirm.
+        let req = FakeRequester::new(vec![]);
+        let res = enable(&req, &cat, &policy, "ses_1", &["tec".to_string()], &[])
+            .await
+            .unwrap();
+        assert!(res.results[0].ok);
+
+        // An agent, no confirm and no reason.
+        let req = FakeRequester::new(vec![]);
+        let res = enable_with_reason(
+            &req,
+            &FakeProbe::default(),
+            &cat,
+            &policy,
+            "ses_1",
+            &["tec".to_string()],
+            &[],
+            ReasonPolicy::Required(None),
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok);
+
+        // The list agrees.
+        let listed = list(&req, &cat, &policy, "ses_1").await.unwrap();
+        assert!(!listed.servers[0].confirm);
+        assert_eq!(listed.servers[0].source, "project:opencode.json");
+    }
+
+    #[tokio::test]
+    async fn test_agent_cannot_enable_untrusted_project_entry() {
+        let cat = project_catalog(REMOTE_TEC);
+        let policy = Policy::default();
+        let req = FakeRequester::new(vec![]);
+
+        // Not even with confirm and a reason.
+        let err = enable_with_reason(
+            &req,
+            &FakeProbe::default(),
+            &cat,
+            &policy,
+            "ses_1",
+            &["tec".to_string()],
+            &["tec".to_string()],
+            ReasonPolicy::Required(Some("the repo asked for it")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.contains("only a person can enable it"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("/mcp enable tec!"), "{}", err.message);
+        assert!(req.calls().is_empty());
+
+        // A person without confirm is told how to confirm...
+        let err = enable(&req, &cat, &policy, "ses_1", &["tec".to_string()], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message,
+            "'tec' can write; use /mcp enable tec! to confirm"
+        );
+
+        // ...and with confirm it goes through.
+        let res = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_1",
+            &["tec".to_string()],
+            &["tec".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok);
+        let listed = list(&req, &cat, &policy, "ses_1").await.unwrap();
+        assert!(listed.servers[0].confirm);
+    }
+
+    #[tokio::test]
+    async fn test_project_entry_does_not_inherit_a_trusted_name() {
+        // The user trusted a name that the catalog does not hold; a repo defines it.
+        let cat = project_catalog(REMOTE_TEC);
+        let policy = Policy::new(["tec".to_string()]);
+        let req = FakeRequester::new(vec![]);
+
+        let err = enable(&req, &cat, &policy, "ses_1", &["tec".to_string()], &[])
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("/mcp enable tec!"), "{}", err.message);
+        assert!(req.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_project_entry_is_refused() {
+        let cat = project_catalog(
+            r#"{"mcp":{"tec":{"type":"remote","url":"http://127.0.0.1:4006/mcp","headers":{"X":"y"}}}}"#,
+        );
+        let req = FakeRequester::new(vec![]);
+        let err = enable(
+            &req,
+            &cat,
+            &Policy::default(),
+            "ses_1",
+            &["tec".to_string()],
+            &["tec".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("'tec' is not supported"));
+        assert!(req.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disable_by_marker_after_the_entry_left_the_catalog() {
+        let cat = Catalog::default();
+        let policy = Policy::default();
+        let marked = serde_json::json!({
+            "extensionKey": "tec",
+            "extension": {"type": "mcp", "description": "honk-mcp:tec", "server": {"name": "tec"}}
+        });
+        let req = FakeRequester::new(vec![marked]);
+
+        let res = disable(&req, &cat, &policy, "ses_1", &["tec".to_string()])
+            .await
+            .unwrap();
+        assert!(res.results[0].ok);
+        assert!(res.results[0].changed);
+        assert_eq!(res.summary, "disabled tec");
+        assert!(req.calls().iter().any(|(m, p)| {
+            m == "_goose/unstable/session/extensions/remove" && p["extensionKey"] == "tec"
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_disable_unknown_unless_marked() {
+        let cat = Catalog::default();
+        let policy = Policy::default();
+        let req = FakeRequester::new(vec![
+            // Same key, someone else's extension.
+            serde_json::json!({
+                "extensionKey": "tec",
+                "extension": {"type": "mcp", "description": "user-added", "server": {"name": "tec"}}
+            }),
+            // Marked for a different name.
+            serde_json::json!({
+                "extensionKey": "other",
+                "extension": {"type": "mcp", "description": "honk-mcp:tec", "server": {"name": "other"}}
+            }),
+        ]);
+
+        for name in ["tec", "other", "nothing"] {
+            let err = disable(&req, &cat, &policy, "ses_1", &[name.to_string()])
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602);
+            assert_eq!(
+                err.message,
+                format!("unknown MCP server '{name}'; /mcp lists them")
+            );
+        }
+        assert!(
+            req.calls()
+                .iter()
+                .all(|(m, _)| m != "_goose/unstable/session/extensions/remove")
+        );
     }
 }
