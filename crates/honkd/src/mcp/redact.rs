@@ -5,8 +5,8 @@
 //! entry's `{file:}` secret files and redacts any occurrences of those secrets before
 //! returning the error to viewers.
 
-use crate::mcp::catalog::{EnvVarSpec, GooseExtensionSpec};
-use std::collections::BTreeSet;
+use crate::mcp::catalog::{EnvVarSpec, GooseExtensionSpec, Transport};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Redacts any `{file:}` secret values found in `err`, and caps the result to
 /// its last 2000 characters (prefixed with '…' if truncated).
@@ -16,7 +16,14 @@ use std::collections::BTreeSet;
 pub fn redact_mcp_error(err: &str, spec: &GooseExtensionSpec) -> String {
     let mut needles = BTreeSet::new();
 
-    for var in spec.env.values() {
+    // An http spec holds no secret files (headers are unsupported), so only
+    // the cap applies to its errors.
+    let no_env = BTreeMap::new();
+    let env = match &spec.transport {
+        Transport::Stdio { env, .. } => env,
+        Transport::Http { .. } => &no_env,
+    };
+    for var in env.values() {
         if let EnvVarSpec::File(path) = var
             && let Ok(content) = std::fs::read_to_string(path)
         {
@@ -55,7 +62,6 @@ pub fn redact_mcp_error(err: &str, spec: &GooseExtensionSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn make_spec_with_files(files: Vec<(&str, PathBuf)>) -> GooseExtensionSpec {
@@ -65,8 +71,10 @@ mod tests {
         }
         GooseExtensionSpec {
             name: "test-server".to_string(),
-            command: vec!["test-cmd".to_string()],
-            env,
+            transport: Transport::Stdio {
+                command: vec!["test-cmd".to_string()],
+                env,
+            },
         }
     }
 
@@ -153,5 +161,21 @@ mod tests {
         assert_eq!(redacted.chars().count(), 2001); // '…' + 2000 chars
         assert!(redacted.contains("[redacted] end"));
         assert!(!redacted.contains("secret12345"));
+    }
+
+    #[test]
+    fn test_http_spec_only_caps() {
+        let spec = GooseExtensionSpec {
+            name: "remote".to_string(),
+            transport: Transport::Http {
+                url: "http://localhost:4006/mcp".to_string(),
+            },
+        };
+        assert_eq!(
+            redact_mcp_error("connection refused", &spec),
+            "connection refused"
+        );
+        let long = "b".repeat(3000);
+        assert_eq!(redact_mcp_error(&long, &spec).chars().count(), 2001);
     }
 }
