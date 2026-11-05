@@ -151,18 +151,15 @@ impl OpResult {
     }
 }
 
+/// The `-ro` / non-`-ro` twin of `name`, when the catalog has one from the
+/// same source. A project entry never pairs with a user entry (or the reverse),
+/// so a repo cannot make enabling its server remove one the user turned on.
 fn find_sibling(name: &str, catalog: &Catalog) -> Option<String> {
-    if let Some(base) = name.strip_suffix("-ro") {
-        if catalog.get(base).is_some() {
-            return Some(base.to_string());
-        }
-    } else {
-        let candidate = format!("{name}-ro");
-        if catalog.get(&candidate).is_some() {
-            return Some(candidate);
-        }
-    }
-    None
+    let entry = catalog.get(name)?;
+    let candidate = crate::mcp::catalog::sibling_name(name);
+    let other = catalog.get(&candidate)?;
+    (std::mem::discriminant(&entry.source) == std::mem::discriminant(&other.source))
+        .then_some(candidate)
 }
 
 /// Whether enabling `entry` needs the person's `name!` confirmation.
@@ -180,6 +177,12 @@ fn needs_confirm(entry: &CatalogEntry, policy: &Policy) -> bool {
 fn project_refusal_hint(name: &str) -> String {
     format!(
         "'{name}' comes from this project's config and is not a loopback server; only a person can enable it, with /mcp enable {name}!"
+    )
+}
+
+fn project_reason_hint(name: &str) -> String {
+    format!(
+        "'{name}' comes from this project's config; to enable it, call mcp_enable with \"{name}\" and a reason saying what you will do with it"
     )
 }
 
@@ -410,31 +413,37 @@ pub async fn enable_with_reason(
         }
 
         let is_agent = matches!(reason_policy, ReasonPolicy::Required(_));
-        if is_agent && matches!(entry.source, EntrySource::Project(_)) && !entry.auto_eligible() {
+        let is_project = matches!(entry.source, EntrySource::Project(_));
+        if is_agent && is_project && !entry.auto_eligible() {
             return Err(OpError::invalid_params(project_refusal_hint(name)));
         }
 
-        if needs_confirm(entry, policy) {
-            if !confirm.iter().any(|c| c == name) {
-                return Err(OpError::invalid_params(confirm_refusal_hint(
-                    name, catalog, is_agent,
-                )));
-            }
+        let confirm_needed = needs_confirm(entry, policy);
+        if confirm_needed && !confirm.iter().any(|c| c == name) {
+            return Err(OpError::invalid_params(confirm_refusal_hint(
+                name, catalog, is_agent,
+            )));
+        }
 
-            if let ReasonPolicy::Required(reason_opt) = reason_policy {
-                let is_empty = reason_opt.map(|r| r.trim().is_empty()).unwrap_or(true);
-                if is_empty {
-                    return Err(OpError::invalid_params(confirm_refusal_hint(
-                        name, catalog, true,
-                    )));
-                }
-                if let Some(r) = reason_opt
-                    && r.chars().count() > 500
-                {
-                    return Err(OpError::invalid_params(
-                        "reason too long (max 500 characters)",
-                    ));
-                }
+        // An agent justifies every `!` and every project-declared server, even
+        // a trusted loopback one: a repo chose it, not the user.
+        if let ReasonPolicy::Required(reason_opt) = reason_policy
+            && (confirm_needed || is_project)
+        {
+            let is_empty = reason_opt.map(|r| r.trim().is_empty()).unwrap_or(true);
+            if is_empty {
+                return Err(OpError::invalid_params(if confirm_needed {
+                    confirm_refusal_hint(name, catalog, true)
+                } else {
+                    project_reason_hint(name)
+                }));
+            }
+            if let Some(r) = reason_opt
+                && r.chars().count() > 500
+            {
+                return Err(OpError::invalid_params(
+                    "reason too long (max 500 characters)",
+                ));
             }
         }
     }
@@ -1718,19 +1727,71 @@ mod tests {
         assert!(probe.probed().is_empty());
     }
 
+    async fn agent_enable(
+        req: &FakeRequester,
+        cat: &Catalog,
+        name: &str,
+        reason: Option<&str>,
+    ) -> Result<OpResult, OpError> {
+        enable_with_reason(
+            req,
+            &FakeProbe::default(),
+            cat,
+            &Policy::default(),
+            "ses_1",
+            &[name.to_string()],
+            &[],
+            ReasonPolicy::Required(reason),
+        )
+        .await
+    }
+
     #[tokio::test]
-    async fn test_loopback_project_entry_needs_no_confirm_or_reason() {
+    async fn test_loopback_project_entry_needs_no_confirm_but_an_agent_needs_a_reason() {
         let cat = project_catalog(LOOPBACK_TEC);
         let policy = Policy::default();
 
-        // A person, no confirm.
+        // A person: no confirm, no reason.
         let req = FakeRequester::new(vec![]);
         let res = enable(&req, &cat, &policy, "ses_1", &["tec".to_string()], &[])
             .await
             .unwrap();
         assert!(res.results[0].ok);
 
-        // An agent, no confirm and no reason.
+        // An agent: no confirm, but a reason, and nothing happens without one.
+        for bad in [None, Some(""), Some("  \t ")] {
+            let req = FakeRequester::new(vec![]);
+            let err = agent_enable(&req, &cat, "tec", bad).await.unwrap_err();
+            assert_eq!(err.code, -32602);
+            assert!(
+                err.message.contains("reason") && err.message.contains("mcp_enable"),
+                "{}",
+                err.message
+            );
+            assert!(req.calls().is_empty());
+        }
+        let req = FakeRequester::new(vec![]);
+        let err = agent_enable(&req, &cat, "tec", Some(&"x".repeat(501)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "reason too long (max 500 characters)");
+        assert!(req.calls().is_empty());
+
+        let res = agent_enable(&req, &cat, "tec", Some(&"x".repeat(500)))
+            .await
+            .unwrap();
+        assert!(res.results[0].ok);
+
+        // The list still says no confirm is needed.
+        let listed = list(&req, &cat, &policy, "ses_1").await.unwrap();
+        assert!(!listed.servers[0].confirm);
+        assert_eq!(listed.servers[0].source, "project:opencode.json");
+    }
+
+    #[tokio::test]
+    async fn test_agent_reason_is_not_required_for_user_entries_without_confirm() {
+        let cat = Catalog::load_from_str(LOOPBACK_TEC, None).unwrap();
+        let policy = Policy::new(["tec".to_string()]);
         let req = FakeRequester::new(vec![]);
         let res = enable_with_reason(
             &req,
@@ -1745,11 +1806,79 @@ mod tests {
         .await
         .unwrap();
         assert!(res.results[0].ok);
+    }
 
-        // The list agrees.
+    /// A user `slack` and a project `slack-ro` (both sources hold both halves of a pair).
+    fn mixed_source_catalog() -> Catalog {
+        let mut cat = Catalog::load_from_str(
+            r#"{"mcp":{"slack":{"type":"local","command":["slack-mcp"]}}}"#,
+            None,
+        )
+        .unwrap();
+        let mut ro = Catalog::load_from_str(
+            r#"{"mcp":{"slack-ro":{"type":"remote","url":"http://127.0.0.1:4006/mcp"}}}"#,
+            None,
+        )
+        .unwrap();
+        ro.entries[0].source = EntrySource::Project("opencode.json".into());
+        cat.entries.extend(ro.entries);
+        cat.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        cat
+    }
+
+    #[tokio::test]
+    async fn test_siblings_only_pair_within_one_source() {
+        let cat = mixed_source_catalog();
+        let policy = Policy::new(["slack".to_string()]);
+        assert_eq!(find_sibling("slack", &cat), None);
+        assert_eq!(find_sibling("slack-ro", &cat), None);
+
+        // slack is on; enabling the project's slack-ro must not remove it.
+        let req = FakeRequester::new(vec![serde_json::json!({
+            "extensionKey": "slack",
+            "extension": {"type": "mcp", "description": "honk-mcp:slack", "server": {"name": "slack"}}
+        })]);
+        let res = enable(&req, &cat, &policy, "ses_1", &["slack-ro".to_string()], &[])
+            .await
+            .unwrap();
+        assert!(res.results[0].ok, "{:?}", res.results[0]);
+        assert_eq!(res.results[0].replaced, None);
+        assert!(
+            req.calls()
+                .iter()
+                .all(|(m, _)| m != "_goose/unstable/session/extensions/remove")
+        );
+        assert!(res.enabled.contains(&"slack".to_string()));
+
+        // And both can be named in one request.
+        let req = FakeRequester::new(vec![]);
+        let res = enable(
+            &req,
+            &cat,
+            &policy,
+            "ses_1",
+            &["slack".to_string(), "slack-ro".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(res.results.iter().all(|r| r.ok));
+
+        // The list shows no sibling across sources.
         let listed = list(&req, &cat, &policy, "ses_1").await.unwrap();
-        assert!(!listed.servers[0].confirm);
-        assert_eq!(listed.servers[0].source, "project:opencode.json");
+        assert!(listed.servers.iter().all(|s| s.sibling.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_project_siblings_still_pair_with_each_other() {
+        let cat = project_catalog(
+            r#"{"mcp":{
+              "foo":{"type":"remote","url":"http://127.0.0.1:1/mcp"},
+              "foo-ro":{"type":"remote","url":"http://127.0.0.1:2/mcp"}
+            }}"#,
+        );
+        assert_eq!(find_sibling("foo", &cat).as_deref(), Some("foo-ro"));
+        assert_eq!(find_sibling("foo-ro", &cat).as_deref(), Some("foo"));
     }
 
     #[tokio::test]

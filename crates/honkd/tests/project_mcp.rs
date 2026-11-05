@@ -320,3 +320,165 @@ async fn an_unusable_project_file_is_reported_as_a_problem() {
     assert_eq!(meta["servers"], json!([]), "{result}");
     assert_eq!(meta["problems"].as_array().unwrap().len(), 1, "{result}");
 }
+
+/// A git project declaring each `(name, url)` as a remote server.
+fn project_of(entries: &[(&str, &str)]) -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::create_dir(td.path().join(".git")).unwrap();
+    let mut mcp = serde_json::Map::new();
+    for (name, url) in entries {
+        mcp.insert(name.to_string(), json!({"type": "remote", "url": url}));
+    }
+    std::fs::write(
+        td.path().join("opencode.json"),
+        json!({ "mcp": mcp }).to_string(),
+    )
+    .unwrap();
+    td
+}
+
+fn extension_keys(fake: &FakeGoose, sid: &str) -> Vec<String> {
+    let mut keys: Vec<String> = fake
+        .get_session_extensions(sid)
+        .iter()
+        .filter_map(|e| e.get("extensionKey").and_then(Value::as_str))
+        .map(String::from)
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn skipped_reason(meta: &Value, name: &str) -> String {
+    meta["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not skipped: {meta}"))["reason"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_sibling_of_a_user_server_neither_shadows_nor_removes_it() {
+    let fake = FakeGoose::start().await;
+    let (url, _) = stub_mcp(200, Duration::ZERO).await;
+    let proj = project_of(&[("slack-ro", &url), ("tec", &url)]);
+    let cat_dir = tempfile::tempdir().unwrap();
+    let cat = cat_dir.path().join("opencode.json");
+    std::fs::write(
+        &cat,
+        r#"{"mcp":{"slack":{"type":"local","command":["slack-mcp"]}}}"#,
+    )
+    .unwrap();
+    let h = spawn_honkd(
+        &fake,
+        &[
+            "--project-mcp",
+            "--mcp-catalog",
+            cat.to_str().unwrap(),
+            "--mcp-no-confirm",
+            "slack",
+        ],
+        &[],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+
+    // The user's slack is on before the project launch runs.
+    let result = session_new(
+        &mut v,
+        proj.path(),
+        Some(json!({"honk": {"mcp": {"names": ["slack"]}}})),
+    )
+    .await;
+    let sid = result["sessionId"].as_str().unwrap();
+    assert_eq!(
+        result["_meta"]["honk"]["mcp"]["results"][0]["ok"], true,
+        "{result}"
+    );
+
+    let meta = &result["_meta"]["honk"]["projectMcp"];
+    assert_eq!(meta["servers"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(meta["servers"][0]["name"], "tec");
+    assert_eq!(
+        skipped_reason(meta, "slack-ro"),
+        "pairs with user catalog entry slack"
+    );
+    assert_eq!(extension_keys(&fake, sid), vec!["slack", "tec"]);
+
+    // Asking for the project's slack-ro by hand finds nothing of that name.
+    let res = v
+        .call(
+            "_honk/mcp/enable",
+            json!({"sessionId": sid, "names": ["slack-ro"]}),
+        )
+        .await;
+    assert_eq!(res["error"]["code"], -32602, "{res}");
+    assert_eq!(extension_keys(&fake, sid), vec!["slack", "tec"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_sibling_pair_enables_only_the_ro_half() {
+    let fake = FakeGoose::start().await;
+    let (url, _) = stub_mcp(200, Duration::ZERO).await;
+    let proj = project_of(&[("foo", &url), ("foo-ro", &url), ("tec", &url)]);
+    let h = spawn_honkd(&fake, &["--project-mcp"], &[]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    let result = session_new(&mut v, proj.path(), None).await;
+    let sid = result["sessionId"].as_str().unwrap();
+    let meta = &result["_meta"]["honk"]["projectMcp"];
+
+    let ok: Vec<_> = meta["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap(), s["ok"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(ok, vec![("foo-ro", true), ("tec", true)], "{result}");
+    assert_eq!(
+        skipped_reason(meta, "foo"),
+        "sibling of foo-ro; enable it with /mcp enable foo!"
+    );
+    assert_eq!(extension_keys(&fake, sid), vec!["foo-ro", "tec"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_swarm_entry_is_never_taken() {
+    let fake = FakeGoose::start().await;
+    let (url, _) = stub_mcp(200, Duration::ZERO).await;
+    let proj = project_of(&[("swarm", &url), ("tec", &url)]);
+    let h = spawn_honkd(&fake, &["--project-mcp"], &[]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    let result = session_new(&mut v, proj.path(), None).await;
+    let sid = result["sessionId"].as_str().unwrap();
+    let meta = &result["_meta"]["honk"]["projectMcp"];
+    assert_eq!(skipped_reason(meta, "swarm"), "reserved name");
+    assert_eq!(extension_keys(&fake, sid), vec!["tec"]);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_config_symlinked_to_a_device_does_not_wedge_honkd() {
+    let fake = FakeGoose::start().await;
+    let td = tempfile::tempdir().unwrap();
+    std::fs::create_dir(td.path().join(".git")).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", td.path().join("opencode.json")).unwrap();
+    let h = spawn_honkd(&fake, &["--project-mcp"], &[]).await;
+    let mut v = Viewer::connect(&h).await;
+
+    let started = std::time::Instant::now();
+    let result = session_new(&mut v, td.path(), None).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let meta = &result["_meta"]["honk"]["projectMcp"];
+    assert_eq!(meta["servers"], json!([]), "{result}");
+    assert_eq!(meta["problems"].as_array().unwrap().len(), 1, "{result}");
+
+    // honkd still answers.
+    let sid = result["sessionId"].as_str().unwrap();
+    let list = v.call("_honk/mcp/list", json!({"sessionId": sid})).await;
+    assert!(list.get("error").is_none(), "{list}");
+}

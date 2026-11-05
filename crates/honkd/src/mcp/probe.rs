@@ -97,7 +97,23 @@ impl RemoteProbe for HttpProbe {
             });
         }
 
-        match resp.status().as_u16() {
+        let status = resp.status();
+        if status.is_redirection() {
+            // goose follows redirects on its own terms, and a redirect can lead
+            // anywhere (including off the loopback host a project vouched for).
+            // Make the config name the final URL instead.
+            let target = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|loc| resp.url().join(loc).ok())
+                .map(|u| display_url(u.as_str()))
+                .unwrap_or_else(|| "another location".to_string());
+            return Err(format!(
+                "redirects to {target}; put the final URL in the config"
+            ));
+        }
+        match status.as_u16() {
             401 | 403 => {
                 Err("needs authorization (OAuth), which honkd does not support".to_string())
             }
@@ -154,6 +170,45 @@ mod tests {
                 "needs authorization (OAuth), which honkd does not support"
             );
         }
+    }
+
+    fn redirect_router(status: StatusCode, location: &'static str) -> Router {
+        Router::new().route(
+            "/mcp",
+            post(move || async move { (status, [("location", location)]) }),
+        )
+    }
+
+    #[tokio::test]
+    async fn redirects_are_failures_that_name_the_target() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let url = serve(redirect_router(
+                status,
+                "https://user:pw@other.example/final?token=abc#frag",
+            ))
+            .await;
+            let err = HttpProbe.probe(&url).await.unwrap_err();
+            assert_eq!(
+                err, "redirects to https://other.example/final; put the final URL in the config",
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relative_redirect_resolves_against_the_probed_url() {
+        let url = serve(redirect_router(StatusCode::FOUND, "/v2/mcp?k=secret")).await;
+        let base = url.trim_end_matches("/mcp");
+        let err = HttpProbe.probe(&url).await.unwrap_err();
+        assert_eq!(
+            err,
+            format!("redirects to {base}/v2/mcp; put the final URL in the config")
+        );
     }
 
     #[tokio::test]

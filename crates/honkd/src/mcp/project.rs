@@ -4,7 +4,7 @@
 //! harnesses, and is stricter where opencode is loose. See [`discover`].
 
 use crate::mcp::catalog::{
-    Catalog, CatalogEntry, EntrySource, GooseExtensionSpec, Transport, parse_entry,
+    Catalog, CatalogEntry, EntrySource, GooseExtensionSpec, Transport, parse_entry, sibling_name,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,8 +26,9 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveCatalog {
     pub catalog: Catalog,
-    /// Names of project entries hidden because the user catalog has the same name.
-    pub shadowed: Vec<String>,
+    /// Project entries left out because the user catalog outranks them, as
+    /// `(name, reason)`, sorted by name.
+    pub shadowed: Vec<(String, String)>,
 }
 
 const PROJECT_STDIO_UNSUPPORTED: &str = "project stdio MCP servers are not supported yet";
@@ -147,6 +148,11 @@ fn has_git_entry(dir: &Path) -> bool {
 ///   entry (file or directory), inclusive. With no `.git` anywhere up to `/`,
 ///   only `cwd` is read. This is stricter than opencode, which walks to `/`;
 ///   a shared parent such as `/tmp` must not be able to inject servers.
+/// - Reads are defensive, because the repo picks the paths: a candidate must be
+///   a regular file (symlinks followed) of at most 1 MiB, resolve inside the
+///   walk root (the cwd with no root), and be owned by the uid honkd runs as;
+///   the git root directory must be too, or it is ignored (cwd only). See
+///   [`discover_as`].
 /// - Each directory is checked for `opencode.jsonc` and `opencode.json`.
 ///   Like opencode, the list is collected nearest-first as `[jsonc, json]` per
 ///   directory and then reversed, so files apply farthest directory first and,
@@ -155,6 +161,117 @@ fn has_git_entry(dir: &Path) -> bool {
 ///   scalars and arrays replaced). A file that cannot be read or parsed is
 ///   skipped and noted in `problems`; a missing file is not a problem.
 pub fn discover(cwd: &Path) -> ProjectConfig {
+    discover_as(cwd, current_uid())
+}
+
+/// The real user id honkd runs as, when this platform lets us read it without
+/// a new dependency (Linux: `/proc/self/status`). `None` turns the ownership
+/// checks off.
+#[cfg(unix)]
+pub(crate) fn current_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    // `Uid:  real  effective  saved  fs`; the effective one decides access.
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_uid() -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn owner_of(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+fn owner_of(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// True unless `expected` is known and `meta` names a different owner.
+fn owned_by(meta: &std::fs::Metadata, expected: Option<u32>) -> bool {
+    match (expected, owner_of(meta)) {
+        (Some(want), Some(have)) => want == have,
+        _ => true,
+    }
+}
+
+/// Largest config file that is read.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// What reading one candidate config file came to.
+enum Read {
+    /// No such file; not worth a word.
+    Missing,
+    Text(String),
+    /// Skipped, with the reason.
+    Problem(String),
+}
+
+/// Reads `path` if it is safe to: a regular file (checked before opening, so a
+/// FIFO or device is never opened), reached through no symlink that leaves
+/// `within`, owned by `expected_uid`, and at most [`MAX_CONFIG_BYTES`].
+fn read_config_file(path: &Path, within: &Path, expected_uid: Option<u32>) -> Read {
+    use std::io::Read as _;
+
+    // `metadata` follows symlinks, so a link to /dev/zero or a FIFO is not a file.
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Missing,
+        Err(e) => return Read::Problem(format!("{}: {e}", path.display())),
+    };
+    if !meta.is_file() {
+        return Read::Problem(format!("{}: not a regular file", path.display()));
+    }
+    match path.canonicalize() {
+        Ok(real) if real.starts_with(within) => {}
+        Ok(_) => {
+            return Read::Problem(format!(
+                "{}: resolves outside the project directory",
+                path.display()
+            ));
+        }
+        Err(e) => return Read::Problem(format!("{}: {e}", path.display())),
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Read::Problem(format!("{}: {e}", path.display())),
+    };
+    // Judge what was opened, not what was there a moment ago.
+    match file.metadata() {
+        Ok(m) if m.is_file() && owned_by(&m, expected_uid) => {}
+        Ok(m) if m.is_file() => {
+            return Read::Problem(format!(
+                "{}: not owned by the user honkd runs as",
+                path.display()
+            ));
+        }
+        Ok(_) => return Read::Problem(format!("{}: not a regular file", path.display())),
+        Err(e) => return Read::Problem(format!("{}: {e}", path.display())),
+    }
+    let mut text = String::new();
+    if let Err(e) = file.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text) {
+        return Read::Problem(format!("{}: {e}", path.display()));
+    }
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Read::Problem(format!(
+            "{}: larger than {} KiB",
+            path.display(),
+            MAX_CONFIG_BYTES / 1024
+        ));
+    }
+    Read::Text(text)
+}
+
+/// [`discover`] with the expected owner of the files it reads given
+/// explicitly: the git root directory and every config file must belong to
+/// `expected_uid` (`None` skips the check). A root that does not is ignored
+/// and only the session directory is read, which keeps a stranger's
+/// `/tmp/.git` from adopting every project under `/tmp`.
+pub(crate) fn discover_as(cwd: &Path, expected_uid: Option<u32>) -> ProjectConfig {
     let mut cfg = ProjectConfig::default();
     let dir = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if !dir.is_dir() {
@@ -171,9 +288,21 @@ pub fn discover(cwd: &Path) -> ProjectConfig {
             break;
         }
     }
+    if let Some(root) = &cfg.root {
+        let owned = std::fs::metadata(root).is_ok_and(|m| owned_by(&m, expected_uid));
+        if !owned {
+            cfg.problems.push(format!(
+                "{}: git root is not owned by the user honkd runs as; reading the session directory only",
+                root.display()
+            ));
+            cfg.root = None;
+        }
+    }
     if cfg.root.is_none() {
         dirs = vec![dir.clone()];
     }
+    // Config files must resolve to somewhere inside this.
+    let within = cfg.root.clone().unwrap_or_else(|| dir.clone());
 
     let mut candidates = Vec::new();
     for d in &dirs {
@@ -185,11 +314,11 @@ pub fn discover(cwd: &Path) -> ProjectConfig {
     let mut merged = serde_json::Map::new();
     let mut last_file: BTreeMap<String, PathBuf> = BTreeMap::new();
     for path in candidates {
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                cfg.problems.push(format!("{}: {e}", path.display()));
+        let text = match read_config_file(&path, &within, expected_uid) {
+            Read::Text(t) => t,
+            Read::Missing => continue,
+            Read::Problem(p) => {
+                cfg.problems.push(p);
                 continue;
             }
         };
@@ -241,19 +370,71 @@ pub fn discover(cwd: &Path) -> ProjectConfig {
     cfg
 }
 
-/// The user catalog with the project's entries added. A user entry beats a
-/// project entry of the same name (the project entry is listed in `shadowed`),
-/// so a repo cannot reuse a name the user has trusted. Merge the swarm entry
-/// afterwards; it overrides both.
-pub fn effective_catalog(mut user: Catalog, project: &ProjectConfig) -> EffectiveCatalog {
-    let mut shadowed = Vec::new();
-    for entry in &project.entries {
-        if user.get(&entry.name).is_some() {
-            shadowed.push(entry.name.clone());
-        } else {
-            user.entries.push(entry.clone());
+/// Names a project may never define: honkd generates them itself.
+const RESERVED_NAMES: [&str; 2] = ["swarm", "swarm-ro"];
+
+/// `url` as the URL parser spells it, so `http://LOCALHOST:80/x` and
+/// `http://localhost/x` compare equal. `None` for anything that is not a URL.
+fn normalized_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url).ok().map(|u| u.to_string())
+}
+
+/// Why the user catalog outranks the project entry `entry`, if it does.
+///
+/// A project must not be able to stand in for something the user trusted, so an
+/// entry loses to the user catalog when it has the same name, when it is the
+/// `-ro` / non-`-ro` sibling of a user entry (the pair would replace each
+/// other, and `--mcp-no-confirm` is keyed by those names), or when it points
+/// at the same URL as a user remote entry.
+fn user_outranks(user: &Catalog, entry: &CatalogEntry) -> Option<String> {
+    if RESERVED_NAMES.contains(&entry.name.as_str()) {
+        return Some("reserved name".to_string());
+    }
+    if user.get(&entry.name).is_some() {
+        return Some("shadowed by user catalog".to_string());
+    }
+    let sibling = sibling_name(&entry.name);
+    if user.get(&sibling).is_some() {
+        return Some(format!("pairs with user catalog entry {sibling}"));
+    }
+    if let Ok(GooseExtensionSpec {
+        transport: Transport::Http { url },
+        ..
+    }) = &entry.supported
+        && let Some(norm) = normalized_url(url)
+    {
+        for other in &user.entries {
+            if let Ok(GooseExtensionSpec {
+                transport: Transport::Http { url: other_url },
+                ..
+            }) = &other.supported
+                && normalized_url(other_url).as_deref() == Some(norm.as_str())
+            {
+                return Some(format!("same url as user catalog entry {}", other.name));
+            }
         }
     }
+    None
+}
+
+/// The user catalog with the project's entries added. The user catalog wins:
+/// a project entry that [`user_outranks`] is left out and listed in
+/// `shadowed` with the reason, so a repo cannot reuse a name, a sibling name
+/// or a URL the user has trusted. `swarm` and `swarm-ro` are reserved and are
+/// never taken from a project, whether or not swarm is configured. Merge the
+/// swarm entry afterwards.
+pub fn effective_catalog(mut user: Catalog, project: &ProjectConfig) -> EffectiveCatalog {
+    let mut shadowed = Vec::new();
+    let mut added = Vec::new();
+    // Judged against the user catalog as it was: project entries do not
+    // shadow each other.
+    for entry in &project.entries {
+        match user_outranks(&user, entry) {
+            Some(reason) => shadowed.push((entry.name.clone(), reason)),
+            None => added.push(entry.clone()),
+        }
+    }
+    user.entries.extend(added);
     user.entries.sort_by(|a, b| a.name.cmp(&b.name));
     EffectiveCatalog {
         catalog: user,
@@ -541,6 +722,155 @@ mod tests {
     }
 
     #[test]
+    fn symlink_to_a_device_is_skipped_quickly() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        // Reading this would never end.
+        std::os::unix::fs::symlink("/dev/zero", r.join("opencode.json")).unwrap();
+        let started = std::time::Instant::now();
+        let cfg = discover(&r);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(cfg.entries.is_empty() && cfg.files.is_empty());
+        assert_eq!(cfg.problems.len(), 1, "{:?}", cfg.problems);
+        assert!(
+            cfg.problems[0].contains("not a regular file"),
+            "{:?}",
+            cfg.problems
+        );
+    }
+
+    #[test]
+    fn fifo_is_never_opened() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let fifo = r.join("opencode.json");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // no mkfifo here
+        }
+        let started = std::time::Instant::now();
+        let cfg = discover(&r);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(cfg.entries.is_empty());
+        assert_eq!(cfg.problems.len(), 1, "{:?}", cfg.problems);
+    }
+
+    #[test]
+    fn symlink_to_a_file_outside_the_root_is_skipped() {
+        let (_td, r) = root();
+        let (_other_td, other) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let outside = write(&other, "global.json", TEC);
+        std::os::unix::fs::symlink(&outside, r.join("opencode.json")).unwrap();
+
+        let cfg = discover(&r);
+        assert!(cfg.entries.is_empty(), "{:?}", cfg.entries);
+        assert!(cfg.files.is_empty());
+        assert_eq!(cfg.problems.len(), 1, "{:?}", cfg.problems);
+        assert!(
+            cfg.problems[0].contains("outside the project"),
+            "{:?}",
+            cfg.problems
+        );
+
+        // Without a git root the bound is the session directory.
+        let (_td2, r2) = root();
+        std::os::unix::fs::symlink(&outside, r2.join("opencode.json")).unwrap();
+        let cfg = discover(&r2);
+        assert!(cfg.entries.is_empty());
+        assert_eq!(cfg.problems.len(), 1, "{:?}", cfg.problems);
+    }
+
+    #[test]
+    fn symlink_to_a_file_inside_the_root_is_read() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let real = write(&r.join("shared"), "mcp.json", TEC);
+        std::os::unix::fs::symlink(&real, r.join("opencode.json")).unwrap();
+        let cfg = discover(&r);
+        assert!(cfg.problems.is_empty(), "{:?}", cfg.problems);
+        assert_eq!(url_of(entry(&cfg, "tec")), "http://localhost:4006/mcp");
+    }
+
+    #[test]
+    fn oversize_file_is_skipped() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let pad = " ".repeat(1024 * 1024 + 1 - TEC.len());
+        write(&r, "opencode.json", &format!("{TEC}{pad}"));
+        let cfg = discover(&r);
+        assert!(cfg.entries.is_empty());
+        assert_eq!(cfg.problems.len(), 1, "{:?}", cfg.problems);
+        assert!(
+            cfg.problems[0].contains("larger than 1024 KiB"),
+            "{:?}",
+            cfg.problems
+        );
+
+        // Exactly at the limit is still read.
+        let pad = " ".repeat(1024 * 1024 - TEC.len());
+        write(&r, "opencode.json", &format!("{TEC}{pad}"));
+        let cfg = discover(&r);
+        assert!(cfg.problems.is_empty(), "{:?}", cfg.problems);
+        assert_eq!(cfg.entries.len(), 1);
+    }
+
+    fn uid_of(p: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(p).unwrap().uid()
+    }
+
+    #[test]
+    fn root_and_files_owned_by_someone_else_are_not_trusted() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let sub = r.join("pkg");
+        write(&r, "opencode.json", TEC);
+        write(
+            &sub,
+            "opencode.json",
+            r#"{"mcp":{"mine":{"type":"remote","url":"http://localhost:5/mcp"}}}"#,
+        );
+        let me = uid_of(&r);
+
+        // Owner matches: root found, both files read.
+        let cfg = discover_as(&sub, Some(me));
+        assert_eq!(cfg.root.as_deref(), Some(r.as_path()));
+        assert_eq!(cfg.files.len(), 2);
+
+        // Somebody else's root is no root: only the session directory counts,
+        // and its file is not ours either.
+        let cfg = discover_as(&sub, Some(me.wrapping_add(1)));
+        assert_eq!(cfg.root, None);
+        assert!(cfg.entries.is_empty() && cfg.files.is_empty());
+        assert!(
+            cfg.problems
+                .iter()
+                .any(|p| p.contains("git root is not owned")),
+            "{:?}",
+            cfg.problems
+        );
+        assert!(
+            cfg.problems
+                .iter()
+                .any(|p| p.contains("opencode.json") && p.contains("not owned")),
+            "{:?}",
+            cfg.problems
+        );
+
+        // No known uid: no check.
+        assert_eq!(discover_as(&sub, None).files.len(), 2);
+    }
+
+    #[test]
+    fn current_uid_matches_the_owner_of_files_we_create() {
+        let (_td, r) = root();
+        if let Some(uid) = current_uid() {
+            assert_eq!(uid, uid_of(&r));
+        }
+    }
+
+    #[test]
     fn missing_cwd_yields_empty_config_with_a_note() {
         let (_td, r) = root();
         let cfg = discover(&r.join("does-not-exist"));
@@ -592,6 +922,38 @@ mod tests {
         assert_eq!(names, vec!["ext", "hdr", "oa", "off", "tec"]);
     }
 
+    /// A catalog of the given user entries, parsed from opencode-style json.
+    fn user_catalog(json: &str) -> Catalog {
+        Catalog::load_from_str(json, None).unwrap()
+    }
+
+    /// A project of loopback remote entries on distinct ports.
+    fn project_with(names: &[&str]) -> (tempfile::TempDir, ProjectConfig) {
+        let (td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let mut mcp = serde_json::Map::new();
+        for (i, n) in names.iter().enumerate() {
+            mcp.insert(
+                n.to_string(),
+                serde_json::json!({"type":"remote","url":format!("http://localhost:{}/mcp", 9000 + i)}),
+            );
+        }
+        write(
+            &r,
+            "opencode.json",
+            &serde_json::json!({ "mcp": mcp }).to_string(),
+        );
+        let cfg = discover(&r);
+        (td, cfg)
+    }
+
+    fn shadowed(eff: &EffectiveCatalog) -> Vec<(&str, &str)> {
+        eff.shadowed
+            .iter()
+            .map(|(n, r)| (n.as_str(), r.as_str()))
+            .collect()
+    }
+
     #[test]
     fn user_entry_shadows_project_entry_of_same_name() {
         let (_td, r) = root();
@@ -611,7 +973,7 @@ mod tests {
         )
         .unwrap();
         let eff = effective_catalog(user, &project);
-        assert_eq!(eff.shadowed, vec!["slack".to_string()]);
+        assert_eq!(shadowed(&eff), vec![("slack", "shadowed by user catalog")]);
         let names: Vec<_> = eff
             .catalog
             .entries
@@ -629,16 +991,21 @@ mod tests {
     }
 
     #[test]
-    fn swarm_still_overrides_project_entries() {
-        let (_td, r) = root();
-        fs::create_dir(r.join(".git")).unwrap();
-        write(
-            &r,
-            "opencode.json",
-            r#"{"mcp":{"swarm":{"type":"remote","url":"http://localhost:9/mcp"}}}"#,
+    fn project_swarm_is_always_dropped() {
+        let (_td, project) = project_with(&["swarm", "swarm-ro", "tec"]);
+
+        // Swarm not configured: the name is still not the project's to take.
+        let eff = effective_catalog(Catalog::default(), &project);
+        assert!(eff.catalog.get("swarm").is_none());
+        assert!(eff.catalog.get("swarm-ro").is_none());
+        assert!(eff.catalog.get("tec").is_some());
+        assert_eq!(
+            shadowed(&eff),
+            vec![("swarm", "reserved name"), ("swarm-ro", "reserved name")]
         );
-        let mut eff = effective_catalog(Catalog::default(), &discover(&r));
-        assert!(eff.catalog.get("swarm").unwrap().auto_eligible());
+
+        // Swarm configured: the builtin is the only one.
+        let mut eff = effective_catalog(Catalog::default(), &project);
         eff.catalog.merge_swarm_entry(
             &crate::mcp::SwarmMcpConfig {
                 bin: PathBuf::from("/bin/honk"),
@@ -652,6 +1019,59 @@ mod tests {
         let e = eff.catalog.get("swarm").unwrap();
         assert_eq!(e.source, EntrySource::Builtin);
         assert!(!e.auto_eligible());
-        assert_eq!(eff.catalog.entries.len(), 1);
+        assert_eq!(eff.catalog.entries.len(), 2); // swarm, tec
+    }
+
+    #[test]
+    fn user_sibling_names_shadow_project_entries() {
+        // A user `slack` makes a project `slack-ro` a stand-in for its sibling;
+        // a user `figma-ro` does the same for a project `figma`.
+        let (_td, project) = project_with(&["slack-ro", "figma", "plain", "tec"]);
+        let user = user_catalog(
+            r#"{"mcp":{
+              "slack":{"type":"local","command":["s"]},
+              "figma-ro":{"type":"local","command":["f"]},
+              "plain-ro-ish":{"type":"local","command":["p"]}
+            }}"#,
+        );
+        let eff = effective_catalog(user, &project);
+        assert_eq!(
+            shadowed(&eff),
+            vec![
+                ("figma", "pairs with user catalog entry figma-ro"),
+                ("slack-ro", "pairs with user catalog entry slack"),
+            ]
+        );
+        assert!(eff.catalog.get("plain").is_some());
+        assert!(eff.catalog.get("tec").is_some());
+        assert_eq!(
+            eff.catalog.get("slack-ro"),
+            None,
+            "the project slack-ro is gone"
+        );
+        assert_eq!(eff.catalog.get("figma").map(|e| e.source.clone()), None);
+    }
+
+    #[test]
+    fn project_url_equal_to_a_user_remote_url_is_shadowed() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        write(
+            &r,
+            "opencode.json",
+            r#"{"mcp":{
+              "alias":{"type":"remote","url":"http://LOCALHOST:4006/mcp"},
+              "other":{"type":"remote","url":"http://localhost:4007/mcp"}
+            }}"#,
+        );
+        let user =
+            user_catalog(r#"{"mcp":{"tec":{"type":"remote","url":"http://localhost:4006/mcp"}}}"#);
+        let eff = effective_catalog(user, &discover(&r));
+        assert_eq!(
+            shadowed(&eff),
+            vec![("alias", "same url as user catalog entry tec")]
+        );
+        assert!(eff.catalog.get("other").is_some());
+        assert!(eff.catalog.get("alias").is_none());
     }
 }

@@ -124,6 +124,15 @@ pub fn is_loopback_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
 }
 
+/// The name `name` pairs with: `x` and `x-ro` are siblings, and only one of a
+/// pair may be on at a time.
+pub fn sibling_name(name: &str) -> String {
+    match name.strip_suffix("-ro") {
+        Some(base) => base.to_string(),
+        None => format!("{name}-ro"),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     pub entries: Vec<CatalogEntry>,
@@ -408,13 +417,17 @@ fn parse_remote(name: &str, val: &serde_json::Value) -> Result<GooseExtensionSpe
         return Err("'{env:' and '{file:' are not expanded in remote urls".to_string());
     }
     match reqwest::Url::parse(url) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") => {}
-        Ok(u) => {
+        Ok(u) if !matches!(u.scheme(), "http" | "https") => {
             return Err(format!(
                 "unsupported url scheme '{}'; only http and https are supported",
                 u.scheme()
             ));
         }
+        Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+            // The url ends up in goose's session, honk's logs and replies.
+            return Err("credentials in the url are not supported".to_string());
+        }
+        Ok(_) => {}
         Err(e) => return Err(format!("invalid url: {e}")),
     }
     if val.get("headers").is_some() {
@@ -776,6 +789,18 @@ mod tests {
             (r#"{"type":"remote","url":"not a url"}"#, "invalid url"),
             (r#"{"type":"remote","url":"ftp://example.com/x"}"#, "scheme"),
             (r#"{"type":"remote","url":"file:///tmp/x"}"#, "scheme"),
+            (
+                r#"{"type":"remote","url":"http://user@localhost:4006/mcp"}"#,
+                "credentials in the url are not supported",
+            ),
+            (
+                r#"{"type":"remote","url":"http://user:pw@localhost:4006/mcp"}"#,
+                "credentials in the url are not supported",
+            ),
+            (
+                r#"{"type":"remote","url":"http://:pw@localhost:4006/mcp"}"#,
+                "credentials in the url are not supported",
+            ),
             (
                 r#"{"type":"remote","url":"https://example.com/{env:TOKEN}"}"#,
                 "{env:",

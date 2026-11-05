@@ -14,9 +14,20 @@ pub type ViewerId = u64;
 static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_SWARM_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Room for a few remote servers to be probed and added; `honk launch` gives
-/// `session/new` 30 s in all, and the swarm wait comes first.
-const DEFAULT_PROJECT_MCP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(12);
+/// Room for a few loopback servers to be probed (3 s each at worst, in
+/// sequence) and added. `honk launch` gives `session/new` 30 s in all.
+const DEFAULT_PROJECT_MCP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(6);
+
+// The honkd-side waits of one `session/new` add up: the swarm wait, then
+// project discovery for the plan, then the project launch (which finds the
+// project config again inside its own wait). Keep the sum well under the 30 s
+// `honk launch` allows, leaving the upstream `session/new` itself its share.
+const _: () = assert!(
+    DEFAULT_SWARM_LAUNCH_TIMEOUT.as_secs()
+        + crate::mcp::DISCOVERY_TIMEOUT.as_secs()
+        + DEFAULT_PROJECT_MCP_LAUNCH_TIMEOUT.as_secs()
+        <= 20
+);
 
 fn env_timeout(var: &str, default: Duration) -> Duration {
     match std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) {

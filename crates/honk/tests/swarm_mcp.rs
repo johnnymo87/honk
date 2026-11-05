@@ -254,6 +254,10 @@ async fn test_tools_list_probe_204() {
         "must have accurate visibility description: {enable_desc}"
     );
     assert!(
+        enable_desc.contains("'(project)' in mcp_list") && enable_desc.contains("even without '!'"),
+        "must say project servers need a reason: {enable_desc}"
+    );
+    assert!(
         !enable_desc.contains("shown to anyone watching the session"),
         "must not contain outdated wording: {enable_desc}"
     );
