@@ -775,7 +775,7 @@ async fn handle_swarm_read(
         }
 
         let mut text = format!(
-            "Message history (already delivered to this session; shown again, not new):\n\n{}",
+            "Message history (previously handed to this session, shown for reference; act only on ones you have no record of handling):\n\n{}",
             hist_blocks.join("\n\n")
         );
 
@@ -807,7 +807,11 @@ async fn handle_swarm_read(
     };
 
     match (drained_section, history_section) {
-        (None, None) => tool_ok("Inbox is empty."),
+        (None, None) => tool_ok(match (since, before) {
+            (Some(s), _) => format!("No messages newer than {s}."),
+            (None, Some(b)) => format!("No messages older than {b}."),
+            (None, None) => "Inbox is empty.".to_string(),
+        }),
         (Some(drained), None) => tool_ok(drained),
         (None, Some(history)) => tool_ok(history),
         (Some(drained), Some(history)) => tool_ok(format!("{drained}\n\n{history}")),
@@ -2055,7 +2059,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_read",
-            "description": "Read this session's swarm messages. First delivers (and acknowledges) any messages still waiting in the pull mailbox, then shows recent message history (the newest 10 by default, most recent last). Mail to this session normally arrives as its own turn, pushed by pigeon; use this to check for backlog or look back at history. History is not consumed by reading. Cursor paging: pass `before` (older-than) to scroll back through history, or `since` (newer-than) to page forward; output ends with a hint naming the next cursor when more exist.",
+            "description": "Read this session's swarm messages. Mail to this session normally arrives as its own turn, pushed by pigeon; use this to check for backlog or look back at history. Two sections: first, any messages still waiting in the pull mailbox are delivered and acknowledged (always, whatever the cursors; these are new); then recent history of pushed messages (the newest 10 by default, most recent last), which reading does not consume. History covers pushed mail only; pull-mailbox mail is not kept once acknowledged. Cursor paging applies to history: pass `before` (older-than) to scroll back, or `since` (newer-than) to page forward; output ends with a hint naming the next cursor when more exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2069,7 +2073,7 @@ fn get_tools(self_grant: bool) -> Value {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of messages to return (default 10). The response is always chronological (oldest-first)."
+                        "description": "Maximum messages per section: the history page size (default 10) and the pull-mailbox drain size (pigeon's default when omitted). Each section is chronological (oldest-first)."
                     }
                 }
             }

@@ -244,8 +244,12 @@ async fn test_tools_list_probe_204() {
         "read must mention pull mailbox: {read_desc}"
     );
     assert!(
-        read_desc.contains("recent message history"),
+        read_desc.contains("recent history of pushed messages"),
         "read must mention message history: {read_desc}"
+    );
+    assert!(
+        read_desc.contains("History covers pushed mail only"),
+        "read must say pull-mailbox mail is not in history: {read_desc}"
     );
     assert!(
         read_desc.contains("before"),
@@ -796,7 +800,7 @@ async fn test_swarm_read_history_only_renders_header_and_compact_blocks() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
 
     let expected = "\
-Message history (already delivered to this session; shown again, not new):
+Message history (previously handed to this session, shown for reference; act only on ones you have no record of handling):
 
 --- msg_id=msg_h1 from=ses_alice kind=chat priority=normal at=2023-11-14T22:13:20.000Z ---
 first history msg
@@ -1123,7 +1127,7 @@ async fn test_swarm_read_drained_and_history_combined_ordering() {
         .find("[pigeon] Message economy")
         .expect("economy footer");
     let header_pos = text
-        .find("Message history (already delivered to this session; shown again, not new):")
+        .find("Message history (previously handed to this session, shown for reference; act only on ones you have no record of handling):")
         .expect("history header");
     let hist_pos = text.find("--- msg_id=msg_hist_1").expect("history block");
 
@@ -1575,6 +1579,126 @@ async fn test_swarm_read_empty_string_cursors_treated_as_absent() {
     );
     assert!(seen[2].body.get("since").is_none());
     assert!(seen[2].body.get("before").is_none());
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_empty_page_after_since_cursor() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (StatusCode::OK, json!({"messages": [], "has_more": false})),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "since": "msg_newest"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "No messages newer than msg_newest.");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_empty_page_after_before_cursor() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (StatusCode::OK, json!({"messages": [], "has_more": false})),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "before": "msg_oldest"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "No messages older than msg_oldest.");
 
     drop(client_tx);
     drop(client_rx);
