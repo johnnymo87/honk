@@ -811,6 +811,10 @@ second history msg";
     assert_eq!(seen[0].path, "/goose/swarm-mailbox");
     assert_eq!(seen[1].path, "/pull/drain");
     assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(
+        seen[2].query.as_deref(),
+        Some("session=gse_reader&limit=10")
+    );
     assert_eq!(seen[2].body["session"], "gse_reader");
     assert_eq!(seen[2].body["limit"], "10");
 
@@ -911,6 +915,10 @@ async fn test_swarm_read_limit_and_before_passthrough_with_has_more() {
     let seen = p.seen();
     assert_eq!(seen.len(), 3);
     assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(
+        seen[2].query.as_deref(),
+        Some("session=gse_reader&limit=5&before=msg_anchor")
+    );
     assert_eq!(seen[2].body["session"], "gse_reader");
     assert_eq!(seen[2].body["limit"], "5");
     assert_eq!(seen[2].body["before"], "msg_anchor");
@@ -1011,6 +1019,10 @@ async fn test_swarm_read_since_passthrough_with_has_more() {
     let seen = p.seen();
     assert_eq!(seen.len(), 3);
     assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(
+        seen[2].query.as_deref(),
+        Some("session=gse_reader&limit=10&since=msg_anchor")
+    );
     assert_eq!(seen[2].body["session"], "gse_reader");
     assert_eq!(seen[2].body["limit"], "10");
     assert_eq!(seen[2].body["since"], "msg_anchor");
@@ -1308,7 +1320,7 @@ async fn test_swarm_read_invalid_limit() {
 
     let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
 
-    for invalid in [json!(0), json!(-1), json!("x")] {
+    for invalid in [json!(0), json!(-1), json!("x"), json!(10.0)] {
         let resp = send_recv(
             &mut client_tx,
             &mut client_rx,
@@ -1345,6 +1357,224 @@ async fn test_swarm_read_invalid_limit() {
         p.seen().is_empty(),
         "no HTTP requests should be sent on invalid limit"
     );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_large_limit_and_cursor_url_encoding() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::OK,
+            json!({
+                "messages": [
+                    {
+                        "msg_id": "msg_encoded",
+                        "from": "ses_alice",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "encoded payload",
+                        "created_at": 1700000000000i64,
+                    }
+                ],
+                "has_more": false
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "limit": 1_000_000,
+                    "before": "msg 1&2"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(seen[2].body["session"], "gse_reader");
+    assert_eq!(seen[2].body["limit"], "1000000");
+    assert_eq!(seen[2].body["before"], "msg 1&2");
+
+    let raw_query = seen[2].query.as_deref().expect("raw query string");
+    assert!(
+        raw_query.contains("limit=1000000"),
+        "raw query must carry large limit: {raw_query}"
+    );
+    assert!(
+        raw_query.contains("before=msg+1%262") || raw_query.contains("before=msg%201%262"),
+        "raw query must URL-encode space and &: {raw_query}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_history_502_empty_body() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (StatusCode::BAD_GATEWAY, Value::Null),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "pigeon /swarm/inbox failed (HTTP 502 Bad Gateway)");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_empty_string_cursors_treated_as_absent() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (StatusCode::OK, json!({"messages": [], "has_more": false})),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "since": "",
+                    "before": ""
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(
+        seen[2].query.as_deref(),
+        Some("session=gse_reader&limit=10")
+    );
+    assert!(seen[2].body.get("since").is_none());
+    assert!(seen[2].body.get("before").is_none());
 
     drop(client_tx);
     drop(client_rx);

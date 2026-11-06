@@ -471,14 +471,13 @@ async fn handle_swarm_send(
     tool_ok(result_text)
 }
 
+const MIN_EPOCH_MS: i64 = -62_167_219_200_000; // 0000-01-01T00:00:00.000Z
+const MAX_EPOCH_MS: i64 = 253_402_300_799_999; // 9999-12-31T23:59:59.999Z
+
 fn format_rfc3339_ms(epoch_ms: i64) -> String {
-    let (days, rem_ms) = if epoch_ms >= 0 {
-        (epoch_ms / 86_400_000, epoch_ms % 86_400_000)
-    } else {
-        let d = (epoch_ms - 86_399_999) / 86_400_000;
-        let rem = epoch_ms - d * 86_400_000;
-        (d, rem)
-    };
+    let epoch_ms = epoch_ms.clamp(MIN_EPOCH_MS, MAX_EPOCH_MS);
+    let days = epoch_ms.div_euclid(86_400_000);
+    let rem_ms = epoch_ms.rem_euclid(86_400_000);
     let hours = rem_ms / 3_600_000;
     let rem_ms = rem_ms % 3_600_000;
     let mins = rem_ms / 60_000;
@@ -487,7 +486,7 @@ fn format_rfc3339_ms(epoch_ms: i64) -> String {
     let millis = rem_ms % 1_000;
 
     let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let era = z.div_euclid(146097);
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
@@ -500,6 +499,15 @@ fn format_rfc3339_ms(epoch_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
 }
 
+fn format_ack_warning(n: usize) -> String {
+    let s = if n == 1 {
+        "1 message"
+    } else {
+        &format!("{n} messages")
+    };
+    format!("warning: {s} could not be acknowledged and may be shown again")
+}
+
 async fn handle_swarm_read(
     client: &reqwest::Client,
     config: &SwarmMcpServerConfig,
@@ -508,13 +516,19 @@ async fn handle_swarm_read(
 ) -> Value {
     let limit = match args.get("limit") {
         None | Some(Value::Null) => None,
-        Some(v) => match v.as_i64() {
-            Some(n) if n > 0 => Some(n as u64),
+        Some(v) => match v.as_u64() {
+            Some(n) if n > 0 => Some(n),
             _ => return tool_err("limit must be a positive integer"),
         },
     };
-    let since = args.get("since").and_then(Value::as_str);
-    let before = args.get("before").and_then(Value::as_str);
+    let since = args
+        .get("since")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let before = args
+        .get("before")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
 
     let session_id = match ensure_mailbox(client, config, cwd).await {
         Ok(s) => s,
@@ -587,14 +601,7 @@ async fn handle_swarm_read(
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if !status.is_success() {
-                    let n = msg_ids.len();
-                    let s = if n == 1 {
-                        "1 message"
-                    } else {
-                        &format!("{n} messages")
-                    };
-                    let msg =
-                        format!("warning: {s} could not be acknowledged and may be shown again");
+                    let msg = format_ack_warning(msg_ids.len());
                     eprintln!(
                         "honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}"
                     );
@@ -603,26 +610,16 @@ async fn handle_swarm_read(
                     && let Some(rej) = val.get("rejected").and_then(Value::as_array)
                     && !rej.is_empty()
                 {
-                    let n = rej.len();
-                    let s = if n == 1 {
-                        "1 message"
-                    } else {
-                        &format!("{n} messages")
-                    };
-                    let msg =
-                        format!("warning: {s} could not be acknowledged and may be shown again");
-                    eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
+                    let msg = format_ack_warning(rej.len());
+                    eprintln!(
+                        "honk-swarm: warning: {n} messages rejected on ack: {rej:?}",
+                        n = rej.len()
+                    );
                     ack_warning = Some(msg);
                 }
             }
             Err(e) => {
-                let n = msg_ids.len();
-                let s = if n == 1 {
-                    "1 message"
-                } else {
-                    &format!("{n} messages")
-                };
-                let msg = format!("warning: {s} could not be acknowledged and may be shown again");
+                let msg = format_ack_warning(msg_ids.len());
                 eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
                 ack_warning = Some(msg);
             }
@@ -714,7 +711,7 @@ async fn handle_swarm_read(
             let text = r.text().await.unwrap_or_default();
             if !status.is_success() {
                 let err = PigeonError::parse(&text);
-                Err(err.message().to_string())
+                Err(err.formatted(&format!("pigeon /swarm/inbox failed (HTTP {status})")))
             } else {
                 match serde_json::from_str::<Value>(&text) {
                     Ok(val) => Ok(val),
@@ -2464,11 +2461,33 @@ mod list_format_tests {
     #[test]
     fn test_format_rfc3339_ms_epoch_and_arbitrary_dates() {
         assert_eq!(format_rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(format_rfc3339_ms(-1), "1969-12-31T23:59:59.999Z");
         assert_eq!(format_rfc3339_ms(1700000000000), "2023-11-14T22:13:20.000Z");
         assert_eq!(format_rfc3339_ms(1700000000123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(format_rfc3339_ms(1700000000005), "2023-11-14T22:13:20.005Z");
         assert_eq!(format_rfc3339_ms(1704067199999), "2023-12-31T23:59:59.999Z");
         assert_eq!(format_rfc3339_ms(1704067200000), "2024-01-01T00:00:00.000Z");
         // Leap day 2024-02-29 12:00:00.000Z
         assert_eq!(format_rfc3339_ms(1709208000000), "2024-02-29T12:00:00.000Z");
+        // Century leap day 2000-02-29 00:00:00.000Z
+        assert_eq!(
+            format_rfc3339_ms(951_782_400_000),
+            "2000-02-29T00:00:00.000Z"
+        );
+        // Clamping bounds: i64::MIN and i64::MAX do not panic
+        assert_eq!(format_rfc3339_ms(i64::MIN), "0000-01-01T00:00:00.000Z");
+        assert_eq!(format_rfc3339_ms(i64::MAX), "9999-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn test_format_ack_warning() {
+        assert_eq!(
+            format_ack_warning(1),
+            "warning: 1 message could not be acknowledged and may be shown again"
+        );
+        assert_eq!(
+            format_ack_warning(2),
+            "warning: 2 messages could not be acknowledged and may be shown again"
+        );
     }
 }

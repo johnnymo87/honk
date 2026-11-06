@@ -250,7 +250,11 @@ async fn swarm_inbox(
         serde_json::to_value(params).unwrap_or(Value::Null),
     );
     let (s, v) = st.behaviour.swarm_inbox.clone();
-    (s, axum::Json(v))
+    if v.is_null() {
+        (s, axum::body::Body::empty()).into_response()
+    } else {
+        (s, axum::Json(v)).into_response()
+    }
 }
 
 async fn pull_drain(
