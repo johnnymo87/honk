@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 #[derive(Clone, Debug)]
 pub struct Seen {
     pub path: String,
+    pub query: Option<String>,
     pub auth: Option<String>,
     pub content_type: Option<String>,
     pub origin: Option<String>,
@@ -28,6 +29,7 @@ pub struct Behaviour {
     pub sessions: Value,
     pub swarm_mailbox: (StatusCode, Value),
     pub swarm_send: (StatusCode, Value),
+    pub swarm_inbox: (StatusCode, Value),
     pub pull_drain: (StatusCode, Value),
     pub pull_ack: (StatusCode, Value),
     pub pull_pending: (StatusCode, Value),
@@ -60,6 +62,7 @@ impl Default for Behaviour {
                 StatusCode::ACCEPTED,
                 json!({"accepted": true, "msg_id": "msg_stub_1"}),
             ),
+            swarm_inbox: (StatusCode::OK, json!({"messages": [], "has_more": false})),
             pull_drain: (
                 StatusCode::OK,
                 json!({"ok": true, "session_id": "gse_stub", "pending_total": 0, "messages": []}),
@@ -126,6 +129,7 @@ impl StubPigeon {
             .route("/sessions", axum::routing::get(sessions))
             .route("/goose/swarm-mailbox", post(swarm_mailbox))
             .route("/swarm/send", post(swarm_send))
+            .route("/swarm/inbox", axum::routing::get(swarm_inbox))
             .route("/swarm/launch", post(swarm_launch))
             .route("/swarm/schedule", post(swarm_schedule))
             .route("/swarm/scheduled", axum::routing::get(swarm_scheduled))
@@ -164,8 +168,13 @@ impl StubPigeon {
 }
 
 fn record(st: &St, path: &str, headers: &HeaderMap, body: Value) {
+    record_with_query(st, path, None, headers, body);
+}
+
+fn record_with_query(st: &St, path: &str, query: Option<String>, headers: &HeaderMap, body: Value) {
     st.seen.lock().unwrap().push(Seen {
         path: path.into(),
+        query,
         auth: headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
@@ -224,6 +233,23 @@ async fn swarm_send(
 ) -> impl IntoResponse {
     record(&st, "/swarm/send", &headers, body);
     let (s, v) = st.behaviour.swarm_send.clone();
+    (s, axum::Json(v))
+}
+
+async fn swarm_inbox(
+    State(st): State<St>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    record_with_query(
+        &st,
+        "/swarm/inbox",
+        uri.query().map(str::to_string),
+        &headers,
+        serde_json::to_value(params).unwrap_or(Value::Null),
+    );
+    let (s, v) = st.behaviour.swarm_inbox.clone();
     (s, axum::Json(v))
 }
 

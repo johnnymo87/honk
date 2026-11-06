@@ -471,13 +471,50 @@ async fn handle_swarm_send(
     tool_ok(result_text)
 }
 
+fn format_rfc3339_ms(epoch_ms: i64) -> String {
+    let (days, rem_ms) = if epoch_ms >= 0 {
+        (epoch_ms / 86_400_000, epoch_ms % 86_400_000)
+    } else {
+        let d = (epoch_ms - 86_399_999) / 86_400_000;
+        let rem = epoch_ms - d * 86_400_000;
+        (d, rem)
+    };
+    let hours = rem_ms / 3_600_000;
+    let rem_ms = rem_ms % 3_600_000;
+    let mins = rem_ms / 60_000;
+    let rem_ms = rem_ms % 60_000;
+    let secs = rem_ms / 1_000;
+    let millis = rem_ms % 1_000;
+
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+
+    format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
+}
+
 async fn handle_swarm_read(
     client: &reqwest::Client,
     config: &SwarmMcpServerConfig,
     args: &Value,
     cwd: Option<&str>,
 ) -> Value {
-    let limit = args.get("limit").and_then(Value::as_u64);
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(n) if n > 0 => Some(n as u64),
+            _ => return tool_err("limit must be a positive integer"),
+        },
+    };
+    let since = args.get("since").and_then(Value::as_str);
+    let before = args.get("before").and_then(Value::as_str);
 
     let session_id = match ensure_mailbox(client, config, cwd).await {
         Ok(s) => s,
@@ -525,35 +562,60 @@ async fn handle_swarm_read(
         .cloned()
         .unwrap_or_default();
 
-    if messages.is_empty() {
-        return tool_ok("Inbox is empty.");
-    }
+    let drained_section = if !messages.is_empty() {
+        let msg_ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| m.get("msg_id").and_then(Value::as_str))
+            .map(String::from)
+            .collect();
 
-    // Ack returned messages
-    let msg_ids: Vec<String> = messages
-        .iter()
-        .filter_map(|m| m.get("msg_id").and_then(Value::as_str))
-        .map(String::from)
-        .collect();
-
-    let mut ack_req = client
-        .post(format!(
-            "{}/pull/ack",
-            config.pigeon_url.trim_end_matches('/')
-        ))
-        .json(&json!({
-            "session_id": session_id,
-            "msg_ids": msg_ids,
-        }));
-    if let Some(tok) = &pigeon_token {
-        ack_req = ack_req.bearer_auth(tok);
-    }
-    let mut ack_warning: Option<String> = None;
-    match ack_req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
+        let mut ack_req = client
+            .post(format!(
+                "{}/pull/ack",
+                config.pigeon_url.trim_end_matches('/')
+            ))
+            .json(&json!({
+                "session_id": session_id,
+                "msg_ids": msg_ids,
+            }));
+        if let Some(tok) = &pigeon_token {
+            ack_req = ack_req.bearer_auth(tok);
+        }
+        let mut ack_warning: Option<String> = None;
+        match ack_req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    let n = msg_ids.len();
+                    let s = if n == 1 {
+                        "1 message"
+                    } else {
+                        &format!("{n} messages")
+                    };
+                    let msg =
+                        format!("warning: {s} could not be acknowledged and may be shown again");
+                    eprintln!(
+                        "honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}"
+                    );
+                    ack_warning = Some(msg);
+                } else if let Ok(val) = serde_json::from_str::<Value>(&text)
+                    && let Some(rej) = val.get("rejected").and_then(Value::as_array)
+                    && !rej.is_empty()
+                {
+                    let n = rej.len();
+                    let s = if n == 1 {
+                        "1 message"
+                    } else {
+                        &format!("{n} messages")
+                    };
+                    let msg =
+                        format!("warning: {s} could not be acknowledged and may be shown again");
+                    eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
+                    ack_warning = Some(msg);
+                }
+            }
+            Err(e) => {
                 let n = msg_ids.len();
                 let s = if n == 1 {
                     "1 message"
@@ -561,93 +623,198 @@ async fn handle_swarm_read(
                     &format!("{n} messages")
                 };
                 let msg = format!("warning: {s} could not be acknowledged and may be shown again");
-                eprintln!(
-                    "honk-swarm: warning: failed to ack drained messages (HTTP {status}): {text}"
-                );
-                ack_warning = Some(msg);
-            } else if let Ok(val) = serde_json::from_str::<Value>(&text)
-                && let Some(rej) = val.get("rejected").and_then(Value::as_array)
-                && !rej.is_empty()
-            {
-                let n = rej.len();
-                let s = if n == 1 {
-                    "1 message"
-                } else {
-                    &format!("{n} messages")
-                };
-                let msg = format!("warning: {s} could not be acknowledged and may be shown again");
-                eprintln!("honk-swarm: warning: {n} messages rejected on ack: {rej:?}");
+                eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
                 ack_warning = Some(msg);
             }
         }
-        Err(e) => {
-            let n = msg_ids.len();
-            let s = if n == 1 {
-                "1 message"
+
+        let pending_total = drain_res
+            .get("pending_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        let mut blocks = Vec::new();
+        for m in &messages {
+            let kind = m.get("kind").and_then(Value::as_str).unwrap_or("chat");
+            let from = m
+                .get("sender_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
+            let priority = m.get("priority").and_then(Value::as_str);
+            let reply_to = m.get("reply_to").and_then(Value::as_str);
+            let redelivered = m
+                .get("redelivered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
+
+            let mut attrs = format!(
+                r#"v="1" kind="{}" from="{}" msg_id="{}""#,
+                xml_escape(kind),
+                xml_escape(from),
+                xml_escape(msg_id),
+            );
+            if let Some(p) = priority {
+                attrs.push_str(&format!(r#" priority="{}""#, xml_escape(p)));
+            }
+            if let Some(r) = reply_to {
+                attrs.push_str(&format!(r#" reply_to="{}""#, xml_escape(r)));
+            }
+            if redelivered {
+                attrs.push_str(r#" redelivered="true""#);
+            }
+            let block =
+                format!("<swarm_message {attrs}>\n{payload}\n</swarm_message>\n\n{ECONOMY_FOOTER}");
+            blocks.push(block);
+        }
+
+        let mut text = blocks.join("\n\n");
+        let returned_count = messages.len() as u64;
+        if pending_total > returned_count {
+            let remaining = pending_total - returned_count;
+            let s = if remaining == 1 { "" } else { "s" };
+            text.push_str(&format!(
+                "\n\n({remaining} more unread message{s} in inbox — call swarm_read again to drain.)"
+            ));
+        }
+        if let Some(warn) = ack_warning {
+            text.push_str(&format!("\n\n{warn}"));
+        }
+        Some(text)
+    } else {
+        None
+    };
+
+    let limit_str = limit.unwrap_or(10).to_string();
+    let mut query_params = vec![
+        ("session", session_id.as_str()),
+        ("limit", limit_str.as_str()),
+    ];
+    if let Some(s) = since {
+        query_params.push(("since", s));
+    }
+    if let Some(b) = before {
+        query_params.push(("before", b));
+    }
+
+    let mut history_req = client
+        .get(format!(
+            "{}/swarm/inbox",
+            config.pigeon_url.trim_end_matches('/')
+        ))
+        .query(&query_params);
+    if let Some(tok) = &pigeon_token {
+        history_req = history_req.bearer_auth(tok);
+    }
+
+    let history_res = match history_req.send().await {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = PigeonError::parse(&text);
+                Err(err.message().to_string())
             } else {
-                &format!("{n} messages")
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(val) => Ok(val),
+                    Err(e) => Err(format!("pigeon returned non-JSON: {e}")),
+                }
+            }
+        }
+        Err(e) => Err(format!("pigeon /swarm/inbox unreachable: {e}")),
+    };
+
+    let history_val = match history_res {
+        Ok(val) => val,
+        Err(err_msg) => {
+            if let Some(drained) = drained_section {
+                return tool_ok(format!(
+                    "{drained}\n\nwarning: message history unavailable: {err_msg}"
+                ));
+            } else {
+                return tool_err(err_msg);
+            }
+        }
+    };
+
+    let history_messages = history_val
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let has_more = history_val
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let history_section = if !history_messages.is_empty() {
+        let mut hist_blocks = Vec::new();
+        for m in &history_messages {
+            let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
+            let from = m
+                .get("from")
+                .or_else(|| m.get("sender_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let kind = m.get("kind").and_then(Value::as_str).unwrap_or("chat");
+            let priority = m
+                .get("priority")
+                .and_then(Value::as_str)
+                .unwrap_or("normal");
+            let reply_to = m.get("reply_to").and_then(Value::as_str);
+            let created_at = m.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+            let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
+
+            let ts = format_rfc3339_ms(created_at);
+            let reply_to_str = match reply_to {
+                Some(r) => format!(" reply_to={r}"),
+                None => String::new(),
             };
-            let msg = format!("warning: {s} could not be acknowledged and may be shown again");
-            eprintln!("honk-swarm: warning: failed to ack drained messages: {e}");
-            ack_warning = Some(msg);
+            hist_blocks.push(format!(
+                "--- msg_id={msg_id} from={from} kind={kind} priority={priority}{reply_to_str} at={ts} ---\n{payload}"
+            ));
         }
-    }
 
-    let pending_total = drain_res
-        .get("pending_total")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    let mut blocks = Vec::new();
-    for m in &messages {
-        let kind = m.get("kind").and_then(Value::as_str).unwrap_or("chat");
-        let from = m
-            .get("sender_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let msg_id = m.get("msg_id").and_then(Value::as_str).unwrap_or("");
-        let priority = m.get("priority").and_then(Value::as_str);
-        let reply_to = m.get("reply_to").and_then(Value::as_str);
-        let redelivered = m
-            .get("redelivered")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let payload = m.get("payload").and_then(Value::as_str).unwrap_or("");
-
-        let mut attrs = format!(
-            r#"v="1" kind="{}" from="{}" msg_id="{}""#,
-            xml_escape(kind),
-            xml_escape(from),
-            xml_escape(msg_id),
+        let mut text = format!(
+            "Message history (already delivered to this session; shown again, not new):\n\n{}",
+            hist_blocks.join("\n\n")
         );
-        if let Some(p) = priority {
-            attrs.push_str(&format!(r#" priority="{}""#, xml_escape(p)));
-        }
-        if let Some(r) = reply_to {
-            attrs.push_str(&format!(r#" reply_to="{}""#, xml_escape(r)));
-        }
-        if redelivered {
-            attrs.push_str(r#" redelivered="true""#);
-        }
-        let block =
-            format!("<swarm_message {attrs}>\n{payload}\n</swarm_message>\n\n{ECONOMY_FOOTER}");
-        blocks.push(block);
-    }
 
-    let mut result_text = blocks.join("\n\n");
-    let returned_count = messages.len() as u64;
-    if pending_total > returned_count {
-        let remaining = pending_total - returned_count;
-        let s = if remaining == 1 { "" } else { "s" };
-        result_text.push_str(&format!(
-            "\n\n({remaining} more unread message{s} in inbox — call swarm_read again to drain.)"
-        ));
-    }
-    if let Some(warn) = ack_warning {
-        result_text.push_str(&format!("\n\n{warn}"));
-    }
+        if has_more {
+            if since.is_some() {
+                let newest = history_messages
+                    .last()
+                    .and_then(|m| m.get("msg_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                text.push_str(&format!(
+                    "\n\nMore recent messages arrived after these. Call swarm_read again with since=\"{newest}\" to continue."
+                ));
+            } else {
+                let oldest = history_messages
+                    .first()
+                    .and_then(|m| m.get("msg_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                text.push_str(&format!(
+                    "\n\nOlder messages exist beyond this page. Call swarm_read again with before=\"{oldest}\" to see them."
+                ));
+            }
+        }
 
-    tool_ok(result_text)
+        Some(text)
+    } else {
+        None
+    };
+
+    match (drained_section, history_section) {
+        (None, None) => tool_ok("Inbox is empty."),
+        (Some(drained), None) => tool_ok(drained),
+        (None, Some(history)) => tool_ok(history),
+        (Some(drained), Some(history)) => tool_ok(format!("{drained}\n\n{history}")),
+    }
 }
 
 async fn handle_swarm_list(
@@ -1891,13 +2058,21 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_read",
-            "description": "Read and drain swarm messages left in this session's pigeon mailbox. Mail to this session normally arrives as its own turn, pushed by pigeon; use this only when told messages are waiting. Each message is wrapped in a <swarm_message> envelope with message-economy reminders. Messages are acknowledged upon drain.",
+            "description": "Read this session's swarm messages. First delivers (and acknowledges) any messages still waiting in the pull mailbox, then shows recent message history (the newest 10 by default, most recent last). Mail to this session normally arrives as its own turn, pushed by pigeon; use this to check for backlog or look back at history. History is not consumed by reading. Cursor paging: pass `before` (older-than) to scroll back through history, or `since` (newer-than) to page forward; output ends with a hint naming the next cursor when more exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "since": {
+                        "type": "string",
+                        "description": "Forward cursor: only messages with msg_id > this value, oldest-first (page forward / catch up)."
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Backward cursor: only messages with msg_id < this value, newest-first within the window (scroll back through history)."
+                    },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of messages to return (default 10)."
+                        "description": "Maximum number of messages to return (default 10). The response is always chronological (oldest-first)."
                     }
                 }
             }
@@ -2284,5 +2459,16 @@ mod list_format_tests {
         assert!(text.contains("on   slack !"), "{text}");
         assert!(!text.contains("slack ! (project)"), "{text}");
         assert!(!text.contains("old (project)"), "{text}");
+    }
+
+    #[test]
+    fn test_format_rfc3339_ms_epoch_and_arbitrary_dates() {
+        assert_eq!(format_rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(format_rfc3339_ms(1700000000000), "2023-11-14T22:13:20.000Z");
+        assert_eq!(format_rfc3339_ms(1700000000123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(format_rfc3339_ms(1704067199999), "2023-12-31T23:59:59.999Z");
+        assert_eq!(format_rfc3339_ms(1704067200000), "2024-01-01T00:00:00.000Z");
+        // Leap day 2024-02-29 12:00:00.000Z
+        assert_eq!(format_rfc3339_ms(1709208000000), "2024-02-29T12:00:00.000Z");
     }
 }

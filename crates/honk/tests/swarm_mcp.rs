@@ -237,6 +237,29 @@ async fn test_tools_list_probe_204() {
         "list schema must include remote property"
     );
 
+    let read_tool = tools.iter().find(|t| t["name"] == "swarm_read").unwrap();
+    let read_desc = read_tool["description"].as_str().unwrap();
+    assert!(
+        read_desc.contains("pull mailbox"),
+        "read must mention pull mailbox: {read_desc}"
+    );
+    assert!(
+        read_desc.contains("recent message history"),
+        "read must mention message history: {read_desc}"
+    );
+    assert!(
+        read_desc.contains("before"),
+        "read must describe before cursor: {read_desc}"
+    );
+    assert!(
+        read_desc.contains("since"),
+        "read must describe since cursor: {read_desc}"
+    );
+    let read_props = &read_tool["inputSchema"]["properties"];
+    assert_eq!(read_props["limit"]["type"], "integer");
+    assert_eq!(read_props["since"]["type"], "string");
+    assert_eq!(read_props["before"]["type"], "string");
+
     let enable_tool = tools.iter().find(|t| t["name"] == "mcp_enable").unwrap();
     let enable_desc = enable_tool["description"].as_str().unwrap();
     assert!(
@@ -688,6 +711,639 @@ async fn test_swarm_send_surfaces_pigeon_409() {
     assert!(
         text.contains("goose-acp session gse_target has no swarm mailbox"),
         "expected 409 error text: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_history_only_renders_header_and_compact_blocks() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::OK,
+            json!({
+                "messages": [
+                    {
+                        "msg_id": "msg_h1",
+                        "from": "ses_alice",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "first history msg",
+                        "created_at": 1700000000000i64,
+                    },
+                    {
+                        "msg_id": "msg_h2",
+                        "from": "ses_bob",
+                        "kind": "status.update",
+                        "priority": "urgent",
+                        "reply_to": "msg_orig1",
+                        "payload": "second history msg",
+                        "created_at": 1700000005500i64,
+                    }
+                ],
+                "has_more": false
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    let expected = "\
+Message history (already delivered to this session; shown again, not new):
+
+--- msg_id=msg_h1 from=ses_alice kind=chat priority=normal at=2023-11-14T22:13:20.000Z ---
+first history msg
+
+--- msg_id=msg_h2 from=ses_bob kind=status.update priority=urgent reply_to=msg_orig1 at=2023-11-14T22:13:25.500Z ---
+second history msg";
+
+    assert_eq!(text, expected);
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 3, "expected mailbox, drain, inbox: {seen:?}");
+    assert_eq!(seen[0].path, "/goose/swarm-mailbox");
+    assert_eq!(seen[1].path, "/pull/drain");
+    assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(seen[2].body["session"], "gse_reader");
+    assert_eq!(seen[2].body["limit"], "10");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_limit_and_before_passthrough_with_has_more() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::OK,
+            json!({
+                "messages": [
+                    {
+                        "msg_id": "msg_oldest",
+                        "from": "ses_alice",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "older message",
+                        "created_at": 1700000000000i64,
+                    },
+                    {
+                        "msg_id": "msg_newer",
+                        "from": "ses_bob",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "newer message",
+                        "created_at": 1700000001000i64,
+                    }
+                ],
+                "has_more": true
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "limit": 5,
+                    "before": "msg_anchor"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    assert!(text.contains("--- msg_id=msg_oldest from=ses_alice"));
+    assert!(text.contains("--- msg_id=msg_newer from=ses_bob"));
+    assert!(
+        text.ends_with(
+            "Older messages exist beyond this page. Call swarm_read again with before=\"msg_oldest\" to see them."
+        ),
+        "expected before hint at end: {text}"
+    );
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(seen[2].body["session"], "gse_reader");
+    assert_eq!(seen[2].body["limit"], "5");
+    assert_eq!(seen[2].body["before"], "msg_anchor");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_since_passthrough_with_has_more() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::OK,
+            json!({
+                "messages": [
+                    {
+                        "msg_id": "msg_older",
+                        "from": "ses_alice",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "older message",
+                        "created_at": 1700000000000i64,
+                    },
+                    {
+                        "msg_id": "msg_newest",
+                        "from": "ses_bob",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "newest message",
+                        "created_at": 1700000001000i64,
+                    }
+                ],
+                "has_more": true
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {
+                    "since": "msg_anchor"
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    assert!(text.contains("--- msg_id=msg_older from=ses_alice"));
+    assert!(text.contains("--- msg_id=msg_newest from=ses_bob"));
+    assert!(
+        text.ends_with(
+            "More recent messages arrived after these. Call swarm_read again with since=\"msg_newest\" to continue."
+        ),
+        "expected since hint at end: {text}"
+    );
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(seen[2].body["session"], "gse_reader");
+    assert_eq!(seen[2].body["limit"], "10");
+    assert_eq!(seen[2].body["since"], "msg_anchor");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_drained_and_history_combined_ordering() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_reader",
+                "pending_total": 1,
+                "messages": [
+                    {
+                        "msg_id": "msg_drained_1",
+                        "source": "swarm",
+                        "sender_id": "ses_alice",
+                        "kind": "chat",
+                        "payload": "freshly drained message",
+                        "created_at": 1700000000000i64,
+                    }
+                ]
+            }),
+        ),
+        pull_ack: (
+            StatusCode::OK,
+            json!({"ok": true, "acked": ["msg_drained_1"], "rejected": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::OK,
+            json!({
+                "messages": [
+                    {
+                        "msg_id": "msg_hist_1",
+                        "from": "ses_bob",
+                        "kind": "chat",
+                        "priority": "normal",
+                        "reply_to": null,
+                        "payload": "historical message",
+                        "created_at": 1700000000001i64,
+                    }
+                ],
+                "has_more": false
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    let drained_pos = text.find("<swarm_message").expect("drained envelope");
+    let economy_pos = text
+        .find("[pigeon] Message economy")
+        .expect("economy footer");
+    let header_pos = text
+        .find("Message history (already delivered to this session; shown again, not new):")
+        .expect("history header");
+    let hist_pos = text.find("--- msg_id=msg_hist_1").expect("history block");
+
+    assert!(drained_pos < economy_pos);
+    assert!(economy_pos < header_pos);
+    assert!(header_pos < hist_pos);
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 4, "mailbox, drain, ack, inbox: {seen:?}");
+    assert_eq!(seen[1].path, "/pull/drain");
+    assert_eq!(seen[2].path, "/pull/ack");
+    assert_eq!(seen[2].body["msg_ids"], json!(["msg_drained_1"]));
+    assert_eq!(seen[3].path, "/swarm/inbox");
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_history_500_with_drained_messages() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "session_id": "gse_reader",
+                "pending_total": 1,
+                "messages": [
+                    {
+                        "msg_id": "msg_drained_err",
+                        "source": "swarm",
+                        "sender_id": "ses_alice",
+                        "kind": "chat",
+                        "payload": "saved payload",
+                        "created_at": 1700000000000i64,
+                    }
+                ]
+            }),
+        ),
+        pull_ack: (
+            StatusCode::OK,
+            json!({"ok": true, "acked": ["msg_drained_err"], "rejected": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "history db crash"}),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    // Must be tool_ok, NOT isError!
+    assert_eq!(resp["result"]["isError"], Value::Null);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    assert!(
+        text.contains("saved payload"),
+        "must retain drained payload: {text}"
+    );
+    assert!(
+        text.contains("warning: message history unavailable: history db crash"),
+        "must append history warning: {text}"
+    );
+
+    let seen = p.seen();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[2].path, "/pull/ack");
+    assert_eq!(seen[2].body["msg_ids"], json!(["msg_drained_err"]));
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_history_500_with_no_drained_messages() {
+    let p = StubPigeon::start(Behaviour {
+        swarm_mailbox: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "backend_session_id": "20261020_owner"}),
+        ),
+        pull_drain: (
+            StatusCode::OK,
+            json!({"ok": true, "session_id": "gse_reader", "pending_total": 0, "messages": []}),
+        ),
+        swarm_inbox: (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "history db crash"}),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_read",
+                "arguments": {},
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    // Must be isError: true
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("history db crash"),
+        "expected error text: {text}"
+    );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn test_swarm_read_invalid_limit() {
+    let p = StubPigeon::start(Behaviour::default()).await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    for invalid in [json!(0), json!(-1), json!("x")] {
+        let resp = send_recv(
+            &mut client_tx,
+            &mut client_rx,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "swarm_read",
+                    "arguments": {
+                        "limit": invalid
+                    },
+                    "_meta": {
+                        "agent-session-id": "20261020_owner"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            resp["result"]["isError"],
+            json!(true),
+            "expected isError for limit={invalid:?}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("limit must be a positive integer"),
+            "expected limit validation message for {invalid:?}, got: {text}"
+        );
+    }
+
+    assert!(
+        p.seen().is_empty(),
+        "no HTTP requests should be sent on invalid limit"
     );
 
     drop(client_tx);
@@ -3271,7 +3927,11 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
     );
 
     let seen = p.seen();
-    assert_eq!(seen.len(), 3, "expected mailbox, drain, ack: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        4,
+        "expected mailbox, drain, ack, inbox: {seen:?}"
+    );
     assert_eq!(seen[0].path, "/goose/swarm-mailbox");
     assert_eq!(seen[0].body["label"], "20261020_owner");
     let current_dir = std::env::current_dir().unwrap();
@@ -3281,6 +3941,9 @@ async fn test_swarm_read_drains_acks_and_formats_envelope() {
     assert_eq!(seen[2].path, "/pull/ack");
     assert_eq!(seen[2].body["session_id"], "gse_reader");
     assert_eq!(seen[2].body["msg_ids"], json!(["msg_msg1", "msg_msg2"]));
+    assert_eq!(seen[3].path, "/swarm/inbox");
+    assert_eq!(seen[3].body["session"], "gse_reader");
+    assert_eq!(seen[3].body["limit"], "10");
 
     drop(client_tx);
     drop(client_rx);
@@ -3338,14 +4001,17 @@ async fn test_swarm_read_empty_inbox() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text, "Inbox is empty.");
 
-    // drain called, but NO ack called
+    // drain called, but NO ack called; inbox called
     let seen = p.seen();
     assert_eq!(
         seen.len(),
-        2,
-        "only mailbox and drain, no ack on empty: {seen:?}"
+        3,
+        "mailbox, drain, and inbox, no ack on empty: {seen:?}"
     );
     assert_eq!(seen[1].path, "/pull/drain");
+    assert_eq!(seen[2].path, "/swarm/inbox");
+    assert_eq!(seen[2].body["session"], "gse_reader");
+    assert_eq!(seen[2].body["limit"], "10");
 
     drop(client_tx);
     drop(client_rx);
