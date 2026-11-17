@@ -1034,15 +1034,41 @@ async fn handle_swarm_list_remote(
         .unwrap_or_default()
         .as_millis() as i64;
 
-    if sessions.is_empty() {
+    // Program coordinators (stall-watch goose sessions) on other machines. pigeon
+    // lists them apart from `sessions`, outside `limit` (pigeon-a0o8); an older
+    // daemon omits the field.
+    let coordinators = body
+        .get("coordinators")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if sessions.is_empty() && coordinators.is_empty() {
         return tool_ok(format!(
             "No sessions on other machines were active in the last 7 days (asked from {machine_id})."
         ));
     }
 
     let mut out = Vec::new();
-    out.push(format!("Sessions on machines other than {machine_id}:"));
-    out.push("ID  SEEN  MACHINE  LABEL".to_string());
+    if !coordinators.is_empty() {
+        out.push(format!(
+            "Program coordinators (stall-watch) on machines other than {machine_id}:"
+        ));
+        out.push("ID  MACHINE  ROLE".to_string());
+        for c in &coordinators {
+            let session_id = c.get("session_id").and_then(Value::as_str).unwrap_or("");
+            let m_id = c.get("machine_id").and_then(Value::as_str).unwrap_or("");
+            let program = c.get("program").and_then(Value::as_str).unwrap_or("");
+            out.push(format!("{session_id}  {m_id}  coordinator of {program}"));
+        }
+        out.push(String::new());
+    }
+    if sessions.is_empty() {
+        out.push("No sessions on other machines were active in the last 7 days.".to_string());
+    } else {
+        out.push(format!("Sessions on machines other than {machine_id}:"));
+        out.push("ID  SEEN  MACHINE  LABEL".to_string());
+    }
 
     for s in &sessions {
         let session_id = s.get("session_id").and_then(Value::as_str).unwrap_or("");
@@ -2080,7 +2106,7 @@ fn get_tools(self_grant: bool) -> Value {
         }),
         json!({
             "name": "swarm_list",
-            "description": "List local sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list sessions on OTHER machines instead (id, last-updated, machine, label), and whether a swarm_send to each machine can be relayed right now. Note: goose sessions on other machines are not listed; a remote goose session's id comes from the message or launch that named it.",
+            "description": "List local sessions across all projects (id, last-updated, directory, title), most-recently-updated first. Use this to discover the session id of a peer to message with swarm_send. With remote: true, list the stall-watch program coordinators on OTHER machines (id, machine, `coordinator of <program>`) and sessions on OTHER machines (id, last-updated, machine, label) instead, and whether a swarm_send to each machine can be relayed right now. Other goose sessions on other machines are not listed; such a session's id comes from the message or launch that named it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2090,7 +2116,7 @@ fn get_tools(self_grant: bool) -> Value {
                     },
                     "remote": {
                         "type": "boolean",
-                        "description": "List sessions on other machines (active in the last 7 days) instead of local ones (goose sessions on other machines are not listed; their ids come from messages or launches that named them)."
+                        "description": "List program coordinators and sessions on other machines (active in the last 7 days) instead of local ones (other goose sessions on other machines are not listed; their ids come from messages or launches that named them)."
                     }
                 }
             }

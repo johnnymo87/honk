@@ -229,8 +229,8 @@ async fn test_tools_list_probe_204() {
         "list must describe remote: {list_desc}"
     );
     assert!(
-        list_desc.contains("goose sessions on other machines are not listed"),
-        "list must describe remote goose sessions: {list_desc}"
+        list_desc.contains("program coordinators on OTHER machines"),
+        "list must say remote lists other machines' coordinators: {list_desc}"
     );
     assert!(
         list_tool["inputSchema"]["properties"]["remote"].is_object(),
@@ -3020,6 +3020,97 @@ async fn test_swarm_list_remote_rendering() {
         remote_seen.is_some(),
         "expected /swarm/remote-sessions in {seen:?}"
     );
+
+    drop(client_tx);
+    drop(client_rx);
+    let _ = server_handle.await;
+}
+
+/// Program coordinators on other machines (pigeon-a0o8) are listed first, even when
+/// no remote opencode session is: they are the goose sessions a session most needs
+/// to find on another machine.
+#[tokio::test]
+async fn test_swarm_list_remote_coordinators() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let p = StubPigeon::start(Behaviour {
+        swarm_remote_sessions: (
+            StatusCode::OK,
+            json!({
+                "machine_id": "devbox",
+                "sessions": [],
+                "coordinators": [
+                    {
+                        "session_id": "gse_3d775ba5-7533-4021-9a81-ef3d32009057",
+                        "machine_id": "cloudbox",
+                        "program": "stall-watcher",
+                        "label": "📋 stall-watcher",
+                        "updated_at": now_ms - 60_000
+                    }
+                ],
+                "machines": [
+                    {
+                        "machine_id": "cloudbox",
+                        "relay": "available",
+                        "last_poll_at": now_ms - 10_000
+                    }
+                ],
+                "truncated": false,
+                "relay_send": true
+            }),
+        ),
+        ..Behaviour::default()
+    })
+    .await;
+
+    let (server_io, client_io) = duplex(4096);
+    let (server_rx, server_tx) = tokio::io::split(server_io);
+    let (client_rx, mut client_tx) = tokio::io::split(client_io);
+    let mut client_rx = BufReader::new(client_rx);
+
+    let config = SwarmMcpServerConfig {
+        session: "20261020_owner".into(),
+        pigeon_url: p.url.clone(),
+        pigeon_token_file: None,
+        honk_url: "http://127.0.0.1:4280/acp".into(),
+        honk_secret_file: None,
+    };
+
+    let server_handle = tokio::spawn(run_server(config, BufReader::new(server_rx), server_tx));
+
+    let resp = send_recv(
+        &mut client_tx,
+        &mut client_rx,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "swarm_list",
+                "arguments": {
+                    "remote": true
+                },
+                "_meta": {
+                    "agent-session-id": "20261020_owner"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["result"]["isError"].as_bool(), None);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let expected = "Program coordinators (stall-watch) on machines other than devbox:\n\
+ID  MACHINE  ROLE\n\
+gse_3d775ba5-7533-4021-9a81-ef3d32009057  cloudbox  coordinator of stall-watcher\n\
+\n\
+No sessions on other machines were active in the last 7 days.\n\
+\n\
+Relay from devbox (what swarm_send to each machine would get now; \"available\" and \"offline\" (within 7 days) are queued by the worker, and the receiving session may still refuse it):\n  cloudbox: available";
+    assert_eq!(text, expected);
 
     drop(client_tx);
     drop(client_rx);
