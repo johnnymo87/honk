@@ -25,6 +25,9 @@ honk chat --new
 # Start a new session in a specific directory
 honk chat --new --cwd /path/to/project
 
+# Start a new session with a specific model
+honk chat --new --model claude-opus-5-5
+
 # Enable MCP servers from catalog on session creation (repeatable, '!' confirms)
 honk chat --new --mcp slack-ro --mcp atlassian!
 
@@ -202,6 +205,24 @@ Every prompt submitted assigns a unique client request ID (`client_req_id`).
 
 ---
 
+## Model Switching (`/model`)
+
+`honk chat` tracks the current model and lets you switch models dynamically **per session**:
+
+- **Status bar**: The current model (e.g. `claude-opus-5-5`) is displayed in the status bar, dropped gracefully on narrower terminal widths.
+- **Commands & Shortcuts**:
+  - `/model <id>` (or `:model <id>`): Switch the session to a specific model. Goose accepts any model ID within the session's provider. If entered while a turn is active, the command is queued (`queued: /model <id>`) and dispatched automatically when the turn ends.
+  - `/model` (or `:model`): Opens the filterable **model picker overlay** above the composer. Type to filter by model ID or display name (subsequence match), use `j`/`k` or arrow keys to navigate, `Enter` to switch, and `Esc` to close.
+  - `Ctrl-X m`: Opens the model picker overlay directly from both Normal and Insert modes.
+  - `F2` / `Shift-F2`: Cycle to the next or previous model in the recent models list from both Normal and Insert modes.
+- **Session creation flags**:
+  - `honk chat --new --model <id>`: Starts a new session directly on the specified model. If setting the model fails, an error notice is displayed in chat and the session remains open.
+  - `honk launch --model <id>`: Headlessly launches a new session on the specified model. Failure aborts before prompting.
+- **Configured models (`--models-file`)**: `honkd` reads an optional JSON configuration file specifying models per provider via `--models-file <path>` (e.g. `{"providers": {"gcp_vertex_ai": [{"id": "...", "name": "..."}]}}`). Configured models appear at the top of the picker in file order, followed by Goose's built-in options. The file is re-read on each `/model` request so edits take effect immediately without restarting `honkd`.
+- **Recent models**: Successful model switches are recorded in `$XDG_STATE_HOME/honk/model-recent.json` (falling back to `~/.local/state/honk/model-recent.json`), maintaining the 10 most recently used models across all `honk chat` sessions on the host.
+
+---
+
 ## Extension Handling on `--new`
 
 When creating a new session with `honk chat --new`:
@@ -283,6 +304,18 @@ honk telegram 20261016_7
 ## Headless Launch (`honk launch`)
 
 `honk launch <dir> <prompt>` starts a goose session headlessly through honkd, tags it, registers it with pigeon (Telegram topic), sends the initial prompt, and exits while the turn runs in the background. It is the goose analogue of `opencode-launch`.
+
+### Command-Line Flags
+
+- `--title <title>`: Session title, set before the first prompt (also sets the Telegram topic title).
+- `--model <id>`: Initial model for the session, set before the first prompt. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
+- `--tag <tag>`: Tag the session in session-tags (`goose:<id>`). Defaults to inheriting the launching session's tag; `--tag auto` opts out.
+- `--no-attach`: Do not auto-attach (do not open a tab running `honk chat`).
+- `--tmux-session <name>`: Target tmux session for auto-attach [default: nvim's session].
+- `--pigeon-url <url>`: pigeon daemon URL [default: `http://127.0.0.1:4731`].
+- `--pigeon-token-file <path>`: File holding pigeon's bearer token.
+- `--url <url>`: honkd WebSocket or HTTP endpoint [default: `http://127.0.0.1:4280/acp`].
+- `--secret <token>`: honkd secret auth token.
 
 ### Auto-Open / Auto-Attach
 

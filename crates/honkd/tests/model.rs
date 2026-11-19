@@ -1,5 +1,5 @@
-use common::{Honkd, Viewer, prompt_params};
-use honk_testgoose::FakeGoose;
+use common::{Honkd, Viewer, new_session, prompt_params};
+use honk_testgoose::{FakeGoose, StubGoose};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -350,4 +350,59 @@ async fn test_model_list_after_actor_reactivation_with_attached_viewer() {
         .await;
     assert_eq!(list_res["result"]["provider"], "gcp_vertex_ai");
     assert_eq!(list_res["result"]["current"], "claude-opus-5-5");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_live_model_switch_with_stub_goose() {
+    let Some(goose) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let h = Honkd::spawn(&goose.url(), goose.secret_file(), &[]).await;
+    let mut v1 = Viewer::connect(&h).await;
+
+    // session/new
+    let sid = new_session(&mut v1, goose.cwd().to_str().unwrap()).await;
+
+    // session/set_config_option configId model value "stub-model-2"
+    let switch_res = v1
+        .call(
+            "session/set_config_option",
+            json!({
+                "sessionId": sid,
+                "configId": "model",
+                "value": "stub-model-2",
+            }),
+        )
+        .await;
+    assert!(
+        switch_res.get("result").is_some(),
+        "switch_res error: {:?}",
+        switch_res.get("error")
+    );
+    let opts = switch_res["result"]["configOptions"]
+        .as_array()
+        .expect("configOptions array");
+    let model_opt = opts
+        .iter()
+        .find(|o| o["id"] == "model")
+        .expect("model option");
+    assert_eq!(model_opt["currentValue"], "stub-model-2");
+
+    // _honk/model/list reports current = that id
+    let list_res = v1
+        .call("_honk/model/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list_res["result"]["current"], "stub-model-2");
+
+    // a second viewer attaching sees it in its session/load reply
+    let mut v2 = Viewer::connect(&h).await;
+    let load_v2 = v2.call("session/load", json!({ "sessionId": sid })).await;
+    let opts_v2 = load_v2["result"]["configOptions"]
+        .as_array()
+        .expect("configOptions array in session/load");
+    let model_v2 = opts_v2
+        .iter()
+        .find(|o| o["id"] == "model")
+        .expect("model option in load");
+    assert_eq!(model_v2["currentValue"], "stub-model-2");
 }
