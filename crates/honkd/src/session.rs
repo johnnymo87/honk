@@ -3182,9 +3182,6 @@ impl Session {
                     );
                     return;
                 }
-                if !self.viewers.contains_key(&viewer_id) {
-                    self.attach_live(viewer_id, viewer.clone(), false);
-                }
                 if method == "session/set_config_option" && self.turn.is_running() {
                     let err_resp =
                         crate::rpc::error(id, -32002, "session is busy; try after this turn", None);
