@@ -127,6 +127,26 @@ pub struct LaunchOpts {
     pub secret: String,
     pub pigeon: PigeonConfig,
     pub timeouts: Timeouts,
+    pub attach: Option<AttachSettings>,
+    pub attach_skip_reason: Option<String>,
+}
+
+/// Settings for auto-attaching to a launched goose session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachSettings {
+    pub bin: String,
+    pub tmux_session: Option<String>,
+    pub log_file: Option<PathBuf>,
+}
+
+impl AttachSettings {
+    pub fn new(bin: impl Into<String>, tmux_session: Option<String>) -> Self {
+        Self {
+            bin: bin.into(),
+            tmux_session,
+            log_file: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for LaunchOpts {
@@ -142,6 +162,8 @@ impl std::fmt::Debug for LaunchOpts {
             .field("secret", &"<redacted>")
             .field("pigeon_url", &self.pigeon.url)
             .field("timeouts", &self.timeouts)
+            .field("attach", &self.attach)
+            .field("attach_skip_reason", &self.attach_skip_reason)
             .finish()
     }
 }
@@ -383,18 +405,88 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
     drop(client);
     match sent {
         Ok(()) => launched.prompt = PromptState::Ok,
-        Err((state, error)) => {
-            launched.prompt = state;
-            let error = match tag_error {
-                Some(t) => error.context(format!("{t:#}; and prompting failed")),
-                None => error.context("prompting failed"),
-            };
-            return Err(LaunchError::Partial { launched, error });
-        }
+        Err((state, _)) => launched.prompt = state,
+    }
+
+    maybe_auto_attach(opts, &launched);
+
+    if let Err((_, error)) = sent {
+        let error = match tag_error {
+            Some(t) => error.context(format!("{t:#}; and prompting failed")),
+            None => error.context("prompting failed"),
+        };
+        return Err(LaunchError::Partial { launched, error });
     }
     match tag_error {
         Some(error) => Err(LaunchError::Partial { launched, error }),
         None => Ok(launched),
+    }
+}
+
+fn spawn_auto_attach(attach: &AttachSettings, native: &str) -> Result<(), std::io::Error> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let log_path = attach
+        .log_file
+        .clone()
+        .or_else(|| std::env::var_os("HONK_AUTO_ATTACH_LOG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/tmp/oc-auto-attach.log"));
+
+    let out_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path);
+
+    let (stdout, stderr) = match out_file {
+        Ok(file) => match file.try_clone() {
+            Ok(clone) => (Stdio::from(file), Stdio::from(clone)),
+            Err(_) => (Stdio::from(file), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+
+    let mut cmd = std::process::Command::new(&attach.bin);
+    if let Some(session) = &attach.tmux_session {
+        cmd.arg("--tmux-session").arg(session);
+    }
+    cmd.arg(format!("goose:{native}"));
+    cmd.stdin(Stdio::null());
+    cmd.stdout(stdout);
+    cmd.stderr(stderr);
+    cmd.process_group(0);
+    cmd.env_remove("OPENCODE_SESSION_ID");
+    cmd.env_remove("AGENT_SESSION_ID");
+
+    cmd.spawn().map(|_| ())
+}
+
+fn auto_attach_step(
+    opts: &LaunchOpts,
+    launched: &Launched,
+    spawn_fn: impl FnOnce(&AttachSettings, &str) -> Result<(), std::io::Error>,
+) -> Option<String> {
+    if let Some(attach) = &opts.attach {
+        if launched.prompt != PromptState::No {
+            match spawn_fn(attach, &launched.native) {
+                Ok(()) => Some("honk launch: auto-attach: started".to_string()),
+                Err(e) => Some(format!(
+                    "honk launch: auto-attach: skipped (spawn failed: {e})"
+                )),
+            }
+        } else {
+            Some("honk launch: auto-attach: skipped (prompt refused)".to_string())
+        }
+    } else {
+        opts.attach_skip_reason
+            .as_ref()
+            .map(|why| format!("honk launch: auto-attach: skipped ({why})"))
+    }
+}
+
+fn maybe_auto_attach(opts: &LaunchOpts, launched: &Launched) {
+    if let Some(line) = auto_attach_step(opts, launched, spawn_auto_attach) {
+        eprintln!("{line}");
     }
 }
 
@@ -656,6 +748,57 @@ fn is_own_turn_start(frame: &Value, sid: &str, crid: &str) -> bool {
             == Some(crid)
 }
 
+/// Whether an env var value is truthy according to the allowlist (`1`, `true`,
+/// `TRUE`, `yes`, `YES`, `on`, `ON`). As in `opencode-launch`, `=0` does not
+/// disable.
+pub fn is_truthy(s: &str) -> bool {
+    matches!(s, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+}
+
+/// Resolves auto-attach settings from CLI args and environment.
+///
+/// Returns `(Some(settings), None)` if auto-attach is enabled, or
+/// `(None, Some(reason))` explaining why it was skipped.
+pub fn resolve_attach_from(
+    no_attach: bool,
+    tmux_session: Option<String>,
+    env_get: impl Fn(&str) -> Option<String>,
+    on_path: impl Fn(&str) -> bool,
+) -> (Option<AttachSettings>, Option<String>) {
+    if no_attach {
+        return (None, Some("--no-attach".to_string()));
+    }
+    if let Some(val) = env_get("HONK_LAUNCH_NO_ATTACH")
+        && is_truthy(&val)
+    {
+        return (None, Some(format!("HONK_LAUNCH_NO_ATTACH={val}")));
+    }
+    let bin = if let Some(b) = env_get("HONK_AUTO_ATTACH_BIN").filter(|b| !b.is_empty()) {
+        Some(b)
+    } else if on_path("oc-auto-attach") {
+        Some("oc-auto-attach".to_string())
+    } else {
+        None
+    };
+
+    match bin {
+        Some(bin) => {
+            let log_file = env_get("HONK_AUTO_ATTACH_LOG")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from);
+            (
+                Some(AttachSettings {
+                    bin,
+                    tmux_session,
+                    log_file,
+                }),
+                None,
+            )
+        }
+        None => (None, Some("oc-auto-attach not found".to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +879,155 @@ mod tests {
             "s",
             "c"
         ));
+    }
+
+    #[test]
+    fn truthy_allowlist() {
+        for truthy in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            assert!(is_truthy(truthy), "{truthy} should be truthy");
+        }
+        for not_truthy in [
+            "0", "false", "no", "off", "FALSE", "NO", "OFF", "random", "",
+        ] {
+            assert!(!is_truthy(not_truthy), "{not_truthy} should not be truthy");
+        }
+    }
+
+    #[test]
+    fn resolve_attach_prefers_cli_flag() {
+        let env = |k: &str| match k {
+            "HONK_LAUNCH_NO_ATTACH" => Some("1".into()),
+            "HONK_AUTO_ATTACH_BIN" => Some("/bin/auto".into()),
+            _ => None,
+        };
+        let (attach, skip) = resolve_attach_from(true, Some("tmux".into()), env, |_| true);
+        assert_eq!(attach, None);
+        assert_eq!(skip.as_deref(), Some("--no-attach"));
+    }
+
+    #[test]
+    fn resolve_attach_honors_env_allowlist() {
+        for v in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            let env = |k: &str| (k == "HONK_LAUNCH_NO_ATTACH").then(|| v.to_string());
+            let (attach, skip) = resolve_attach_from(false, None, env, |_| true);
+            assert_eq!(attach, None);
+            assert_eq!(
+                skip.as_deref(),
+                Some(format!("HONK_LAUNCH_NO_ATTACH={v}").as_str())
+            );
+        }
+
+        // =0 does not disable
+        let env = |k: &str| (k == "HONK_LAUNCH_NO_ATTACH").then(|| "0".to_string());
+        let (attach, skip) = resolve_attach_from(false, None, env, |b| b == "oc-auto-attach");
+        assert_eq!(
+            attach,
+            Some(AttachSettings {
+                bin: "oc-auto-attach".into(),
+                tmux_session: None,
+                log_file: None,
+            })
+        );
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn resolve_attach_bin_precedence_and_options() {
+        // Custom bin wins over PATH
+        let env = |k: &str| match k {
+            "HONK_AUTO_ATTACH_BIN" => Some("/opt/my-attach".into()),
+            "HONK_AUTO_ATTACH_LOG" => Some("/tmp/test.log".into()),
+            _ => None,
+        };
+        let (attach, skip) = resolve_attach_from(false, Some("sess".into()), env, |_| true);
+        assert_eq!(
+            attach,
+            Some(AttachSettings {
+                bin: "/opt/my-attach".into(),
+                tmux_session: Some("sess".into()),
+                log_file: Some(PathBuf::from("/tmp/test.log")),
+            })
+        );
+        assert_eq!(skip, None);
+
+        // Missing from PATH and no env bin -> skipped
+        let (attach, skip) = resolve_attach_from(false, None, |_| None, |_| false);
+        assert_eq!(attach, None);
+        assert_eq!(skip.as_deref(), Some("oc-auto-attach not found"));
+    }
+
+    #[test]
+    fn test_auto_attach_step_lines() {
+        let dummy_opts = |attach, attach_skip_reason| LaunchOpts {
+            dir: PathBuf::from("/tmp"),
+            prompt: "p".into(),
+            title: None,
+            tag: TagRequest::Off,
+            launcher: None,
+            tags_bin: "tags".into(),
+            honk_url: "http://1".into(),
+            secret: "s".into(),
+            pigeon: PigeonConfig {
+                url: "http://2".into(),
+                token: None,
+            },
+            timeouts: Timeouts::default(),
+            attach,
+            attach_skip_reason,
+        };
+        let mut launched = Launched {
+            native: "20261104_1".into(),
+            prompt: PromptState::Ok,
+            ..Default::default()
+        };
+        let attach = AttachSettings::new("my-attach", None);
+
+        // 1. Success -> started
+        let line = auto_attach_step(
+            &dummy_opts(Some(attach.clone()), None),
+            &launched,
+            |_, _| Ok(()),
+        );
+        assert_eq!(line.as_deref(), Some("honk launch: auto-attach: started"));
+
+        // 2. Spawn error -> skipped (spawn failed: ...)
+        let line = auto_attach_step(
+            &dummy_opts(Some(attach.clone()), None),
+            &launched,
+            |_, _| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no file")),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("honk launch: auto-attach: skipped (spawn failed: no file)")
+        );
+
+        // 3. Prompt refused (PromptState::No) -> skipped (prompt refused)
+        launched.prompt = PromptState::No;
+        let line = auto_attach_step(
+            &dummy_opts(Some(attach.clone()), None),
+            &launched,
+            |_, _| panic!("spawn_fn should not be called"),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("honk launch: auto-attach: skipped (prompt refused)")
+        );
+
+        // 4. Attach None with skip reason -> skipped (<why>)
+        let line = auto_attach_step(
+            &dummy_opts(None, Some("--no-attach".into())),
+            &launched,
+            |_, _| panic!("spawn_fn should not be called"),
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("honk launch: auto-attach: skipped (--no-attach)")
+        );
+
+        // 5. Attach None without skip reason -> None
+        let line = auto_attach_step(&dummy_opts(None, None), &launched, |_, _| {
+            panic!("spawn_fn should not be called")
+        });
+        assert_eq!(line, None);
     }
 }

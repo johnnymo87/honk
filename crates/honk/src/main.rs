@@ -42,6 +42,13 @@ as goose:<id>, registers it with pigeon (a Telegram topic, notify on, honkd as \
 its push endpoint, so swarm_send reaches it), sends the prompt, and exits while \
 the turn runs.
 
+Auto-attach: after the prompt, unless opted out, spawns \
+`oc-auto-attach [--tmux-session <name>] goose:<id>` in the background to open \
+the session in a new tab running `honk chat <id>`. Opt out via `--no-attach` \
+or `HONK_LAUNCH_NO_ATTACH` (truthy: 1, true, yes, on). Override the binary via \
+`$HONK_AUTO_ATTACH_BIN` (default: `oc-auto-attach` on PATH). Output appends to \
+/tmp/oc-auto-attach.log.
+
 Tag: --tag <tag> wins. Without --tag the launching session's tag is inherited \
 ($OPENCODE_SESSION_ID, or goose:$AGENT_SESSION_ID); a launcher that is a \
 stall-watch coordinator gives its program's tag, never its own \
@@ -100,6 +107,14 @@ struct LaunchArgs {
     /// Secret auth token (defaults to $HONK_SECRET or state file)
     #[arg(long)]
     secret: Option<String>,
+
+    /// Do not auto-attach (do not open a tab running honk chat)
+    #[arg(long = "no-attach")]
+    no_attach: bool,
+
+    /// Target tmux session for auto-attach [default: nvim's session]
+    #[arg(long = "tmux-session")]
+    tmux_session: Option<String>,
 }
 
 /// Where cloudbox keeps pigeon's daemon token (honkd reads the same file). The
@@ -147,6 +162,12 @@ fn launch_opts(
     }
     .load()?;
     let secret = resolve_secret(args.secret.as_deref())?;
+    let (attach, attach_skip_reason) = honk::launch::resolve_attach_from(
+        args.no_attach,
+        args.tmux_session,
+        &env_get,
+        honk::octags::on_path,
+    );
     Ok(honk::launch::LaunchOpts {
         dir,
         prompt,
@@ -158,6 +179,8 @@ fn launch_opts(
         secret,
         pigeon,
         timeouts: honk::launch::Timeouts::default(),
+        attach,
+        attach_skip_reason,
     })
 }
 
@@ -1164,6 +1187,49 @@ mod tests {
         let f = temp.path().join("file");
         std::fs::write(&f, "").unwrap();
         assert!(err(&[f.to_str().unwrap(), "--secret", "s", "p"], "").contains("not a directory"));
+    }
+
+    #[test]
+    fn test_launch_auto_attach_args_and_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let d = temp.path().to_str().unwrap();
+
+        // 1. --no-attach
+        let a = launch(&[d, "--secret", "s", "--no-attach", "do it"]).unwrap();
+        let o = launch_opts(a, launch_env, || unreachable!()).unwrap();
+        assert_eq!(o.attach, None);
+        assert_eq!(o.attach_skip_reason.as_deref(), Some("--no-attach"));
+
+        // 2. --tmux-session with HONK_AUTO_ATTACH_BIN
+        let env_with_bin = |k: &str| match k {
+            "HONK_AUTO_ATTACH_BIN" => Some("/bin/custom-attach".into()),
+            other => launch_env(other),
+        };
+        let a = launch(&[d, "--secret", "s", "--tmux-session", "work", "do it"]).unwrap();
+        let o = launch_opts(a, env_with_bin, || unreachable!()).unwrap();
+        assert_eq!(
+            o.attach,
+            Some(honk::launch::AttachSettings {
+                bin: "/bin/custom-attach".into(),
+                tmux_session: Some("work".into()),
+                log_file: None,
+            })
+        );
+        assert_eq!(o.attach_skip_reason, None);
+
+        // 3. HONK_LAUNCH_NO_ATTACH env var
+        let env_no_attach = |k: &str| match k {
+            "HONK_LAUNCH_NO_ATTACH" => Some("yes".into()),
+            "HONK_AUTO_ATTACH_BIN" => Some("/bin/custom-attach".into()),
+            other => launch_env(other),
+        };
+        let a = launch(&[d, "--secret", "s", "do it"]).unwrap();
+        let o = launch_opts(a, env_no_attach, || unreachable!()).unwrap();
+        assert_eq!(o.attach, None);
+        assert_eq!(
+            o.attach_skip_reason.as_deref(),
+            Some("HONK_LAUNCH_NO_ATTACH=yes")
+        );
     }
 
     #[test]

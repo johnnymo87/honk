@@ -276,6 +276,32 @@ honk telegram 20261016_7
 
 ---
 
+## Headless Launch (`honk launch`)
+
+`honk launch <dir> <prompt>` starts a goose session headlessly through honkd, tags it, registers it with pigeon (Telegram topic), sends the initial prompt, and exits while the turn runs in the background. It is the goose analogue of `opencode-launch`.
+
+### Auto-Open / Auto-Attach
+
+After sending the prompt, `honk launch` auto-opens the new session in a new nvim/tmux tab running `honk chat <id>`:
+
+- **Mechanism**: Spawns `oc-auto-attach [--tmux-session <name>] goose:<id>` in its own process group with stdin null and stdout/stderr appended to `/tmp/oc-auto-attach.log` (overridable via `HONK_AUTO_ATTACH_LOG`).
+- **Target session**: Passes `--tmux-session <name>` if provided; defaults to the current nvim/tmux session.
+- **Environment scrubbing**: `OPENCODE_SESSION_ID` and `AGENT_SESSION_ID` are scrubbed from the spawned process environment so a new tmux server will not capture the launcher's session ID.
+- **Binary resolution**: Runs `$HONK_AUTO_ATTACH_BIN` if set and non-empty, otherwise resolves `oc-auto-attach` from `$PATH`. If not found, auto-attach is skipped with a stderr message.
+- **Opting out**: Pass `--no-attach` or set `HONK_LAUNCH_NO_ATTACH` to a truthy value (`1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON`). Other values like `0` do not disable auto-attach.
+- **Status reporting**: Exactly one stderr line reports the outcome:
+  ```
+  honk launch: auto-attach: started
+  honk launch: auto-attach: skipped (--no-attach)
+  honk launch: auto-attach: skipped (HONK_LAUNCH_NO_ATTACH=1)
+  honk launch: auto-attach: skipped (oc-auto-attach not found)
+  honk launch: auto-attach: skipped (spawn failed: <err>)
+  honk launch: auto-attach: skipped (prompt refused)
+  ```
+- **Robustness**: Auto-attach is best-effort; a spawn failure never fails the launch. If the launch fails before a session is created, auto-attach is not reported.
+
+---
+
 ## Copying Text
 
 - **Terminal Selection**: Mouse capture is intentionally disabled. Native terminal mouse selection (click and drag, Shift-drag in certain terminals) and standard copy shortcuts (`Ctrl-Shift-C`, `Cmd-C`) work out of the box.
