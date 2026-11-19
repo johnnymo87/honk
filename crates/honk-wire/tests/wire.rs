@@ -1030,3 +1030,89 @@ fn test_turn_text_separator_skips_textless_messages_and_tops_up_newlines() {
         Some("first\n\nsecond\n\nthird")
     );
 }
+
+#[test]
+fn test_classify_and_is_human_prompt() {
+    use honk_wire::{Trigger, classify, is_human_prompt};
+
+    assert_eq!(
+        classify("[sw wake run=r_1 reason=heartbeat:settle] ses_x went quiet"),
+        Trigger::Wake("heartbeat:settle".into())
+    );
+    assert!(!is_human_prompt(
+        "[sw wake run=r_1 reason=heartbeat:settle] ses_x went quiet"
+    ));
+
+    assert_eq!(
+        classify("[sw wake run=r_1 reason=mail] Woken (mail)."),
+        Trigger::Wake("mail".into())
+    );
+    assert!(!is_human_prompt(
+        "[sw wake run=r_1 reason=mail] Woken (mail)."
+    ));
+
+    assert_eq!(
+        classify("[sw wake run=r_1] hi"),
+        Trigger::Wake("wake".into())
+    );
+    assert!(!is_human_prompt("[sw wake run=r_1] hi"));
+
+    assert_eq!(
+        classify(
+            "<swarm_message v=\"1\" kind=\"chat\" from=\"ses_abc\" to=\"gse_x\" msg_id=\"m\">\nhello from=\"nope\""
+        ),
+        Trigger::Swarm("ses_abc".into())
+    );
+    assert!(!is_human_prompt(
+        "<swarm_message v=\"1\" kind=\"chat\" from=\"ses_abc\" to=\"gse_x\" msg_id=\"m\">\nhello from=\"nope\""
+    ));
+
+    assert_eq!(
+        classify(
+            "<swarm_message v=\"1\" kind=\"chat\" from=\"gse_x\" to=\"gse_x\" scheduled_for=\"2026\">\nwake"
+        ),
+        Trigger::Scheduled
+    );
+    assert!(!is_human_prompt(
+        "<swarm_message v=\"1\" kind=\"chat\" from=\"gse_x\" to=\"gse_x\" scheduled_for=\"2026\">\nwake"
+    ));
+
+    assert_eq!(classify("so where are we with honk?"), Trigger::You);
+    assert!(is_human_prompt("so where are we with honk?"));
+
+    assert_eq!(
+        classify("You MUST call the `final_output` tool NOW with the final output"),
+        Trigger::Goose
+    );
+    assert!(!is_human_prompt(
+        "You MUST call the `final_output` tool NOW with the final output"
+    ));
+
+    assert_eq!(
+        classify("You are goose session 20261016_222 (author reattaches"),
+        Trigger::Goose
+    );
+    assert!(!is_human_prompt(
+        "You are goose session 20261016_222 (author reattaches"
+    ));
+
+    assert_eq!(
+        classify("{\"program\": \"honk\"}"),
+        Trigger::Wake("wake".into())
+    );
+    assert!(!is_human_prompt("{\"program\": \"honk\"}"));
+
+    assert_eq!(
+        classify("[Replying to this earlier message in the topic: ...] go"),
+        Trigger::You
+    );
+    assert!(is_human_prompt(
+        "[Replying to this earlier message in the topic: ...] go"
+    ));
+
+    assert_eq!(
+        classify("  [sw wake run=r reason=x] y"),
+        Trigger::Wake("x".into())
+    );
+    assert!(!is_human_prompt("  [sw wake run=r reason=x] y"));
+}

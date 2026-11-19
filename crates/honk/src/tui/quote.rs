@@ -7,71 +7,7 @@
 //! See docs/plans/2026-11-19-quote-replies.md.
 
 use crate::tui::transcript::{Block, BlockKind};
-
-/// What started a turn.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Trigger {
-    /// Blocks before the first user block.
-    Start,
-    /// A stall-watch wake: `[sw wake run=... reason=X] ...`.
-    Wake(String),
-    /// A swarm message: `<swarm_message ... from="X" ...>`.
-    Swarm(String),
-    /// A swarm message the session scheduled for itself (`scheduled_for=` attribute).
-    Scheduled,
-    /// A prompt goose wrote itself (self-compaction resume, final_output nudge).
-    Goose,
-    /// Anything else: the human.
-    You,
-}
-
-impl Trigger {
-    fn label(&self) -> String {
-        match self {
-            Trigger::Start => "start".into(),
-            Trigger::Wake(r) => format!("wake: {r}"),
-            Trigger::Swarm(f) => format!("swarm: {f}"),
-            Trigger::Scheduled => "scheduled".into(),
-            Trigger::Goose => "goose".into(),
-            Trigger::You => "you".into(),
-        }
-    }
-}
-
-/// Classifies a user block's text.
-pub fn classify(text: &str) -> Trigger {
-    let t = text.trim_start();
-    if let Some(rest) = t.strip_prefix("[sw wake ") {
-        let header = rest.split(']').next().unwrap_or("");
-        let reason = header
-            .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("reason="))
-            .filter(|r| !r.is_empty())
-            .unwrap_or("wake");
-        return Trigger::Wake(reason.to_string());
-    }
-    if t.starts_with("<swarm_message ") {
-        let header = t.split('>').next().unwrap_or("");
-        if header.contains(" scheduled_for=") {
-            return Trigger::Scheduled;
-        }
-        let from = header
-            .split(" from=\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("?");
-        return Trigger::Swarm(from.to_string());
-    }
-    if t.starts_with("You are goose session ") || t.starts_with("You MUST call the `final_output`")
-    {
-        return Trigger::Goose;
-    }
-    if t.starts_with("{\"program\"") {
-        return Trigger::Wake("wake".into());
-    }
-    Trigger::You
-}
+pub use honk_wire::{Trigger, classify};
 
 /// The quoted replies and how many turns they cover.
 #[derive(Debug, PartialEq, Eq)]
@@ -227,55 +163,6 @@ mod tests {
     }
     fn fmt(secs: i64) -> Option<String> {
         Some(format!("T{secs}"))
-    }
-
-    #[test]
-    fn classify_shapes() {
-        assert_eq!(
-            classify("[sw wake run=r_1 reason=heartbeat:settle] ses_x went quiet"),
-            Trigger::Wake("heartbeat:settle".into())
-        );
-        assert_eq!(
-            classify("[sw wake run=r_1 reason=mail] Woken (mail)."),
-            Trigger::Wake("mail".into())
-        );
-        assert_eq!(
-            classify("[sw wake run=r_1] hi"),
-            Trigger::Wake("wake".into())
-        );
-        assert_eq!(
-            classify(
-                "<swarm_message v=\"1\" kind=\"chat\" from=\"ses_abc\" to=\"gse_x\" msg_id=\"m\">\nhello from=\"nope\""
-            ),
-            Trigger::Swarm("ses_abc".into())
-        );
-        assert_eq!(
-            classify(
-                "<swarm_message v=\"1\" kind=\"chat\" from=\"gse_x\" to=\"gse_x\" scheduled_for=\"2026\">\nwake"
-            ),
-            Trigger::Scheduled
-        );
-        assert_eq!(classify("so where are we with honk?"), Trigger::You);
-        assert_eq!(
-            classify("You MUST call the `final_output` tool NOW with the final output"),
-            Trigger::Goose
-        );
-        assert_eq!(
-            classify("You are goose session 20261016_222 (author reattaches"),
-            Trigger::Goose
-        );
-        assert_eq!(
-            classify("{\"program\": \"honk\"}"),
-            Trigger::Wake("wake".into())
-        );
-        assert_eq!(
-            classify("[Replying to this earlier message in the topic: ...] go"),
-            Trigger::You
-        );
-        assert_eq!(
-            classify("  [sw wake run=r reason=x] y"),
-            Trigger::Wake("x".into())
-        );
     }
 
     #[test]

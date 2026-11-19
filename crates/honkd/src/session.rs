@@ -1855,6 +1855,13 @@ impl Session {
                         .and_then(Value::as_str)
                 {
                     self.turn.on_user_message(msg_id);
+                    if self.turn.current_prompt_msg_id() == Some(msg_id) {
+                        if let Some(id) = id_opt {
+                            let _ = self.log.mark_processed(id);
+                            self.last_processed_session_id = Some(id);
+                        }
+                        return;
+                    }
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
@@ -2140,10 +2147,30 @@ impl Session {
             }
         }
 
+        let is_echo = is_session_stream
+            && kind == crate::rpc::Kind::Notification
+            && frame
+                .pointer("/params/update")
+                .and_then(|u| {
+                    if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                    {
+                        u.get("messageId")
+                            .or_else(|| u.pointer("/_meta/goose/messageId"))
+                            .and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .is_some_and(|msg_id| self.turn.current_prompt_msg_id() == Some(msg_id));
+
         // 3. Record & 4. Fan out stamped frame
         if is_session_stream {
             if kind == crate::rpc::Kind::Notification {
-                if is_suppressed {
+                if is_echo {
+                    if let Some(id) = id_opt {
+                        let _ = self.log.mark_processed(id);
+                    }
+                } else if is_suppressed {
                     if let Some(id) = id_opt {
                         let _ = self.log.mark_processed(id);
                     }
@@ -2422,10 +2449,15 @@ impl Session {
 
                     let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
-                    let msg_id = crid
-                        .as_ref()
-                        .map(|c| format!("synth_{c}"))
-                        .unwrap_or_else(|| format!("synth_{}", self.ids.next()));
+                    let msg_id = params
+                        .pointer("/_meta/goose/messageId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            crid.as_ref()
+                                .map(|c| format!("synth_{c}"))
+                                .unwrap_or_else(|| format!("synth_{}", self.ids.next()))
+                        });
                     let mut synth_frame = json!({
                         "jsonrpc": "2.0",
                         "method": "session/update",
@@ -5794,5 +5826,223 @@ mod tests {
 
         assert!(!session.mcp_op_running, "mcp_op_running must stay false");
         assert!(session.rx.try_recv().is_err(), "no task should be spawned");
+    }
+
+    #[tokio::test]
+    async fn test_synth_user_block_message_id() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_synth_id_test", ActorState::Live).await;
+
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_42".to_string()),
+        };
+
+        // Case 1: Prompt params carry injected messageId
+        let params_with_id = json!({
+            "prompt": "hello with id",
+            "_meta": {
+                "goose": {
+                    "messageId": "msg_honk_abcdef1234567890abcdef1234567890"
+                }
+            }
+        });
+
+        session
+            .execute_actions(vec![Action::SynthUser {
+                params: params_with_id,
+                owner: owner.clone(),
+                upstream_id: Some("up_1".to_string()),
+            }])
+            .await;
+
+        let entries = session.log.entries();
+        assert_eq!(entries.len(), 1);
+        let update = entries[0].frame.pointer("/params/update").unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(Value::as_str),
+            Some("user_message_chunk")
+        );
+        assert_eq!(
+            update.get("messageId").and_then(Value::as_str),
+            Some("msg_honk_abcdef1234567890abcdef1234567890")
+        );
+
+        // Case 2: Prompt params do NOT carry injected messageId -> fallback to synth_{crid}
+        let params_without_id = json!({
+            "prompt": "hello fallback"
+        });
+
+        session
+            .execute_actions(vec![Action::SynthUser {
+                params: params_without_id,
+                owner,
+                upstream_id: Some("up_2".to_string()),
+            }])
+            .await;
+
+        let entries = session.log.entries();
+        assert_eq!(entries.len(), 2);
+        let update2 = entries[1].frame.pointer("/params/update").unwrap();
+        assert_eq!(
+            update2.get("messageId").and_then(Value::as_str),
+            Some("synth_req_42")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_goose_echo_live() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_echo_live_test", ActorState::Live).await;
+
+        // Simulate prompt in flight
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_1".to_string()),
+        };
+        let params = json!({"prompt": "compact"});
+        let _ = session.turn.on_prompt(owner, params, &mut session.ids);
+        let prompt_id = session
+            .turn
+            .current_prompt_msg_id()
+            .expect("prompt id present")
+            .to_string();
+
+        // 1. Goose echoes the prompt back with matching messageId
+        let echo_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": prompt_id,
+                    "content": { "type": "text", "text": "compact" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                echo_frame,
+                Some(101),
+            ))
+            .await;
+
+        // Verify echo is NOT in log
+        assert_eq!(session.log.entries().len(), 0);
+        // Verify upstream event id was marked processed
+        assert_eq!(session.last_processed_session_id, Some(101));
+        assert_eq!(session.log.last_upstream_id(), Some(101));
+
+        // 2. A different user_message_chunk arrives (e.g. steer or different id)
+        let other_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_other_9999",
+                    "content": { "type": "text", "text": "other text" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                other_frame,
+                Some(102),
+            ))
+            .await;
+
+        // Verify other frame IS in log
+        assert_eq!(session.log.entries().len(), 1);
+        assert_eq!(
+            session.log.entries()[0]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("msg_other_9999")
+        );
+        assert_eq!(session.last_processed_session_id, Some(102));
+        assert_eq!(session.log.last_upstream_id(), Some(102));
+    }
+
+    #[tokio::test]
+    async fn test_drop_goose_echo_rebuilding() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_echo_rebuild_test", ActorState::Rebuilding).await;
+
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_1".to_string()),
+        };
+        let params = json!({"prompt": "compact"});
+        let _ = session.turn.on_prompt(owner, params, &mut session.ids);
+        let prompt_id = session
+            .turn
+            .current_prompt_msg_id()
+            .expect("prompt id present")
+            .to_string();
+
+        // 1. Goose echo arrives during rebuilding
+        let echo_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": prompt_id,
+                    "content": { "type": "text", "text": "compact" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                echo_frame,
+                Some(201),
+            ))
+            .await;
+
+        // Verify echo is NOT in rebuilding_buffered_frames
+        assert_eq!(session.rebuilding_buffered_frames.len(), 0);
+        // Verify upstream event id was marked processed
+        assert_eq!(session.last_processed_session_id, Some(201));
+        assert_eq!(session.log.last_upstream_id(), Some(201));
+
+        // 2. A different user_message_chunk arrives during rebuilding
+        let other_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_other_7777",
+                    "content": { "type": "text", "text": "other" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                other_frame,
+                Some(202),
+            ))
+            .await;
+
+        // Verify other frame IS in rebuilding_buffered_frames
+        assert_eq!(session.rebuilding_buffered_frames.len(), 1);
+        assert_eq!(session.last_processed_session_id, Some(202));
     }
 }

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 pub mod export;
+pub mod prompt_kind;
+
+pub use prompt_kind::{Trigger, classify, is_human_prompt};
 
 pub const PROTOCOL: u32 = 1;
 pub const FEATURE_RESUME_ONLY: &str = "resume_only";

@@ -29,6 +29,10 @@ pub struct TurnMeta {
 }
 
 impl Inflight {
+    pub fn message_id(&self) -> Option<&str> {
+        prompt_message_id(&self.params)
+    }
+
     pub fn client_req_ids(&self) -> Vec<String> {
         let mut seen = std::collections::BTreeSet::new();
         let mut client_req_ids = Vec::new();
@@ -138,6 +142,39 @@ pub struct TurnCore {
     pub steers: Vec<(String, ViewerId)>,
     pub consumed_steers: std::collections::BTreeSet<String>,
     pub client_prompts: usize,
+    pub current_prompt_msg_id: Option<String>,
+}
+
+/// Returns the prompt's `_meta.goose.messageId` if present as a string.
+pub fn prompt_message_id(params: &Value) -> Option<&str> {
+    params
+        .pointer("/_meta/goose/messageId")
+        .and_then(Value::as_str)
+}
+
+/// Injects a stable prompt message id into `params["_meta"]["goose"]["messageId"]`.
+/// Always overwrites any caller value. Merges into existing `_meta` and `_meta.goose` objects.
+/// Handles missing or non-object `_meta`/`_meta.goose` (replaces with object).
+pub fn stamp_prompt_message_id(params: &mut Value) -> String {
+    let id = format!("msg_honk_{:x}", uuid::Uuid::new_v4().simple());
+    if !params.is_object() {
+        *params = serde_json::json!({});
+    }
+    let obj = params.as_object_mut().expect("is object");
+    let meta = obj.entry("_meta").or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({});
+    }
+    let meta_obj = meta.as_object_mut().expect("is object");
+    let goose = meta_obj
+        .entry("goose")
+        .or_insert_with(|| serde_json::json!({}));
+    if !goose.is_object() {
+        *goose = serde_json::json!({});
+    }
+    let goose_obj = goose.as_object_mut().expect("is object");
+    goose_obj.insert("messageId".to_string(), Value::String(id.clone()));
+    id
 }
 
 impl TurnCore {
@@ -145,12 +182,19 @@ impl TurnCore {
         self.run.is_some() || self.inflight.is_some() || !self.parked.is_empty()
     }
 
+    pub fn current_prompt_msg_id(&self) -> Option<&str> {
+        self.current_prompt_msg_id
+            .as_deref()
+            .or_else(|| self.inflight.as_ref().and_then(|i| i.message_id()))
+    }
+
     pub fn on_prompt(
         &mut self,
         owner: OwnerRef,
-        params: Value,
+        mut params: Value,
         ids: &mut crate::rpc::UpstreamIds,
     ) -> Vec<Action> {
+        let msg_id = stamp_prompt_message_id(&mut params);
         if let Some(run) = &self.run {
             return vec![Action::Reply {
                 owners: vec![owner],
@@ -164,6 +208,7 @@ impl TurnCore {
             self.parked.push((vec![owner], params));
             return vec![];
         }
+        self.current_prompt_msg_id = Some(msg_id);
         let upstream_id = ids.next();
         self.inflight = Some(Inflight {
             upstream_id: upstream_id.clone(),
@@ -213,6 +258,7 @@ impl TurnCore {
                     out.push(Action::NotifySteerUnconsumed { viewer, message_id });
                 }
                 if self.inflight.is_none() {
+                    self.current_prompt_msg_id = None;
                     out.extend(self.dispatch_parked(ids));
                 }
             }
@@ -236,6 +282,7 @@ impl TurnCore {
         }
         if let Some(run) = crate::rpc::busy_run_id(frame) {
             self.run = Some(run);
+            self.current_prompt_msg_id = None;
         } else {
             self.run = None;
         }
@@ -270,6 +317,7 @@ impl TurnCore {
             turn,
         }];
         if self.run.is_none() {
+            self.current_prompt_msg_id = None;
             out.extend(self.dispatch_parked(ids));
         }
         out
@@ -293,6 +341,7 @@ impl TurnCore {
             turn: None,
         }];
         if self.run.is_none() {
+            self.current_prompt_msg_id = None;
             out.extend(self.dispatch_parked(ids));
         }
         out
@@ -322,6 +371,7 @@ impl TurnCore {
             turn: None,
         }];
         if self.run.is_none() {
+            self.current_prompt_msg_id = None;
             out.extend(self.dispatch_parked(ids));
         }
         out
@@ -331,7 +381,11 @@ impl TurnCore {
         if self.parked.is_empty() {
             return vec![];
         }
-        let (owners, params) = self.parked.remove(0);
+        let (owners, mut params) = self.parked.remove(0);
+        let msg_id = prompt_message_id(&params)
+            .map(String::from)
+            .unwrap_or_else(|| stamp_prompt_message_id(&mut params));
+        self.current_prompt_msg_id = Some(msg_id);
         let upstream_id = ids.next();
         self.inflight = Some(Inflight {
             upstream_id: upstream_id.clone(),
@@ -372,6 +426,7 @@ impl TurnCore {
 
     pub fn interrupt(&mut self, reason: &str) -> Vec<Action> {
         self.run = None;
+        self.current_prompt_msg_id = None;
         self.cancel_pending = false;
         self.steers.clear();
         self.consumed_steers.clear();
@@ -588,13 +643,17 @@ mod tests {
 
         let owner1 = make_owner(Some(1), 10, Some("req_1"));
         let p1_actions = core.on_prompt(owner1.clone(), json!({"prompt": "first"}), &mut ids);
-        assert_eq!(
-            p1_actions,
-            vec![Action::SendPrompt {
-                upstream_id: "hk1-1".into(),
-                params: json!({"prompt": "first"}),
-            }]
-        );
+        assert_eq!(p1_actions.len(), 1);
+        let Action::SendPrompt {
+            upstream_id,
+            params,
+        } = &p1_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id, "hk1-1");
+        assert_eq!(params["prompt"], "first");
+        assert!(prompt_message_id(params).is_some());
 
         let owner2 = make_owner(Some(2), 20, Some("req_2"));
         let p2_actions = core.on_prompt(owner2.clone(), json!({"prompt": "second"}), &mut ids);
@@ -603,14 +662,19 @@ mod tests {
 
         let run_actions = core.on_run_state(Some("run_1".into()), &mut ids);
         assert_eq!(core.run.as_deref(), Some("run_1"));
-        assert_eq!(
-            run_actions,
-            vec![Action::SynthUser {
-                params: json!({"prompt": "first"}),
-                owner: owner1.clone(),
-                upstream_id: Some("hk1-1".into()),
-            }]
-        );
+        assert_eq!(run_actions.len(), 1);
+        let Action::SynthUser {
+            params,
+            owner,
+            upstream_id,
+        } = &run_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id.as_deref(), Some("hk1-1"));
+        assert_eq!(owner, &owner1);
+        assert_eq!(params["prompt"], "first");
+        assert!(prompt_message_id(params).is_some());
         assert_eq!(core.parked.len(), 1);
 
         // Run ends
@@ -623,28 +687,33 @@ mod tests {
             "result": {"text": "done"},
         });
         let reply_actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert_eq!(reply_actions.len(), 2);
         assert_eq!(
-            reply_actions,
-            vec![
-                Action::Reply {
-                    owners: vec![owner1],
-                    body: Reply::Result(json!({"text": "done"})),
-                    user_text: Some("first".to_string()),
-                    prompt_index: Some(0),
-                    turn: Some(TurnMeta {
-                        upstream_id: "hk1-1".into(),
-                        client_req_ids: vec!["req_1".into()],
-                        prompt_text: "first".into(),
-                        run_id: Some("run_1".into()),
-                        honk_reason: None,
-                    }),
-                },
-                Action::SendPrompt {
-                    upstream_id: "hk1-2".into(),
-                    params: json!({"prompt": "second"}),
-                },
-            ]
+            reply_actions[0],
+            Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Result(json!({"text": "done"})),
+                user_text: Some("first".to_string()),
+                prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-1".into(),
+                    client_req_ids: vec!["req_1".into()],
+                    prompt_text: "first".into(),
+                    run_id: Some("run_1".into()),
+                    honk_reason: None,
+                }),
+            }
         );
+        let Action::SendPrompt {
+            upstream_id,
+            params,
+        } = &reply_actions[1]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id, "hk1-2");
+        assert_eq!(params["prompt"], "second");
+        assert!(prompt_message_id(params).is_some());
         assert!(core.parked.is_empty());
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
     }
@@ -669,28 +738,34 @@ mod tests {
         });
         let actions = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
 
+        assert_eq!(actions.len(), 2);
         assert_eq!(
-            actions,
-            vec![
-                Action::Reply {
-                    owners: vec![owner1],
-                    body: Reply::Result(json!({"text": "done"})),
-                    user_text: Some("first".into()),
-                    prompt_index: Some(0),
-                    turn: Some(TurnMeta {
-                        upstream_id: "hk1-1".into(),
-                        client_req_ids: vec!["req_1".into()],
-                        prompt_text: "first".into(),
-                        run_id: None,
-                        honk_reason: None,
-                    }),
-                },
-                Action::SendPrompt {
-                    upstream_id: "hk1-2".into(),
-                    params: json!({"prompt": "second"}),
-                },
-            ]
+            actions[0],
+            Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Result(json!({"text": "done"})),
+                user_text: Some("first".into()),
+                prompt_index: Some(0),
+                turn: Some(TurnMeta {
+                    upstream_id: "hk1-1".into(),
+                    client_req_ids: vec!["req_1".into()],
+                    prompt_text: "first".into(),
+                    run_id: None,
+                    honk_reason: None,
+                }),
+            }
         );
+        let Action::SendPrompt {
+            upstream_id,
+            params,
+        } = &actions[1]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id, "hk1-2");
+        assert_eq!(params["prompt"], "second");
+        assert!(prompt_message_id(params).is_some());
+
         assert!(core.parked.is_empty());
         assert!(core.run.is_none());
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
@@ -751,17 +826,20 @@ mod tests {
 
         // Run announcement arrives
         let run_actions = core.on_run_state(Some("run_1".into()), &mut ids);
-        assert_eq!(
-            run_actions,
-            vec![
-                Action::SynthUser {
-                    params: json!({"prompt": "hi"}),
-                    owner,
-                    upstream_id: Some("hk1-1".into()),
-                },
-                Action::SendCancel,
-            ]
-        );
+        assert_eq!(run_actions.len(), 2);
+        let Action::SynthUser {
+            params,
+            owner: syn_owner,
+            upstream_id,
+        } = &run_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(params["prompt"], "hi");
+        assert!(prompt_message_id(params).is_some());
+        assert_eq!(syn_owner, &owner);
+        assert_eq!(upstream_id.as_deref(), Some("hk1-1"));
+        assert_eq!(run_actions[1], Action::SendCancel);
         assert!(!core.cancel_pending);
     }
 
@@ -903,7 +981,8 @@ mod tests {
         assert_eq!(p.upstream_id, "hk1-1");
         // Deduplicated preserving order: req_1 was seen first, then req_2.
         assert_eq!(p.client_req_ids, vec!["req_1", "req_2"]);
-        assert_eq!(p.params, json!({"prompt": "hi"}));
+        assert_eq!(p.params["prompt"], "hi");
+        assert!(prompt_message_id(&p.params).is_some());
         assert!(!p.announced);
         assert_eq!(p.prompt_index, 0);
 
@@ -971,14 +1050,19 @@ mod tests {
 
         // p2 is announced -> MUST NOT emit SendCancel
         let run_actions = core.on_run_state(Some("run_2".into()), &mut ids);
-        assert_eq!(
-            run_actions,
-            vec![Action::SynthUser {
-                params: json!({"prompt": "p2"}),
-                owner: owner2,
-                upstream_id: Some("hk1-2".into()),
-            }]
-        );
+        assert_eq!(run_actions.len(), 1);
+        let Action::SynthUser {
+            params,
+            owner: syn_owner,
+            upstream_id,
+        } = &run_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(params["prompt"], "p2");
+        assert!(prompt_message_id(params).is_some());
+        assert_eq!(syn_owner, &owner2);
+        assert_eq!(upstream_id.as_deref(), Some("hk1-2"));
         assert!(!core.cancel_pending);
     }
 
@@ -1115,13 +1199,17 @@ mod tests {
         let end_actions = core.on_run_state(None, &mut ids);
         assert!(core.run.is_none());
         // Parked prompt 2 is now dispatched!
-        assert_eq!(
-            end_actions,
-            vec![Action::SendPrompt {
-                upstream_id: "hk1-2".into(),
-                params: json!({"prompt": "p2"}),
-            }]
-        );
+        assert_eq!(end_actions.len(), 1);
+        let Action::SendPrompt {
+            upstream_id,
+            params,
+        } = &end_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id, "hk1-2");
+        assert_eq!(params["prompt"], "p2");
+        assert!(prompt_message_id(params).is_some());
         assert!(core.parked.is_empty());
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
     }
@@ -1141,22 +1229,27 @@ mod tests {
         let err = json!({"code": -32603, "message": "network error"});
         let actions = core.on_prompt_send_failed("hk1-1", err.clone(), &mut ids);
 
+        assert_eq!(actions.len(), 2);
         assert_eq!(
-            actions,
-            vec![
-                Action::Reply {
-                    owners: vec![owner1],
-                    body: Reply::Error(err),
-                    user_text: None,
-                    prompt_index: Some(0),
-                    turn: None,
-                },
-                Action::SendPrompt {
-                    upstream_id: "hk1-2".into(),
-                    params: json!({"prompt": "p2"}),
-                },
-            ]
+            actions[0],
+            Action::Reply {
+                owners: vec![owner1],
+                body: Reply::Error(err),
+                user_text: None,
+                prompt_index: Some(0),
+                turn: None,
+            }
         );
+        let Action::SendPrompt {
+            upstream_id,
+            params,
+        } = &actions[1]
+        else {
+            panic!()
+        };
+        assert_eq!(upstream_id, "hk1-2");
+        assert_eq!(params["prompt"], "p2");
+        assert!(prompt_message_id(params).is_some());
         assert_eq!(core.inflight.as_ref().unwrap().upstream_id, "hk1-2");
         assert!(core.parked.is_empty());
         assert!(!core.cancel_pending);
@@ -1246,14 +1339,19 @@ mod tests {
             core.inflight.as_ref().unwrap().run_id.as_deref(),
             Some("run_123")
         );
-        assert_eq!(
-            run_actions,
-            vec![Action::SynthUser {
-                params: json!({"prompt": "hello"}),
-                owner: make_owner(Some(1), 10, Some("req_1")),
-                upstream_id: Some("hk1-1".into()),
-            }]
-        );
+        assert_eq!(run_actions.len(), 1);
+        let Action::SynthUser {
+            params,
+            owner: syn_owner,
+            upstream_id,
+        } = &run_actions[0]
+        else {
+            panic!()
+        };
+        assert_eq!(params["prompt"], "hello");
+        assert!(prompt_message_id(params).is_some());
+        assert_eq!(syn_owner, &make_owner(Some(1), 10, Some("req_1")));
+        assert_eq!(upstream_id.as_deref(), Some("hk1-1"));
 
         // Later run state update while in-flight still exists
         let _ = core.on_run_state(Some("run_456".into()), &mut ids);
@@ -1732,5 +1830,176 @@ mod tests {
             panic!("not_delivered replies: {actions:?}");
         };
         assert_eq!(turn_outcome(body, turn.as_ref(), *prompt_index), None);
+    }
+
+    #[test]
+    fn test_stamp_prompt_message_id_shape() {
+        let mut params = json!({
+            "prompt": "hello",
+            "_meta": {
+                "goose": {
+                    "maxTurns": 10,
+                    "messageId": "caller_supplied_id"
+                },
+                "honk": {
+                    "client_req_id": "crid_1"
+                }
+            }
+        });
+        let id = stamp_prompt_message_id(&mut params);
+        assert!(id.starts_with("msg_honk_"));
+        assert_eq!(id.len(), "msg_honk_".len() + 32);
+        let hex_part = &id["msg_honk_".len()..];
+        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Overwrote caller-supplied id
+        assert_eq!(params["_meta"]["goose"]["messageId"].as_str().unwrap(), id);
+        // Preserved maxTurns and honk meta
+        assert_eq!(params["_meta"]["goose"]["maxTurns"], 10);
+        assert_eq!(params["_meta"]["honk"]["client_req_id"], "crid_1");
+    }
+
+    #[test]
+    fn test_stamp_prompt_message_id_non_object_meta() {
+        // String _meta
+        let mut params1 = json!({
+            "prompt": "hello",
+            "_meta": "not an object"
+        });
+        let id1 = stamp_prompt_message_id(&mut params1);
+        assert!(id1.starts_with("msg_honk_"));
+        assert_eq!(
+            params1["_meta"]["goose"]["messageId"].as_str().unwrap(),
+            id1
+        );
+
+        // Non-object _meta.goose
+        let mut params2 = json!({
+            "prompt": "hello",
+            "_meta": {
+                "goose": 42
+            }
+        });
+        let id2 = stamp_prompt_message_id(&mut params2);
+        assert!(id2.starts_with("msg_honk_"));
+        assert_eq!(
+            params2["_meta"]["goose"]["messageId"].as_str().unwrap(),
+            id2
+        );
+
+        // Empty params
+        let mut params3 = json!({});
+        let id3 = stamp_prompt_message_id(&mut params3);
+        assert!(id3.starts_with("msg_honk_"));
+        assert_eq!(
+            params3["_meta"]["goose"]["messageId"].as_str().unwrap(),
+            id3
+        );
+    }
+
+    #[test]
+    fn test_on_prompt_injects_message_id_and_parked_prompt_keeps_id() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner1 = make_owner(Some(1), 10, Some("req_1"));
+        let owner2 = make_owner(Some(2), 20, Some("req_2"));
+
+        let prompt1_params = json!({"prompt": "first"});
+        let actions = core.on_prompt(owner1, prompt1_params, &mut ids);
+
+        assert_eq!(actions.len(), 1);
+        let id1 = match &actions[0] {
+            Action::SendPrompt { params, .. } => {
+                prompt_message_id(params).expect("id injected").to_string()
+            }
+            other => panic!("expected SendPrompt, got {other:?}"),
+        };
+        assert!(id1.starts_with("msg_honk_"));
+        assert_eq!(core.current_prompt_msg_id(), Some(id1.as_str()));
+        assert_eq!(
+            core.inflight.as_ref().unwrap().message_id(),
+            Some(id1.as_str())
+        );
+
+        // Second prompt while inflight is parked
+        let prompt2_params = json!({
+            "prompt": "second",
+            "_meta": { "goose": { "maxTurns": 5 } }
+        });
+        let actions2 = core.on_prompt(owner2, prompt2_params, &mut ids);
+        assert!(actions2.is_empty());
+        assert_eq!(core.parked.len(), 1);
+
+        // Check parked prompt already has injected id
+        let parked_id = prompt_message_id(&core.parked[0].1)
+            .expect("parked prompt already stamped")
+            .to_string();
+        assert!(parked_id.starts_with("msg_honk_"));
+        assert_ne!(id1, parked_id);
+        assert_eq!(core.parked[0].1["_meta"]["goose"]["maxTurns"], 5);
+
+        // current_prompt_msg_id is still first prompt
+        assert_eq!(core.current_prompt_msg_id(), Some(id1.as_str()));
+
+        // Reply finishes first prompt and dispatches parked prompt
+        let reply_actions = core.on_prompt_reply("hk1-1", &json!({"result": {}}), &mut ids);
+        // Dispatched parked prompt should be in reply_actions
+        let dispatched = reply_actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendPrompt { params, .. } => Some(params),
+                _ => None,
+            })
+            .expect("dispatched parked prompt");
+
+        let dispatched_id = prompt_message_id(dispatched).expect("id present");
+        assert_eq!(dispatched_id, parked_id);
+        assert_eq!(core.current_prompt_msg_id(), Some(parked_id.as_str()));
+    }
+
+    #[test]
+    fn test_current_prompt_msg_id_survives_reply_while_run_active() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let actions = core.on_prompt(owner, json!({"prompt": "p"}), &mut ids);
+        let Action::SendPrompt { params, .. } = &actions[0] else {
+            panic!("expected SendPrompt");
+        };
+        let prompt_id = prompt_message_id(params).unwrap().to_string();
+        assert_eq!(core.current_prompt_msg_id(), Some(prompt_id.as_str()));
+
+        // Run announces
+        let _ = core.on_run_state(Some("r1".to_string()), &mut ids);
+        assert_eq!(core.current_prompt_msg_id(), Some(prompt_id.as_str()));
+
+        // Run ends
+        let _ = core.on_run_state(None, &mut ids);
+        // Prompt is still inflight (no reply yet) -> current_prompt_msg_id is still Some
+        assert_eq!(core.current_prompt_msg_id(), Some(prompt_id.as_str()));
+
+        // Prompt reply arrives -> turn ends -> current_prompt_msg_id becomes None
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "hk1-1",
+            "result": {"text": "done"},
+        });
+        let _ = core.on_prompt_reply("hk1-1", &reply_frame, &mut ids);
+        assert_eq!(core.current_prompt_msg_id(), None);
+    }
+
+    #[test]
+    fn test_current_prompt_msg_id_cleared_on_interrupt() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let _ = core.on_prompt(owner, json!({"prompt": "p"}), &mut ids);
+        assert!(core.current_prompt_msg_id().is_some());
+
+        let _ = core.interrupt("cancelled");
+        assert_eq!(core.current_prompt_msg_id(), None);
     }
 }
