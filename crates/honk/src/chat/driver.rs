@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -48,6 +48,8 @@ pub struct DriverOpts {
     pub no_swarm: bool,
     /// When set, the initial model to set after session/new.
     pub model: Option<String>,
+    /// When set, the directory to store/load recent models in.
+    pub recent_dir: Option<PathBuf>,
 }
 
 impl DriverOpts {
@@ -63,6 +65,7 @@ impl DriverOpts {
             tag: None,
             no_swarm: false,
             model: None,
+            recent_dir: None,
         }
     }
 }
@@ -326,6 +329,16 @@ enum EffectAction {
     Exit,
 }
 
+fn record_recent_model(recent_dir: Option<&Path>, id: &str) {
+    let res = match recent_dir {
+        Some(dir) => crate::chat::recent::record_in(dir, id),
+        None => crate::chat::recent::record(id),
+    };
+    if let Err(e) = res {
+        tracing::warn!("failed to record recent model {id}: {e}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_effects(
     effects: Vec<Effect>,
@@ -338,6 +351,7 @@ async fn process_effects(
     connection_state: &mut ConnectionState,
     list_paging: &mut ListPagingState,
     known_cwd: &mut Option<String>,
+    recent_dir: Option<&Path>,
 ) -> EffectAction {
     for effect in effects {
         match effect {
@@ -440,9 +454,7 @@ async fn process_effects(
                 return EffectAction::Reattach;
             }
             Effect::RecordRecentModel(id) => {
-                if let Err(e) = crate::chat::recent::record(&id) {
-                    tracing::warn!("failed to record recent model {id}: {e}");
-                }
+                record_recent_model(recent_dir, &id);
             }
             Effect::ModelList {
                 current,
@@ -829,9 +841,7 @@ async fn run_driver(
                             } else {
                                 let res = frame.get("result").cloned().unwrap_or(Value::Null);
                                 model_config_options = Some(res);
-                                if let Err(e) = crate::chat::recent::record(model_id) {
-                                    tracing::warn!("failed to record recent model {model_id}: {e}");
-                                }
+                                record_recent_model(opts.recent_dir.as_deref(), model_id);
                             }
                         }
                         Ok(Err(e)) => {
@@ -911,6 +921,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -945,6 +956,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -979,6 +991,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -1190,6 +1203,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -1285,6 +1299,7 @@ async fn run_driver(
                                 &mut connection_state,
                                 &mut list_paging,
                                 &mut known_cwd,
+                                opts.recent_dir.as_deref(),
                             ).await;
                             if matches!(action, EffectAction::Exit) {
                                 return;
@@ -1337,6 +1352,7 @@ async fn run_driver(
                     &mut connection_state,
                     &mut list_paging,
                     &mut known_cwd,
+                    opts.recent_dir.as_deref(),
                 ).await;
                 if matches!(action, EffectAction::Exit) {
                     return;

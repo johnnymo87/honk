@@ -4112,9 +4112,7 @@ async fn test_new_session_swarm_meta_pending_skips_enable_and_shows_no_error() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
     let temp_xdg = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", temp_xdg.path());
-    }
+    let recent_dir = temp_xdg.path().join("honk");
 
     let (url, server_task) = fake_ws_server(|listener| {
         Box::pin(async move {
@@ -4208,6 +4206,7 @@ async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
     );
     opts.no_swarm = true;
     opts.model = Some("gemini-3.8-flash".into());
+    opts.recent_dir = Some(recent_dir.clone());
 
     let (handle, mut rx) = start(opts).await.unwrap();
 
@@ -4229,7 +4228,7 @@ async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
     }
 
     assert_eq!(model_in_state.as_deref(), Some("gemini-3.8-flash"));
-    let recents = honk::chat::recent::load_from(&temp_xdg.path().join("honk"));
+    let recents = honk::chat::recent::load_from(&recent_dir);
     assert_eq!(recents, vec!["gemini-3.8-flash".to_string()]);
 
     let _ = handle.send(UiCommand::Shutdown);

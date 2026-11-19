@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -41,6 +42,8 @@ pub struct App {
     pub pending_dump: bool,
     /// First visible visual row of the composer (see `tui::composer`).
     pub composer_scroll: usize,
+    /// When set, the directory to store/load recent models in.
+    pub recent_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -75,6 +78,14 @@ impl App {
             last_transcript_area: Rect::new(0, 0, 80, 24),
             pending_dump: false,
             composer_scroll: 0,
+            recent_dir: None,
+        }
+    }
+
+    fn load_recent(&self) -> Vec<String> {
+        match &self.recent_dir {
+            Some(dir) => crate::chat::recent::load_from(dir),
+            None => crate::chat::recent::load(),
         }
     }
 
@@ -232,7 +243,7 @@ impl App {
                 let _ = self.cmd_tx.send(UiCommand::Line("/model".into()));
             }
             Action::CycleModelNext => {
-                let recent = crate::chat::recent::load();
+                let recent = self.load_recent();
                 let current = self
                     .state_snapshot
                     .as_ref()
@@ -253,7 +264,7 @@ impl App {
                 }
             }
             Action::CycleModelPrev => {
-                let recent = crate::chat::recent::load();
+                let recent = self.load_recent();
                 let current = self
                     .state_snapshot
                     .as_ref()
@@ -568,7 +579,7 @@ impl App {
                 warning: _,
             } => {
                 self.pending_prefix = None;
-                let recent = crate::chat::recent::load();
+                let recent = self.load_recent();
                 self.model_picker = Some(ModelPicker::new(current, models, recent));
             }
         }
@@ -1703,9 +1714,7 @@ mod tests {
         });
 
         let temp = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", temp.path());
-        }
+        app.recent_dir = Some(temp.path().join("honk"));
 
         app.handle_key(key(KeyCode::F(2)));
         assert!(cmd_rx.try_recv().is_err());
@@ -1736,9 +1745,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-2").unwrap();
         crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-1").unwrap();
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", temp.path());
-        }
+        app.recent_dir = Some(temp.path().join("honk"));
 
         // F2 -> next after model-1 is model-2
         app.handle_key(key(KeyCode::F(2)));
