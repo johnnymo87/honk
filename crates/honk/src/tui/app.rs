@@ -128,8 +128,11 @@ impl App {
                 PickerOutcome::Stay => {
                     self.model_picker = Some(picker);
                 }
-                PickerOutcome::Close => {}
+                PickerOutcome::Close => {
+                    self.pending_prefix = None;
+                }
                 PickerOutcome::Select(id) => {
+                    self.pending_prefix = None;
                     let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
                 }
             }
@@ -564,6 +567,7 @@ impl App {
                 models,
                 warning: _,
             } => {
+                self.pending_prefix = None;
                 let recent = crate::chat::recent::load();
                 self.model_picker = Some(ModelPicker::new(current, models, recent));
             }
@@ -1629,6 +1633,42 @@ mod tests {
 
         let cmd = cmd_rx.try_recv().expect("expected /model command");
         assert_eq!(cmd, UiCommand::Line("/model model-b".to_string()));
+    }
+
+    #[test]
+    fn test_picker_clears_pending_prefix_on_open_and_close() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_prefix", cmd_tx);
+
+        // 1. Prefix is cleared when picker opens
+        app.pending_prefix = Some('z');
+        app.handle_ui_event(UiEvent::ModelList {
+            current: None,
+            models: vec![],
+            warning: None,
+        });
+        assert_eq!(app.pending_prefix, None);
+
+        // 2. Prefix is cleared when picker closes via Esc
+        app.pending_prefix = Some('\x18');
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.pending_prefix, None);
+
+        // 3. Prefix is cleared when picker closes via Enter (Select)
+        app.handle_ui_event(UiEvent::ModelList {
+            current: None,
+            models: vec![crate::chat::types::ModelItem {
+                id: "m1".to_string(),
+                name: "m1".to_string(),
+                source: "goose".to_string(),
+            }],
+            warning: None,
+        });
+        app.pending_prefix = Some('g');
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.pending_prefix, None);
     }
 
     #[test]

@@ -111,12 +111,12 @@ pub fn resolve(
         return Action::PendingPrefix('\x18');
     }
 
-    if key_event.code == KeyCode::F(2) {
-        if key_event.modifiers == KeyModifiers::SHIFT {
-            return Action::CycleModelPrev;
-        } else if key_event.modifiers.is_empty() {
-            return Action::CycleModelNext;
-        }
+    if (key_event.code == KeyCode::F(2) && key_event.modifiers == KeyModifiers::SHIFT)
+        || (key_event.code == KeyCode::F(14) && key_event.modifiers.is_empty())
+    {
+        return Action::CycleModelPrev;
+    } else if key_event.code == KeyCode::F(2) && key_event.modifiers.is_empty() {
+        return Action::CycleModelNext;
     }
 
     match mode {
@@ -765,6 +765,17 @@ mod tests {
         );
         assert_eq!(
             resolve(EditorMode::Insert, false, shift_f2, None, false),
+            Action::CycleModelPrev
+        );
+
+        // F(14) without modifiers (Shift+F2 on xterm/tmux without kitty keyboard protocol)
+        let f14 = key(KeyCode::F(14));
+        assert_eq!(
+            resolve(EditorMode::Normal, true, f14, None, false),
+            Action::CycleModelPrev
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, f14, None, false),
             Action::CycleModelPrev
         );
     }

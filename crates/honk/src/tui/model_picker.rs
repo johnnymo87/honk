@@ -255,11 +255,12 @@ impl ModelPicker {
     }
 
     pub fn popup_area(&self, area: Rect) -> Rect {
-        let width = (area.width.saturating_sub(4)).clamp(30, 65);
+        if area.width == 0 || area.height == 0 {
+            return Rect::default();
+        }
+        let width = area.width.saturating_sub(4).clamp(30, 65).min(area.width);
         let desired_height = (self.rows.len() as u16 + 4).max(7);
-        let height = desired_height
-            .min(18)
-            .min(area.height.saturating_sub(2).max(1));
+        let height = desired_height.min(18).min(area.height);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         Rect::new(x, y, width, height)
@@ -267,7 +268,7 @@ impl ModelPicker {
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
         let popup = self.popup_area(area);
-        if popup.width < 4 || popup.height < 3 {
+        if popup.width < 6 || popup.height < 4 {
             return None;
         }
         let inner_x = popup.x + 1;
@@ -657,5 +658,39 @@ mod tests {
         let sel = picker.selected.unwrap();
         assert!(sel >= picker.scroll_offset);
         assert!(picker.scroll_offset > 0);
+    }
+
+    #[test]
+    fn test_picker_tiny_buffer_no_panic() {
+        let models = sample_models();
+        let mut picker = ModelPicker::new(None, models, vec![]);
+
+        // 20x5 buffer (narrow width < 30): bounded within buffer, renders without panic
+        let area20x5 = Rect::new(0, 0, 20, 5);
+        let popup20x5 = picker.popup_area(area20x5);
+        assert!(popup20x5.right() <= area20x5.right());
+        assert!(popup20x5.bottom() <= area20x5.bottom());
+        let mut buf20x5 = Buffer::empty(area20x5);
+        picker.render(area20x5, &mut buf20x5);
+        let cursor20x5 = picker.cursor_position(area20x5);
+        if let Some((cx, cy)) = cursor20x5 {
+            assert!(cx < area20x5.right());
+            assert!(cy < area20x5.bottom());
+        }
+
+        // 8x3 buffer: too small, bails cleanly without panic
+        let area8x3 = Rect::new(0, 0, 8, 3);
+        let popup8x3 = picker.popup_area(area8x3);
+        assert!(popup8x3.right() <= area8x3.right());
+        assert!(popup8x3.bottom() <= area8x3.bottom());
+        let mut buf8x3 = Buffer::empty(area8x3);
+        picker.render(area8x3, &mut buf8x3);
+        assert_eq!(picker.cursor_position(area8x3), None);
+
+        // 0x0 buffer: bails cleanly
+        let area0 = Rect::new(0, 0, 0, 0);
+        let mut buf0 = Buffer::empty(area0);
+        picker.render(area0, &mut buf0);
+        assert_eq!(picker.cursor_position(area0), None);
     }
 }
