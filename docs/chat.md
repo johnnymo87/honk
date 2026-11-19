@@ -285,7 +285,9 @@ honk telegram 20261016_7
 After sending the prompt, `honk launch` auto-opens the new session in a new nvim/tmux tab running `honk chat <id>`:
 
 - **Mechanism**: Spawns `oc-auto-attach [--tmux-session <name>] goose:<id>` in its own process group with stdin null and stdout/stderr appended to `/tmp/oc-auto-attach.log` (overridable via `HONK_AUTO_ATTACH_LOG`).
-- **Target session**: Passes `--tmux-session <name>` if provided; defaults to the current nvim/tmux session.
+- **Target session**: Passes `--tmux-session <name>` if provided; otherwise the tab opens in tmux session `main`.
+- **Timing**: `oc-auto-attach` waits up to `OC_AA_GOOSE_GRACE_SECS` (default 10) for goose to list the new session, which it does only once the first user message is persisted (honk-9qf.9). `started` means the spawn succeeded, not that a tab opened; why one did not is in the log.
+- **Automated launchers should opt out.** An open tab is a viewer, and honkd never idle-evicts a session with a viewer, so every auto-opened session stays loaded in goose serve until its tab is closed. The stall-watch goose worker recipe sets `HONK_LAUNCH_NO_ATTACH=1`, as opencode workers pass `--no-attach`.
 - **Environment scrubbing**: `OPENCODE_SESSION_ID` and `AGENT_SESSION_ID` are scrubbed from the spawned process environment so a new tmux server will not capture the launcher's session ID.
 - **Binary resolution**: Runs `$HONK_AUTO_ATTACH_BIN` if set and non-empty, otherwise resolves `oc-auto-attach` from `$PATH`. If not found, auto-attach is skipped with a stderr message.
 - **Opting out**: Pass `--no-attach` or set `HONK_LAUNCH_NO_ATTACH` to a truthy value (`1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON`). Other values like `0` do not disable auto-attach.

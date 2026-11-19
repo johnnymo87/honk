@@ -15,8 +15,13 @@ Verified 2026-11-19 against origin/main (workstation cca5a0f0, honk 0ecf5e6).
 | pigeon remote-launch receiver (`swarm_launch` from another machine) | none: the receiver only creates opencode sessions | no |
 | pigeon revive-and-deliver | none: honkd is durable | no |
 
-Unchanged by design: lgtm and stall-watch workers pass `--no-attach`;
-stall-watch coordinators are created over honk transport, not by a launcher.
+Unchanged by design: lgtm passes `--no-attach` to opencode-launch and runs goose
+via `goose run`, not `honk launch`; stall-watch coordinators are created over
+honk transport, not by a launcher. Stall-watch *goose* workers DO go through
+`honk launch` (eng-agent-platform stallwatch/sw_skill/SKILL.md), so their recipe
+gains `HONK_LAUNCH_NO_ATTACH=1` (safe in either deploy order: an older honk
+ignores the env var, whereas it would reject `--no-attach`). That must land
+before the honk change deploys.
 
 The open itself already exists: `oc-auto-attach goose:<id>` resolves the cwd
 from `honk list --json` and RPCs nvim's `user.oc_auto_attach.open` with
@@ -89,7 +94,13 @@ the single `honk list --json` with a poll:
 
 ## Delivery
 
-Three PRs, independent (any order): workstation (1), honk (2), pigeon (3). Each
+Four PRs: workstation (1), honk (2), pigeon (3), and eng-agent-platform (the
+stall-watch goose recipe's `HONK_LAUNCH_NO_ATTACH=1`). Safe in any merge order,
+with two constraints: the eng-agent-platform change ships before the honk bump,
+and the end-to-end check needs workstation's grace poll live. pigeon-daemon runs
+the oc-auto-attach pinned in the NixOS system config (`OC_AUTO_ATTACH_BIN`), so
+for the Telegram path that means a `nixos-rebuild switch` plus a pigeon-daemon
+restart, not just a home-manager switch. Each
 gets an adversarial review before opening. No merge, deploy, home-manager switch
 or restart without Jonathan's OK. After deploy, verify end to end: `honk launch`
 on a throwaway prompt opens a tab; `/launch --backend goose` from Telegram opens
