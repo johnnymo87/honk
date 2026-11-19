@@ -94,7 +94,8 @@ The user interface consists of three distinct vertical areas:
 3. **Composer / Command Bar** (bottom):
    - Multiline editor with modal vim navigation.
    - Long lines wrap at the screen edge. The composer grows with the number of wrapped rows,
-     up to 8; taller input scrolls to keep the cursor visible.
+     up to 8; taller input scrolls to keep the cursor visible. `zm` maximizes it (all but the
+     status bar and 3 transcript rows) until you toggle it back or send.
    - Pasted text keeps its line breaks (the CR or CRLF that terminals and tmux send become
      newlines). In insert mode it goes in at the cursor, as if typed.
    - Pressing `:` in normal mode switches to a single-line command bar for executing commands.
@@ -135,9 +136,10 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `z a` | Toggle tool call expansion (expand/collapse tool arguments and outputs). |
 | `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
 | `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
+| `z m` | Toggle a maximized composer. `/quote` turns it on; sending or clearing the composer turns it off. |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
-| `Ctrl-C` | If idle and composer has text: clears composer. Otherwise: interrupts active turn (`Action::Interrupt`). |
+| `Ctrl-C` | If composer has text and honk is idle or the composer is maximized: clears composer (and unmaximizes). Otherwise: interrupts active turn (`Action::Interrupt`). |
 | Standard Vim | `h`, `j`, `k`, `l`, `w`, `b`, `x`, `u`, `dd`, etc. for composer text manipulation. |
 
 ### Command Line Mode (`:`)
@@ -165,6 +167,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
+| `/quote [N]` | `:quote [N]` | Load the last N (default 3) replies into the composer, oldest first, each quoted with `> ` under a `# MM-DD HH:MM (trigger)` header, and maximize the composer in normal mode. A turn counts only if the agent wrote reply text in it; thoughts, tool calls and the message that started the turn (a stall-watch wake, a swarm message, or your own prompt) are left out, and `/compact` turns are skipped. N is capped at 50. The trigger is `you`, `wake: <reason>`, `swarm: <sender>`, `scheduled`, `goose` (a prompt goose wrote itself), or `start`; `in progress` marks a reply still streaming. `/quote` replaces the composer; `:quote` keeps your draft below the quotes. Never sent upstream. |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
 | — | `:json` | Toggle JSON payload expansion (`zj`). |

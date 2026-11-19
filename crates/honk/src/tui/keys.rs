@@ -15,6 +15,7 @@ pub enum Action {
     ToggleTools,
     ToggleThoughts,
     ToggleJson,
+    ToggleMaximize,
     OpenCommand,
     HistoryPrev,
     HistoryNext,
@@ -77,6 +78,7 @@ pub fn resolve(
                         KeyCode::Char('a') => return Action::ToggleTools,
                         KeyCode::Char('t') => return Action::ToggleThoughts,
                         KeyCode::Char('j') => return Action::ToggleJson,
+                        KeyCode::Char('m') => return Action::ToggleMaximize,
                         _ => return Action::Edtui(key_event),
                     }
                 }
@@ -448,6 +450,19 @@ mod tests {
             ),
             Action::ToggleJson
         );
+        // 'm' with prefix 'z' -> ToggleMaximize, whether or not the composer is empty
+        for empty in [true, false] {
+            assert_eq!(
+                resolve(
+                    EditorMode::Normal,
+                    empty,
+                    key(KeyCode::Char('m')),
+                    Some('z'),
+                    false
+                ),
+                Action::ToggleMaximize
+            );
+        }
         // any other key with prefix 'z' -> Edtui
         let x_event = key(KeyCode::Char('x'));
         assert_eq!(
