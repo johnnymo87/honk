@@ -155,6 +155,7 @@ pub struct StateSnapshot {
     pub prompt_in_flight: bool,
     pub connection: ConnectionState,
     pub mcp_enabled: Vec<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +304,7 @@ fn maybe_emit_state(
         prompt_in_flight: core.prompt_in_flight(),
         connection: connection.clone(),
         mcp_enabled: core.mcp_enabled().to_vec(),
+        model: core.model().map(str::to_string),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -511,6 +513,7 @@ async fn run_driver(
         prompt_in_flight: false,
         connection: connection_state.clone(),
         mcp_enabled: Vec::new(),
+        model: None,
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
@@ -762,7 +765,10 @@ async fn run_driver(
                 }
             }
 
-            ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
+            let mut core =
+                ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids);
+            core.set_config_options(result);
+            core
         }
         Target::Attach(session_id) => ChatCore::new(session_id, chat_opts, Instant::now()),
     };

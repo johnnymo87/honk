@@ -68,6 +68,46 @@ pub fn text_of(update: &Value) -> Option<&str> {
     update.pointer("/content/text").and_then(Value::as_str)
 }
 
+fn config_options_array(config_options: &Value) -> Option<&Vec<Value>> {
+    match config_options {
+        Value::Array(a) => Some(a),
+        Value::Object(o) => o.get("configOptions")?.as_array(),
+        _ => None,
+    }
+}
+
+/// Extracts currentValue for a config option select id (e.g. "model", "provider")
+/// from a configOptions array or an object containing configOptions.
+pub fn config_select_value(config_options: &Value, id: &str) -> Option<String> {
+    let arr = config_options_array(config_options)?;
+    arr.iter()
+        .find(|opt| opt.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|opt| opt.get("currentValue").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// Extracts the list of option values for a config option select id (e.g. "model")
+/// from a configOptions array or an object containing configOptions.
+pub fn config_select_options(config_options: &Value, id: &str) -> Vec<String> {
+    let Some(arr) = config_options_array(config_options) else {
+        return Vec::new();
+    };
+    let Some(opt) = arr
+        .iter()
+        .find(|opt| opt.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return Vec::new();
+    };
+    let Some(options) = opt.get("options").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    options
+        .iter()
+        .filter_map(|o| o.get("value").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Cost {
     pub amount: f64,

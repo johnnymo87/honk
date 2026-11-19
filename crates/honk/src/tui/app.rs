@@ -1219,6 +1219,7 @@ mod tests {
                 reason: "closed".into(),
             },
             mcp_enabled: Vec::new(),
+            model: None,
         });
 
         // Any key sends RetryAttach AND performs normal key
@@ -1277,6 +1278,7 @@ mod tests {
             prompt_in_flight: false,
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
+            model: None,
         });
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
@@ -1318,6 +1320,7 @@ mod tests {
             prompt_in_flight: false,
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
+            model: None,
         }));
 
         let backend = TestBackend::new(100, 20);

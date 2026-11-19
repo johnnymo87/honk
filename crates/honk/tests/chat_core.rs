@@ -4859,3 +4859,188 @@ fn test_mcp_queued_busy_requeues_bounded() {
     assert!(has_notice(&effs, "session is busy; try after this turn"));
     assert_eq!(core.local_queue().len(), 0);
 }
+
+#[test]
+fn test_model_parsed_from_load_result_no_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+
+    let load_reply = json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "result": {
+            "title": "My Goose Session",
+            "configOptions": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "type": "select",
+                    "currentValue": "gcp_vertex_ai",
+                    "options": [{"value": "gcp_vertex_ai", "name": "Google Cloud Vertex AI"}]
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "claude-opus-5-5",
+                    "options": [
+                        {"value": "claude-opus-5-5", "name": "Claude Opus 5.5"},
+                        {"value": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"}
+                    ]
+                }
+            ]
+        }
+    });
+
+    let effs = core.handle(Input::Frame(load_reply));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert_eq!(core.provider(), Some("gcp_vertex_ai"));
+    assert_eq!(
+        core.known_model_ids(),
+        &[
+            "claude-opus-5-5".to_string(),
+            "claude-sonnet-4-6".to_string()
+        ]
+    );
+    // No notice emitted on load
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_model_config_option_update_during_replay_no_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    assert!(core.is_replaying());
+
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [{"value": "claude-opus-5-5"}]
+                    }
+                ]
+            }
+        }
+    });
+
+    let effs = core.handle(Input::Frame(frame));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+
+    // Second update during replay also has no notice
+    let frame2 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+
+    let effs2 = core.handle(Input::Frame(frame2));
+    assert_eq!(core.model(), Some("claude-sonnet-4-6"));
+    assert!(!effs2.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_model_config_option_update_live_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    // End replay
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+    assert!(!core.is_replaying());
+
+    // Initial model learned live when previous was None -> no notice
+    let frame1 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [{"value": "claude-opus-5-5"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs1 = core.handle(Input::Frame(frame1));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert!(!effs1.iter().any(|e| matches!(e, Effect::Notice(_))));
+
+    // Model changes live from claude-opus-5-5 to claude-sonnet-4-6 -> notice
+    let frame2 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs2 = core.handle(Input::Frame(frame2));
+    assert_eq!(core.model(), Some("claude-sonnet-4-6"));
+    let notice = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on live model change");
+    assert_eq!(notice.kind, NoticeKind::Info);
+    assert_eq!(notice.text, "model: claude-opus-5-5 → claude-sonnet-4-6");
+
+    // Same model received again live -> no notice
+    let frame3 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs3 = core.handle(Input::Frame(frame3));
+    assert!(!effs3.iter().any(|e| matches!(e, Effect::Notice(_))));
+}

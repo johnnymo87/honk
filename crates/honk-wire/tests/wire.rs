@@ -2,7 +2,9 @@ use honk_wire::export::{
     client_prompt_entries, client_prompts, export_used_tokens, to_updates, turn_text,
     turn_text_at_index,
 };
-use honk_wire::{BlockKey, Blocks, block_key, run_state};
+use honk_wire::{
+    BlockKey, Blocks, block_key, config_select_options, config_select_value, run_state,
+};
 use serde_json::Value;
 use std::fs::read_to_string;
 
@@ -1029,4 +1031,69 @@ fn test_turn_text_separator_skips_textless_messages_and_tops_up_newlines() {
         turn_text(&session, "prompt").as_deref(),
         Some("first\n\nsecond\n\nthird")
     );
+}
+
+#[test]
+fn test_config_select_helpers() {
+    let opts = serde_json::json!([
+        {
+            "id": "provider",
+            "name": "Provider",
+            "type": "select",
+            "currentValue": "gcp_vertex_ai",
+            "options": [
+                {"value": "gcp_vertex_ai", "name": "Google Cloud Vertex AI"}
+            ]
+        },
+        {
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "currentValue": "claude-opus-5-5",
+            "options": [
+                {"value": "claude-opus-5-5", "name": "Claude Opus 5.5"},
+                {"value": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+                {"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"}
+            ]
+        }
+    ]);
+
+    // Test with array directly
+    assert_eq!(
+        config_select_value(&opts, "provider").as_deref(),
+        Some("gcp_vertex_ai")
+    );
+    assert_eq!(
+        config_select_value(&opts, "model").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(config_select_value(&opts, "missing"), None);
+
+    // Test with object wrapping configOptions
+    let wrapped = serde_json::json!({ "configOptions": opts });
+    assert_eq!(
+        config_select_value(&wrapped, "model").as_deref(),
+        Some("claude-opus-5-5")
+    );
+
+    // Test options extraction
+    let model_options = config_select_options(&opts, "model");
+    assert_eq!(
+        model_options,
+        vec![
+            "claude-opus-5-5".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "gemini-3.8-flash".to_string(),
+        ]
+    );
+
+    let wrapped_options = config_select_options(&wrapped, "model");
+    assert_eq!(wrapped_options, model_options);
+
+    let missing_options = config_select_options(&opts, "missing");
+    assert!(missing_options.is_empty());
+
+    // Null or invalid
+    assert_eq!(config_select_value(&serde_json::Value::Null, "model"), None);
+    assert!(config_select_options(&serde_json::Value::Null, "model").is_empty());
 }

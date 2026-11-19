@@ -3468,6 +3468,7 @@ mod tests {
             prompt_in_flight: false,
             connection: ConnectionState::Reconnecting { attempt: 1 },
             mcp_enabled: Vec::new(),
+            model: None,
         };
         transcript.apply_ui_event(&UiEvent::State(snapshot), &mut viewport);
         assert!(!transcript.is_rebuilding);

@@ -41,6 +41,9 @@ pub struct ChatCore {
     pub(crate) mcp_enabled: Vec<String>,
     pub(crate) mcp_available: bool,
     pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) known_model_ids: Vec<String>,
 }
 
 impl ChatCore {
@@ -92,6 +95,9 @@ impl ChatCore {
             mcp_enabled: Vec::new(),
             mcp_available: true,
             pending_mcp_reqs: HashMap::new(),
+            model: None,
+            provider: None,
+            known_model_ids: Vec::new(),
         }
     }
 
@@ -172,6 +178,49 @@ impl ChatCore {
 
     pub fn mcp_enabled(&self) -> &[String] {
         &self.mcp_enabled
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn known_model_ids(&self) -> &[String] {
+        &self.known_model_ids
+    }
+
+    pub(crate) fn update_model_state(
+        &mut self,
+        val: &Value,
+        allow_notice: bool,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(p) = honk_wire::config_select_value(val, "provider") {
+            self.provider = Some(p);
+        }
+        let opts = honk_wire::config_select_options(val, "model");
+        if !opts.is_empty() {
+            self.known_model_ids = opts;
+        }
+        if let Some(new_m) = honk_wire::config_select_value(val, "model") {
+            if allow_notice
+                && !self.is_replaying
+                && let Some(ref old_m) = self.model
+                && old_m != &new_m
+            {
+                effects.push(Effect::Notice(Notice::info(format!(
+                    "model: {old_m} → {new_m}"
+                ))));
+            }
+            self.model = Some(new_m);
+        }
+    }
+
+    pub fn set_config_options(&mut self, val: &Value) {
+        self.update_model_state(val, false, &mut Vec::new());
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
@@ -471,6 +520,7 @@ impl ChatCore {
                         effects.push(Effect::AttachFailed { error: err.clone() });
                     } else {
                         let result = frame.get("result").cloned().unwrap_or(Value::Null);
+                        self.set_config_options(&result);
                         effects.push(Effect::Attached { result });
                     }
                     return;
@@ -726,6 +776,12 @@ impl ChatCore {
             }
             "session/update" => {
                 if let Some(u) = frame.pointer("/params/update") {
+                    if u.get("sessionUpdate").and_then(Value::as_str)
+                        == Some("config_option_update")
+                    {
+                        self.update_model_state(u, true, effects);
+                    }
+
                     if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
                     {
                         let msg_id = u
