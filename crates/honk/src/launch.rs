@@ -131,12 +131,15 @@ pub struct LaunchOpts {
     pub attach_skip_reason: Option<String>,
 }
 
+/// Default path where auto-attach output is logged.
+pub const DEFAULT_AUTO_ATTACH_LOG: &str = "/tmp/oc-auto-attach.log";
+
 /// Settings for auto-attaching to a launched goose session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachSettings {
     pub bin: String,
     pub tmux_session: Option<String>,
-    pub log_file: Option<PathBuf>,
+    pub log_file: PathBuf,
 }
 
 impl AttachSettings {
@@ -144,7 +147,7 @@ impl AttachSettings {
         Self {
             bin: bin.into(),
             tmux_session,
-            log_file: None,
+            log_file: PathBuf::from(DEFAULT_AUTO_ATTACH_LOG),
         }
     }
 }
@@ -427,16 +430,10 @@ fn spawn_auto_attach(attach: &AttachSettings, native: &str) -> Result<(), std::i
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
-    let log_path = attach
-        .log_file
-        .clone()
-        .or_else(|| std::env::var_os("HONK_AUTO_ATTACH_LOG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("/tmp/oc-auto-attach.log"));
-
     let out_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path);
+        .open(&attach.log_file);
 
     let (stdout, stderr) = match out_file {
         Ok(file) => match file.try_clone() {
@@ -455,8 +452,8 @@ fn spawn_auto_attach(attach: &AttachSettings, native: &str) -> Result<(), std::i
     cmd.stdout(stdout);
     cmd.stderr(stderr);
     cmd.process_group(0);
-    cmd.env_remove("OPENCODE_SESSION_ID");
-    cmd.env_remove("AGENT_SESSION_ID");
+    cmd.env_remove(crate::octags::OPENCODE_SESSION_ID_ENV);
+    cmd.env_remove(crate::octags::AGENT_SESSION_ID_ENV);
 
     cmd.spawn().map(|_| ())
 }
@@ -785,7 +782,8 @@ pub fn resolve_attach_from(
         Some(bin) => {
             let log_file = env_get("HONK_AUTO_ATTACH_LOG")
                 .filter(|p| !p.is_empty())
-                .map(PathBuf::from);
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTO_ATTACH_LOG));
             (
                 Some(AttachSettings {
                     bin,
@@ -925,7 +923,7 @@ mod tests {
             Some(AttachSettings {
                 bin: "oc-auto-attach".into(),
                 tmux_session: None,
-                log_file: None,
+                log_file: PathBuf::from(DEFAULT_AUTO_ATTACH_LOG),
             })
         );
         assert_eq!(skip, None);
@@ -945,7 +943,7 @@ mod tests {
             Some(AttachSettings {
                 bin: "/opt/my-attach".into(),
                 tmux_session: Some("sess".into()),
-                log_file: Some(PathBuf::from("/tmp/test.log")),
+                log_file: PathBuf::from("/tmp/test.log"),
             })
         );
         assert_eq!(skip, None);

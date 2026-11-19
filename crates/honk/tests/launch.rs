@@ -673,6 +673,8 @@ async fn preflight_failures_create_nothing_even_with_an_explicit_tag() {
     run(&o).await.expect("launch");
 }
 
+static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct EnvGuard {
     keys: Vec<&'static str>,
 }
@@ -705,11 +707,18 @@ fn make_fake_auto_attach(dir: &Path, record_path: &Path) -> PathBuf {
     let script_path = dir.join("fake-oc-auto-attach.sh");
     let script = format!(
         "#!/bin/sh\n\
-         echo \"ARGS:$*\" > \"{}\"\n\
-         echo \"OPENCODE_SESSION_ID:${{OPENCODE_SESSION_ID-ABSENT}}\" >> \"{}\"\n\
-         echo \"AGENT_SESSION_ID:${{AGENT_SESSION_ID-ABSENT}}\" >> \"{}\"\n",
+         tmp=\"{}.tmp$$\"\n\
+         {{\n\
+           echo \"ARGS:$*\"\n\
+           echo \"{}:${{{}-ABSENT}}\"\n\
+           echo \"{}:${{{}-ABSENT}}\"\n\
+         }} > \"$tmp\"\n\
+         mv \"$tmp\" \"{}\"\n",
         record_path.display(),
-        record_path.display(),
+        honk::octags::OPENCODE_SESSION_ID_ENV,
+        honk::octags::OPENCODE_SESSION_ID_ENV,
+        honk::octags::AGENT_SESSION_ID_ENV,
+        honk::octags::AGENT_SESSION_ID_ENV,
         record_path.display(),
     );
     std::fs::write(&script_path, script).unwrap();
@@ -731,9 +740,10 @@ async fn wait_for_record(path: &Path) -> Option<String> {
 
 #[tokio::test]
 async fn auto_attach_happy_path_spawns_and_scrubs_env() {
+    let _lock = ENV_MUTEX.lock().await;
     let _guard = EnvGuard::new(&[
-        ("OPENCODE_SESSION_ID", "ses_launcher_123"),
-        ("AGENT_SESSION_ID", "agent_launcher_456"),
+        (honk::octags::OPENCODE_SESSION_ID_ENV, "ses_launcher_123"),
+        (honk::octags::AGENT_SESSION_ID_ENV, "agent_launcher_456"),
     ]);
 
     let r = rig(Script::default(), Behaviour::default(), "", 0).await;
@@ -751,7 +761,7 @@ async fn auto_attach_happy_path_spawns_and_scrubs_env() {
     o.attach = Some(AttachSettings {
         bin: script_path.to_string_lossy().into_owned(),
         tmux_session: Some("honk-test-session".into()),
-        log_file: Some(log_path),
+        log_file: log_path,
     });
 
     let out = run(&o).await.expect("launch");
@@ -768,22 +778,17 @@ async fn auto_attach_happy_path_spawns_and_scrubs_env() {
         "recorded args mismatch: {recorded}"
     );
     assert!(
-        recorded.contains("OPENCODE_SESSION_ID:ABSENT"),
+        recorded.contains(&format!("{}:ABSENT", honk::octags::OPENCODE_SESSION_ID_ENV)),
         "OPENCODE_SESSION_ID should be scrubbed: {recorded}"
     );
     assert!(
-        recorded.contains("AGENT_SESSION_ID:ABSENT"),
+        recorded.contains(&format!("{}:ABSENT", honk::octags::AGENT_SESSION_ID_ENV)),
         "AGENT_SESSION_ID should be scrubbed: {recorded}"
     );
 }
 
 #[tokio::test]
 async fn auto_attach_none_spawns_nothing() {
-    let _guard = EnvGuard::new(&[
-        ("OPENCODE_SESSION_ID", "ses_launcher_123"),
-        ("AGENT_SESSION_ID", "agent_launcher_456"),
-    ]);
-
     let r = rig(Script::default(), Behaviour::default(), "", 0).await;
     let temp = tempfile::tempdir().unwrap();
     let record_path = temp.path().join("record.txt");
@@ -795,7 +800,6 @@ async fn auto_attach_none_spawns_nothing() {
     let out = run(&o).await.expect("launch");
     assert_eq!(out.native, SID);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !record_path.exists(),
         "record file should not exist when attach: None"
@@ -811,13 +815,14 @@ async fn auto_attach_prompt_refused_spawns_nothing() {
     let r = rig(script, Behaviour::default(), "", 0).await;
     let temp = tempfile::tempdir().unwrap();
     let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
     let script_path = make_fake_auto_attach(temp.path(), &record_path);
 
     let mut o = opts(&r, TagRequest::Off, None, None);
     o.attach = Some(AttachSettings {
         bin: script_path.to_string_lossy().into_owned(),
         tmux_session: None,
-        log_file: None,
+        log_file: log_path,
     });
 
     let err = run(&o).await.unwrap_err();
@@ -826,7 +831,6 @@ async fn auto_attach_prompt_refused_spawns_nothing() {
     };
     assert_eq!(launched.prompt, honk::launch::PromptState::No);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !record_path.exists(),
         "record file should not exist when prompt was refused"
@@ -838,13 +842,14 @@ async fn auto_attach_tag_failure_partial_still_spawns() {
     let r = rig(Script::default(), Behaviour::default(), "", 1).await;
     let temp = tempfile::tempdir().unwrap();
     let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
     let script_path = make_fake_auto_attach(temp.path(), &record_path);
 
     let mut o = opts(&r, TagRequest::Explicit("honk".into()), None, None);
     o.attach = Some(AttachSettings {
         bin: script_path.to_string_lossy().into_owned(),
         tmux_session: None,
-        log_file: None,
+        log_file: log_path,
     });
 
     let err = run(&o).await.unwrap_err();
@@ -868,13 +873,14 @@ async fn auto_attach_prompt_unknown_still_spawns() {
     let r = rig(script, Behaviour::default(), "", 0).await;
     let temp = tempfile::tempdir().unwrap();
     let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
     let script_path = make_fake_auto_attach(temp.path(), &record_path);
 
     let mut o = opts(&r, TagRequest::Off, None, None);
     o.attach = Some(AttachSettings {
         bin: script_path.to_string_lossy().into_owned(),
         tmux_session: None,
-        log_file: None,
+        log_file: log_path,
     });
 
     let err = run(&o).await.unwrap_err();

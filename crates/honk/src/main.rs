@@ -47,7 +47,7 @@ Auto-attach: after the prompt, unless opted out, spawns \
 the session in a new tab running `honk chat <id>`. Opt out via `--no-attach` \
 or `HONK_LAUNCH_NO_ATTACH` (truthy: 1, true, yes, on). Override the binary via \
 `$HONK_AUTO_ATTACH_BIN` (default: `oc-auto-attach` on PATH). Output appends to \
-/tmp/oc-auto-attach.log.
+/tmp/oc-auto-attach.log (override via $HONK_AUTO_ATTACH_LOG).
 
 Tag: --tag <tag> wins. Without --tag the launching session's tag is inherited \
 ($OPENCODE_SESSION_ID, or goose:$AGENT_SESSION_ID); a launcher that is a \
@@ -1212,7 +1212,7 @@ mod tests {
             Some(honk::launch::AttachSettings {
                 bin: "/bin/custom-attach".into(),
                 tmux_session: Some("work".into()),
-                log_file: None,
+                log_file: PathBuf::from(honk::launch::DEFAULT_AUTO_ATTACH_LOG),
             })
         );
         assert_eq!(o.attach_skip_reason, None);
