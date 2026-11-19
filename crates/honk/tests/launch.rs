@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
-use honk::launch::{LaunchError, LaunchOpts, TagRequest, Timeouts, run};
+use honk::launch::{AttachSettings, LaunchError, LaunchOpts, TagRequest, Timeouts, run};
 use honk::pigeon::PigeonConfig;
 use serde_json::{Value, json};
 use support::pigeon_stub::{Behaviour, StubPigeon};
@@ -218,6 +218,8 @@ fn opts(r: &Rig, tag: TagRequest, launcher: Option<&str>, title: Option<&str>) -
             prompt_confirm: Duration::from_secs(2),
             ..Timeouts::default()
         },
+        attach: None,
+        attach_skip_reason: None,
     }
 }
 
@@ -669,4 +671,148 @@ async fn preflight_failures_create_nothing_even_with_an_explicit_tag() {
     let mut o = opts(&r, TagRequest::Off, None, None);
     o.tags_bin = r.dir.join("nope").to_string_lossy().into_owned();
     run(&o).await.expect("launch");
+}
+
+fn make_fake_auto_attach(dir: &Path, record_path: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script_path = dir.join("fake-oc-auto-attach.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         tmp=\"{}.tmp$$\"\n\
+         {{\n\
+           echo \"ARGS:$*\"\n\
+           echo \"{}:${{{}-ABSENT}}\"\n\
+           echo \"{}:${{{}-ABSENT}}\"\n\
+         }} > \"$tmp\"\n\
+         mv \"$tmp\" \"{}\"\n",
+        record_path.display(),
+        honk::octags::OPENCODE_SESSION_ID_ENV,
+        honk::octags::OPENCODE_SESSION_ID_ENV,
+        honk::octags::AGENT_SESSION_ID_ENV,
+        honk::octags::AGENT_SESSION_ID_ENV,
+        record_path.display(),
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script_path
+}
+
+async fn wait_for_record(path: &Path) -> Option<String> {
+    for _ in 0..100 {
+        if let Ok(c) = std::fs::read_to_string(path)
+            && !c.trim().is_empty()
+        {
+            return Some(c);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn auto_attach_none_spawns_nothing() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("record.txt");
+    let _script_path = make_fake_auto_attach(temp.path(), &record_path);
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.attach = None;
+
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.native, SID);
+
+    assert!(
+        !record_path.exists(),
+        "record file should not exist when attach: None"
+    );
+}
+
+#[tokio::test]
+async fn auto_attach_prompt_refused_spawns_nothing() {
+    let script = Script {
+        prompt: PromptReply::Error("busy"),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
+    let script_path = make_fake_auto_attach(temp.path(), &record_path);
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.attach = Some(AttachSettings {
+        bin: script_path.to_string_lossy().into_owned(),
+        tmux_session: None,
+        log_file: log_path,
+    });
+
+    let err = run(&o).await.unwrap_err();
+    let LaunchError::Partial { launched, .. } = err else {
+        panic!("expected partial error")
+    };
+    assert_eq!(launched.prompt, honk::launch::PromptState::No);
+
+    assert!(
+        !record_path.exists(),
+        "record file should not exist when prompt was refused"
+    );
+}
+
+#[tokio::test]
+async fn auto_attach_tag_failure_partial_still_spawns() {
+    let r = rig(Script::default(), Behaviour::default(), "", 1).await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
+    let script_path = make_fake_auto_attach(temp.path(), &record_path);
+
+    let mut o = opts(&r, TagRequest::Explicit("honk".into()), None, None);
+    o.attach = Some(AttachSettings {
+        bin: script_path.to_string_lossy().into_owned(),
+        tmux_session: None,
+        log_file: log_path,
+    });
+
+    let err = run(&o).await.unwrap_err();
+    let LaunchError::Partial { launched, .. } = err else {
+        panic!("expected partial error on tag failure")
+    };
+    assert_eq!(launched.prompt, honk::launch::PromptState::Ok);
+
+    let recorded = wait_for_record(&record_path)
+        .await
+        .expect("fake oc-auto-attach should have run even on tag failure");
+    assert!(recorded.contains(&format!("ARGS:goose:{SID}")));
+}
+
+#[tokio::test]
+async fn auto_attach_prompt_unknown_still_spawns() {
+    let script = Script {
+        prompt: PromptReply::Silent,
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("record.txt");
+    let log_path = temp.path().join("attach.log");
+    let script_path = make_fake_auto_attach(temp.path(), &record_path);
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.attach = Some(AttachSettings {
+        bin: script_path.to_string_lossy().into_owned(),
+        tmux_session: None,
+        log_file: log_path,
+    });
+
+    let err = run(&o).await.unwrap_err();
+    let LaunchError::Partial { launched, .. } = err else {
+        panic!("expected partial error on silent prompt")
+    };
+    assert_eq!(launched.prompt, honk::launch::PromptState::Unknown);
+
+    let recorded = wait_for_record(&record_path)
+        .await
+        .expect("fake oc-auto-attach should have run on prompt unknown");
+    assert!(recorded.contains(&format!("ARGS:goose:{SID}")));
 }
