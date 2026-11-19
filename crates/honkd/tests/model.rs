@@ -312,3 +312,42 @@ async fn test_model_list_e2e() {
     assert_eq!(models_corrupt[0]["source"], "goose");
     assert_eq!(models_corrupt[1]["source"], "goose");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_model_list_after_actor_reactivation_with_attached_viewer() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+
+    let new_res = v.call("session/new", json!({ "cwd": "/tmp" })).await;
+    let sid = new_res["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // v is attached to sid (v.attached_sessions contains sid).
+    // Simulate actor retirement: remove session from fake and restart so actor terminates
+    fake.remove_session(&sid);
+    fake.restart().await;
+
+    // Viewer receives evicted notification
+    let evicted = v
+        .wait_for(|f| f.get("method").and_then(Value::as_str) == Some(honk_wire::method::EVICTED))
+        .await;
+    assert_eq!(evicted["params"]["sessionId"], sid);
+
+    // Re-register sid in FakeGoose so get_or_activate_session can succeed
+    fake.insert_session(&sid, "/tmp");
+
+    // Call _honk/model/list: fresh actor activated, v.attached_sessions already contains sid.
+    // ModelList must auto-attach unknown viewer and reply successfully (not hang).
+    let list_res = v
+        .call("_honk/model/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list_res["result"]["provider"], "gcp_vertex_ai");
+    assert_eq!(list_res["result"]["current"], "claude-opus-5-5");
+}

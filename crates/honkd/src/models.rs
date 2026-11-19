@@ -15,9 +15,23 @@ pub struct ModelsFile {
     pub providers: HashMap<String, Vec<ModelEntry>>,
 }
 
-pub fn load(path: &Path) -> Result<ModelsFile, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| e.to_string())
+pub async fn load_for_list(path: Option<&Path>) -> (Option<ModelsFile>, Option<String>) {
+    let Some(p) = path else {
+        return (None, None);
+    };
+    match tokio::fs::read_to_string(p).await {
+        Ok(content) => match serde_json::from_str::<ModelsFile>(&content) {
+            Ok(mf) => (Some(mf), None),
+            Err(e) => (
+                None,
+                Some(format!("failed to parse models file {}: {e}", p.display())),
+            ),
+        },
+        Err(e) => (
+            None,
+            Some(format!("failed to read models file {}: {e}", p.display())),
+        ),
+    }
 }
 
 pub fn list_reply(
@@ -51,6 +65,9 @@ pub fn list_reply(
         && let Some(entries) = cfg.providers.get(prov)
     {
         for entry in entries {
+            if entry.id.is_empty() {
+                continue;
+            }
             if !seen_ids.contains(&entry.id) {
                 seen_ids.insert(entry.id.clone());
                 let name = entry.name.clone().unwrap_or_else(|| entry.id.clone());
@@ -226,23 +243,60 @@ mod tests {
     }
 
     #[test]
-    fn test_load_and_garbled_file_warning() {
+    fn test_skip_empty_configured_id() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gcp_vertex_ai".to_string(),
+            vec![
+                ModelEntry {
+                    id: "".to_string(),
+                    name: Some("Empty ID".to_string()),
+                },
+                ModelEntry {
+                    id: "valid-id".to_string(),
+                    name: None,
+                },
+            ],
+        );
+        let mf = ModelsFile { providers };
+        let init_result = sample_init_result(Some("gcp_vertex_ai"), None);
+        let reply = list_reply(Some(&mf), None, &init_result);
+        let models = reply["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "valid-id");
+    }
+
+    #[tokio::test]
+    async fn test_load_for_list_and_garbled_file_warning() {
+        assert_eq!(load_for_list(None).await, (None, None));
+
         let temp_dir = tempfile::tempdir().unwrap();
         let valid_path = temp_dir.path().join("models.json");
-        std::fs::write(
+        tokio::fs::write(
             &valid_path,
             r#"{"providers": {"p1": [{"id": "m1", "name": "Model 1"}]}}"#,
         )
+        .await
         .unwrap();
 
-        let loaded = load(&valid_path).expect("load valid");
+        let (loaded, warning) = load_for_list(Some(&valid_path)).await;
+        assert!(warning.is_none());
+        let loaded = loaded.expect("load valid");
         assert_eq!(loaded.providers["p1"].len(), 1);
         assert_eq!(loaded.providers["p1"][0].id, "m1");
 
         let garbled_path = temp_dir.path().join("garbled.json");
-        std::fs::write(&garbled_path, "{ invalid json").unwrap();
-        let err = load(&garbled_path).expect_err("load garbled fails");
-        assert!(!err.is_empty());
+        tokio::fs::write(&garbled_path, "{ invalid json")
+            .await
+            .unwrap();
+        let (loaded_garbled, warning_garbled) = load_for_list(Some(&garbled_path)).await;
+        assert!(loaded_garbled.is_none());
+        assert!(warning_garbled.is_some());
+
+        let nonexistent_path = temp_dir.path().join("nonexistent.json");
+        let (loaded_missing, warning_missing) = load_for_list(Some(&nonexistent_path)).await;
+        assert!(loaded_missing.is_none());
+        assert!(warning_missing.is_some());
 
         let init_result = sample_init_result(Some("p1"), Some("m1"));
         let reply = list_reply(

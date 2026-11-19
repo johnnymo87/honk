@@ -240,6 +240,7 @@ pub enum SessionMsg {
     ModelList {
         viewer_id: ViewerId,
         viewer: ViewerTx,
+        is_honk_aware: bool,
         id: Value,
         configured: Option<crate::models::ModelsFile>,
         warning: Option<String>,
@@ -2217,7 +2218,10 @@ impl Session {
         }
         let sid = self.sid.clone();
         let mut s = self.state_store.lock().await;
-        let _ = s.mutate(|st| {
+        if !s.sessions.contains_key(&sid) {
+            return;
+        }
+        if let Err(e) = s.mutate(|st| {
             if let Some(h) = st.sessions.get_mut(&sid) {
                 if let Some(ref mut ir) = h.init_result {
                     if let Some(obj) = ir.as_object_mut() {
@@ -2229,7 +2233,9 @@ impl Session {
                     h.init_result = Some(json!({ "configOptions": opts_val }));
                 }
             }
-        });
+        }) {
+            tracing::error!("Session {sid}: failed to persist configOptions: {e:#}");
+        }
     }
 
     /// Records or clears the session's turn error. A clear writes state only
@@ -3176,6 +3182,9 @@ impl Session {
                     );
                     return;
                 }
+                if !self.viewers.contains_key(&viewer_id) {
+                    self.attach_live(viewer_id, viewer.clone(), false);
+                }
                 if method == "session/set_config_option" && self.turn.is_running() {
                     let err_resp =
                         crate::rpc::error(id, -32002, "session is busy; try after this turn", None);
@@ -3223,11 +3232,15 @@ impl Session {
             }
             SessionMsg::ModelList {
                 viewer_id,
-                viewer: _,
+                viewer,
+                is_honk_aware,
                 id,
                 configured,
                 warning,
             } => {
+                if !self.viewers.contains_key(&viewer_id) {
+                    self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
+                }
                 let reply =
                     crate::models::list_reply(configured.as_ref(), warning, &self.init_result);
                 self.send_to_viewer(viewer_id, crate::rpc::response(id, reply));
@@ -5020,6 +5033,35 @@ mod tests {
             })
             .await;
         assert_eq!(session.queued_msgs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_model_list_auto_attaches_unknown_viewer() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_model_list_attach", ActorState::Live).await;
+        assert!(!session.viewers.contains_key(&1));
+
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::ModelList {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                is_honk_aware: true,
+                id: json!(42),
+                configured: None,
+                warning: None,
+            })
+            .await;
+
+        assert!(session.viewers.contains_key(&1));
+        let msg = v_rx.recv().await.expect("received frame");
+        match msg {
+            axum::extract::ws::Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v.get("id"), Some(&json!(42)));
+            }
+            other => panic!("expected Text message, got {other:?}"),
+        }
     }
 
     #[tokio::test]
