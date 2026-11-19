@@ -431,6 +431,11 @@ async fn process_effects(
             Effect::Reattach => {
                 return EffectAction::Reattach;
             }
+            Effect::RecordRecentModel(id) => {
+                if let Err(e) = crate::chat::recent::record(&id) {
+                    tracing::warn!("failed to record recent model {id}: {e}");
+                }
+            }
             Effect::Exit(code) => {
                 if let Some(conn) = conn_opt.as_mut() {
                     let _ = conn.close().await;

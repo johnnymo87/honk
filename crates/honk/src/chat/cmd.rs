@@ -351,6 +351,8 @@ impl ChatCore {
     fn must_queue_model(&self, queued_dispatch: bool) -> bool {
         self.prompt_sent.is_some()
             || self.run_state.is_running()
+            || self.has_pending_model_mutation()
+            || self.has_pending_mcp_mutation()
             || (!queued_dispatch && !self.local_queue.is_empty())
     }
 

@@ -68,10 +68,10 @@ pub fn text_of(update: &Value) -> Option<&str> {
     update.pointer("/content/text").and_then(Value::as_str)
 }
 
-fn config_options_array(config_options: &Value) -> Option<&Vec<Value>> {
+fn config_options_array(config_options: &Value) -> Option<&[Value]> {
     match config_options {
-        Value::Array(a) => Some(a),
-        Value::Object(o) => o.get("configOptions")?.as_array(),
+        Value::Array(a) => Some(a.as_slice()),
+        Value::Object(o) => o.get("configOptions")?.as_array().map(|a| a.as_slice()),
         _ => None,
     }
 }

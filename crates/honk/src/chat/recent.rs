@@ -6,17 +6,7 @@ pub const RECENT_FILENAME: &str = "model-recent.json";
 pub const MAX_RECENT_MODELS: usize = 10;
 
 pub fn honk_state_dir() -> anyhow::Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
-        && !xdg.trim().is_empty()
-    {
-        Ok(PathBuf::from(xdg.trim()).join("honk"))
-    } else if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        Ok(PathBuf::from(home.trim()).join(".local/state/honk"))
-    } else {
-        anyhow::bail!("cannot resolve honk state dir: XDG_STATE_HOME and HOME unset");
-    }
+    crate::client::honk_state_dir()
 }
 
 pub fn load() -> Vec<String> {
@@ -43,7 +33,8 @@ pub fn record(id: &str) -> anyhow::Result<()> {
 }
 
 pub fn record_in(dir: &Path, id: &str) -> anyhow::Result<()> {
-    if id.trim().is_empty() {
+    let id = id.trim();
+    if id.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(dir)?;
@@ -104,6 +95,13 @@ mod tests {
             load_from(temp.path()),
             vec!["model-b".to_string(), "model-a".to_string()]
         );
+    }
+
+    #[test]
+    fn test_record_in_trims_id() {
+        let temp = tempfile::tempdir().unwrap();
+        record_in(temp.path(), "  claude-opus-5-5  ").unwrap();
+        assert_eq!(load_from(temp.path()), vec!["claude-opus-5-5".to_string()]);
     }
 
     #[test]

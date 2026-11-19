@@ -5371,9 +5371,7 @@ fn test_model_command_busy_32002_requeues_bounded() {
 
 #[test]
 fn test_model_command_success_updates_state_and_records_recent() {
-    let temp = tempfile::tempdir().unwrap();
     let (mut core, _) = new_test_core();
-    core.set_recent_dir(temp.path().to_path_buf());
 
     // End replay
     core.handle(Input::Frame(json!({
@@ -5432,9 +5430,11 @@ fn test_model_command_success_updates_state_and_records_recent() {
         .expect("expected notice on model change");
     assert_eq!(notice.text, "model: claude-sonnet-4-6 → claude-opus-5-5");
 
-    // Recorded in recent list
-    let recent_models = honk::chat::recent::load_from(temp.path());
-    assert_eq!(recent_models, vec!["claude-opus-5-5".to_string()]);
+    // Effect::RecordRecentModel emitted
+    assert!(
+        effs.iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(m) if m == "claude-opus-5-5"))
+    );
 
     // Subsequent live config_option_update notification does NOT emit double notice
     let notif_frame = json!({
@@ -5455,6 +5455,69 @@ fn test_model_command_success_updates_state_and_records_recent() {
     });
     let effs = core.handle(Input::Frame(notif_frame));
     assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_two_quick_model_commands_serialized() {
+    let (mut core, _) = new_test_core();
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "model-0",
+            "options": [{"value": "model-a"}, {"value": "model-b"}]
+        }
+    ]));
+
+    // First command sent immediately
+    let effs1 = core.handle(Input::Line("/model model-a".into()));
+    let req_id_a = effs1
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("first /model should send request");
+
+    // Second command typed while first is pending -> queued
+    let effs2 = core.handle(Input::Line("/model model-b".into()));
+    assert!(!effs2.iter().any(|e| matches!(e, Effect::Request { .. })));
+    let notice = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("second /model should be queued");
+    assert_eq!(notice.text, "queued: /model model-b");
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Reply for first model arrives -> success, second model popped and dispatched
+    let effs3 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id_a,
+        "result": {
+            "configOptions": [
+                {
+                    "id": "model",
+                    "currentValue": "model-a",
+                    "options": [{"value": "model-a"}, {"value": "model-b"}]
+                }
+            ]
+        }
+    })));
+
+    let req_id_b = effs3
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("queued /model model-b should be dispatched after first completes");
+    assert_ne!(req_id_a, req_id_b);
 }
 
 #[test]

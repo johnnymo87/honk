@@ -86,6 +86,7 @@ pub enum Effect {
     },
     Detach,
     Reattach,
+    RecordRecentModel(String),
     Exit(i32),
 }
 

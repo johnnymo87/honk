@@ -44,7 +44,6 @@ pub struct ChatCore {
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) known_model_ids: Vec<String>,
-    pub(crate) recent_dir: Option<std::path::PathBuf>,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
 }
 
@@ -100,7 +99,6 @@ impl ChatCore {
             model: None,
             provider: None,
             known_model_ids: Vec::new(),
-            recent_dir: None,
             pending_model_reqs: HashMap::new(),
         }
     }
@@ -481,10 +479,6 @@ impl ChatCore {
         !self.pending_model_reqs.is_empty()
     }
 
-    pub fn set_recent_dir(&mut self, dir: std::path::PathBuf) {
-        self.recent_dir = Some(dir);
-    }
-
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
         if !self.is_replaying
             && !self.run_state.is_running()
@@ -736,6 +730,8 @@ impl ChatCore {
             if !requeued {
                 self.check_queued_prompts(effects);
             }
+            #[allow(clippy::needless_return)]
+            return;
         }
     }
 
@@ -1248,12 +1244,7 @@ impl ChatCore {
 
         let result = frame.get("result").unwrap_or(&Value::Null);
         self.update_model_state(result, true, effects);
-
-        if let Some(ref dir) = self.recent_dir {
-            let _ = crate::chat::recent::record_in(dir, &req.model);
-        } else {
-            let _ = crate::chat::recent::record(&req.model);
-        }
+        effects.push(Effect::RecordRecentModel(req.model));
 
         false
     }
