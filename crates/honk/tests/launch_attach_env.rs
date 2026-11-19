@@ -159,6 +159,7 @@ fn opts(r: &Rig) -> LaunchOpts {
         dir: r.dir.clone(),
         prompt: "do the thing".into(),
         title: Some("Fix it".into()),
+        model: None,
         tag: TagRequest::Explicit("honk".into()),
         launcher: Some("ses_launcher".into()),
         tags_bin: r.tags_bin.clone(),

@@ -46,6 +46,8 @@ pub struct DriverOpts {
     pub tag: Option<crate::octags::TagAction>,
     /// When true, do not enable the swarm MCP server by default on a new session.
     pub no_swarm: bool,
+    /// When set, the initial model to set after session/new.
+    pub model: Option<String>,
 }
 
 impl DriverOpts {
@@ -60,6 +62,7 @@ impl DriverOpts {
             pigeon: None,
             tag: None,
             no_swarm: false,
+            model: None,
         }
     }
 }
@@ -786,9 +789,70 @@ async fn run_driver(
                 }
             }
 
+            let mut model_config_options = None;
+            if let Some(ref model_id) = opts.model {
+                let model_req_id = ids.allocate();
+                let model_params = json!({
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model_id,
+                });
+                if let Err(e) = conn
+                    .send_request(model_req_id, "session/set_config_option", model_params)
+                    .await
+                {
+                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                } else {
+                    let model_timeout = Duration::from_secs(5);
+                    let model_res = tokio::time::timeout(model_timeout, async {
+                        while let Some(frame) = frame_rx.recv().await {
+                            if frame.get("id") == Some(&json!(model_req_id))
+                                && crate::conn::is_response(&frame)
+                            {
+                                return Ok(frame);
+                            }
+                        }
+                        Err(anyhow::anyhow!(
+                            "stream closed while awaiting session/set_config_option response"
+                        ))
+                    })
+                    .await;
+
+                    match model_res {
+                        Ok(Ok(frame)) => {
+                            if let Some(err) = frame.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("model error");
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(msg)));
+                            } else {
+                                let res = frame.get("result").cloned().unwrap_or(Value::Null);
+                                model_config_options = Some(res);
+                                if let Err(e) = crate::chat::recent::record(model_id) {
+                                    tracing::warn!("failed to record recent model {model_id}: {e}");
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            let _ =
+                                ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                        }
+                        Err(_) => {
+                            let _ = ui_tx.send(UiEvent::Notice(Notice::error(
+                                "model: timed out setting initial model",
+                            )));
+                        }
+                    }
+                }
+            }
+
             let mut core =
                 ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids);
             core.set_config_options(result);
+            if let Some(ref m_res) = model_config_options {
+                core.set_config_options(m_res);
+            }
             core
         }
         Target::Attach(session_id) => ChatCore::new(session_id, chat_opts, Instant::now()),

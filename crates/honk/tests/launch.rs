@@ -37,6 +37,7 @@ struct Script {
     /// Reply to `_honk/mcp/enable` (the whole frame minus id/jsonrpc).
     enable: Value,
     prompt: PromptReply,
+    model_error: Option<&'static str>,
 }
 
 impl Default for Script {
@@ -45,6 +46,7 @@ impl Default for Script {
             swarm_meta: Some(json!({"enabled": true})),
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
+            model_error: None,
         }
     }
 }
@@ -107,6 +109,13 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                     out.push(f);
                 }
                 "_goose/unstable/session/rename" => out.push(json!({"id": id, "result": {}})),
+                "session/set_config_option" => {
+                    if let Some(err) = script.model_error {
+                        out.push(json!({"id": id, "error": {"code": -32602, "message": err}}));
+                    } else {
+                        out.push(json!({"id": id, "result": {"configOptions": []}}));
+                    }
+                }
                 "session/prompt" => {
                     let crid = v["params"]["_meta"]["honk"]["client_req_id"]
                         .as_str()
@@ -205,6 +214,7 @@ fn opts(r: &Rig, tag: TagRequest, launcher: Option<&str>, title: Option<&str>) -
         dir: r.dir.clone(),
         prompt: "do the thing".into(),
         title: title.map(str::to_string),
+        model: None,
         tag,
         launcher: launcher.map(str::to_string),
         tags_bin: r.tags_bin.clone(),
@@ -815,4 +825,68 @@ async fn auto_attach_prompt_unknown_still_spawns() {
         .await
         .expect("fake oc-auto-attach should have run on prompt unknown");
     assert!(recorded.contains(&format!("ARGS:goose:{SID}")));
+}
+
+#[tokio::test]
+async fn launch_with_model_sets_config_option_before_prompt() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    o.model = Some("gemini-3.8-flash".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_goose/unstable/session/rename",
+            "session/set_config_option",
+            "session/prompt"
+        ],
+        "set_config_option must be called after rename and before prompt"
+    );
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let m = &reqs[3];
+    assert_eq!(
+        m.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "gemini-3.8-flash",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_with_model_failure_aborts_before_prompt() {
+    let script = Script {
+        model_error: Some("unknown model"),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("bad-model".into());
+    let err = run(&o).await.unwrap_err();
+    assert_eq!(err.exit_code(), honk::launch::EXIT_PARTIAL);
+    let LaunchError::Partial { launched, error } = err else {
+        panic!("expected partial error");
+    };
+    assert_eq!(launched.native, SID);
+    assert_eq!(launched.prompt, honk::launch::PromptState::No);
+    let msg = format!("{error:#}");
+    assert!(
+        msg.contains("setting the model failed"),
+        "error must mention setting the model failed: {msg}"
+    );
+    assert!(
+        msg.contains("unknown model"),
+        "error must contain upstream message: {msg}"
+    );
+
+    assert_eq!(
+        methods(&r),
+        ["initialize", "session/new", "session/set_config_option",],
+        "prompt must not be sent if set_config_option fails"
+    );
 }

@@ -4108,3 +4108,251 @@ async fn test_new_session_swarm_meta_pending_skips_enable_and_shows_no_error() {
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
+    let temp_xdg = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", temp_xdg.path());
+    }
+
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_model_new",
+                        "configOptions": [
+                            {"id": "model", "currentValue": "claude-opus-5-5"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/set_config_option
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            assert_eq!(v["params"]["sessionId"], "s_model_new");
+            assert_eq!(v["params"]["configId"], "model");
+            assert_eq!(v["params"]["value"], "gemini-3.8-flash");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "configOptions": [
+                            {"id": "model", "currentValue": "gemini-3.8-flash"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_model_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+    opts.no_swarm = true;
+    opts.model = Some("gemini-3.8-flash".into());
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut model_in_state = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::State(s) => {
+                    if s.model.is_some() {
+                        model_in_state = s.model;
+                        break;
+                    }
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(model_in_state.as_deref(), Some("gemini-3.8-flash"));
+    let recents = honk::chat::recent::load_from(&temp_xdg.path().join("honk"));
+    assert_eq!(recents, vec!["gemini-3.8-flash".to_string()]);
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_model_err",
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/set_config_option -> error
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "error": {
+                        "code": -32602,
+                        "message": "unknown model: bad-model"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/load (must still happen, chat stays open!)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_model_err" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+    opts.no_swarm = true;
+    opts.model = Some("bad-model".into());
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut notice_seen = false;
+    let mut attached_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("unknown model: bad-model") {
+                        assert_eq!(n.kind, honk::chat::NoticeKind::Error);
+                        notice_seen = true;
+                    }
+                }
+                UiEvent::Attached { .. } => {
+                    attached_seen = true;
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+            if notice_seen && attached_seen {
+                break;
+            }
+        }
+    }
+
+    assert!(notice_seen, "expected error notice for failed model switch");
+    assert!(attached_seen, "session must stay open and attach");
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
