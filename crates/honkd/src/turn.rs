@@ -156,7 +156,7 @@ pub fn prompt_message_id(params: &Value) -> Option<&str> {
 /// Always overwrites any caller value. Merges into existing `_meta` and `_meta.goose` objects.
 /// Handles missing or non-object `_meta`/`_meta.goose` (replaces with object).
 pub fn stamp_prompt_message_id(params: &mut Value) -> String {
-    let id = format!("msg_honk_{:x}", uuid::Uuid::new_v4().simple());
+    let id = format!("msg_honk_{}", uuid::Uuid::new_v4().simple());
     if !params.is_object() {
         *params = serde_json::json!({});
     }
@@ -1959,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_current_prompt_msg_id_survives_reply_while_run_active() {
+    fn test_current_prompt_msg_id_lives_until_run_end_and_reply() {
         let mut ids = UpstreamIds::new(1);
         let mut core = TurnCore::default();
 
