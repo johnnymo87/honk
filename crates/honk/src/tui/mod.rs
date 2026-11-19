@@ -1,6 +1,7 @@
 pub mod app;
 pub mod composer;
 pub mod keys;
+pub mod quote;
 pub mod status;
 pub mod transcript;
 

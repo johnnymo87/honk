@@ -1,0 +1,75 @@
+# Message history: opencode parity study
+
+Date: 2026-11-19. Bead: honk-9qf.31 (epic). Requested by Jonathan in the honk Telegram topic: "need a way to interact with message history (let's have a worker study opencode functionality here and then we can pick the subset of features we want)".
+
+Status: study complete and adversarially reviewed. Picked so far (2026-11-19): (1) load the last N coordinator replies into $EDITOR for quote-and-reply (built first), (2) undo (bead honk-9qf.31.1, needs a goose patch). Everything else below is catalogued for later.
+
+```text
+CATALOGUE: opencode TUI message-history features vs honk chat (study 2026-11-19)
+
+Sources: opencode v1.18.18 (installed: opencode-patched-1.18.18.5), worktree /tmp/opencode/oc-1.18.18, TUI under packages/tui/src. S=routes/session/index.tsx, KB=config/keybind.ts (leader=ctrl+x, KB:41). Local patches in ~/projects/opencode-patched/patches (vim.patch, tui-message-scroll.patch).
+goose = johnnymo87/goose patched-1.54.0.9 (deployed), ACP server crates/goose/src/acp. honk = origin/main 00309bf.
+Cost legend: H = honk-only (crates/honk), D = needs honkd, G = needs a goose (fork) patch. S/M/L = rough size (S <1 day, M 1-3 days, L multi-PR).
+
+== A. NAVIGATION ==
+A1 Line/half-page/page/top/bottom scroll. oc: pageup/pagedown, ctrl+alt+y/e/u/d, ctrl+g/home, ctrl+alt+g/end (KB:135-142, S:752-831); vim.patch maps ctrl+e/y/d/u/f/b, gg, G from prompt normal mode. honk: HAS Ctrl-E/Y/D/U/F/B, gg/G in Normal (tui/keys.rs:85-151, transcript.rs Viewport 2117-2280). Gap: wheel only scrolls when composer empty (alternate-scroll mode, no mouse capture, app.rs:630). DONE.
+A2 Auto-follow (sticky bottom). oc: stickyScroll S:1194. honk: HAS Viewport.follow. DONE.
+A3 Next/prev message jump. oc: messages_next/previous, UNBOUND by default (KB:143-144, S:378-422). honk: none. H/S-M. Scrolling to a block is O(1) (anchor=(key,0)), but blocks are not messages: Text/Thought blocks are keyed by goose messageId, Tool blocks only by toolCallId (honk-wire lib.rs:43-46), and one turn splits into many blocks — so jump between USER blocks (turn boundaries), as opencode does. Key choice must not collide with composer Normal mode (keys fall through to edtui, keys.rs:96-151; gg/G only work with an empty composer).
+A4 Jump to last user message. oc: unbound (KB:145, S:832-862). honk: none. H/S.
+A5 Timeline / "jump to message" dialog. oc: <leader>g, /timeline (S:518-539, dialog-timeline.tsx): user messages newest-first with times, fuzzy filter, highlight live-scrolls transcript, Enter opens Message Actions (A5->D2). honk: none. H/M+ — honk has no overlay/popup widget, no fuzzy matcher and no modal input routing yet.
+A6 Scroll to message, external hook (honk-9qf.15.12). oc: tui-message-scroll.patch adds POST /session/:id/scroll-to-message + env OPENCODE_SCROLL_TO=<sid>:<msgid> at cold start; pages in older messages if outside the 100-msg window. Used for jump-to-unread from outside the TUI. honk: none. Cold start (`honk chat --scroll-to <msgid>`) H/S; live (an external process tells an attached TUI) D/S-M (honkd route that fans a notification to that session's viewers) — or H via a per-TUI local socket. Recent user prompts are honkd synth_<crid> blocks without goose ids, and tool-only messages have no block keyed by messageId, so a messageId->block index (and ideally the goose prompt-id patch, see D) is needed.
+A7 Search in transcript. oc: DOES NOT EXIST (only timeline fuzzy filter on user text, session-list title search). honk: none (edtui search is composer-only). H/M (`/` over rendered lines, n/N, highlight). Beyond opencode.
+A8 Timestamps toggle. oc: /timestamps (S:695-707), user messages only, default hidden. honk: none; goose stamps every chunk with _meta.goose.created (goose acp/server/message_meta.rs:9-77) and export frames carry it (honk-wire export.rs:157). H/S. Caveat: honkd-synthesized live user blocks (synth_<crid>, honkd session.rs:2427) have no created until a rebuild.
+A9 Scrollbar toggle. oc: unbound, hidden by default. honk: none. H/S, low value.
+A10 Message window. oc loads only newest 100 messages (context/sync.tsx:603). honk replays the full honkd log. honk is AHEAD.
+
+== B. COPY / EXPORT ==
+B1 Copy last assistant message. oc: <leader>y (S:877-916). honk: HAS `:yank` via OSC52, 100KB cap (app.rs:288-344). Bug: `/yank` documented (docs/chat.md:168) but cmd.rs has no branch -> "unknown command". H/S fix.
+B2 Copy a chosen message. oc: Message Actions -> Copy (dialog-message.tsx). honk: none. H/S once a message cursor/timeline exists.
+B3 Copy a code block. oc: DOES NOT EXIST. honk: none. H/S-M. Beyond opencode.
+B4 Copy whole transcript. oc: /copy (S:917-946, util/transcript.ts). honk: none (but Transcript::to_markdown exists, transcript.rs:602). H/S; OSC52 size cap makes large sessions fail -> prefer B5.
+B5 Export transcript to $EDITOR / file. oc: <leader>x, /export (S:947-1021, dialog-export-options.tsx): options for thinking/tool details/metadata, saves session-<id8>.md in cwd or opens a temp file in $VISUAL/$EDITOR; no pager. honk: HAS `:dump` -> tempfile -> $PAGER|$EDITOR|less (app.rs:752-797), tool I/O untruncated, no key binding, no options, not saved. Gap H/S: a key binding, optional save path.
+B6 Share / unshare. oc: /share, /unshare (opencode cloud). No goose equivalent. Recommend SKIP.
+B7 CLI export/import JSON. oc: `opencode export [id]`, `opencode import <file|url>`. goose: _goose/unstable/session/export {format json|markdown} and /import (custom_requests.rs:865-905). honk: none. D/S: generic sessionId forwarding would activate+hold an unheld session (viewer.rs:1310-1340), so add a honkd route over hub.export's side connection (hub.rs:953-1048). Import creates a new session (also D/S, same identity issues as D5).
+
+== C. DISPLAY / COLLAPSE ==
+C1 Global tool/thought/JSON toggles. oc: tool_details, display_thinking (/thinking), generic tool output, all unbound or slash. honk: HAS za/zt/zj (keys.rs:77-79). DONE.
+C2 Per-block expand/collapse (honk-9qf.15.4). oc: mouse click on a tool block or a "+ Thought" header (S:1587-1648, 1806-1913). honk: none; flags are global and part of LayoutKey + prefix-sum validity (transcript.rs:432-600). H/M: needs a "selected block" cursor (keyboard; honk has no mouse capture) plus per-key overrides folded into revision/cache key.
+C3 Code concealment (<leader>h, markdown/code conceal in messages) and sidebar (<leader>b). Low value. SKIP.
+C4 Compaction divider. oc renders a "Compaction" divider (S:1457). honk shows goose's "Compaction complete" user-visible message. DONE enough.
+
+== D. HISTORY MUTATION ==
+How opencode does it (packages/opencode/src/session/revert.ts): revert is SOFT and restores FILES — later messages are hidden, file patches after the point are undone via a shadow-git snapshot; unrevert restores files+messages; the revert is committed (messages deleted) by the next prompt, shell command, or compact. Fork copies messages strictly before the point into a new session (session.ts:693-734).
+How goose can do it: _goose/unstable/session/conversation/truncate {sessionId, truncateFrom: unix SECONDS} = hard DELETE ... WHERE created_timestamp >= ts (session_manager.rs:2636); next turn reloads from SQLite so the model sees the cut. No busy guard, no client notification, no redo, NO FILE RESTORE (no snapshots anywhere). Same-second hazard: deletes every row in that second, incl. rows before the target (add_message clamps created up). An id-based truncate_conversation_from_message exists (session_manager.rs:571) but is not exposed over ACP. Compaction trap: cutting before a compaction deletes the agent-only summary while originals stay agent_visible=false -> model sees ~nothing. session/fork (unstable, implemented, not advertised) copies the session; _meta.conversationBefore=<secs> cuts the copy (fork_session.rs:36-99). goose desktop builds Edit = truncate(created)+re-prompt and Fork-from-message = fork(conversationBefore) on exactly these.
+honkd impact: honkd keeps its own per-session JSONL log; a truncate behind its back leaves the log stale. honkd already has export->new-epoch rebuild + `_honk/reset` to viewers (session.rs:1404-1540), so a `_honk/session/truncate` route = busy guard + goose truncate + start_rebuild. Live user blocks are synth_<crid> with no goose id/created, so honkd must resolve the cut point from an export (it already counts client_prompts there) — or goose echoes the stored prompt id.
+The same-second hazard is the NORMAL case in honk: the local queue sends the next prompt the moment a run ends (chat/core.rs:427) and pigeon/swarm prompts arrive the same way, and add_message clamps created up to MAX (session_manager.rs:1937-1941). So seconds-based truncate would routinely delete the tail of the previous turn. => A goose patch is REQUIRED for D1-D4: (a) accept a client-supplied message id on session/prompt (today convert_acp_prompt_to_message sets none, server.rs:1374), (b) expose id-based truncate_conversation_from_message over ACP. (a) also gives honkd's synth blocks real ids at once, helping A6/A8.
+Hazards a honkd truncate route must handle: run through the session actor (start_rebuild is a no-op while a rebuild runs, session.rs:1405, so a truncate mid-rebuild would be overwritten by a stale export; force a fresh rebuild); busy guard covers active run, inflight prompt, pending permission requests, compaction, queued steers — or abort first like opencode's /undo (decide); _honk/reset only reaches honk-aware viewers (session.rs:1546); rebuild drops honkd-only frames (prompt source attribution); a soft revert must commit before EVERY prompt path (other honk clients, steers, pigeon) and survive a honkd restart; truncating a turn that came from a swarm message silently drops it from the model's context; providers that manage their own context (claude_code, gemini_cli, acp) keep provider-side state (harmless with current gcp_vertex_ai).
+D1 Undo (<leader>u, /undo) — revert to previous user message, refill composer with its text. honk: none. D+G/L. Soft-revert semantics (hide until next prompt, redo possible) would live in honkd. Files are NOT restored — differs from opencode.
+D2 Revert to a chosen message (Message Actions). Same machinery as D1 + selection UI (A5 or a message cursor). Incremental on D1.
+D3 Redo (<leader>r, /redo). Only possible if revert is soft (honkd holds the point and truncates on next prompt) — goose has no un-truncate. Part of D1 if done soft; otherwise impossible.
+D4 Edit and resend a prompt. oc: no in-place edit; undo/revert/fork prefill the composer. honk: only auto-return of a failed prompt's text (core.rs:538-637, app.rs:480). Falls out of D1/D5.
+D5 Fork session (full, or before a message). oc: /fork dialog (dialog-fork-from-timeline.tsx), Message Actions -> Fork, `--fork` CLI. goose: session/fork works today. honk: none. D/M-L. Identity hazard: copy_session copies extension_data verbatim (session_manager.rs:2608), and honkd's swarm extension is `honk swarm-mcp --session <PARENT sid>` (honkd mcp/catalog.rs:360), so a naive fork sends and reads mail AS THE PARENT; honkd's session/new setup (swarm, project/client MCP, held-session limit, viewer.rs:823-900) is also skipped. A honkd fork route must re-add swarm with the new sid and adopt the session. honk chat cannot switch sessions in-process (ChatCore.session_id fixed, chat/core.rs:14,48) -> adoption UX (cheapest: exec `honk chat <newsid>`). Fork-at-message uses conversationBefore seconds (same hazard as D1) and inherits the compaction trap. Full fork needs no goose change. Nothing in the parent is destroyed.
+D6 Compact. oc: <leader>c, /compact. honk: HAS /compact, :compact (cmd.rs:84-109). DONE.
+D7 Rename session. oc: ctrl+r, /rename. goose: _goose/unstable/session/rename. honk: none. H/S: honkd caches no title (session/list goes to goose, hub.rs:874-935), but goose sends no rename notification and honk refreshes the title only at run end (chat/driver.rs:1046) — refresh explicitly; other viewers stay stale until their next run end.
+
+== E. PROMPT HISTORY / COMPOSER ==
+E1 Prompt history recall. oc: up/down at input start/end, global, persisted (<state>/prompt-history.jsonl, 50). honk: HAS Ctrl-P/N, in-memory, this process only (app.rs:27-29, 226-257). Gap H/S: seed from the session's user blocks on attach and/or persist globally.
+E2 Prompt stash (stash/pop/list). oc: unbound, palette only. honk: none. H/S, low value.
+E3 Compose in $EDITOR (honk-9qf.15.14). oc: <leader>e, /editor (prompt/index.tsx:424-516). honk: none (edtui system-editor feature off). H/S — reuse :dump's suspend/resume path.
+E4 Interrupt. oc: esc esc. honk: HAS /cancel. DONE.
+E5 Queued prompts. oc: QUEUED badge on queued user messages (S:1388-1451); <leader>q session_queued_prompts is dead in 1.18.18. honk: local queue + /drop. Roughly at parity.
+
+== F. OTHER ==
+F1 Help / key overlay. oc: ctrl+p command palette lists every command. honk: /help lists slash commands only; key map only in docs/chat.md. H/S.
+F2 Session list/switch, subagent child navigation, /diff viewer: out of scope for this epic (external ,fs/,fp pickers; honk-9qf.15.3; honk-9qf.15.6).
+
+== DESIGN NOTE ==
+Most of A3-A5, B2-B3, C2, D2, D5 share one primitive: a keyboard cursor over the transcript, then actions on the selection (expand/collapse, yank, fork-from, revert-to). opencode's equivalent is mouse click -> Message Actions dialog. In honk this needs a TRANSCRIPT FOCUS MODE (Normal mode today is the composer's vim mode, so y/Enter/za after a motion would collide with composer editing), two motions (user-turn jumps for A3/A5/D*, block-level for C2/B3), a selection highlight applied after the layout cache (not in LayoutKey, transcript.rs:49-53), and follow-mode suppression while a cursor is active (visible_lines re-enables follow near the bottom, transcript.rs:2172). Building it once makes each action small.
+
+== RECOMMENDED SUBSET (pending Jonathan's pick; reviewed by adversarial-reviewer-opus 2026-11-19) ==
+Tier 1, honk-only quick wins (~3-4 days): fix /yank (B1), :dump key binding (B5), $EDITOR compose (E3, .15.14), timestamps (A8), seed prompt history from the session (E1), [[ / ]] jump between user turns (A3/A4, scroll-only, no cursor).
+Tier 1b, honk-only (~1.5-2 weeks): transcript focus mode + cursor -> per-block collapse (C2, .15.4), yank message/code block (B2/B3); timeline/jump dialog (A5) with a new overlay widget.
+Tier 2, needs honkd: fork, full first (D5: swarm identity rewrite + adopt/exec UX; at-message after the goose patch); honk export route (B7); rename with title refresh (D7); scroll-to-message hook (A6, .15.12) only if a caller needs it.
+Tier 3, honkd + goose patch (L): goose patch (client-supplied prompt id + id-based truncate over ACP), then undo/revert/redo/edit-resend (D1-D4) as a soft revert serialized in the honkd session actor. Decide abort-vs-refuse during a run. No file restore; cutting before a compaction is hazardous.
+Skip: share (B6), conceal/sidebar (C3), stash (E2), scrollbar (A9), search (A7) unless wanted (opencode lacks it too).
+```

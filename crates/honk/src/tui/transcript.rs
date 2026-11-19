@@ -36,6 +36,8 @@ pub struct Block {
     pub output_text: String,
     pub notification_line: Option<String>,
     pub notice: Option<Notice>,
+    /// Unix seconds from goose's `_meta.goose.created` (first chunk that carries it).
+    pub created: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -240,6 +242,7 @@ impl Transcript {
                 output_text: String::new(),
                 notification_line: None,
                 notice: None,
+                created: None,
             });
             self.block_indices.insert(key.clone(), i);
             i
@@ -247,6 +250,9 @@ impl Transcript {
 
         self.invalidate_prefix_sums_from(idx);
         self.blocks[idx].revision += 1;
+        if self.blocks[idx].created.is_none() {
+            self.blocks[idx].created = u.pointer("/_meta/goose/created").and_then(Value::as_i64);
+        }
 
         match &key {
             BlockKey::Tool(_) => {
@@ -349,6 +355,7 @@ impl Transcript {
             output_text: String::new(),
             notification_line: None,
             notice: Some(notice),
+            created: None,
         });
         self.block_indices.insert(key, idx);
     }

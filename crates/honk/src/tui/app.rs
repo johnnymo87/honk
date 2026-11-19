@@ -13,8 +13,27 @@ use crate::chat::driver::{ConnectionState, StateSnapshot, UiCommand, UiEvent};
 use crate::chat::types::Notice;
 use crate::tui::composer;
 use crate::tui::keys::{Action, configure_key_handler, resolve};
+use crate::tui::quote;
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
+
+/// Transcript rows kept visible above a maximized composer.
+const MAXIMIZED_TRANSCRIPT_ROWS: u16 = 3;
+
+/// If `line` is the local command `name` (e.g. `/quote`), its argument (possibly empty).
+/// Mirrors how honk chat recognizes commands: trimmed, and `//text` is a literal.
+fn local_command<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let t = line.trim();
+    if t.starts_with("//") {
+        return None;
+    }
+    if t == name {
+        return Some("");
+    }
+    t.strip_prefix(name)
+        .filter(|rest| rest.starts_with(' '))
+        .map(str::trim)
+}
 
 pub struct App {
     pub session_id: String,
@@ -39,6 +58,8 @@ pub struct App {
     pub pending_dump: bool,
     /// First visible visual row of the composer (see `tui::composer`).
     pub composer_scroll: usize,
+    /// `zm`: the composer takes most of the screen (see `/quote`).
+    pub composer_maximized: bool,
 }
 
 impl App {
@@ -72,6 +93,7 @@ impl App {
             last_transcript_area: Rect::new(0, 0, 80, 24),
             pending_dump: false,
             composer_scroll: 0,
+            composer_maximized: false,
         }
     }
 
@@ -205,19 +227,31 @@ impl App {
             Action::ToggleJson => {
                 self.transcript.toggle_json();
             }
+            Action::ToggleMaximize => {
+                self.composer_maximized = !self.composer_maximized;
+            }
             Action::OpenCommand => {
                 self.command_line = Some(String::new());
             }
             Action::Submit => {
                 let text = self.get_composer_text();
                 let trimmed = text.trim();
-                if !trimmed.is_empty() {
+                if let Some(arg) = local_command(trimmed, "/quote") {
+                    let arg = arg.to_string();
+                    self.set_composer_text("");
+                    self.quote(&arg, false);
+                } else if local_command(trimmed, "/yank").is_some() {
+                    self.set_composer_text("");
+                    self.reset_history_recall();
+                    let mut stdout = std::io::stdout();
+                    self.yank_last_assistant(&mut stdout);
+                } else if !trimmed.is_empty() {
                     let _ = self.cmd_tx.send(UiCommand::Line(text.clone()));
                     self.history.push(text);
-                    self.history_index = None;
-                    self.history_stash.clear();
+                    self.reset_history_recall();
                     self.set_composer_text("");
                     self.composer.mode = EditorMode::Insert;
+                    self.composer_maximized = false;
                 }
             }
             Action::Newline => {
@@ -258,6 +292,7 @@ impl App {
             Action::Interrupt => {
                 if self.is_idle() && !self.is_composer_empty() {
                     self.set_composer_text("");
+                    self.composer_maximized = false;
                 } else {
                     let _ = self.cmd_tx.send(UiCommand::Interrupt);
                 }
@@ -292,6 +327,10 @@ impl App {
             "dump" => {
                 self.pending_dump = true;
             }
+            cmd if local_command(cmd, "quote").is_some() => {
+                let arg = local_command(cmd, "quote").unwrap_or("").to_string();
+                self.quote(&arg, true);
+            }
             "cancel" => {
                 let _ = self.cmd_tx.send(UiCommand::Line("/cancel".into()));
             }
@@ -324,6 +363,55 @@ impl App {
                     .apply_notice(Notice::warning(format!("unknown command: :{other}")));
             }
         }
+    }
+
+    fn reset_history_recall(&mut self) {
+        self.history_index = None;
+        self.history_stash.clear();
+    }
+
+    /// `/quote [N]` / `:quote [N]`: loads the last N coordinator replies, quoted, into the
+    /// composer (see `tui::quote`). `keep_draft` keeps the current composer text below them.
+    pub fn quote(&mut self, arg: &str, keep_draft: bool) {
+        let n = if arg.is_empty() {
+            3
+        } else {
+            match arg.parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    self.transcript.apply_notice(Notice::warning(
+                        "invalid /quote argument: must be a positive integer",
+                    ));
+                    return;
+                }
+            }
+        };
+        let running = self.transcript.active_run.is_some();
+        let Some(q) = quote::build(&self.transcript.blocks, n, running, quote::local_time) else {
+            self.transcript
+                .apply_notice(Notice::warning("no replies to quote"));
+            return;
+        };
+        if q.count < n {
+            self.transcript
+                .apply_notice(Notice::info(format!("only {} replies to quote", q.count)));
+        }
+        let draft = if keep_draft {
+            self.get_composer_text()
+        } else {
+            String::new()
+        };
+        let text = if draft.trim().is_empty() {
+            q.text
+        } else {
+            format!("{}\n\n{}", q.text, draft)
+        };
+        self.set_composer_text(&text);
+        self.composer.cursor = edtui::Index2::new(0, 0);
+        self.composer.mode = EditorMode::Normal;
+        self.composer_scroll = 0;
+        self.composer_maximized = true;
+        self.reset_history_recall();
     }
 
     pub fn yank_last_assistant<W: Write>(&mut self, writer: &mut W) {
@@ -512,7 +600,15 @@ impl App {
 
         // The composer spans the full width; render it first to learn its wrapped height.
         let rendered_composer = composer::Rendered::new(&mut self.composer, area.width);
-        let composer_height = rendered_composer.height();
+        // Rows left for the composer after the status bar, the command line and a few
+        // transcript rows.
+        let reserved = 1 + u16::from(self.command_line.is_some()) + MAXIMIZED_TRANSCRIPT_ROWS;
+        let available = area.height.saturating_sub(reserved).max(1);
+        let composer_height = if self.composer_maximized {
+            available
+        } else {
+            rendered_composer.height().min(available)
+        };
 
         let chunks = if self.command_line.is_some() {
             Layout::vertical([
@@ -1500,5 +1596,154 @@ mod tests {
         app2.handle_key(key(KeyCode::Left));
         app2.handle_paste("1\n2".to_string());
         assert_eq!(app2.get_composer_text(), "a1\n2b");
+    }
+
+    fn update(kind: &str, id: &str, text: &str, created: i64) -> Value {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "ses_q",
+            "update": {"sessionUpdate": kind, "messageId": id,
+                "content": {"type": "text", "text": text},
+                "_meta": {"goose": {"created": created, "messageId": id}}}}})
+    }
+
+    fn quote_app() -> (App, mpsc::UnboundedReceiver<UiCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        for f in [
+            update("user_message_chunk", "u1", "what's up?", 100),
+            update("agent_message_chunk", "a1", "reply one", 101),
+            update(
+                "user_message_chunk",
+                "u2",
+                "[sw wake run=r reason=mail] Woken",
+                200,
+            ),
+            update("agent_thought_chunk", "t2", "hmm", 201),
+            update("agent_message_chunk", "a2", "reply two", 202),
+            update(
+                "user_message_chunk",
+                "u3",
+                "<swarm_message v=\"1\" from=\"ses_w\">\nx",
+                300,
+            ),
+        ] {
+            app.transcript.apply_frame(&f);
+        }
+        (app, cmd_rx)
+    }
+
+    #[test]
+    fn test_slash_quote_fills_maximized_normal_composer_and_sends_nothing() {
+        let (mut app, mut cmd_rx) = quote_app();
+        type_str(&mut app, "/quote 2");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
+        let text = app.get_composer_text();
+        assert!(text.starts_with("# "), "{text}");
+        assert!(text.contains("(you)\n> reply one\n\n# "), "{text}");
+        assert!(text.ends_with("(wake: mail)\n> reply two"), "{text}");
+        assert!(!text.contains("Woken") && !text.contains("hmm") && !text.contains("what's up"));
+        assert_eq!(app.composer.mode, EditorMode::Normal);
+        assert_eq!(app.composer.cursor, edtui::Index2::new(0, 0));
+        assert!(app.composer_maximized);
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn test_colon_quote_keeps_draft_below() {
+        let (mut app, mut cmd_rx) = quote_app();
+        app.set_composer_text("my draft");
+        app.execute_app_command("quote 1");
+        assert!(cmd_rx.try_recv().is_err());
+        let text = app.get_composer_text();
+        assert!(text.ends_with("> reply two\n\nmy draft"), "{text}");
+        assert!(!text.contains("reply one"));
+    }
+
+    #[test]
+    fn test_quote_with_nothing_to_quote_warns() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        type_str(&mut app, "/quote");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.is_composer_empty());
+        assert!(!app.composer_maximized);
+        let last = app.transcript.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::Notice);
+        assert!(last.text.contains("no replies to quote"));
+    }
+
+    #[test]
+    fn test_quote_bad_arg_and_literal_escape() {
+        let (mut app, mut cmd_rx) = quote_app();
+        app.execute_app_command("quote zero");
+        assert!(app.is_composer_empty());
+        assert!(
+            app.transcript
+                .blocks
+                .last()
+                .unwrap()
+                .text
+                .contains("invalid /quote")
+        );
+        // `//quote` is the literal escape and goes upstream untouched.
+        type_str(&mut app, "//quote");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("//quote".into())
+        );
+        // `/quoted` is not the command.
+        type_str(&mut app, "/quoted");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("/quoted".into())
+        );
+    }
+
+    #[test]
+    fn test_slash_yank_stays_local() {
+        let (mut app, mut cmd_rx) = quote_app();
+        type_str(&mut app, "/yank");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.is_composer_empty());
+    }
+
+    #[test]
+    fn test_zm_maximizes_composer_and_submit_resets() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_max", cmd_tx);
+        type_str(&mut app, "hi");
+        let (rows, _) = render_rows(&mut app, 20, 20);
+        assert_eq!(composer_rows(&rows, "INSERT").1.len(), 1);
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('z')));
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(app.composer_maximized);
+        let (rows, _) = render_rows(&mut app, 20, 20);
+        // 20 rows - status bar - 3 transcript rows.
+        assert_eq!(composer_rows(&rows, "NORMAL").1.len(), 16);
+
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.composer.mode, EditorMode::Insert);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.is_composer_empty(), "submitted");
+        assert!(!app.composer_maximized);
+    }
+
+    #[test]
+    fn test_maximized_composer_on_tiny_terminal_does_not_panic() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_tiny", cmd_tx);
+        app.composer_maximized = true;
+        app.command_line = Some(String::new());
+        for h in 1..6 {
+            render_rows(&mut app, 10, h);
+        }
     }
 }
