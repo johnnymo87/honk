@@ -17,6 +17,9 @@ use crate::tui::quote;
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
 
+/// Most replies `/quote` loads; the composer re-renders its whole content every frame.
+const MAX_QUOTE: usize = 50;
+
 /// Transcript rows kept visible above a maximized composer.
 const MAXIMIZED_TRANSCRIPT_ROWS: u16 = 3;
 
@@ -290,7 +293,9 @@ impl App {
                 }
             }
             Action::Interrupt => {
-                if self.is_idle() && !self.is_composer_empty() {
+                // A maximized draft (e.g. a loaded quote) is cleared even mid-run, so the
+                // reflex "Ctrl-C to discard" cannot cancel the run instead.
+                if (self.is_idle() || self.composer_maximized) && !self.is_composer_empty() {
                     self.set_composer_text("");
                     self.composer_maximized = false;
                 } else {
@@ -377,6 +382,12 @@ impl App {
             3
         } else {
             match arg.parse::<usize>() {
+                Ok(n) if n > MAX_QUOTE => {
+                    self.transcript.apply_notice(Notice::info(format!(
+                        "/quote is capped at {MAX_QUOTE} replies"
+                    )));
+                    MAX_QUOTE
+                }
                 Ok(n) if n >= 1 => n,
                 _ => {
                     self.transcript.apply_notice(Notice::warning(
@@ -386,7 +397,9 @@ impl App {
                 }
             }
         };
-        let running = self.transcript.active_run.is_some();
+        // The core's run state, not the transcript's: the transcript's `active_run` is not
+        // carried across a replay swap, so right after attaching it can read idle mid-run.
+        let running = !self.is_idle();
         let Some(q) = quote::build(&self.transcript.blocks, n, running, quote::local_time) else {
             self.transcript
                 .apply_notice(Notice::warning("no replies to quote"));
@@ -1745,5 +1758,34 @@ mod tests {
         for h in 1..6 {
             render_rows(&mut app, 10, h);
         }
+    }
+
+    #[test]
+    fn test_ctrl_c_clears_maximized_draft_even_mid_run() {
+        let (mut app, mut cmd_rx) = quote_app();
+        app.state_snapshot = Some(StateSnapshot {
+            run_state: RunState::Running("r".into()),
+            ownership: Ownership::Foreign,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
+        });
+        // Running: the quote's last turn is marked in progress.
+        app.transcript
+            .apply_frame(&update("agent_message_chunk", "a3", "partial", 301));
+        app.set_composer_text("");
+        app.execute_app_command("quote 1");
+        assert!(
+            app.get_composer_text().contains(", in progress)"),
+            "{}",
+            app.get_composer_text()
+        );
+        assert!(!app.is_idle());
+        app.handle_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.is_composer_empty());
+        assert!(!app.composer_maximized);
+        assert!(cmd_rx.try_recv().is_err(), "no interrupt sent");
     }
 }

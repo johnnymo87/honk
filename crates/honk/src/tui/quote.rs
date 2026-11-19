@@ -19,6 +19,8 @@ pub enum Trigger {
     Swarm(String),
     /// A swarm message the session scheduled for itself (`scheduled_for=` attribute).
     Scheduled,
+    /// A prompt goose wrote itself (self-compaction resume, final_output nudge).
+    Goose,
     /// Anything else: the human.
     You,
 }
@@ -30,6 +32,7 @@ impl Trigger {
             Trigger::Wake(r) => format!("wake: {r}"),
             Trigger::Swarm(f) => format!("swarm: {f}"),
             Trigger::Scheduled => "scheduled".into(),
+            Trigger::Goose => "goose".into(),
             Trigger::You => "you".into(),
         }
     }
@@ -59,6 +62,13 @@ pub fn classify(text: &str) -> Trigger {
             .filter(|s| !s.is_empty())
             .unwrap_or("?");
         return Trigger::Swarm(from.to_string());
+    }
+    if t.starts_with("You are goose session ") || t.starts_with("You MUST call the `final_output`")
+    {
+        return Trigger::Goose;
+    }
+    if t.starts_with("{\"program\"") {
+        return Trigger::Wake("wake".into());
     }
     Trigger::You
 }
@@ -246,6 +256,18 @@ mod tests {
             Trigger::Scheduled
         );
         assert_eq!(classify("so where are we with honk?"), Trigger::You);
+        assert_eq!(
+            classify("You MUST call the `final_output` tool NOW with the final output"),
+            Trigger::Goose
+        );
+        assert_eq!(
+            classify("You are goose session 20261016_222 (author reattaches"),
+            Trigger::Goose
+        );
+        assert_eq!(
+            classify("{\"program\": \"honk\"}"),
+            Trigger::Wake("wake".into())
+        );
         assert_eq!(
             classify("[Replying to this earlier message in the topic: ...] go"),
             Trigger::You

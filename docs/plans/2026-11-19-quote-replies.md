@@ -103,3 +103,12 @@ the only composer path upstream. Folded in: injectable time formatter, exact int
 history reset, `/compact` skip, `scheduled` label, `in progress` header. Not changed (UX he
 picked): Enter in Insert still submits even when maximized; edtui undo can bring back the
 pre-quote text (Ctrl-R recovers).
+
+## Pre-PR review (adversarial-reviewer-opus, 2026-11-19)
+
+No drift from the plan. Fixed: `in progress` now uses the core's run state (`!is_idle()`),
+because the transcript's `active_run` is not carried across a replay swap and reads idle right
+after attaching mid-run; goose-written prompts (self-compaction resume, `final_output` nudge)
+label as `goose` and old `{"program"...}` JSON wakes as `wake`; N capped at 50 (the composer
+re-renders its whole content each frame); Ctrl-C clears a maximized draft even mid-run instead
+of interrupting. Left: `:quote` while a quote is already loaded quotes again under it.
