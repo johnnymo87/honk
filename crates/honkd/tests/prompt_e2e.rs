@@ -452,3 +452,43 @@ async fn busy_rejection_leaves_state_inflight_intact() {
         "ledger entry must be Done"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_undo_redo_viewer_routing() {
+    let Some(g) = StubGoose::start_or_skip().await else {
+        return;
+    };
+    let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+
+    // 1. Missing sessionId
+    let r1 = v.call("_honk/undo", serde_json::json!({})).await;
+    assert_eq!(r1["error"]["code"], -32602);
+    assert!(
+        r1["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing sessionId in _honk/undo")
+    );
+
+    let r2 = v.call("_honk/redo", serde_json::json!({})).await;
+    assert_eq!(r2["error"]["code"], -32602);
+    assert!(
+        r2["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing sessionId in _honk/redo")
+    );
+
+    // 2. With sessionId (creates/activates session, routes to actor)
+    let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    let r3 = v
+        .call("_honk/undo", serde_json::json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(r3["error"]["code"], -32002);
+    // Stub goose does not advertise truncateFromMessage by default -> capability refusal
+    assert_eq!(
+        r3["error"]["message"],
+        "goose does not support undo (needs patched goose with truncateFromMessage)"
+    );
+}
