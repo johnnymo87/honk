@@ -173,6 +173,11 @@ pub enum UiEvent {
         cwd: Option<String>,
     },
     State(StateSnapshot),
+    ModelList {
+        current: Option<String>,
+        models: Vec<crate::chat::types::ModelItem>,
+        warning: Option<String>,
+    },
     Fatal(String),
     Exit(i32),
 }
@@ -435,6 +440,17 @@ async fn process_effects(
                 if let Err(e) = crate::chat::recent::record(&id) {
                     tracing::warn!("failed to record recent model {id}: {e}");
                 }
+            }
+            Effect::ModelList {
+                current,
+                models,
+                warning,
+            } => {
+                let _ = ui_tx.send(UiEvent::ModelList {
+                    current,
+                    models,
+                    warning,
+                });
             }
             Effect::Exit(code) => {
                 if let Some(conn) = conn_opt.as_mut() {

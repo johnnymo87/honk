@@ -5060,39 +5060,107 @@ fn test_help_command_includes_model() {
 }
 
 #[test]
-fn test_model_command_bare_prints_current_model() {
+fn test_model_command_bare_requests_list() {
     let (mut core, _) = new_test_core();
 
-    // No model set initially
     let effs = core.handle(Input::Line("/model".into()));
-    let notice = effs
+    let (req_id, method, params) = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Notice(n) => Some(n),
+            Effect::Request { id, method, params } => Some((*id, method.clone(), params.clone())),
             _ => None,
         })
-        .expect("expected notice for bare /model");
-    assert_eq!(notice.kind, NoticeKind::Info);
-    assert_eq!(notice.text, "no model set");
+        .expect("expected Effect::Request for bare /model");
+    assert_eq!(method, "_honk/model/list");
+    assert_eq!(params["sessionId"], "test-session");
 
-    // Model set
-    core.set_config_options(&json!([
-        {
-            "id": "model",
-            "currentValue": "claude-opus-5-5",
-            "options": [{"value": "claude-opus-5-5"}]
+    // Success response with models and warning
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "provider": "gcp_vertex_ai",
+            "current": "claude-opus-5-5",
+            "warning": "stale models file",
+            "models": [
+                { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured" },
+                { "id": "gemini-3.8-flash", "name": "gemini-3.8-flash", "source": "goose" }
+            ]
         }
-    ]));
-    let effs = core.handle(Input::Line("/model".into()));
-    let notice = effs
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+
+    // 1. Warning notice emitted
+    let warning_notice = resp_effs
         .iter()
         .find_map(|e| match e {
-            Effect::Notice(n) => Some(n),
+            Effect::Notice(n) if n.kind == NoticeKind::Warning => Some(n),
             _ => None,
         })
-        .expect("expected notice for bare /model");
-    assert_eq!(notice.kind, NoticeKind::Info);
-    assert_eq!(notice.text, "model: claude-opus-5-5");
+        .expect("expected warning notice");
+    assert_eq!(warning_notice.text, "stale models file");
+
+    // 2. Effect::ModelList emitted
+    let model_list = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::ModelList {
+                current,
+                models,
+                warning,
+            } => Some((current.clone(), models.clone(), warning.clone())),
+            _ => None,
+        })
+        .expect("expected Effect::ModelList");
+    assert_eq!(model_list.0, Some("claude-opus-5-5".to_string()));
+    assert_eq!(model_list.1.len(), 2);
+    assert_eq!(model_list.1[0].id, "claude-opus-5-5");
+    assert_eq!(model_list.1[0].name, "Claude Opus 5.5");
+    assert_eq!(model_list.1[0].source, "configured");
+    assert_eq!(model_list.2, Some("stale models file".to_string()));
+
+    // 3. ChatCore's known_model_ids refreshed
+    // Now /model gemini-3.8-flash shouldn't emit "not in goose's model list" warning
+    let set_effs = core.handle(Input::Line("/model gemini-3.8-flash".into()));
+    assert!(
+        !set_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning))
+    );
+}
+
+#[test]
+fn test_model_command_list_error_emits_error_notice() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .expect("expected Effect::Request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32601,
+            "message": "Method not found"
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let error_notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.kind == NoticeKind::Error => Some(n),
+            _ => None,
+        })
+        .expect("expected error notice");
+    assert_eq!(error_notice.text, "Method not found");
 }
 
 #[test]

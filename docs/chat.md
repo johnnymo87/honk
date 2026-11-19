@@ -135,6 +135,9 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `z a` | Toggle tool call expansion (expand/collapse tool arguments and outputs). |
 | `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
 | `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
+| `Ctrl-X m` | Open model picker overlay (in both Normal and Insert modes). |
+| `F2` | Cycle to next recent model (in both Normal and Insert modes). |
+| `Shift-F2` | Cycle to previous recent model (in both Normal and Insert modes). |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
 | `Ctrl-C` | If idle and composer has text: clears composer. Otherwise: interrupts active turn (`Action::Interrupt`). |
@@ -164,7 +167,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
-| `/model [id]` | `:model [id]` | Switch model (`/model <id>`) or show current model (`/model`). |
+| `/model [id]` | `:model [id]` | Switch model (`/model <id>`), open model picker (`/model`), or cycle recent models with `F2`/`Shift-F2`. |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
@@ -339,5 +342,4 @@ set -g set-clipboard on
 - **No Interactive Permission UI**: Permissions on own turns are auto-approved (`allow_once`); foreign turns require their owner or manual `/approve`.
 - **No Elicitation Form UI**: Elicitation prompts are auto-declined.
 - **Duplicate User Line after Log Rebuild**: Following a `honkd` state rebuild from export, a user message may appear duplicated due to echo-reconciliation differences.
-- **Model Switching**: Mid-session model switching is not supported from the TUI.
 - **Per-Session Extension Toggles**: Platform extensions (`--ext`) are selected at creation time; catalog MCP servers can be dynamically toggled per session via `/mcp`.

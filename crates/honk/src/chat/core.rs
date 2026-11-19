@@ -476,7 +476,9 @@ impl ChatCore {
     }
 
     pub fn has_pending_model_mutation(&self) -> bool {
-        !self.pending_model_reqs.is_empty()
+        self.pending_model_reqs
+            .values()
+            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }))
     }
 
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
@@ -1058,7 +1060,10 @@ impl ChatCore {
                 "mcp: change may or may not have applied; run /mcp to check",
             )));
         }
-        let had_model_mutation = !self.pending_model_reqs.is_empty();
+        let had_model_mutation = self
+            .pending_model_reqs
+            .values()
+            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }));
         self.pending_model_reqs.clear();
         if had_model_mutation {
             effects.push(Effect::Notice(Notice::warning(
@@ -1223,30 +1228,90 @@ impl ChatCore {
         frame: &Value,
         effects: &mut Vec<Effect>,
     ) -> bool {
-        if let Some(err) = frame.get("error") {
-            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("model error");
+        match req {
+            super::types::PendingModelReq::List => {
+                if let Some(err) = frame.get("error") {
+                    let msg = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("model error");
+                    effects.push(Effect::Notice(Notice::error(msg)));
+                    return false;
+                }
 
-            if code == -32002
-                && let Some((raw_line, count)) = req.queued
-                && count < 3
-            {
-                self.local_queue.push_front((raw_line, count + 1));
-                return true;
+                let result = frame.get("result").unwrap_or(&Value::Null);
+                let current = result
+                    .get("current")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| self.model().map(String::from));
+                let warning = result
+                    .get("warning")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let models: Vec<super::types::ModelItem> = result
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                let id = m.get("id").and_then(Value::as_str)?.to_string();
+                                let name = m
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&id)
+                                    .to_string();
+                                let source = m
+                                    .get("source")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                Some(super::types::ModelItem { id, name, source })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                self.known_model_ids = models.iter().map(|m| m.id.clone()).collect();
+
+                if let Some(ref w) = warning {
+                    effects.push(Effect::Notice(Notice::warning(w.clone())));
+                }
+
+                effects.push(Effect::ModelList {
+                    current,
+                    models,
+                    warning,
+                });
+                false
             }
+            super::types::PendingModelReq::Set { model, queued } => {
+                if let Some(err) = frame.get("error") {
+                    let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                    let msg = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("model error");
 
-            effects.push(Effect::Notice(Notice::error(msg)));
-            return false;
+                    if code == -32002
+                        && let Some((raw_line, count)) = queued
+                        && count < 3
+                    {
+                        self.local_queue.push_front((raw_line, count + 1));
+                        return true;
+                    }
+
+                    effects.push(Effect::Notice(Notice::error(msg)));
+                    return false;
+                }
+
+                let result = frame.get("result").unwrap_or(&Value::Null);
+                self.update_model_state(result, true, effects);
+                effects.push(Effect::RecordRecentModel(model));
+
+                false
+            }
         }
-
-        let result = frame.get("result").unwrap_or(&Value::Null);
-        self.update_model_state(result, true, effects);
-        effects.push(Effect::RecordRecentModel(req.model));
-
-        false
     }
 }
 

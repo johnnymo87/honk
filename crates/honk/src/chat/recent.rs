@@ -64,6 +64,56 @@ pub fn record_in(dir: &Path, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CycleDirection {
+    Next,
+    Prev,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CycleResult {
+    Switch(String),
+    NoOtherRecent,
+}
+
+pub fn cycle(recent: &[String], current: Option<&str>, direction: CycleDirection) -> CycleResult {
+    let mut deduped: Vec<&str> = Vec::new();
+    for id in recent {
+        if !deduped.contains(&id.as_str()) {
+            deduped.push(id.as_str());
+        }
+    }
+
+    let distinct_count = if let Some(curr) = current {
+        if deduped.contains(&curr) {
+            deduped.len()
+        } else {
+            deduped.len() + 1
+        }
+    } else {
+        deduped.len()
+    };
+
+    if distinct_count < 2 || deduped.is_empty() {
+        return CycleResult::NoOtherRecent;
+    }
+
+    if let Some(curr) = current
+        && let Some(idx) = deduped.iter().position(|&id| id == curr)
+    {
+        let next_idx = match direction {
+            CycleDirection::Next => (idx + 1) % deduped.len(),
+            CycleDirection::Prev => (idx + deduped.len() - 1) % deduped.len(),
+        };
+        return CycleResult::Switch(deduped[next_idx].to_string());
+    }
+
+    match direction {
+        CycleDirection::Next => CycleResult::Switch(deduped[0].to_string()),
+        CycleDirection::Prev => CycleResult::Switch(deduped[deduped.len() - 1].to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +191,56 @@ mod tests {
         assert_eq!(loaded.len(), 10);
         assert_eq!(loaded[0], "model-15");
         assert_eq!(loaded[9], "model-6");
+    }
+
+    #[test]
+    fn test_cycle_models() {
+        let recent = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+
+        // Next from m1 -> m2
+        assert_eq!(
+            cycle(&recent, Some("m1"), CycleDirection::Next),
+            CycleResult::Switch("m2".to_string())
+        );
+        // Prev from m1 -> m3 (wrapping)
+        assert_eq!(
+            cycle(&recent, Some("m1"), CycleDirection::Prev),
+            CycleResult::Switch("m3".to_string())
+        );
+        // Next from m3 -> m1 (wrapping)
+        assert_eq!(
+            cycle(&recent, Some("m3"), CycleDirection::Next),
+            CycleResult::Switch("m1".to_string())
+        );
+        // Current not in recent: F2 picks recent[0]
+        assert_eq!(
+            cycle(&recent, Some("m0"), CycleDirection::Next),
+            CycleResult::Switch("m1".to_string())
+        );
+        // Current not in recent: shift+F2 picks recent.last()
+        assert_eq!(
+            cycle(&recent, Some("m0"), CycleDirection::Prev),
+            CycleResult::Switch("m3".to_string())
+        );
+
+        // Fewer than 2 distinct options
+        assert_eq!(
+            cycle(&[], Some("m1"), CycleDirection::Next),
+            CycleResult::NoOtherRecent
+        );
+        assert_eq!(
+            cycle(&["m1".to_string()], Some("m1"), CycleDirection::Next),
+            CycleResult::NoOtherRecent
+        );
+        assert_eq!(
+            cycle(&["m1".to_string()], None, CycleDirection::Next),
+            CycleResult::NoOtherRecent
+        );
+
+        // 2 distinct options (current not in recent, recent has 1 differing item)
+        assert_eq!(
+            cycle(&["m1".to_string()], Some("m2"), CycleDirection::Next),
+            CycleResult::Switch("m1".to_string())
+        );
     }
 }

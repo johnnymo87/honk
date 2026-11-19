@@ -13,6 +13,7 @@ use crate::chat::driver::{ConnectionState, StateSnapshot, UiCommand, UiEvent};
 use crate::chat::types::Notice;
 use crate::tui::composer;
 use crate::tui::keys::{Action, configure_key_handler, resolve};
+use crate::tui::model_picker::{ModelPicker, PickerOutcome};
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
 
@@ -28,6 +29,7 @@ pub struct App {
     pub history_index: Option<usize>,
     pub history_stash: String,
     pub command_line: Option<String>,
+    pub model_picker: Option<ModelPicker>,
     pub state_snapshot: Option<StateSnapshot>,
     pub pending_prefix: Option<char>,
     pub enhanced_keyboard: bool,
@@ -62,6 +64,7 @@ impl App {
             history_index: None,
             history_stash: String::new(),
             command_line: None,
+            model_picker: None,
             state_snapshot: None,
             pending_prefix: None,
             enhanced_keyboard: false,
@@ -117,6 +120,20 @@ impl App {
         // Stopped state + any key -> UiCommand::RetryAttach (in addition to key's normal effect)
         if matches!(self.connection_state(), ConnectionState::Stopped { .. }) {
             let _ = self.cmd_tx.send(UiCommand::RetryAttach);
+        }
+
+        // If model picker is active
+        if let Some(mut picker) = self.model_picker.take() {
+            match picker.handle_key(key_event) {
+                PickerOutcome::Stay => {
+                    self.model_picker = Some(picker);
+                }
+                PickerOutcome::Close => {}
+                PickerOutcome::Select(id) => {
+                    let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                }
+            }
+            return;
         }
 
         // If app command line is active
@@ -207,6 +224,51 @@ impl App {
             }
             Action::OpenCommand => {
                 self.command_line = Some(String::new());
+            }
+            Action::OpenModelPicker => {
+                let _ = self.cmd_tx.send(UiCommand::Line("/model".into()));
+            }
+            Action::CycleModelNext => {
+                let recent = crate::chat::recent::load();
+                let current = self
+                    .state_snapshot
+                    .as_ref()
+                    .and_then(|s| s.model.as_deref());
+                match crate::chat::recent::cycle(
+                    &recent,
+                    current,
+                    crate::chat::recent::CycleDirection::Next,
+                ) {
+                    crate::chat::recent::CycleResult::Switch(id) => {
+                        let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                    }
+                    crate::chat::recent::CycleResult::NoOtherRecent => {
+                        self.transcript.apply_notice(Notice::info(
+                            "no other recent model; use /model to pick one",
+                        ));
+                    }
+                }
+            }
+            Action::CycleModelPrev => {
+                let recent = crate::chat::recent::load();
+                let current = self
+                    .state_snapshot
+                    .as_ref()
+                    .and_then(|s| s.model.as_deref());
+                match crate::chat::recent::cycle(
+                    &recent,
+                    current,
+                    crate::chat::recent::CycleDirection::Prev,
+                ) {
+                    crate::chat::recent::CycleResult::Switch(id) => {
+                        let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                    }
+                    crate::chat::recent::CycleResult::NoOtherRecent => {
+                        self.transcript.apply_notice(Notice::info(
+                            "no other recent model; use /model to pick one",
+                        ));
+                    }
+                }
             }
             Action::Submit => {
                 let text = self.get_composer_text();
@@ -497,6 +559,14 @@ impl App {
                 self.should_quit = true;
             }
             UiEvent::Transcript(_) => {}
+            UiEvent::ModelList {
+                current,
+                models,
+                warning: _,
+            } => {
+                let recent = crate::chat::recent::load();
+                self.model_picker = Some(ModelPicker::new(current, models, recent));
+            }
         }
     }
 
@@ -577,6 +647,15 @@ impl App {
                 cmd_area.y,
             ));
             return;
+        }
+
+        // 5. Model picker popup if active
+        if let Some(ref mut picker) = self.model_picker {
+            picker.render(area, frame.buffer_mut());
+            if let Some((cx, cy)) = picker.cursor_position(area) {
+                frame.set_cursor_position(Position::new(cx, cy));
+                return;
+            }
         }
 
         frame.set_cursor_position(composer_cursor);
@@ -1508,5 +1587,127 @@ mod tests {
         app2.handle_key(key(KeyCode::Left));
         app2.handle_paste("1\n2".to_string());
         assert_eq!(app2.get_composer_text(), "a1\n2b");
+    }
+
+    #[test]
+    fn test_ui_event_model_list_opens_picker_and_captures_keys() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_picker", cmd_tx);
+
+        assert!(app.model_picker.is_none());
+
+        // UiEvent::ModelList arrives -> picker opens
+        let models = vec![
+            crate::chat::types::ModelItem {
+                id: "model-a".to_string(),
+                name: "Model A".to_string(),
+                source: "configured".to_string(),
+            },
+            crate::chat::types::ModelItem {
+                id: "model-b".to_string(),
+                name: "Model B".to_string(),
+                source: "goose".to_string(),
+            },
+        ];
+        app.handle_ui_event(UiEvent::ModelList {
+            current: Some("model-a".to_string()),
+            models,
+            warning: None,
+        });
+
+        assert!(app.model_picker.is_some());
+
+        // Keys are captured by the picker overlay:
+        // Move down to select model-b
+        app.handle_key(key(KeyCode::Down));
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, Some(3));
+
+        // Pressing Enter on model-b -> sends /model model-b and closes picker
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.model_picker.is_none());
+
+        let cmd = cmd_rx.try_recv().expect("expected /model command");
+        assert_eq!(cmd, UiCommand::Line("/model model-b".to_string()));
+    }
+
+    #[test]
+    fn test_ctrl_x_m_sends_slash_model() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_ctrl_x", cmd_tx);
+
+        // Ctrl-X then m
+        app.handle_key(ctrl('x'));
+        assert_eq!(app.pending_prefix, Some('\x18'));
+        app.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(app.pending_prefix, None);
+
+        let cmd = cmd_rx.try_recv().expect("expected /model command");
+        assert_eq!(cmd, UiCommand::Line("/model".to_string()));
+    }
+
+    #[test]
+    fn test_f2_cycling_fewer_than_2_emits_notice() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_f2", cmd_tx);
+
+        app.state_snapshot = Some(StateSnapshot {
+            run_state: crate::chat::types::RunState::Idle,
+            ownership: crate::chat::types::Ownership::Unknown,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
+            model: Some("single-model".to_string()),
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temp.path());
+        }
+
+        app.handle_key(key(KeyCode::F(2)));
+        assert!(cmd_rx.try_recv().is_err());
+        let last_block = app.transcript.blocks.last().unwrap();
+        assert_eq!(last_block.kind, BlockKind::Notice);
+        assert_eq!(
+            last_block.notice.as_ref().unwrap().text,
+            "no other recent model; use /model to pick one"
+        );
+    }
+
+    #[test]
+    fn test_f2_and_shift_f2_cycle_switches() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_f2_cycle", cmd_tx);
+
+        app.state_snapshot = Some(StateSnapshot {
+            run_state: crate::chat::types::RunState::Idle,
+            ownership: crate::chat::types::Ownership::Unknown,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
+            model: Some("model-1".to_string()),
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-2").unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-1").unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temp.path());
+        }
+
+        // F2 -> next after model-1 is model-2
+        app.handle_key(key(KeyCode::F(2)));
+        let cmd = cmd_rx.try_recv().expect("expected /model command");
+        assert_eq!(cmd, UiCommand::Line("/model model-2".to_string()));
+
+        // Shift-F2 -> prev before model-1 is model-2 (wrapping)
+        app.handle_key(press(KeyCode::F(2), KeyModifiers::SHIFT));
+        let cmd = cmd_rx.try_recv().expect("expected /model command");
+        assert_eq!(cmd, UiCommand::Line("/model model-2".to_string()));
     }
 }

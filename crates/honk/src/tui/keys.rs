@@ -16,6 +16,9 @@ pub enum Action {
     ToggleThoughts,
     ToggleJson,
     OpenCommand,
+    OpenModelPicker,
+    CycleModelNext,
+    CycleModelPrev,
     HistoryPrev,
     HistoryNext,
     Interrupt,
@@ -40,6 +43,8 @@ pub fn configure_key_handler(handler: &mut edtui::events::KeyEventHandler) {
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('p')]));
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('n')]));
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('d')]));
+    handler.remove(&KeyEventRegister::n(vec![KeyInput::ctrl('x')]));
+    handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('x')]));
     handler.remove(&KeyEventRegister::n(vec![KeyInput::new(':')]));
 }
 
@@ -66,30 +71,51 @@ pub fn resolve(
         return Action::Ignore;
     }
 
-    // Pending prefix resolution (Normal mode only)
-    if mode == EditorMode::Normal
-        && let Some(prefix) = pending_prefix
-    {
-        match prefix {
-            'z' => {
-                if key_event.modifiers == KeyModifiers::NONE {
-                    match key_event.code {
-                        KeyCode::Char('a') => return Action::ToggleTools,
-                        KeyCode::Char('t') => return Action::ToggleThoughts,
-                        KeyCode::Char('j') => return Action::ToggleJson,
-                        _ => return Action::Edtui(key_event),
+    // Pending prefix resolution
+    if let Some(prefix) = pending_prefix {
+        if prefix == '\x18' {
+            if key_event.modifiers == KeyModifiers::NONE && key_event.code == KeyCode::Char('m') {
+                return Action::OpenModelPicker;
+            } else {
+                return Action::Ignore;
+            }
+        }
+        if mode == EditorMode::Normal {
+            match prefix {
+                'z' => {
+                    if key_event.modifiers == KeyModifiers::NONE {
+                        match key_event.code {
+                            KeyCode::Char('a') => return Action::ToggleTools,
+                            KeyCode::Char('t') => return Action::ToggleThoughts,
+                            KeyCode::Char('j') => return Action::ToggleJson,
+                            _ => return Action::Edtui(key_event),
+                        }
                     }
+                    return Action::Edtui(key_event);
                 }
-                return Action::Edtui(key_event);
-            }
-            'g' => {
-                if key_event.modifiers == KeyModifiers::NONE && key_event.code == KeyCode::Char('g')
-                {
-                    return Action::ScrollTop;
+                'g' => {
+                    if key_event.modifiers == KeyModifiers::NONE
+                        && key_event.code == KeyCode::Char('g')
+                    {
+                        return Action::ScrollTop;
+                    }
+                    return Action::Edtui(key_event);
                 }
-                return Action::Edtui(key_event);
+                _ => return Action::Edtui(key_event),
             }
-            _ => return Action::Edtui(key_event),
+        }
+    }
+
+    // Global keys across both Normal and Insert modes:
+    if key_event.modifiers == KeyModifiers::CONTROL && key_event.code == KeyCode::Char('x') {
+        return Action::PendingPrefix('\x18');
+    }
+
+    if key_event.code == KeyCode::F(2) {
+        if key_event.modifiers == KeyModifiers::SHIFT {
+            return Action::CycleModelPrev;
+        } else if key_event.modifiers.is_empty() {
+            return Action::CycleModelNext;
         }
     }
 
@@ -655,6 +681,91 @@ mod tests {
         assert_eq!(
             resolve(EditorMode::Insert, false, esc, None, false),
             Action::Edtui(esc)
+        );
+    }
+
+    #[test]
+    fn test_ctrl_x_prefix_and_picker_both_modes() {
+        let ctrl_x = ctrl('x');
+        let m_key = key(KeyCode::Char('m'));
+        let a_key = key(KeyCode::Char('a'));
+
+        // Normal mode
+        assert_eq!(
+            resolve(EditorMode::Normal, true, ctrl_x, None, false),
+            Action::PendingPrefix('\x18')
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, false, ctrl_x, None, false),
+            Action::PendingPrefix('\x18')
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, true, m_key, Some('\x18'), false),
+            Action::OpenModelPicker
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, true, a_key, Some('\x18'), false),
+            Action::Ignore
+        );
+
+        // Insert mode
+        assert_eq!(
+            resolve(EditorMode::Insert, true, ctrl_x, None, false),
+            Action::PendingPrefix('\x18')
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, false, ctrl_x, None, false),
+            Action::PendingPrefix('\x18')
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, m_key, Some('\x18'), false),
+            Action::OpenModelPicker
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, a_key, Some('\x18'), false),
+            Action::Ignore
+        );
+    }
+
+    #[test]
+    fn test_f2_and_shift_f2_cycle_model_both_modes() {
+        let f2 = key(KeyCode::F(2));
+        let shift_f2 = press(KeyCode::F(2), KeyModifiers::SHIFT);
+
+        // Normal mode
+        assert_eq!(
+            resolve(EditorMode::Normal, true, f2, None, false),
+            Action::CycleModelNext
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, false, f2, None, false),
+            Action::CycleModelNext
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, true, shift_f2, None, false),
+            Action::CycleModelPrev
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, false, shift_f2, None, false),
+            Action::CycleModelPrev
+        );
+
+        // Insert mode
+        assert_eq!(
+            resolve(EditorMode::Insert, true, f2, None, false),
+            Action::CycleModelNext
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, false, f2, None, false),
+            Action::CycleModelNext
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, shift_f2, None, false),
+            Action::CycleModelPrev
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, false, shift_f2, None, false),
+            Action::CycleModelPrev
         );
     }
 }

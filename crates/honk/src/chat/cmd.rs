@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /model [id] - switch model (/model <id>) or show current model (/model)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /model [id] - switch model (/model <id>) or open model picker (/model, ctrl+x m; cycle with F2/shift+F2)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -330,11 +330,7 @@ impl ChatCore {
     ) {
         let rest = line.strip_prefix("/model").unwrap().trim();
         if rest.is_empty() {
-            let msg = match self.model() {
-                Some(m) => format!("model: {m}"),
-                None => "no model set".to_string(),
-            };
-            effects.push(Effect::Notice(Notice::info(msg)));
+            self.dispatch_model_list(line, effects);
             return;
         }
 
@@ -346,6 +342,20 @@ impl ChatCore {
         }
 
         self.dispatch_model_set(line, queued, id, effects);
+    }
+
+    fn dispatch_model_list(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+            return;
+        }
+        let req_id = self.allocate_id();
+        self.pending_model_reqs
+            .insert(req_id, super::types::PendingModelReq::List);
+        effects.push(Effect::Request {
+            id: req_id,
+            method: "_honk/model/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
     }
 
     fn must_queue_model(&self, queued_dispatch: bool) -> bool {
@@ -381,7 +391,7 @@ impl ChatCore {
             let req_id = self.allocate_id();
             self.pending_model_reqs.insert(
                 req_id,
-                super::types::PendingModelReq {
+                super::types::PendingModelReq::Set {
                     model: id.to_string(),
                     queued,
                 },
