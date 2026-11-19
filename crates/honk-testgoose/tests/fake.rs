@@ -1070,7 +1070,10 @@ async fn test_load_frames_delivered_after_load_reply() -> anyhow::Result<()> {
             Duration::from_secs(5),
         )
         .await?;
-    assert_eq!(reply, json!({}));
+    assert_eq!(
+        reply,
+        json!({ "configOptions": fake.get_session_config_options(&sid) })
+    );
 
     // Next event on session stream should be the usage frame
     let ev = tokio::time::timeout(Duration::from_secs(2), async {

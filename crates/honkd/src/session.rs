@@ -1857,6 +1857,14 @@ impl Session {
                     self.turn.on_user_message(msg_id);
                 }
 
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("config_option_update")
+                    && let Some(config_options) =
+                        update.get("configOptions").and_then(Value::as_array)
+                {
+                    self.update_config_options(config_options).await;
+                }
+
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     if run_opt.is_some() {
                         self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
@@ -1888,6 +1896,14 @@ impl Session {
                         .and_then(Value::as_str)
                 {
                     self.turn.on_user_message(msg_id);
+                }
+
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("config_option_update")
+                    && let Some(config_options) =
+                        update.get("configOptions").and_then(Value::as_array)
+                {
+                    self.update_config_options(config_options).await;
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
@@ -2181,6 +2197,30 @@ impl Session {
                 });
             }
         }
+    }
+
+    async fn update_config_options(&mut self, config_options: &[Value]) {
+        let opts_val = Value::Array(config_options.to_vec());
+        if let Some(obj) = self.init_result.as_object_mut() {
+            obj.insert("configOptions".to_string(), opts_val.clone());
+        } else {
+            self.init_result = json!({ "configOptions": opts_val.clone() });
+        }
+        let sid = self.sid.clone();
+        let mut s = self.state_store.lock().await;
+        let _ = s.mutate(|st| {
+            if let Some(h) = st.sessions.get_mut(&sid) {
+                if let Some(ref mut ir) = h.init_result {
+                    if let Some(obj) = ir.as_object_mut() {
+                        obj.insert("configOptions".to_string(), opts_val);
+                    } else {
+                        *ir = json!({ "configOptions": opts_val });
+                    }
+                } else {
+                    h.init_result = Some(json!({ "configOptions": opts_val }));
+                }
+            }
+        });
     }
 
     /// Records or clears the session's turn error. A clear writes state only
@@ -3125,6 +3165,12 @@ impl Session {
                             params,
                         },
                     );
+                    return;
+                }
+                if method == "session/set_config_option" && self.turn.is_running() {
+                    let err_resp =
+                        crate::rpc::error(id, -32002, "session is busy; try after this turn", None);
+                    self.send_to_viewer(viewer_id, err_resp);
                     return;
                 }
                 let raw_extension_op = method == "_goose/unstable/session/extensions/add"
