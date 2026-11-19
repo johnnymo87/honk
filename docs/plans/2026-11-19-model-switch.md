@@ -119,3 +119,53 @@ Provider switching and GPT models (`honk-9qf.15.24`); Telegram `/model`
 
 Merge (author's OK) → workstation PR: models file + `--models-file` flag in the honkd unit
 (cloudbox and devbox) → home-manager switch + honkd restart (author's OK).
+
+## Tasks (subagent-driven; one commit per task, TDD)
+
+Build/test: `nix develop -c cargo test -p <crate> --test <file>`; live tests need
+`HONK_GOOSE_BIN=$HOME/.local/state/honk-goose-bin/patched-1.54.0.3/pkg/bin/goose`. Before
+the PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace`.
+
+- **T1 honkd: fresh `init_result` + busy guard.** `session.rs` `on_upstream` session-stream
+  block: on `config_option_update` replace `self.init_result["configOptions"]` and the
+  persisted `HeldSession.init_result` (same `state_store.mutate` shape as
+  `last_conn_event_id`). Forward: `session/set_config_option` while `self.turn.is_running()`
+  → -32002 "session is busy; try after this turn". Tests (`honkd/tests/model.rs`,
+  FakeGoose): viewer B attaching after A's switch sees the new `currentValue` in its
+  `session/load` reply; state file has it; set during a running turn → -32002; idle set is
+  forwarded and both viewers get the update frame.
+- **T2 honkd: `--models-file` + `_honk/model/list`.** `config.rs` flag;
+  `honkd/src/models.rs` pure `load(path) -> Result<ModelsFile>` and
+  `merge(configured, init_result) -> ListReply` (unit tests: order, dedupe, missing
+  provider, absent `configOptions`, garbled file → warning). `viewer.rs` branch before the
+  generic Forward (get-or-activate + auto-attach as `_honk/mcp/*`, not gated on
+  `hub.mcp`); `SessionMsg::ModelList` answered from `init_result`. e2e in `model.rs`.
+- **T3 honk core: model state, notices, status bar.** Parse `configOptions` (`model`,
+  `provider` selects) from the `session/new` result, `Attached` result and
+  `config_option_update`; `ChatCore` field + `StateSnapshot.model`; notice
+  `model: A → B` on change when not replaying; `status.rs` segment with fallback.
+  Tests: `chat_core.rs`, status width tests.
+- **T4 honk: `/model <id>`, queueing, recent file.** `cmd.rs` `/model <id>` and `:model`;
+  `PendingModelReq`; queue/flush/-32002 re-queue like `/mcp` (`check_queued_prompts`
+  learns the `/model ` prefix); warning for ids not in the last known list; on success
+  update `honk/src/chat/recent.rs` (`model-recent.json`, max 10, MRU). Tests:
+  `chat_core.rs` + recent-file unit tests (tempdir via `XDG_STATE_HOME`).
+- **T5 honk TUI: picker, `ctrl+x m`, `F2`.** `/model` with no arg → `_honk/model/list` →
+  `UiEvent::ModelList` → `tui/model_picker.rs` overlay (filter, sections, `●` current,
+  j/k/arrows, Enter → `UiCommand::Line("/model <id>")`, Esc). `keys.rs`: `ctrl+x` prefix
+  (both modes) → `m` opens picker; `F2`/`shift+F2` cycle recent. Tests: picker unit tests
+  (filter, sections, selection), key resolution tests.
+- **T6 `--model` on `honk chat --new` and `honk launch`.** `main.rs` flags; driver sends
+  `session/set_config_option` after `session/new` before building `ChatCore` (error →
+  notice); `launch.rs` `step!` after `rename`, failure aborts before prompt. Tests:
+  `launch.rs` (order of calls, abort), `chat_driver.rs`.
+- **T7 docs + live.** `docs/chat.md` (`/model`, keys, `--model`), README/flags if listed;
+  live StubGoose test: real `set_config_option` through honkd, `_honk/model/list` reports
+  the new current.
+
+## Workstation (after merge, author's OK)
+
+`--models-file` written by Nix (Vertex Claude + Gemini ids from opencode's config,
+`@default` stripped) on cloudbox and devbox; bump the honk flake input; home-manager
+switch + `systemctl --user restart honkd`.
