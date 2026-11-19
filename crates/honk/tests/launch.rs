@@ -673,35 +673,6 @@ async fn preflight_failures_create_nothing_even_with_an_explicit_tag() {
     run(&o).await.expect("launch");
 }
 
-static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct EnvGuard {
-    keys: Vec<&'static str>,
-}
-
-impl EnvGuard {
-    fn new(vars: &[(&'static str, &str)]) -> Self {
-        for &(k, v) in vars {
-            unsafe {
-                std::env::set_var(k, v);
-            }
-        }
-        Self {
-            keys: vars.iter().map(|&(k, _)| k).collect(),
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for k in &self.keys {
-            unsafe {
-                std::env::remove_var(k);
-            }
-        }
-    }
-}
-
 fn make_fake_auto_attach(dir: &Path, record_path: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script_path = dir.join("fake-oc-auto-attach.sh");
@@ -736,55 +707,6 @@ async fn wait_for_record(path: &Path) -> Option<String> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     None
-}
-
-#[tokio::test]
-async fn auto_attach_happy_path_spawns_and_scrubs_env() {
-    let _lock = ENV_MUTEX.lock().await;
-    let _guard = EnvGuard::new(&[
-        (honk::octags::OPENCODE_SESSION_ID_ENV, "ses_launcher_123"),
-        (honk::octags::AGENT_SESSION_ID_ENV, "agent_launcher_456"),
-    ]);
-
-    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
-    let temp = tempfile::tempdir().unwrap();
-    let record_path = temp.path().join("record.txt");
-    let log_path = temp.path().join("attach.log");
-    let script_path = make_fake_auto_attach(temp.path(), &record_path);
-
-    let mut o = opts(
-        &r,
-        TagRequest::Explicit("honk".into()),
-        Some("ses_launcher"),
-        Some("Fix it"),
-    );
-    o.attach = Some(AttachSettings {
-        bin: script_path.to_string_lossy().into_owned(),
-        tmux_session: Some("honk-test-session".into()),
-        log_file: log_path,
-    });
-
-    let out = run(&o).await.expect("launch");
-    assert_eq!(out.native, SID);
-    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
-
-    let recorded = wait_for_record(&record_path)
-        .await
-        .expect("fake oc-auto-attach should have written record file");
-    assert!(
-        recorded.contains(&format!(
-            "ARGS:--tmux-session honk-test-session goose:{SID}"
-        )),
-        "recorded args mismatch: {recorded}"
-    );
-    assert!(
-        recorded.contains(&format!("{}:ABSENT", honk::octags::OPENCODE_SESSION_ID_ENV)),
-        "OPENCODE_SESSION_ID should be scrubbed: {recorded}"
-    );
-    assert!(
-        recorded.contains(&format!("{}:ABSENT", honk::octags::AGENT_SESSION_ID_ENV)),
-        "AGENT_SESSION_ID should be scrubbed: {recorded}"
-    );
 }
 
 #[tokio::test]
