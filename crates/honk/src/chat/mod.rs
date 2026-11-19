@@ -2,6 +2,7 @@ pub mod cmd;
 pub mod core;
 pub mod driver;
 pub mod parse;
+pub mod recent;
 pub mod types;
 
 pub use core::ChatCore;

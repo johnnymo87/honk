@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /model [id] - switch model (/model <id>) or show current model (/model)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -110,6 +110,11 @@ impl ChatCore {
 
         if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
             self.handle_mcp_command(trimmed, effects);
+            return true;
+        }
+
+        if trimmed == "/model" || trimmed.starts_with("/model ") {
+            self.handle_model_command(trimmed, effects);
             return true;
         }
 
@@ -299,6 +304,93 @@ impl ChatCore {
                 params: json!({
                     "sessionId": self.session_id,
                     "names": names,
+                }),
+            });
+        }
+    }
+
+    pub(crate) fn handle_model_command(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        self.handle_model_command_inner(line, None, effects);
+    }
+
+    pub(crate) fn handle_queued_model_command(
+        &mut self,
+        line: &str,
+        requeues: u32,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.handle_model_command_inner(line, Some((line.to_string(), requeues)), effects);
+    }
+
+    fn handle_model_command_inner(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rest = line.strip_prefix("/model").unwrap().trim();
+        if rest.is_empty() {
+            let msg = match self.model() {
+                Some(m) => format!("model: {m}"),
+                None => "no model set".to_string(),
+            };
+            effects.push(Effect::Notice(Notice::info(msg)));
+            return;
+        }
+
+        let mut tokens = rest.split_whitespace();
+        let id = tokens.next().unwrap();
+        if tokens.next().is_some() {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return;
+        }
+
+        self.dispatch_model_set(line, queued, id, effects);
+    }
+
+    fn must_queue_model(&self, queued_dispatch: bool) -> bool {
+        self.prompt_sent.is_some()
+            || self.run_state.is_running()
+            || (!queued_dispatch && !self.local_queue.is_empty())
+    }
+
+    fn dispatch_model_set(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        id: &str,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+            return;
+        }
+
+        if self.must_queue_model(queued.is_some()) {
+            self.local_queue.push_back((line.to_string(), 0));
+            effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
+        } else {
+            let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
+            if requeues == 0 && !self.known_model_ids.iter().any(|k| k == id) {
+                effects.push(Effect::Notice(Notice::warning(format!(
+                    "{id} is not in goose's model list; goose does not check it, a wrong id fails at the next turn"
+                ))));
+            }
+
+            let req_id = self.allocate_id();
+            self.pending_model_reqs.insert(
+                req_id,
+                super::types::PendingModelReq {
+                    model: id.to_string(),
+                    queued,
+                },
+            );
+            effects.push(Effect::Request {
+                id: req_id,
+                method: "session/set_config_option".to_string(),
+                params: json!({
+                    "sessionId": self.session_id,
+                    "configId": "model",
+                    "value": id,
                 }),
             });
         }

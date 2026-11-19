@@ -44,6 +44,8 @@ pub struct ChatCore {
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) known_model_ids: Vec<String>,
+    pub(crate) recent_dir: Option<std::path::PathBuf>,
+    pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
 }
 
 impl ChatCore {
@@ -98,6 +100,8 @@ impl ChatCore {
             model: None,
             provider: None,
             known_model_ids: Vec::new(),
+            recent_dir: None,
+            pending_model_reqs: HashMap::new(),
         }
     }
 
@@ -473,15 +477,26 @@ impl ChatCore {
         })
     }
 
+    pub fn has_pending_model_mutation(&self) -> bool {
+        !self.pending_model_reqs.is_empty()
+    }
+
+    pub fn set_recent_dir(&mut self, dir: std::path::PathBuf) {
+        self.recent_dir = Some(dir);
+    }
+
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
         if !self.is_replaying
             && !self.run_state.is_running()
             && self.prompt_sent.is_none()
             && !self.has_pending_mcp_mutation()
+            && !self.has_pending_model_mutation()
             && let Some((next_text, conv_count)) = self.local_queue.pop_front()
         {
             if next_text.starts_with("/mcp ") {
                 self.handle_queued_mcp_command(&next_text, conv_count, effects);
+            } else if next_text.starts_with("/model ") {
+                self.handle_queued_model_command(&next_text, conv_count, effects);
             } else {
                 self.send_prompt(next_text, conv_count, effects);
             }
@@ -710,6 +725,14 @@ impl ChatCore {
 
         if let Some(mcp_req) = self.pending_mcp_reqs.remove(&id) {
             let requeued = self.handle_mcp_response(mcp_req, frame, effects);
+            if !requeued {
+                self.check_queued_prompts(effects);
+            }
+            return;
+        }
+
+        if let Some(model_req) = self.pending_model_reqs.remove(&id) {
+            let requeued = self.handle_model_response(model_req, frame, effects);
             if !requeued {
                 self.check_queued_prompts(effects);
             }
@@ -1039,6 +1062,13 @@ impl ChatCore {
                 "mcp: change may or may not have applied; run /mcp to check",
             )));
         }
+        let had_model_mutation = !self.pending_model_reqs.is_empty();
+        self.pending_model_reqs.clear();
+        if had_model_mutation {
+            effects.push(Effect::Notice(Notice::warning(
+                "model: change may or may not have applied; reconnect to check",
+            )));
+        }
     }
 
     pub fn auto_refresh_mcp(&mut self) -> Option<Effect> {
@@ -1188,6 +1218,43 @@ impl ChatCore {
                 }
             }
         }
+        false
+    }
+
+    fn handle_model_response(
+        &mut self,
+        req: super::types::PendingModelReq,
+        frame: &Value,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        if let Some(err) = frame.get("error") {
+            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("model error");
+
+            if code == -32002
+                && let Some((raw_line, count)) = req.queued
+                && count < 3
+            {
+                self.local_queue.push_front((raw_line, count + 1));
+                return true;
+            }
+
+            effects.push(Effect::Notice(Notice::error(msg)));
+            return false;
+        }
+
+        let result = frame.get("result").unwrap_or(&Value::Null);
+        self.update_model_state(result, true, effects);
+
+        if let Some(ref dir) = self.recent_dir {
+            let _ = crate::chat::recent::record_in(dir, &req.model);
+        } else {
+            let _ = crate::chat::recent::record(&req.model);
+        }
+
         false
     }
 }

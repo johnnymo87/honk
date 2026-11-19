@@ -164,6 +164,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
+| `/model [id]` | `:model [id]` | Switch model (`/model <id>`) or show current model (`/model`). |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |

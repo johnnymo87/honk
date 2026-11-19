@@ -189,3 +189,9 @@ pub enum PendingMcpReq {
         queued: Option<(String, u32)>,
     },
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingModelReq {
+    pub model: String,
+    pub queued: Option<(String, u32)>,
+}

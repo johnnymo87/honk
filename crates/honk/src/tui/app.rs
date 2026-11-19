@@ -319,6 +319,9 @@ impl App {
             cmd if cmd == "mcp" || cmd.starts_with("mcp ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
+            cmd if cmd == "model" || cmd.starts_with("model ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             other => {
                 self.transcript
                     .apply_notice(Notice::warning(format!("unknown command: :{other}")));
@@ -997,6 +1000,8 @@ mod tests {
             ("compact now", "/compact now"),
             ("mcp", "/mcp"),
             ("mcp enable slack-ro", "/mcp enable slack-ro"),
+            ("model", "/model"),
+            ("model claude-opus-5-5", "/model claude-opus-5-5"),
         ];
 
         for (typed, expected_cmd) in commands {
