@@ -23,6 +23,26 @@ const MAX_QUOTE: usize = 50;
 /// Transcript rows kept visible above a maximized composer.
 const MAXIMIZED_TRANSCRIPT_ROWS: u16 = 3;
 
+/// Blank columns left and right of everything honk chat draws, as in opencode's session
+/// view (`paddingLeft={2} paddingRight={2}` around both transcript and prompt).
+const SIDE_PADDING: u16 = 2;
+
+/// Narrowest content width the padding may leave; below it the full width is used.
+const MIN_PADDED_CONTENT_WIDTH: u16 = 20;
+
+/// The frame area minus the side padding: transcript, status bar, composer and command
+/// line all lay out (and wrap) within it.
+fn content_area(area: Rect) -> Rect {
+    if area.width < MIN_PADDED_CONTENT_WIDTH + 2 * SIDE_PADDING {
+        return area;
+    }
+    Rect {
+        x: area.x + SIDE_PADDING,
+        width: area.width - 2 * SIDE_PADDING,
+        ..area
+    }
+}
+
 /// If `line` is the local command `name` (e.g. `/quote`), its argument (possibly empty).
 /// Mirrors how honk chat recognizes commands: trimmed, and `//text` is a literal.
 fn local_command<'a>(line: &'a str, name: &str) -> Option<&'a str> {
@@ -606,12 +626,12 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+        let area = content_area(frame.area());
         if area.width == 0 || area.height == 0 {
             return;
         }
 
-        // The composer spans the full width; render it first to learn its wrapped height.
+        // The composer spans the content width; render it first to learn its wrapped height.
         let rendered_composer = composer::Rendered::new(&mut self.composer, area.width);
         // Rows left for the composer after the status bar, the command line and a few
         // transcript rows.
@@ -1578,8 +1598,70 @@ mod tests {
 
         let (rows, _) = render_rows(&mut app, 30, 12);
         let (_, composer) = composer_rows(&rows, "INSERT");
-        let composer: Vec<&str> = composer.iter().map(|r| r.trim_end()).collect();
+        let composer: Vec<&str> = composer.iter().map(|r| r.trim()).collect();
         assert_eq!(composer, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_side_padding_insets_every_region() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_pad", cmd_tx);
+        let reply = "w".repeat(50);
+        app.handle_ui_event(UiEvent::Transcript(json!({
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "msg_pad",
+                "content": {"type": "text", "text": reply}
+            }}
+        })));
+        // 45 chars wrap at the 36-column content width, not the 40-column terminal.
+        let text = "a".repeat(36) + "bbbbbbbbb";
+        type_str(&mut app, &text);
+
+        let (rows, cursor) = render_rows(&mut app, 40, 16);
+        assert_eq!(app.last_transcript_area, Rect::new(2, 0, 36, 13));
+        for row in &rows {
+            assert!(
+                row.starts_with("  ") && row.ends_with("  "),
+                "two blank columns each side: {rows:#?}"
+            );
+        }
+        // The reply wraps within the content width.
+        let reply_rows: Vec<&str> = rows
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| r.contains('w'))
+            .collect();
+        assert_eq!(reply_rows.len(), 2, "{rows:#?}");
+        assert!(reply_rows[0].len() <= 36, "{rows:#?}");
+
+        let (top, composer) = composer_rows(&rows, "INSERT");
+        assert_eq!(composer[0], format!("  {}  ", "a".repeat(36)));
+        assert_eq!(composer[1].trim_end(), "  bbbbbbbbb");
+        assert_eq!(cursor, Position::new(2 + 9, (top + 1) as u16));
+
+        // The `:` command line is inset too, and so is its cursor.
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char(':')));
+        type_str(&mut app, "dump");
+        let (rows, cursor) = render_rows(&mut app, 40, 16);
+        assert_eq!(rows[15].trim_end(), "  :dump");
+        assert_eq!(cursor, Position::new(2 + 5, 15));
+    }
+
+    #[test]
+    fn test_narrow_terminal_drops_side_padding() {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_pad", cmd_tx);
+        type_str(&mut app, &"a".repeat(23));
+        let (rows, cursor) = render_rows(&mut app, 23, 12);
+        let (top, composer) = composer_rows(&rows, "INSERT");
+        assert_eq!(composer[0], "a".repeat(23), "{rows:#?}");
+        assert_eq!(cursor, Position::new(0, (top + 1) as u16));
+        // 24 columns is the narrowest that keeps the padding (20 content columns).
+        assert_eq!(content_area(Rect::new(0, 0, 24, 5)), Rect::new(2, 0, 20, 5));
+        assert_eq!(content_area(Rect::new(0, 0, 23, 5)), Rect::new(0, 0, 23, 5));
     }
 
     #[test]
