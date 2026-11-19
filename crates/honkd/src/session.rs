@@ -237,6 +237,13 @@ pub enum SessionMsg {
         method: String,
         params: Value,
     },
+    ModelList {
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        id: Value,
+        configured: Option<crate::models::ModelsFile>,
+        warning: Option<String>,
+    },
     Internal {
         method: String,
         params: Value,
@@ -902,6 +909,7 @@ impl Session {
                 SessionMsg::Prompt { viewer_id, id, .. }
                 | SessionMsg::Steer { viewer_id, id, .. }
                 | SessionMsg::Forward { viewer_id, id, .. }
+                | SessionMsg::ModelList { viewer_id, id, .. }
                 | SessionMsg::McpOp { viewer_id, id, .. } => {
                     let err_resp =
                         crate::rpc::error(id, -32000, format!("Session is gone: {reason}"), None);
@@ -1703,6 +1711,7 @@ impl Session {
                             SessionMsg::Prompt { viewer, id, .. }
                             | SessionMsg::Steer { viewer, id, .. }
                             | SessionMsg::Forward { viewer, id, .. }
+                            | SessionMsg::ModelList { viewer, id, .. }
                             | SessionMsg::McpOp { viewer, id, .. } => {
                                 let err_frame =
                                     crate::rpc::error(id, e.code, e.message.clone(), None);
@@ -3211,6 +3220,17 @@ impl Session {
                         Box::pin(self.handle_gone()).await;
                     }
                 }
+            }
+            SessionMsg::ModelList {
+                viewer_id,
+                viewer: _,
+                id,
+                configured,
+                warning,
+            } => {
+                let reply =
+                    crate::models::list_reply(configured.as_ref(), warning, &self.init_result);
+                self.send_to_viewer(viewer_id, crate::rpc::response(id, reply));
             }
             SessionMsg::Internal {
                 method,

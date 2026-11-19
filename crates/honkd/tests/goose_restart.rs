@@ -665,11 +665,10 @@ async fn pending_requests_fail_with_32000_on_connection_replacement() {
     // Send a forward request that FakeGoose doesn't answer
     let forward_id = v
         .request(
-            "session/set_config_option",
+            "session/set_mode",
             json!({
                 "sessionId": &sid,
-                "configId": "model",
-                "value": "custom-model"
+                "mode": "chat"
             }),
         )
         .await;
@@ -678,9 +677,7 @@ async fn pending_requests_fail_with_32000_on_connection_replacement() {
     fake.restart().await;
 
     // The in-flight forward request must fail with -32000, not hang!
-    let resp = v
-        .response_timeout(&forward_id, Duration::from_secs(5))
-        .await;
+    let resp = v.response_timeout(&forward_id, SECS * 2).await;
     assert_eq!(
         resp.pointer("/error/code").and_then(Value::as_i64),
         Some(-32000),

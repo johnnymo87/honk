@@ -192,3 +192,123 @@ async fn test_model_switch_and_fresh_init_result() {
         .expect("model option after restart");
     assert_eq!(model_after["currentValue"], "gemini-3.8-flash");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_model_list_e2e() {
+    let fake = FakeGoose::start().await;
+
+    // 1. With no --models-file flag: only goose models returned, no warning
+    let h_no_flag = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v_no_flag = Viewer::connect(&h_no_flag).await;
+
+    let new_res = v_no_flag
+        .call("session/new", json!({ "cwd": "/tmp" }))
+        .await;
+    let sid = new_res["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let list_no_flag = v_no_flag
+        .call("_honk/model/list", json!({ "sessionId": sid }))
+        .await;
+    assert_eq!(list_no_flag["result"]["provider"], "gcp_vertex_ai");
+    assert_eq!(list_no_flag["result"]["current"], "claude-opus-5-5");
+    assert!(list_no_flag["result"].get("warning").is_none());
+    let models_no_flag = list_no_flag["result"]["models"]
+        .as_array()
+        .expect("models array");
+    assert_eq!(models_no_flag.len(), 2);
+    assert_eq!(models_no_flag[0]["id"], "claude-opus-5-5");
+    assert_eq!(models_no_flag[0]["source"], "goose");
+    assert_eq!(models_no_flag[1]["id"], "gemini-3.8-flash");
+    assert_eq!(models_no_flag[1]["source"], "goose");
+
+    // 2. With --models-file flag: configured first then goose, current reflects switch
+    let temp_dir = tempfile::tempdir().unwrap();
+    let models_path = temp_dir.path().join("models.json");
+    let initial_models_json = json!({
+        "providers": {
+            "gcp_vertex_ai": [
+                { "id": "custom-model", "name": "Custom Model" },
+                { "id": "claude-opus-5-5", "name": "Claude Opus Configured" }
+            ]
+        }
+    });
+    std::fs::write(&models_path, initial_models_json.to_string()).unwrap();
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--models-file",
+            models_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+
+    let new_res2 = v.call("session/new", json!({ "cwd": "/tmp" })).await;
+    let sid2 = new_res2["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let list_res = v
+        .call("_honk/model/list", json!({ "sessionId": sid2 }))
+        .await;
+    assert_eq!(list_res["result"]["provider"], "gcp_vertex_ai");
+    assert_eq!(list_res["result"]["current"], "claude-opus-5-5");
+    assert!(list_res["result"].get("warning").is_none());
+
+    let models = list_res["result"]["models"]
+        .as_array()
+        .expect("models array");
+    assert_eq!(models.len(), 3);
+    // Configured first
+    assert_eq!(models[0]["id"], "custom-model");
+    assert_eq!(models[0]["name"], "Custom Model");
+    assert_eq!(models[0]["source"], "configured");
+    assert_eq!(models[1]["id"], "claude-opus-5-5");
+    assert_eq!(models[1]["name"], "Claude Opus Configured");
+    assert_eq!(models[1]["source"], "configured");
+    // Goose option that wasn't already listed
+    assert_eq!(models[2]["id"], "gemini-3.8-flash");
+    assert_eq!(models[2]["source"], "goose");
+
+    // Switch model and verify current reflects prior switch
+    let switch_res = v
+        .call(
+            "session/set_config_option",
+            json!({
+                "sessionId": sid2,
+                "configId": "model",
+                "value": "gemini-3.8-flash",
+            }),
+        )
+        .await;
+    assert!(switch_res.get("result").is_some());
+
+    let list_after_switch = v
+        .call("_honk/model/list", json!({ "sessionId": sid2 }))
+        .await;
+    assert_eq!(list_after_switch["result"]["current"], "gemini-3.8-flash");
+
+    // Corrupt the models file: list still succeeds with goose models and a warning
+    std::fs::write(&models_path, "not valid json").unwrap();
+    let list_corrupt = v
+        .call("_honk/model/list", json!({ "sessionId": sid2 }))
+        .await;
+    assert_eq!(list_corrupt["result"]["provider"], "gcp_vertex_ai");
+    assert_eq!(list_corrupt["result"]["current"], "gemini-3.8-flash");
+    assert!(list_corrupt["result"].get("warning").is_some());
+    let models_corrupt = list_corrupt["result"]["models"]
+        .as_array()
+        .expect("models array");
+    assert_eq!(models_corrupt.len(), 2);
+    assert_eq!(models_corrupt[0]["source"], "goose");
+    assert_eq!(models_corrupt[1]["source"], "goose");
+}
