@@ -279,6 +279,7 @@ pub enum SessionMsg {
         dir: RevertDir,
         viewer_id: ViewerId,
         viewer: ViewerTx,
+        is_honk_aware: bool,
         id: Value,
     },
     // from spawned recovery / helper tasks (I1)
@@ -443,19 +444,22 @@ pub async fn create_new_generation_from_export(
     state_store: &Arc<Mutex<crate::state::StateStore>>,
     mut frames: Vec<Value>,
     keys: HashSet<honk_wire::BlockKey>,
-    mut buffered_frames: Vec<(Option<u64>, Value)>,
+    buffered_frames: Vec<(Option<u64>, Value)>,
     carried_usage: Option<Value>,
     export_used: Option<u64>,
     resume_from: Option<u64>,
     last_processed_session_id: Option<u64>,
-) -> anyhow::Result<(SessionLog, u64)> {
+    raw_client_prompts: usize,
+) -> anyhow::Result<(SessionLog, u64, usize)> {
     let log_path = state_dir.join("sessions").join(format!("{sid}.jsonl"));
 
-    let revert_target = {
+    let revert = {
         let s = state_store.lock().await;
-        s.state().reverts.get(sid).map(|r| r.target.clone())
+        s.state().reverts.get(sid).cloned()
     };
-    if let Some(target) = revert_target {
+    let mut adjusted_client_prompts = raw_client_prompts;
+    if let Some(r) = revert {
+        let target = &r.target;
         let cut_idx = frames.iter().position(|f| {
             f.pointer("/params/update")
                 .and_then(|u| {
@@ -472,7 +476,8 @@ pub async fn create_new_generation_from_export(
         });
         if let Some(pos) = cut_idx {
             frames.truncate(pos);
-            buffered_frames.clear();
+            adjusted_client_prompts = r.prompts_before as usize;
+            // Note: buffered_frames are kept (new live activity after export)
         } else {
             let mut s = state_store.lock().await;
             let _ = s.mutate(|st| {
@@ -480,6 +485,10 @@ pub async fn create_new_generation_from_export(
             });
             let _ = crate::log::delete_redo_sidecar(&log_path);
         }
+    } else {
+        // Orphaned sidecar: when building a generation and `reverts` has no entry for the sid,
+        // delete `<log>.redo.jsonl` if present (crash between sidecar write and state persist).
+        let _ = crate::log::delete_redo_sidecar(&log_path);
     }
 
     let next_epoch = bump_epoch(sid, &log_path, state_store).await?;
@@ -520,7 +529,7 @@ pub async fn create_new_generation_from_export(
     };
 
     let new_log = crate::log::SessionLog::create(&log_path, next_epoch, max_resume, combined)?;
-    Ok((new_log, next_epoch))
+    Ok((new_log, next_epoch, adjusted_client_prompts))
 }
 
 impl Drop for Session {
@@ -1292,7 +1301,7 @@ impl Session {
 
                 let export_val = hub.export(&sid).await?;
                 let export_used = honk_wire::export::export_used_tokens(&export_val);
-                let client_prompts = honk_wire::export::client_prompts(&export_val).len();
+                let raw_client_prompts = honk_wire::export::client_prompts(&export_val).len();
                 let frames = honk_wire::export::to_updates(&export_val, &sid);
                 let mut keys = HashSet::new();
                 for f in &frames {
@@ -1301,7 +1310,7 @@ impl Session {
                     }
                 }
 
-                let (new_log, next_epoch) = create_new_generation_from_export(
+                let (new_log, next_epoch, client_prompts) = create_new_generation_from_export(
                     &sid,
                     &state_dir,
                     &state_store,
@@ -1312,6 +1321,7 @@ impl Session {
                     export_used,
                     None,
                     None,
+                    raw_client_prompts,
                 )
                 .await?;
 
@@ -1518,7 +1528,7 @@ impl Session {
     ) {
         let carried_usage = crate::log::last_usage_frame(self.log.entries()).cloned();
         let buffered = std::mem::take(&mut self.rebuilding_buffered_frames);
-        let (new_log, _next_epoch) = match create_new_generation_from_export(
+        let (new_log, _next_epoch, client_prompts) = match create_new_generation_from_export(
             &self.sid,
             &self.state_dir,
             &self.state_store,
@@ -1529,6 +1539,7 @@ impl Session {
             export_used,
             resume_from,
             self.last_processed_session_id,
+            client_prompts,
         )
         .await
         {
@@ -3472,19 +3483,20 @@ impl Session {
                 dir,
                 viewer_id,
                 viewer,
+                is_honk_aware,
                 id,
             } => {
+                if !self.viewers.contains_key(&viewer_id) {
+                    self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
+                }
                 if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
-                    self.queue_msg(
-                        viewer_id,
-                        id.clone(),
-                        SessionMsg::Revert {
-                            dir,
-                            viewer_id,
-                            viewer,
-                            id,
-                        },
+                    let err = crate::rpc::error(
+                        id,
+                        -32002,
+                        "the session is rebuilding; try again in a moment",
+                        None,
                     );
+                    self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
                     return;
                 }
 
@@ -4449,9 +4461,8 @@ impl Session {
     /// Reply shape:
     /// ```json
     /// {
-    ///   "undone": 1,        // count of human stops removed this time
-    ///   "turns": <count>,   // count of user prompts (any kind) in the removed tail
-    ///   "text": "<text>",   // target human prompt text
+    ///   "turns": <count>,   // distinct user prompt messageIds removed
+    ///   "text": "<text>",   // target prompt text
     ///   "messageId": "<id>" // target goose message id
     /// }
     /// ```
@@ -4527,13 +4538,13 @@ impl Session {
             return;
         };
 
-        let crosses_compaction = conversation[target_conv_idx..].iter().any(|m| {
-            m.pointer("/metadata/agentVisible")
-                .or_else(|| m.pointer("/metadata/agent_visible"))
-                .and_then(Value::as_bool)
-                == Some(false)
-        });
-        if crosses_compaction {
+        let target_row = &conversation[target_conv_idx];
+        let target_agent_invisible = target_row
+            .pointer("/metadata/agentVisible")
+            .or_else(|| target_row.pointer("/metadata/agent_visible"))
+            .and_then(Value::as_bool)
+            == Some(false);
+        if target_agent_invisible {
             let err = crate::rpc::error(id, -32002, "can't undo past a compaction", None);
             self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
             return;
@@ -4565,9 +4576,16 @@ impl Session {
         let tail_frames: Vec<Value> = tail_entries.iter().map(|e| e.frame.clone()).collect();
         let turns = tail_entries
             .iter()
-            .filter(|e| is_user_message_chunk(&e.frame))
-            .count();
+            .filter_map(|e| user_message_chunk_id(&e.frame))
+            .collect::<HashSet<_>>()
+            .len();
 
+        // Crash safety write order:
+        // 1. Write redo sidecar with the undone tail frames.
+        // 2. Bump epoch and create the new log generation without the undone tail.
+        // 3. Persist the revert state in state store LAST.
+        // If a crash occurs between step 1 and step 3, state store has no revert entry,
+        // and create_new_generation_from_export cleans up any orphaned sidecar on restart/rebuild.
         if let Err(e) = self.log.prepend_redo_sidecar(&tail_frames) {
             let err = crate::rpc::error(
                 id,
@@ -4643,7 +4661,6 @@ impl Session {
         }
 
         let reply = json!({
-            "undone": 1,
             "turns": turns,
             "text": target_text,
             "messageId": target,
@@ -4718,10 +4735,40 @@ impl Session {
             None => (&sidecar_frames[..], &[][..], None),
         };
 
+        let new_prompts_before = if let Some(ref next) = next_opt {
+            let export_val = match self.hub.export(&self.sid).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = crate::rpc::error(
+                        id,
+                        -32002,
+                        format!("failed to export session: {e:#}"),
+                        None,
+                    );
+                    self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                    return;
+                }
+            };
+            let conversation = export_val.get("conversation").and_then(Value::as_array);
+            let target_conv_idx = conversation.and_then(|conv| {
+                conv.iter()
+                    .position(|m| m.get("id").and_then(Value::as_str) == Some(next))
+            });
+            match (conversation, target_conv_idx) {
+                (Some(conv), Some(idx)) => honk_wire::export::client_prompt_entries(conv)
+                    .filter(|(i, _)| *i < idx)
+                    .count() as u64,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
         let restored = frames_to_restore
             .iter()
-            .filter(|f| is_user_message_chunk(f))
-            .count();
+            .filter_map(|f| user_message_chunk_id(f))
+            .collect::<HashSet<_>>()
+            .len();
 
         let mut combined_frames: Vec<(Option<u64>, Value)> = self
             .log
@@ -4784,6 +4831,7 @@ impl Session {
             let _ = s.mutate(|st| {
                 if let Some(r) = st.reverts.get_mut(&self.sid) {
                     r.target = next;
+                    r.prompts_before = new_prompts_before;
                 }
             });
         } else {
@@ -4818,7 +4866,22 @@ fn is_human_stop(msg: &Value) -> bool {
         return false;
     }
     let text = extract_msg_text(msg);
+    if text.trim().starts_with('/') {
+        return false;
+    }
     honk_wire::is_human_prompt(&text)
+}
+
+fn user_message_chunk_id(frame: &Value) -> Option<&str> {
+    frame.pointer("/params/update").and_then(|u| {
+        if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk") {
+            u.get("messageId")
+                .or_else(|| u.pointer("/_meta/goose/messageId"))
+                .and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
 }
 
 fn extract_msg_text(msg: &Value) -> String {
@@ -4833,13 +4896,6 @@ fn extract_msg_text(msg: &Value) -> String {
         }
     }
     text
-}
-
-fn is_user_message_chunk(frame: &Value) -> bool {
-    frame
-        .pointer("/params/update")
-        .and_then(|u| u.get("sessionUpdate").and_then(Value::as_str))
-        == Some("user_message_chunk")
 }
 
 fn is_user_message_chunk_with_id(frame: &Value, expected_id: &str) -> bool {
@@ -4956,7 +5012,7 @@ mod tests {
             (Some(11), usage_frame(sid, 300, 400)),
         ];
 
-        let (log, epoch) = create_new_generation_from_export(
+        let (log, epoch, _) = create_new_generation_from_export(
             sid,
             d.path(),
             &state_store,
@@ -4967,6 +5023,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .await
         .unwrap();
@@ -5044,7 +5101,7 @@ mod tests {
         );
 
         // Case 1: Carried usage exists, export_used is Some(175) -> overrides used, keeps size and cost
-        let (log1, _epoch) = create_new_generation_from_export(
+        let (log1, _epoch, _) = create_new_generation_from_export(
             sid,
             d.path(),
             &state_store,
@@ -5055,6 +5112,7 @@ mod tests {
             Some(175),
             None,
             None,
+            0,
         )
         .await
         .unwrap();
@@ -5070,7 +5128,7 @@ mod tests {
         );
 
         // Case 2: No carried usage, export_used is Some(175) -> does NOT synthesize a frame
-        let (log2, _epoch) = create_new_generation_from_export(
+        let (log2, _epoch, _) = create_new_generation_from_export(
             sid,
             d.path(),
             &state_store,
@@ -5081,6 +5139,7 @@ mod tests {
             Some(175),
             None,
             None,
+            0,
         )
         .await
         .unwrap();
@@ -5328,6 +5387,20 @@ mod tests {
         let (replay_tx, _replay_rx) = tokio::sync::mpsc::channel(1);
         let evict = Arc::new(tokio::sync::Notify::new());
         crate::viewer::ViewerTx::new(tx, replay_tx, evict)
+    }
+
+    fn test_viewer_tx_with_replay(
+        tx: tokio::sync::mpsc::Sender<axum::extract::ws::Message>,
+    ) -> (
+        crate::viewer::ViewerTx,
+        tokio::sync::mpsc::Receiver<crate::viewer::ReplayBatch>,
+    ) {
+        let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(10);
+        let evict = Arc::new(tokio::sync::Notify::new());
+        (
+            crate::viewer::ViewerTx::new(tx, replay_tx, evict),
+            replay_rx,
+        )
     }
 
     #[tokio::test]
@@ -6572,6 +6645,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer,
+                is_honk_aware: true,
                 id: json!(10),
             })
             .await;
@@ -6618,6 +6692,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(1),
             })
             .await;
@@ -6642,6 +6717,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(2),
             })
             .await;
@@ -6662,6 +6738,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(3),
             })
             .await;
@@ -6686,6 +6763,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(4),
             })
             .await;
@@ -6703,6 +6781,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(5),
             })
             .await;
@@ -6720,6 +6799,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(6),
             })
             .await;
@@ -6737,6 +6817,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(7),
             })
             .await;
@@ -6754,6 +6835,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(8),
             })
             .await;
@@ -6781,6 +6863,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(1),
             })
             .await;
@@ -6790,7 +6873,7 @@ mod tests {
         let r: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(r["error"]["message"], "nothing to undo");
 
-        // Case 2: Conversation has only non-human stops (wake, swarm, goose prompt, steer, non-msg_honk id)
+        // Case 2: Conversation has only non-human stops (wake, swarm, goose prompt, steer, non-msg_honk id, slash commands)
         fake.set_export_data(
             &session.sid,
             json!({
@@ -6826,6 +6909,11 @@ mod tests {
                         "role": "user",
                         "metadata": {"userVisible": false},
                         "content": [{"type": "text", "text": "human text but userVisible false"}]
+                    },
+                    {
+                        "id": "msg_honk_6",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "   /goal write tests"}]
                     }
                 ]
             }),
@@ -6835,6 +6923,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(2),
             })
             .await;
@@ -6844,21 +6933,16 @@ mod tests {
         let r: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(r["error"]["message"], "nothing to undo");
 
-        // Case 3: Conversation has a human stop, but a row at or after it has agentVisible: false -> compaction guard!
+        // Case 3a: Compacted target (target row has metadata.agentVisible: false) -> refuses!
         fake.set_export_data(
             &session.sid,
             json!({
                 "conversation": [
                     {
-                        "id": "msg_honk_human1",
+                        "id": "msg_honk_compacted",
                         "role": "user",
-                        "content": [{"type": "text", "text": "hello"}]
-                    },
-                    {
-                        "id": "msg_compaction",
-                        "role": "assistant",
                         "metadata": {"agentVisible": false},
-                        "content": [{"type": "text", "text": "compacted away"}]
+                        "content": [{"type": "text", "text": "compacted prompt"}]
                     }
                 ]
             }),
@@ -6868,6 +6952,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(3),
             })
             .await;
@@ -6877,12 +6962,77 @@ mod tests {
         let r: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(r["error"]["message"], "can't undo past a compaction");
 
+        // Case 3b: Slash-command or agent-invisible row after the target does NOT block undo!
+        let target_id = "msg_honk_target_visible";
+        session
+            .log
+            .append(vec![(
+                Some(1),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session.sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": target_id,
+                            "content": { "type": "text", "text": "visible target" }
+                        }
+                    }
+                }),
+            )])
+            .unwrap();
+
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": target_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "visible target"}]
+                    },
+                    {
+                        "id": "msg_slash_reply",
+                        "role": "assistant",
+                        "metadata": {"agentVisible": false},
+                        "content": [{"type": "text", "text": "slash reply with agentVisible false"}]
+                    }
+                ]
+            }),
+        );
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(32),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["id"], 32);
+        assert_eq!(r["result"]["messageId"], target_id);
+
         // Case 4: Redo when nothing to redo
+        // Clear reverts first
+        {
+            let mut s = session.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.reverts.remove(&session.sid);
+            });
+        }
+        let _ = session.log.delete_redo_sidecar();
+
         session
             .on_msg(SessionMsg::Revert {
                 dir: RevertDir::Redo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(4),
             })
             .await;
@@ -6899,7 +7049,7 @@ mod tests {
             create_test_session("ses_undo_redo_flow", ActorState::Live).await;
         enable_truncate_capability(&session);
         let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(100);
-        let viewer = test_viewer_tx(v_tx);
+        let (viewer, mut replay_rx) = test_viewer_tx_with_replay(v_tx);
         session.attach_live(1, viewer.clone(), true);
 
         // Helper to construct frames
@@ -6983,6 +7133,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(10),
             })
             .await;
@@ -6994,7 +7145,7 @@ mod tests {
         };
         let resp: Value = serde_json::from_str(&t).unwrap();
         assert_eq!(resp["id"], 10);
-        assert_eq!(resp["result"]["undone"], 1);
+        assert!(resp["result"].get("undone").is_none());
         assert_eq!(resp["result"]["turns"], 1);
         assert_eq!(resp["result"]["text"], "second prompt");
         assert_eq!(resp["result"]["messageId"], h2_id);
@@ -7028,8 +7179,46 @@ mod tests {
             assert_eq!(rev.prompts_before, 1);
         }
 
-        // Drain replay frames
-        while v_rx.try_recv().is_ok() {}
+        // Verify fan-out: _honk/reset first, kept entries, _honk/replay_done last
+        let batch1 = replay_rx.recv().await.expect("replay batch 1");
+        assert_eq!(batch1.session_id, session.sid);
+        assert_eq!(batch1.msgs.len(), 4);
+        let axum::extract::ws::Message::Text(reset_t1) = &batch1.msgs[0] else {
+            panic!()
+        };
+        let reset_v1: Value = serde_json::from_str(reset_t1).unwrap();
+        assert_eq!(reset_v1["method"], "_honk/reset");
+        assert_eq!(reset_v1["params"]["sessionId"], session.sid);
+        assert_eq!(reset_v1["params"]["epoch"], 2);
+
+        let axum::extract::ws::Message::Text(e1) = &batch1.msgs[1] else {
+            panic!()
+        };
+        let e1_v: Value = serde_json::from_str(e1).unwrap();
+        assert_eq!(
+            e1_v.pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+
+        let axum::extract::ws::Message::Text(e2) = &batch1.msgs[2] else {
+            panic!()
+        };
+        let e2_v: Value = serde_json::from_str(e2).unwrap();
+        assert_eq!(
+            e2_v.pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("asst_1")
+        );
+
+        let axum::extract::ws::Message::Text(done_t1) = &batch1.msgs[3] else {
+            panic!()
+        };
+        let done_v1: Value = serde_json::from_str(done_t1).unwrap();
+        assert_eq!(done_v1["method"], "_honk/replay_done");
+        assert_eq!(done_v1["params"]["sessionId"], session.sid);
+        assert_eq!(done_v1["params"]["epoch"], 2);
+        assert_eq!(done_v1["params"]["seq"], 2);
 
         // --- 2. Undo twice: undoes Turn 1 ---
         session
@@ -7037,6 +7226,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(20),
             })
             .await;
@@ -7047,7 +7237,7 @@ mod tests {
         };
         let resp2: Value = serde_json::from_str(&t2).unwrap();
         assert_eq!(resp2["id"], 20);
-        assert_eq!(resp2["result"]["undone"], 1);
+        assert!(resp2["result"].get("undone").is_none());
         assert_eq!(resp2["result"]["turns"], 1);
         assert_eq!(resp2["result"]["text"], "first prompt");
         assert_eq!(resp2["result"]["messageId"], h1_id);
@@ -7080,7 +7270,24 @@ mod tests {
             assert_eq!(rev.prompts_before, 0);
         }
 
-        while v_rx.try_recv().is_ok() {}
+        // Verify fan-out: _honk/reset first, 0 entries, _honk/replay_done last
+        let batch2 = replay_rx.recv().await.expect("replay batch 2");
+        assert_eq!(batch2.session_id, session.sid);
+        assert_eq!(batch2.msgs.len(), 2);
+        let axum::extract::ws::Message::Text(reset_t2) = &batch2.msgs[0] else {
+            panic!()
+        };
+        let reset_v2: Value = serde_json::from_str(reset_t2).unwrap();
+        assert_eq!(reset_v2["method"], "_honk/reset");
+        assert_eq!(reset_v2["params"]["epoch"], 3);
+
+        let axum::extract::ws::Message::Text(done_t2) = &batch2.msgs[1] else {
+            panic!()
+        };
+        let done_v2: Value = serde_json::from_str(done_t2).unwrap();
+        assert_eq!(done_v2["method"], "_honk/replay_done");
+        assert_eq!(done_v2["params"]["epoch"], 3);
+        assert_eq!(done_v2["params"]["seq"], 0);
 
         // --- 3. Undo third time: nothing to undo ---
         session
@@ -7088,6 +7295,7 @@ mod tests {
                 dir: RevertDir::Undo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(30),
             })
             .await;
@@ -7103,6 +7311,7 @@ mod tests {
                 dir: RevertDir::Redo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(40),
             })
             .await;
@@ -7136,14 +7345,32 @@ mod tests {
             Some(h2_id)
         );
 
-        // Verify revert target moved to h2_id
+        // Verify revert target moved to h2_id AND prompts_before recomputed (item 1)
         {
             let s = session.state_store.lock().await;
             let rev = s.state().reverts.get(&session.sid).unwrap();
             assert_eq!(rev.target, h2_id);
+            assert_eq!(rev.prompts_before, 1);
         }
 
-        while v_rx.try_recv().is_ok() {}
+        // Verify fan-out for partial redo
+        let batch3 = replay_rx.recv().await.expect("replay batch 3");
+        assert_eq!(batch3.session_id, session.sid);
+        assert_eq!(batch3.msgs.len(), 4);
+        let axum::extract::ws::Message::Text(reset_t3) = &batch3.msgs[0] else {
+            panic!()
+        };
+        let reset_v3: Value = serde_json::from_str(reset_t3).unwrap();
+        assert_eq!(reset_v3["method"], "_honk/reset");
+        assert_eq!(reset_v3["params"]["epoch"], 4);
+
+        let axum::extract::ws::Message::Text(done_t3) = &batch3.msgs[3] else {
+            panic!()
+        };
+        let done_v3: Value = serde_json::from_str(done_t3).unwrap();
+        assert_eq!(done_v3["method"], "_honk/replay_done");
+        assert_eq!(done_v3["params"]["epoch"], 4);
+        assert_eq!(done_v3["params"]["seq"], 2);
 
         // --- 5. Redo twice (full redo: restores Turn 2, clears revert) ---
         session
@@ -7151,6 +7378,7 @@ mod tests {
                 dir: RevertDir::Redo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(50),
             })
             .await;
@@ -7176,7 +7404,24 @@ mod tests {
             assert!(!s.state().reverts.contains_key(&session.sid));
         }
 
-        while v_rx.try_recv().is_ok() {}
+        // Verify fan-out for full redo
+        let batch4 = replay_rx.recv().await.expect("replay batch 4");
+        assert_eq!(batch4.session_id, session.sid);
+        assert_eq!(batch4.msgs.len(), 6);
+        let axum::extract::ws::Message::Text(reset_t4) = &batch4.msgs[0] else {
+            panic!()
+        };
+        let reset_v4: Value = serde_json::from_str(reset_t4).unwrap();
+        assert_eq!(reset_v4["method"], "_honk/reset");
+        assert_eq!(reset_v4["params"]["epoch"], 5);
+
+        let axum::extract::ws::Message::Text(done_t4) = &batch4.msgs[5] else {
+            panic!()
+        };
+        let done_v4: Value = serde_json::from_str(done_t4).unwrap();
+        assert_eq!(done_v4["method"], "_honk/replay_done");
+        assert_eq!(done_v4["params"]["epoch"], 5);
+        assert_eq!(done_v4["params"]["seq"], 4);
 
         // --- 6. Redo third time: nothing to redo ---
         session
@@ -7184,6 +7429,7 @@ mod tests {
                 dir: RevertDir::Redo,
                 viewer_id: 1,
                 viewer: viewer.clone(),
+                is_honk_aware: true,
                 id: json!(60),
             })
             .await;
@@ -7192,6 +7438,61 @@ mod tests {
         };
         let resp6: Value = serde_json::from_str(&t6).unwrap();
         assert_eq!(resp6["error"]["message"], "nothing to redo");
+    }
+
+    #[tokio::test]
+    async fn test_revert_while_rebuilding_refused_immediately() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_revert_rebuilding", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        session.state = ActorState::Rebuilding;
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(99),
+            })
+            .await;
+
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["id"], 99);
+        assert_eq!(r["error"]["code"], -32002);
+        assert_eq!(
+            r["error"]["message"],
+            "the session is rebuilding; try again in a moment"
+        );
+        assert!(session.queued_msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_revert_auto_attaches_unregistered_viewer() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_revert_attach", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+
+        assert!(!session.viewers.contains_key(&2));
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 2,
+                viewer,
+                is_honk_aware: true,
+                id: json!(101),
+            })
+            .await;
+
+        assert!(session.viewers.contains_key(&2));
     }
 
     #[tokio::test]
@@ -7257,7 +7558,7 @@ mod tests {
             asst_frame("asst_2", "reply 2"),
         ];
 
-        let (new_log, _epoch) = create_new_generation_from_export(
+        let (new_log, _epoch, adj_prompts) = create_new_generation_from_export(
             sid,
             d.path(),
             &state_store,
@@ -7268,9 +7569,12 @@ mod tests {
             None,
             None,
             None,
+            2,
         )
         .await
         .unwrap();
+
+        assert_eq!(adj_prompts, 1);
 
         // Must drop Turn 2 frames! Log must contain only Turn 1 (2 entries).
         assert_eq!(new_log.entries().len(), 2);
@@ -7287,6 +7591,144 @@ mod tests {
             let s = state_store.lock().await;
             assert!(s.state().reverts.contains_key(sid));
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_cleans_orphaned_sidecar_when_no_revert_in_state() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_orphaned_sidecar_test";
+        let log_p = d.path().join("sessions").join(format!("{sid}.jsonl"));
+        crate::log::write_redo_sidecar(&log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(&log_p);
+        assert!(sidecar_p.exists());
+
+        let export_frames = vec![json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_honk_1",
+                    "content": { "type": "text", "text": "hello" }
+                }
+            }
+        })];
+
+        let (_new_log, _epoch, _prompts) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(!sidecar_p.exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_preserves_buffered_frames_when_revert_active() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_buffered_preserve_test";
+        let h1_id = "msg_honk_11111111111111111111111111111111";
+        let h2_id = "msg_honk_22222222222222222222222222222222";
+
+        {
+            let mut s = state_store.lock().await;
+            s.mutate(|st| {
+                st.reverts.insert(
+                    sid.into(),
+                    crate::state::Revert {
+                        target: h2_id.into(),
+                        stops: vec![h1_id.into(), h2_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        let user_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+        let asst_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+
+        let export_frames = vec![
+            user_frame(h1_id, "prompt 1"),
+            asst_frame("asst_1", "reply 1"),
+            user_frame(h2_id, "prompt 2"),
+            asst_frame("asst_2", "reply 2"),
+        ];
+
+        let live_frame = (
+            Some(100),
+            asst_frame("asst_live", "live reply after export"),
+        );
+
+        let (new_log, _epoch, adj_prompts) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            vec![live_frame],
+            None,
+            None,
+            None,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(adj_prompts, 1);
+        // Must contain Turn 1 (2 entries) + live buffered frame (1 entry) = 3 entries!
+        assert_eq!(new_log.entries().len(), 3);
+        assert_eq!(
+            new_log.entries()[2]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("asst_live")
+        );
     }
 
     #[tokio::test]
@@ -7339,7 +7781,7 @@ mod tests {
         // Export frames contain ONLY Turn 1 (Turn 2 was committed/truncated on goose!)
         let export_frames = vec![user_frame(h1_id, "prompt 1")];
 
-        let (new_log, _epoch) = create_new_generation_from_export(
+        let (new_log, _epoch, adj_prompts) = create_new_generation_from_export(
             sid,
             d.path(),
             &state_store,
@@ -7350,10 +7792,12 @@ mod tests {
             None,
             None,
             None,
+            1,
         )
         .await
         .unwrap();
 
+        assert_eq!(adj_prompts, 1);
         assert_eq!(new_log.entries().len(), 1);
 
         // Revert must be removed from state store!

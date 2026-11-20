@@ -1633,25 +1633,26 @@ impl Hub {
                 }
             }
 
-            let (new_log, next_epoch) = crate::session::create_new_generation_from_export(
-                &sid_str,
-                &hub.state_dir,
-                &hub.state,
-                frames,
-                keys.clone(),
-                Vec::new(),
-                carried_usage,
-                export_used,
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| ActivationError {
-                code: -32603,
-                message: format!("failed to create session log: {e:#}"),
-            })?;
-
-            let client_prompts = honk_wire::export::client_prompts(&export_val).len();
+            let raw_client_prompts = honk_wire::export::client_prompts(&export_val).len();
+            let (new_log, next_epoch, client_prompts) =
+                crate::session::create_new_generation_from_export(
+                    &sid_str,
+                    &hub.state_dir,
+                    &hub.state,
+                    frames,
+                    keys.clone(),
+                    Vec::new(),
+                    carried_usage,
+                    export_used,
+                    None,
+                    None,
+                    raw_client_prompts,
+                )
+                .await
+                .map_err(|e| ActivationError {
+                    code: -32603,
+                    message: format!("failed to create session log: {e:#}"),
+                })?;
 
             // Step 6: The session is now held
             let now = std::time::SystemTime::now()

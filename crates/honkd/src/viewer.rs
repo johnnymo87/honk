@@ -1371,6 +1371,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                 dir,
                                 viewer_id: viewer.id,
                                 viewer: viewer.tx.clone(),
+                                is_honk_aware: viewer.is_honk_aware,
                                 id: id.clone(),
                             })
                             .await
@@ -1384,6 +1385,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                                             dir,
                                             viewer_id: viewer.id,
                                             viewer: viewer.tx.clone(),
+                                            is_honk_aware: viewer.is_honk_aware,
                                             id,
                                         })
                                         .await;
