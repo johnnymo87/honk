@@ -945,6 +945,7 @@ dependencies = [
  "honk-testgoose",
  "honk-wire",
  "indexmap",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

@@ -2,6 +2,7 @@ pub mod app;
 pub mod composer;
 pub mod keys;
 pub mod model_picker;
+pub mod quote;
 pub mod status;
 pub mod transcript;
 
