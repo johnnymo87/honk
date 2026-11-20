@@ -295,13 +295,19 @@ impl App {
             }
             Action::CycleModelNext => {
                 let mut recent = self.load_recent();
-                let known_models = self
+                let models_listed = self
                     .state_snapshot
                     .as_ref()
-                    .map(|s| s.known_models.as_slice())
-                    .unwrap_or(&[]);
-                if !known_models.is_empty() {
-                    recent.retain(|id| known_models.contains(id));
+                    .is_some_and(|s| s.models_listed);
+                if models_listed {
+                    let known_models = self
+                        .state_snapshot
+                        .as_ref()
+                        .map(|s| s.known_models.as_slice())
+                        .unwrap_or(&[]);
+                    if !known_models.is_empty() {
+                        recent.retain(|id| known_models.contains(id));
+                    }
                 }
                 let current = self
                     .state_snapshot
@@ -327,13 +333,19 @@ impl App {
             }
             Action::CycleModelPrev => {
                 let mut recent = self.load_recent();
-                let known_models = self
+                let models_listed = self
                     .state_snapshot
                     .as_ref()
-                    .map(|s| s.known_models.as_slice())
-                    .unwrap_or(&[]);
-                if !known_models.is_empty() {
-                    recent.retain(|id| known_models.contains(id));
+                    .is_some_and(|s| s.models_listed);
+                if models_listed {
+                    let known_models = self
+                        .state_snapshot
+                        .as_ref()
+                        .map(|s| s.known_models.as_slice())
+                        .unwrap_or(&[]);
+                    if !known_models.is_empty() {
+                        recent.retain(|id| known_models.contains(id));
+                    }
                 }
                 let current = self
                     .state_snapshot
@@ -1475,6 +1487,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         });
 
         // Any key sends RetryAttach AND performs normal key
@@ -1535,6 +1548,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         });
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
@@ -1578,6 +1592,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         }));
 
         let backend = TestBackend::new(100, 20);
@@ -1938,6 +1953,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: Some("single-model".to_string()),
             known_models: vec!["single-model".to_string()],
+            models_listed: true,
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -1968,6 +1984,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: Some("model-1".to_string()),
             known_models: vec!["model-1".to_string(), "model-2".to_string()],
+            models_listed: true,
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -2024,6 +2041,7 @@ mod tests {
                 "model-b".to_string(),
                 "model-c".to_string(),
             ],
+            models_listed: true,
         };
 
         // Starting with current model A
@@ -2090,6 +2108,45 @@ mod tests {
                 "model-b".to_string(),
                 "model-c".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_f2_recents_not_filtered_before_models_listed() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_f2_not_listed", cmd_tx);
+
+        // Before _honk/model/list reply arrives, models_listed is false,
+        // and known_models only has goose's stale static list.
+        app.state_snapshot = Some(StateSnapshot {
+            run_state: crate::chat::types::RunState::Idle,
+            ownership: crate::chat::types::Ownership::Unknown,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
+            model: Some("custom-author-model-1".to_string()),
+            known_models: vec!["goose-stale-model".to_string()],
+            models_listed: false,
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "custom-author-model-2")
+            .unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "custom-author-model-1")
+            .unwrap();
+        app.recent_dir = Some(temp.path().join("honk"));
+
+        // F2 should NOT filter out custom-author-model-2 even though it's not in known_models yet
+        app.handle_key(key(KeyCode::F(2)));
+        let cmd = cmd_rx.try_recv().expect("expected SetModel command");
+        assert_eq!(
+            cmd,
+            UiCommand::SetModel {
+                id: "custom-author-model-2".to_string(),
+                record_recent: false
+            }
         );
     }
 
@@ -2276,6 +2333,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         });
         // Running: the quote's last turn is marked in progress.
         app.transcript

@@ -163,6 +163,7 @@ pub struct StateSnapshot {
     pub mcp_enabled: Vec<String>,
     pub model: Option<String>,
     pub known_models: Vec<String>,
+    pub models_listed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -319,6 +320,7 @@ fn maybe_emit_state(
         mcp_enabled: core.mcp_enabled().to_vec(),
         model: core.model().map(str::to_string),
         known_models: core.known_model_ids().to_vec(),
+        models_listed: core.models_listed(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -554,6 +556,7 @@ async fn run_driver(
         mcp_enabled: Vec::new(),
         model: None,
         known_models: Vec::new(),
+        models_listed: false,
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 

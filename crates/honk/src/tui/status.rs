@@ -389,6 +389,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         }
     }
 

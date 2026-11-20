@@ -690,14 +690,22 @@ async fn check_model_allowed(
     .await
     {
         Ok(f) => f,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({e})");
+            return Ok(());
+        }
     };
 
     if let Some(err) = frame.get("error") {
         let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
         if code == -32601 {
             return Ok(());
         }
+        eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({msg})");
         return Ok(());
     }
 

@@ -974,3 +974,28 @@ async fn launch_with_model_skips_check_on_empty_list() {
         ]
     );
 }
+
+#[tokio::test]
+async fn launch_with_model_skips_check_on_other_error_with_warning() {
+    let script = Script {
+        model_list: Some(json!({
+            "error": { "code": -32603, "message": "internal error listing models" }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("custom-model".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+}

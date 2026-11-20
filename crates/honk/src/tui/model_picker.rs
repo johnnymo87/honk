@@ -518,6 +518,25 @@ mod tests {
     }
 
     #[test]
+    fn test_picker_does_not_push_recent_header_when_all_recents_filtered_out() {
+        let models = vec![ModelItem {
+            id: "m1".to_string(),
+            name: "m1".to_string(),
+            source: "goose".to_string(),
+        }];
+        let recent = vec!["stale-1".to_string(), "stale-2".to_string()];
+        let picker = ModelPicker::new(None, models, recent);
+
+        assert!(
+            !picker
+                .rows
+                .iter()
+                .any(|r| matches!(r, PickerRow::Header(h) if h == "Recent"))
+        );
+        assert_eq!(picker.rows.len(), 2);
+    }
+
+    #[test]
     fn test_sectioning_omits_empty_headers() {
         let models = vec![ModelItem {
             id: "m1".to_string(),

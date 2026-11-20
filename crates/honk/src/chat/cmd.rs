@@ -118,12 +118,6 @@ impl ChatCore {
             return true;
         }
 
-        if trimmed.starts_with("/model! ") {
-            let id = trimmed.strip_prefix("/model! ").unwrap().trim();
-            self.dispatch_model_set(trimmed, None, id, false, effects);
-            return true;
-        }
-
         effects.push(Effect::Notice(Notice::warning(format!(
             "unknown command: '{trimmed}'; type /help for commands"
         ))));
@@ -321,36 +315,41 @@ impl ChatCore {
 
     pub fn handle_model_set_command(&mut self, id: &str, record_recent: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let id = id.trim();
+        if id.is_empty() {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return effects;
+        }
         let line = if record_recent {
             format!("/model {id}")
         } else {
-            format!("/model! {id}")
+            format!("\0model:{id}")
         };
         self.dispatch_model_set(&line, None, id, record_recent, &mut effects);
         effects
     }
 
-    pub(crate) fn handle_queued_model_command(
+    pub fn handle_queued_model_set(&mut self, id: &str, requeues: u32, effects: &mut Vec<Effect>) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let line = format!("\0model:{id}");
+        self.dispatch_model_set(&line, Some((line.clone(), requeues)), id, false, effects);
+    }
+
+    pub fn handle_queued_model_command(
         &mut self,
         line: &str,
         requeues: u32,
         effects: &mut Vec<Effect>,
     ) {
-        let record_recent = !line.starts_with("/model! ");
-        let rest = if let Some(r) = line.strip_prefix("/model! ") {
-            r.trim()
-        } else {
-            line.strip_prefix("/model").unwrap().trim()
-        };
+        let rest = line.strip_prefix("/model").unwrap_or("").trim();
         let mut tokens = rest.split_whitespace();
-        let id = tokens.next().unwrap();
-        self.dispatch_model_set(
-            line,
-            Some((line.to_string(), requeues)),
-            id,
-            record_recent,
-            effects,
-        );
+        let Some(id) = tokens.next() else {
+            return;
+        };
+        self.dispatch_model_set(line, Some((line.to_string(), requeues)), id, true, effects);
     }
 
     fn handle_model_command_inner(
@@ -359,14 +358,17 @@ impl ChatCore {
         queued: Option<(String, u32)>,
         effects: &mut Vec<Effect>,
     ) {
-        let rest = line.strip_prefix("/model").unwrap().trim();
+        let rest = line.strip_prefix("/model").unwrap_or("").trim();
         if rest.is_empty() {
             self.dispatch_model_list(line, effects);
             return;
         }
 
         let mut tokens = rest.split_whitespace();
-        let id = tokens.next().unwrap();
+        let Some(id) = tokens.next() else {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return;
+        };
         if tokens.next().is_some() {
             effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
             return;
@@ -413,7 +415,12 @@ impl ChatCore {
 
         if self.must_queue_model(queued.is_some()) {
             self.local_queue.push_back((line.to_string(), 0));
-            effects.push(Effect::Notice(Notice::info(format!("queued: {line}"))));
+            let notice_text = if line.starts_with('\0') {
+                format!("queued: /model {id}")
+            } else {
+                format!("queued: {line}")
+            };
+            effects.push(Effect::Notice(Notice::info(notice_text)));
         } else {
             let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
             if requeues == 0 && !self.known_model_ids.iter().any(|k| k == id) {

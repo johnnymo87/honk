@@ -6016,13 +6016,23 @@ fn test_model_set_other_error_emits_notice_and_sends_silent_list_to_adopt_curren
 fn test_typo_model_id_not_recorded_in_recents() {
     let (mut core, _) = new_test_core();
 
-    core.set_config_options(&json!([
-        {
-            "id": "model",
-            "currentValue": "claude-opus-5-5",
-            "options": [{"value": "claude-opus-5-5"}]
+    // Models listed reply received -> models_listed becomes true
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "claude-opus-5-5",
+            "models": [{"id": "claude-opus-5-5"}]
         }
-    ]));
+    })));
 
     // 1. Valid model -> recorded
     let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
@@ -6048,6 +6058,119 @@ fn test_typo_model_id_not_recorded_in_recents() {
     )));
 
     // 2. Typo model -> NOT recorded
+    let effs = core.handle(Input::Line("/model typo-model-id".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "typo-model-id"}]
+        }
+    })));
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(_)))
+    );
+}
+
+#[test]
+fn test_model_set_with_empty_id_does_not_panic() {
+    let (mut core, _) = new_test_core();
+
+    // Bare /model requests list
+    let effs = core.handle(Input::Line("/model".into()));
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+
+    // /model with whitespace only requests list
+    let effs = core.handle(Input::Line("/model   ".into()));
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+
+    // handle_model_set_command with empty ID returns usage warning, does not panic
+    let effs = core.handle_model_set_command("", false);
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Warning && n.text == "usage: /model [id]"
+    )));
+
+    let effs = core.handle_model_set_command("   ", true);
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Warning && n.text == "usage: /model [id]"
+    )));
+
+    // handle_queued_model_command and handle_queued_model_set with empty ID do not panic
+    let mut effs = Vec::new();
+    core.handle_queued_model_command("/model", 0, &mut effs);
+    core.handle_queued_model_command("/model   ", 0, &mut effs);
+    core.handle_queued_model_set("", 0, &mut effs);
+    core.handle_queued_model_set("   ", 0, &mut effs);
+}
+
+#[test]
+fn test_recents_recording_hygiene_before_and_after_models_listed() {
+    let (mut core, _) = new_test_core();
+    assert!(!core.models_listed());
+
+    // 1. Before models_listed, switching to ANY model succeeds and records recent (e.g. old honkd)
+    let effs = core.handle(Input::Line("/model custom-unlisted-model".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "custom-unlisted-model"}]
+        }
+    })));
+    // Should be recorded before models_listed
+    assert!(reply_effs.iter().any(|e| matches!(
+        e,
+        Effect::RecordRecentModel(m) if m == "custom-unlisted-model"
+    )));
+
+    // 2. Now receive _honk/model/list reply
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "claude-opus-5-5",
+            "models": [{"id": "claude-opus-5-5"}]
+        }
+    })));
+    assert!(core.models_listed());
+
+    // 3. After models_listed, typo is NOT recorded
     let effs = core.handle(Input::Line("/model typo-model-id".into()));
     let req_id = effs
         .iter()

@@ -3477,6 +3477,7 @@ mod tests {
             mcp_enabled: Vec::new(),
             model: None,
             known_models: Vec::new(),
+            models_listed: false,
         };
         transcript.apply_ui_event(&UiEvent::State(snapshot), &mut viewport);
         assert!(!transcript.is_rebuilding);

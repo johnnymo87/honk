@@ -46,6 +46,7 @@ pub struct ChatCore {
     pub(crate) goose_model_ids: Vec<String>,
     pub(crate) listed_model_ids: Vec<String>,
     pub(crate) known_model_ids: Vec<String>,
+    pub(crate) models_listed: bool,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
 }
 
@@ -103,6 +104,7 @@ impl ChatCore {
             goose_model_ids: Vec::new(),
             listed_model_ids: Vec::new(),
             known_model_ids: Vec::new(),
+            models_listed: false,
             pending_model_reqs: HashMap::new(),
         }
     }
@@ -196,6 +198,10 @@ impl ChatCore {
 
     pub fn known_model_ids(&self) -> &[String] {
         &self.known_model_ids
+    }
+
+    pub fn models_listed(&self) -> bool {
+        self.models_listed
     }
 
     fn recompute_known_model_ids(&mut self) {
@@ -532,8 +538,10 @@ impl ChatCore {
         {
             if next_text.starts_with("/mcp ") {
                 self.handle_queued_mcp_command(&next_text, conv_count, effects);
-            } else if next_text.starts_with("/model ") || next_text.starts_with("/model! ") {
+            } else if next_text.starts_with("/model ") {
                 self.handle_queued_model_command(&next_text, conv_count, effects);
+            } else if let Some(id) = next_text.strip_prefix("\0model:") {
+                self.handle_queued_model_set(id, conv_count, effects);
             } else {
                 self.send_prompt(next_text, conv_count, effects);
             }
@@ -1319,6 +1327,7 @@ impl ChatCore {
                     })
                     .unwrap_or_default();
 
+                self.models_listed = true;
                 self.listed_model_ids = models.iter().map(|m| m.id.clone()).collect();
                 self.recompute_known_model_ids();
 
@@ -1365,7 +1374,13 @@ impl ChatCore {
 
                 let result = frame.get("result").unwrap_or(&Value::Null);
                 self.update_model_state(result, true, effects);
-                if record_recent && self.known_model_ids.contains(&model) {
+                // If honkd's model list has been received, enforce recents hygiene by only
+                // recording models present in the known list (typos not recorded).
+                // Before a list reply arrives (or if honkd is too old to support _honk/model/list),
+                // record any successful model set so valid models aren't dropped.
+                let should_record =
+                    record_recent && (self.known_model_ids.contains(&model) || !self.models_listed);
+                if should_record {
                     effects.push(Effect::RecordRecentModel(model));
                 }
 
