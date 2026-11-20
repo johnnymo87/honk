@@ -260,6 +260,7 @@ When creating a new session with `honk chat --new`:
 - **Wire protocol**:
   - `_honk/undo {sessionId}`: Returns `{ "turns": <count>, "text": "<target prompt text>", "messageId": "<target id>" }`.
   - `_honk/redo {sessionId}`: Returns `{ "restored": <count>, "cleared": <bool> }` where `cleared` is true when all undone turns have been restored and no further redo state remains.
+  - `_honk/notice {sessionId, level, message}`: Ephemeral notification sent to honk-aware viewers (not logged in the session log), such as warning when a revert commit could not be made permanent upstream before prompt post.
 
 ---
 

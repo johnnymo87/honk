@@ -18,6 +18,7 @@ pub mod method {
     pub const STEER_UNCONSUMED: &str = "_honk/steer_unconsumed";
     pub const GAP: &str = "_honk/gap";
     pub const EVICTED: &str = "_honk/evicted";
+    pub const NOTICE: &str = "_honk/notice";
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

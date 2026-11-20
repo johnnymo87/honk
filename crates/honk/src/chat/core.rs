@@ -42,6 +42,7 @@ pub struct ChatCore {
     pub(crate) mcp_available: bool,
     pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
     pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
+    pub(crate) undone_prompts: Vec<String>,
 }
 
 impl ChatCore {
@@ -94,6 +95,7 @@ impl ChatCore {
             mcp_available: true,
             pending_mcp_reqs: HashMap::new(),
             pending_revert_reqs: HashMap::new(),
+            undone_prompts: Vec::new(),
         }
     }
 
@@ -356,6 +358,7 @@ impl ChatCore {
 
         let is_command = text == "/compact";
         self.run_is_command = is_command;
+        self.undone_prompts.clear();
         self.prompt_sent = Some(PromptSent {
             crid,
             text,
@@ -706,6 +709,7 @@ impl ChatCore {
                 let msg = format!(
                     "undid {turns} turn{s}; files are not restored. /redo restores until the next prompt."
                 );
+                self.undone_prompts.push(text.to_string());
                 effects.push(Effect::Notice(Notice::returned(msg, text)));
             }
             super::types::PendingRevertReq::Redo => {
@@ -720,7 +724,15 @@ impl ChatCore {
                 } else {
                     format!("restored {restored} turn{s}")
                 };
-                effects.push(Effect::Notice(Notice::info(msg)));
+                let clear_candidate = self.undone_prompts.pop();
+                if cleared {
+                    self.undone_prompts.clear();
+                }
+                if let Some(undone_text) = clear_candidate {
+                    effects.push(Effect::Notice(Notice::returned_clear(msg, undone_text)));
+                } else {
+                    effects.push(Effect::Notice(Notice::info(msg)));
+                }
             }
         }
     }
@@ -933,6 +945,24 @@ impl ChatCore {
                 effects.push(Effect::Notice(Notice::info(
                     "session evicted; re-attaching...",
                 )));
+            }
+            honk_wire::method::NOTICE => {
+                if !self.is_replaying {
+                    let level = frame
+                        .pointer("/params/level")
+                        .and_then(Value::as_str)
+                        .unwrap_or("info");
+                    let msg = frame
+                        .pointer("/params/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let notice = match level {
+                        "warning" => Notice::warning(msg),
+                        "error" => Notice::error(msg),
+                        _ => Notice::info(msg),
+                    };
+                    effects.push(Effect::Notice(notice));
+                }
             }
             "_honk/mcp_changed" => {
                 if let Some(params) = frame.get("params") {
