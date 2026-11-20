@@ -189,7 +189,10 @@ impl App {
                 }
                 PickerOutcome::Select(id) => {
                     self.pending_prefix = None;
-                    let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                    let _ = self.cmd_tx.send(UiCommand::SetModel {
+                        id,
+                        record_recent: true,
+                    });
                 }
             }
             return;
@@ -291,7 +294,15 @@ impl App {
                 let _ = self.cmd_tx.send(UiCommand::Line("/model".into()));
             }
             Action::CycleModelNext => {
-                let recent = self.load_recent();
+                let mut recent = self.load_recent();
+                let known_models = self
+                    .state_snapshot
+                    .as_ref()
+                    .map(|s| s.known_models.as_slice())
+                    .unwrap_or(&[]);
+                if !known_models.is_empty() {
+                    recent.retain(|id| known_models.contains(id));
+                }
                 let current = self
                     .state_snapshot
                     .as_ref()
@@ -302,7 +313,10 @@ impl App {
                     crate::chat::recent::CycleDirection::Next,
                 ) {
                     crate::chat::recent::CycleResult::Switch(id) => {
-                        let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                        let _ = self.cmd_tx.send(UiCommand::SetModel {
+                            id,
+                            record_recent: false,
+                        });
                     }
                     crate::chat::recent::CycleResult::NoOtherRecent => {
                         self.transcript.apply_notice(Notice::info(
@@ -312,7 +326,15 @@ impl App {
                 }
             }
             Action::CycleModelPrev => {
-                let recent = self.load_recent();
+                let mut recent = self.load_recent();
+                let known_models = self
+                    .state_snapshot
+                    .as_ref()
+                    .map(|s| s.known_models.as_slice())
+                    .unwrap_or(&[]);
+                if !known_models.is_empty() {
+                    recent.retain(|id| known_models.contains(id));
+                }
                 let current = self
                     .state_snapshot
                     .as_ref()
@@ -323,7 +345,10 @@ impl App {
                     crate::chat::recent::CycleDirection::Prev,
                 ) {
                     crate::chat::recent::CycleResult::Switch(id) => {
-                        let _ = self.cmd_tx.send(UiCommand::Line(format!("/model {id}")));
+                        let _ = self.cmd_tx.send(UiCommand::SetModel {
+                            id,
+                            record_recent: false,
+                        });
                     }
                     crate::chat::recent::CycleResult::NoOtherRecent => {
                         self.transcript.apply_notice(Notice::info(
@@ -694,15 +719,16 @@ impl App {
                 self.should_quit = true;
             }
             UiEvent::Transcript(_) => {}
-            UiEvent::ModelList {
-                current,
-                models,
-                warning: _,
-            } => {
-                self.pending_prefix = None;
-                let recent = self.load_recent();
-                self.model_picker = Some(ModelPicker::new(current, models, recent));
-            }
+        UiEvent::ModelList {
+            current,
+            models,
+            warning: _,
+        } => {
+            self.pending_prefix = None;
+            self.command_line = None;
+            let recent = self.load_recent();
+            self.model_picker = Some(ModelPicker::new(current, models, recent));
+        }
         }
     }
 
@@ -1448,6 +1474,7 @@ mod tests {
             },
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         });
 
         // Any key sends RetryAttach AND performs normal key
@@ -1507,6 +1534,7 @@ mod tests {
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         });
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
@@ -1549,6 +1577,7 @@ mod tests {
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         }));
 
         let backend = TestBackend::new(100, 20);
@@ -1829,12 +1858,18 @@ mod tests {
         let picker = app.model_picker.as_ref().unwrap();
         assert_eq!(picker.selected, Some(3));
 
-        // Pressing Enter on model-b -> sends /model model-b and closes picker
+        // Pressing Enter on model-b -> sends SetModel { id: model-b, record_recent: true } and closes picker
         app.handle_key(key(KeyCode::Enter));
         assert!(app.model_picker.is_none());
 
         let cmd = cmd_rx.try_recv().expect("expected /model command");
-        assert_eq!(cmd, UiCommand::Line("/model model-b".to_string()));
+        assert_eq!(
+            cmd,
+            UiCommand::SetModel {
+                id: "model-b".to_string(),
+                record_recent: true
+            }
+        );
     }
 
     #[test]
@@ -1902,6 +1937,7 @@ mod tests {
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
             model: Some("single-model".to_string()),
+            known_models: vec!["single-model".to_string()],
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -1931,6 +1967,7 @@ mod tests {
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
             model: Some("model-1".to_string()),
+            known_models: vec!["model-1".to_string(), "model-2".to_string()],
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -1941,12 +1978,128 @@ mod tests {
         // F2 -> next after model-1 is model-2
         app.handle_key(key(KeyCode::F(2)));
         let cmd = cmd_rx.try_recv().expect("expected /model command");
-        assert_eq!(cmd, UiCommand::Line("/model model-2".to_string()));
+        assert_eq!(
+            cmd,
+            UiCommand::SetModel {
+                id: "model-2".to_string(),
+                record_recent: false
+            }
+        );
 
         // Shift-F2 -> prev before model-1 is model-2 (wrapping)
         app.handle_key(press(KeyCode::F(2), KeyModifiers::SHIFT));
         let cmd = cmd_rx.try_recv().expect("expected /model command");
-        assert_eq!(cmd, UiCommand::Line("/model model-2".to_string()));
+        assert_eq!(
+            cmd,
+            UiCommand::SetModel {
+                id: "model-2".to_string(),
+                record_recent: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_f2_cycling_three_times_visits_b_c_a_without_reordering_recents() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_f2_3x", cmd_tx);
+
+        let temp = tempfile::tempdir().unwrap();
+        // Record in order: C, then B, then A -> recent list is [A, B, C]
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-c").unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-b").unwrap();
+        crate::chat::recent::record_in(temp.path().join("honk").as_path(), "model-a").unwrap();
+        app.recent_dir = Some(temp.path().join("honk"));
+
+        let make_snapshot = |current_model: &str| StateSnapshot {
+            run_state: crate::chat::types::RunState::Idle,
+            ownership: crate::chat::types::Ownership::Unknown,
+            queued_len: 0,
+            replaying: false,
+            prompt_in_flight: false,
+            connection: ConnectionState::Live,
+            mcp_enabled: Vec::new(),
+            model: Some(current_model.to_string()),
+            known_models: vec![
+                "model-a".to_string(),
+                "model-b".to_string(),
+                "model-c".to_string(),
+            ],
+        };
+
+        // Starting with current model A
+        app.state_snapshot = Some(make_snapshot("model-a"));
+
+        // 1st F2: next after A in [A, B, C] is B
+        app.handle_key(key(KeyCode::F(2)));
+        let cmd1 = cmd_rx.try_recv().expect("expected SetModel B");
+        assert_eq!(
+            cmd1,
+            UiCommand::SetModel {
+                id: "model-b".to_string(),
+                record_recent: false
+            }
+        );
+        // Apply switch result: model is now B, and recent list is NOT reordered
+        app.state_snapshot = Some(make_snapshot("model-b"));
+        assert_eq!(
+            app.load_recent(),
+            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+        );
+
+        // 2nd F2: next after B in [A, B, C] is C
+        app.handle_key(key(KeyCode::F(2)));
+        let cmd2 = cmd_rx.try_recv().expect("expected SetModel C");
+        assert_eq!(
+            cmd2,
+            UiCommand::SetModel {
+                id: "model-c".to_string(),
+                record_recent: false
+            }
+        );
+        // Apply switch result: model is now C, recents still [A, B, C]
+        app.state_snapshot = Some(make_snapshot("model-c"));
+        assert_eq!(
+            app.load_recent(),
+            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+        );
+
+        // 3rd F2: next after C in [A, B, C] wraps to A
+        app.handle_key(key(KeyCode::F(2)));
+        let cmd3 = cmd_rx.try_recv().expect("expected SetModel A");
+        assert_eq!(
+            cmd3,
+            UiCommand::SetModel {
+                id: "model-a".to_string(),
+                record_recent: false
+            }
+        );
+        // Apply switch result: model is now A, recents still [A, B, C]
+        app.state_snapshot = Some(make_snapshot("model-a"));
+        assert_eq!(
+            app.load_recent(),
+            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_picker_opens_closes_command_line() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_picker_cmd", cmd_tx);
+
+        // Colon command line is open
+        app.command_line = Some("model".to_string());
+        assert!(app.command_line.is_some());
+
+        // UiEvent::ModelList arrives
+        app.handle_ui_event(UiEvent::ModelList {
+            current: None,
+            models: vec![],
+            warning: None,
+        });
+
+        // Command line must be closed
+        assert!(app.command_line.is_none());
+        assert!(app.model_picker.is_some());
     }
 
     fn update(kind: &str, id: &str, text: &str, created: i64) -> Value {
@@ -2110,6 +2263,7 @@ mod tests {
             connection: ConnectionState::Live,
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         });
         // Running: the quote's last turn is marked in progress.
         app.transcript

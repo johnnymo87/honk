@@ -118,6 +118,12 @@ impl ChatCore {
             return true;
         }
 
+        if trimmed.starts_with("/model! ") {
+            let id = trimmed.strip_prefix("/model! ").unwrap().trim();
+            self.dispatch_model_set(trimmed, None, id, false, effects);
+            return true;
+        }
+
         effects.push(Effect::Notice(Notice::warning(format!(
             "unknown command: '{trimmed}'; type /help for commands"
         ))));
@@ -313,13 +319,36 @@ impl ChatCore {
         self.handle_model_command_inner(line, None, effects);
     }
 
+    pub fn handle_model_set_command(
+        &mut self,
+        id: &str,
+        record_recent: bool,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let line = if record_recent {
+            format!("/model {id}")
+        } else {
+            format!("/model! {id}")
+        };
+        self.dispatch_model_set(&line, None, id, record_recent, &mut effects);
+        effects
+    }
+
     pub(crate) fn handle_queued_model_command(
         &mut self,
         line: &str,
         requeues: u32,
         effects: &mut Vec<Effect>,
     ) {
-        self.handle_model_command_inner(line, Some((line.to_string(), requeues)), effects);
+        let record_recent = !line.starts_with("/model! ");
+        let rest = if let Some(r) = line.strip_prefix("/model! ") {
+            r.trim()
+        } else {
+            line.strip_prefix("/model").unwrap().trim()
+        };
+        let mut tokens = rest.split_whitespace();
+        let id = tokens.next().unwrap();
+        self.dispatch_model_set(line, Some((line.to_string(), requeues)), id, record_recent, effects);
     }
 
     fn handle_model_command_inner(
@@ -341,7 +370,7 @@ impl ChatCore {
             return;
         }
 
-        self.dispatch_model_set(line, queued, id, effects);
+        self.dispatch_model_set(line, queued, id, true, effects);
     }
 
     fn dispatch_model_list(&mut self, line: &str, effects: &mut Vec<Effect>) {
@@ -371,6 +400,7 @@ impl ChatCore {
         line: &str,
         queued: Option<(String, u32)>,
         id: &str,
+        record_recent: bool,
         effects: &mut Vec<Effect>,
     ) {
         if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
@@ -394,6 +424,7 @@ impl ChatCore {
                 super::types::PendingModelReq::Set {
                     model: id.to_string(),
                     queued,
+                    record_recent,
                 },
             );
             effects.push(Effect::Request {

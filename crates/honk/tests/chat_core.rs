@@ -5980,3 +5980,58 @@ fn test_model_set_other_error_emits_notice_and_sends_silent_list_to_adopt_curren
     assert_eq!(core.model(), Some("adopted-model"));
     assert!(!reply_effs.iter().any(|e| matches!(e, Effect::Notice(_))));
 }
+
+#[test]
+fn test_typo_model_id_not_recorded_in_recents() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "claude-opus-5-5",
+            "options": [{"value": "claude-opus-5-5"}]
+        }
+    ]));
+
+    // 1. Valid model -> recorded
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "claude-opus-5-5"}]
+        }
+    })));
+    assert!(reply_effs.iter().any(|e| matches!(
+        e,
+        Effect::RecordRecentModel(m) if m == "claude-opus-5-5"
+    )));
+
+    // 2. Typo model -> NOT recorded
+    let effs = core.handle(Input::Line("/model typo-model-id".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "typo-model-id"}]
+        }
+    })));
+    assert!(!reply_effs.iter().any(|e| matches!(
+        e,
+        Effect::RecordRecentModel(_)
+    )));
+}

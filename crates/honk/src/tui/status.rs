@@ -388,6 +388,7 @@ mod tests {
             connection,
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         }
     }
 

@@ -532,7 +532,7 @@ impl ChatCore {
         {
             if next_text.starts_with("/mcp ") {
                 self.handle_queued_mcp_command(&next_text, conv_count, effects);
-            } else if next_text.starts_with("/model ") {
+            } else if next_text.starts_with("/model ") || next_text.starts_with("/model! ") {
                 self.handle_queued_model_command(&next_text, conv_count, effects);
             } else {
                 self.send_prompt(next_text, conv_count, effects);
@@ -1335,7 +1335,11 @@ impl ChatCore {
                 }
                 false
             }
-            super::types::PendingModelReq::Set { model, queued } => {
+            super::types::PendingModelReq::Set {
+                model,
+                queued,
+                record_recent,
+            } => {
                 if let Some(err) = frame.get("error") {
                     let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
                     let msg = err
@@ -1361,7 +1365,9 @@ impl ChatCore {
 
                 let result = frame.get("result").unwrap_or(&Value::Null);
                 self.update_model_state(result, true, effects);
-                effects.push(Effect::RecordRecentModel(model));
+                if record_recent && self.known_model_ids.contains(&model) {
+                    effects.push(Effect::RecordRecentModel(model));
+                }
 
                 false
             }

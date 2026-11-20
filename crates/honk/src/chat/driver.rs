@@ -162,6 +162,7 @@ pub struct StateSnapshot {
     pub connection: ConnectionState,
     pub mcp_enabled: Vec<String>,
     pub model: Option<String>,
+    pub known_models: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -204,6 +205,7 @@ pub enum UiCommand {
     Eof,
     RetryAttach,
     Shutdown,
+    SetModel { id: String, record_recent: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +318,7 @@ fn maybe_emit_state(
         connection: connection.clone(),
         mcp_enabled: core.mcp_enabled().to_vec(),
         model: core.model().map(str::to_string),
+        known_models: core.known_model_ids().to_vec(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -550,6 +553,7 @@ async fn run_driver(
         connection: connection_state.clone(),
         mcp_enabled: Vec::new(),
         model: None,
+        known_models: Vec::new(),
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
@@ -997,6 +1001,41 @@ async fn run_driver(
                             return;
                         }
                         return;
+                    }
+                    UiCommand::SetModel { id, record_recent } => {
+                        let effects = core.handle_model_set_command(&id, record_recent);
+                        let action = process_effects(
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
+                            &mut list_paging,
+                            &mut known_cwd,
+                            opts.recent_dir.as_deref(),
+                        ).await;
+                        if matches!(action, EffectAction::Exit) {
+                            return;
+                        }
+                        if matches!(action, EffectAction::Reattach) {
+                            trigger_disconnect(
+                                &mut core,
+                                &mut conn_opt,
+                                &mut frame_rx_opt,
+                                &mut attach_retry_timer,
+                                &mut reconnect_timer,
+                                &mut reconnect_attempt,
+                                &mut connection_state,
+                                &mut last_state,
+                                &ui_tx,
+                                &mut live_since,
+                                &mut list_paging,
+                            );
+                        }
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                     }
                     UiCommand::Shutdown => {
                         if let Some(c) = conn_opt.as_mut() {

@@ -214,5 +214,6 @@ pub enum PendingModelReq {
     Set {
         model: String,
         queued: Option<(String, u32)>,
+        record_recent: bool,
     },
 }

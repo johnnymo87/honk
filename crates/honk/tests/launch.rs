@@ -38,6 +38,7 @@ struct Script {
     enable: Value,
     prompt: PromptReply,
     model_error: Option<&'static str>,
+    model_list: Option<Value>,
 }
 
 impl Default for Script {
@@ -47,6 +48,7 @@ impl Default for Script {
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
             model_error: None,
+            model_list: None,
         }
     }
 }
@@ -107,6 +109,15 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                     let mut f = script.enable.clone();
                     f["id"] = id;
                     out.push(f);
+                }
+                "_honk/model/list" => {
+                    if let Some(list) = &script.model_list {
+                        let mut f = list.clone();
+                        f["id"] = id;
+                        out.push(f);
+                    } else {
+                        out.push(json!({"id": id, "error": {"code": -32601, "message": "Method not found"}}));
+                    }
                 }
                 "_goose/unstable/session/rename" => out.push(json!({"id": id, "result": {}})),
                 "session/set_config_option" => {
@@ -841,13 +852,14 @@ async fn launch_with_model_sets_config_option_before_prompt() {
             "initialize",
             "session/new",
             "_goose/unstable/session/rename",
+            "_honk/model/list",
             "session/set_config_option",
             "session/prompt"
         ],
         "set_config_option must be called after rename and before prompt"
     );
     let reqs = r.honkd.reqs.lock().unwrap().clone();
-    let m = &reqs[3];
+    let m = &reqs[4];
     assert_eq!(
         m.params,
         json!({
@@ -886,7 +898,77 @@ async fn launch_with_model_failure_aborts_before_prompt() {
 
     assert_eq!(
         methods(&r),
-        ["initialize", "session/new", "session/set_config_option",],
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+        ],
         "prompt must not be sent if set_config_option fails"
+    );
+}
+
+#[tokio::test]
+async fn launch_with_model_refuses_id_not_in_honkd_list() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "models": [
+                    {"id": "claude-opus-5-5"}
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("typo-model".into());
+    let err = run(&o).await.unwrap_err();
+    assert_eq!(err.exit_code(), honk::launch::EXIT_PARTIAL);
+    let LaunchError::Partial { launched, error } = err else {
+        panic!("expected partial error");
+    };
+    assert_eq!(launched.native, SID);
+    assert_eq!(launched.prompt, honk::launch::PromptState::No);
+    let msg = format!("{error:#}");
+    assert!(
+        msg.contains("setting the model failed"),
+        "error must mention setting the model failed: {msg}"
+    );
+    assert!(
+        msg.contains("typo-model is not in honkd's model list (configured via honkd --models-file)"),
+        "error must contain honkd list message: {msg}"
+    );
+    assert_eq!(
+        methods(&r),
+        ["initialize", "session/new", "_honk/model/list"],
+        "set_config_option and prompt must not be called when model check fails"
+    );
+}
+
+#[tokio::test]
+async fn launch_with_model_skips_check_on_empty_list() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "models": []
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("custom-model".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
     );
 }

@@ -3476,6 +3476,7 @@ mod tests {
             connection: ConnectionState::Reconnecting { attempt: 1 },
             mcp_enabled: Vec::new(),
             model: None,
+            known_models: Vec::new(),
         };
         transcript.apply_ui_event(&UiEvent::State(snapshot), &mut viewport);
         assert!(!transcript.is_rebuilding);

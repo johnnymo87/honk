@@ -73,6 +73,9 @@ impl ModelPicker {
                     if shown_ids.contains(id) {
                         continue;
                     }
+                    if !self.models.is_empty() && !self.models.iter().any(|m| &m.id == id) {
+                        continue;
+                    }
                     shown_ids.insert(id.clone());
                     let item = self
                         .models
@@ -130,16 +133,18 @@ impl ModelPicker {
                 .iter()
                 .position(|r| matches!(r, PickerRow::Model(_)));
         } else {
-            // Flat list of all models: models in original order, plus any recent id not in models
+            // Flat list of all models: models in original order, plus any recent id not in models only if models is empty
             let mut all_models = self.models.clone();
-            let known_ids: HashSet<String> = all_models.iter().map(|m| m.id.clone()).collect();
-            for id in &self.recent {
-                if !known_ids.contains(id) {
-                    all_models.push(ModelItem {
-                        id: id.clone(),
-                        name: id.clone(),
-                        source: String::new(),
-                    });
+            if self.models.is_empty() {
+                let known_ids: HashSet<String> = all_models.iter().map(|m| m.id.clone()).collect();
+                for id in &self.recent {
+                    if !known_ids.contains(id) {
+                        all_models.push(ModelItem {
+                            id: id.clone(),
+                            name: id.clone(),
+                            source: String::new(),
+                        });
+                    }
                 }
             }
 
@@ -446,7 +451,7 @@ mod tests {
         ];
         let picker = ModelPicker::new(Some("gemini-3.8-flash".to_string()), models, recent);
 
-        assert_eq!(picker.rows.len(), 8);
+        assert_eq!(picker.rows.len(), 7);
         assert_eq!(picker.rows[0], PickerRow::Header("Recent".to_string()));
         assert_eq!(
             picker.rows[1],
@@ -464,30 +469,50 @@ mod tests {
                 source: "configured".to_string(),
             })
         );
+        // "old-custom-model" is not in sample_models, so it is omitted when models list is non-empty
+        assert_eq!(picker.rows[3], PickerRow::Header("Configured".to_string()));
         assert_eq!(
-            picker.rows[3],
-            PickerRow::Model(ModelItem {
-                id: "old-custom-model".to_string(),
-                name: "old-custom-model".to_string(),
-                source: String::new(),
-            })
-        );
-        assert_eq!(picker.rows[4], PickerRow::Header("Configured".to_string()));
-        assert_eq!(
-            picker.rows[5],
+            picker.rows[4],
             PickerRow::Model(ModelItem {
                 id: "claude-haiku-4-5".to_string(),
                 name: "Claude Haiku 4.5".to_string(),
                 source: "configured".to_string(),
             })
         );
-        assert_eq!(picker.rows[6], PickerRow::Header("goose".to_string()));
+        assert_eq!(picker.rows[5], PickerRow::Header("goose".to_string()));
         assert_eq!(
-            picker.rows[7],
+            picker.rows[6],
             PickerRow::Model(ModelItem {
                 id: "gemini-2.5-pro".to_string(),
                 name: "Gemini Pro 2.5".to_string(),
                 source: "goose".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sectioning_empty_models_shows_recents() {
+        let picker = ModelPicker::new(
+            None,
+            vec![],
+            vec!["recent-a".to_string(), "recent-b".to_string()],
+        );
+        assert_eq!(picker.rows.len(), 3);
+        assert_eq!(picker.rows[0], PickerRow::Header("Recent".to_string()));
+        assert_eq!(
+            picker.rows[1],
+            PickerRow::Model(ModelItem {
+                id: "recent-a".to_string(),
+                name: "recent-a".to_string(),
+                source: String::new(),
+            })
+        );
+        assert_eq!(
+            picker.rows[2],
+            PickerRow::Model(ModelItem {
+                id: "recent-b".to_string(),
+                name: "recent-b".to_string(),
+                source: String::new(),
             })
         );
     }

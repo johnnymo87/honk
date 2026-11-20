@@ -354,6 +354,10 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
 
     if let Some(model) = &opts.model {
         step!(
+            check_model_allowed(&mut client, &native, model, opts.timeouts.model).await,
+            "setting the model failed"
+        );
+        step!(
             set_model(&mut client, &native, model, opts.timeouts.model).await,
             "setting the model failed"
         );
@@ -668,6 +672,46 @@ async fn rename(
     if let Some(e) = rpc_error(&frame) {
         bail!("_goose/unstable/session/rename: {e}");
     }
+    Ok(())
+}
+
+async fn check_model_allowed(
+    client: &mut Client,
+    sid: &str,
+    model: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let frame = match call_with_timeout(
+        client,
+        "_honk/model/list",
+        json!({ "sessionId": sid }),
+        timeout,
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+
+    if let Some(err) = frame.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        if code == -32601 {
+            return Ok(());
+        }
+        return Ok(());
+    }
+
+    if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array) {
+        if !models.is_empty() {
+            let found = models
+                .iter()
+                .any(|m| m.get("id").and_then(Value::as_str) == Some(model));
+            if !found {
+                bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
+            }
+        }
+    }
+
     Ok(())
 }
 
