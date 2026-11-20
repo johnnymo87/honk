@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  /quote [N]  - load the last N (default 3) replies, quoted, into the composer (wake, swarm and your own messages left out); zm toggles a maximized composer\n  /yank       - copy the latest assistant message to the clipboard (OSC 52)\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /undo       - hide the last turn (files are not restored; /redo brings it back until the next prompt)\n  /redo       - restore the last undone turn (until the next prompt arrives)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  /quote [N]  - load the last N (default 3) replies, quoted, into the composer (wake, swarm and your own messages left out); zm toggles a maximized composer\n  /yank       - copy the latest assistant message to the clipboard (OSC 52)\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -105,6 +105,26 @@ impl ChatCore {
             } else {
                 self.send_prompt("/compact".to_string(), 0, effects);
             }
+            return true;
+        }
+
+        if trimmed == "/undo" || trimmed.starts_with("/undo ") {
+            let arg = trimmed.strip_prefix("/undo").unwrap().trim();
+            if !arg.is_empty() {
+                effects.push(Effect::Notice(Notice::warning("/undo takes no arguments")));
+                return true;
+            }
+            self.dispatch_revert(super::types::PendingRevertReq::Undo, effects);
+            return true;
+        }
+
+        if trimmed == "/redo" || trimmed.starts_with("/redo ") {
+            let arg = trimmed.strip_prefix("/redo").unwrap().trim();
+            if !arg.is_empty() {
+                effects.push(Effect::Notice(Notice::warning("/redo takes no arguments")));
+                return true;
+            }
+            self.dispatch_revert(super::types::PendingRevertReq::Redo, effects);
             return true;
         }
 
@@ -220,6 +240,42 @@ impl ChatCore {
         effects.push(Effect::Request {
             id: req_id,
             method: "_honk/mcp/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
+    }
+
+    fn local_revert_busy_reason(&self, op: &str) -> Option<String> {
+        if self.run_state.is_running() {
+            Some(format!("can't {op} while a turn is running"))
+        } else if self.queued_len() > 0 {
+            Some(format!("can't {op} while prompts are queued"))
+        } else if self.prompt_sent.is_some() {
+            Some(format!("can't {op} while a prompt is in flight"))
+        } else if !self.pending_permissions.is_empty() {
+            Some(format!("can't {op} while a permission request is pending"))
+        } else if self.is_replaying || self.is_reattaching || self.is_detached {
+            Some(format!("can't {op} while the session is rebuilding"))
+        } else {
+            None
+        }
+    }
+
+    fn dispatch_revert(&mut self, kind: super::types::PendingRevertReq, effects: &mut Vec<Effect>) {
+        let (op, method) = match kind {
+            super::types::PendingRevertReq::Undo => ("undo", "_honk/undo"),
+            super::types::PendingRevertReq::Redo => ("redo", "_honk/redo"),
+        };
+
+        if let Some(reason) = self.local_revert_busy_reason(op) {
+            effects.push(Effect::Notice(Notice::warning(reason)));
+            return;
+        }
+
+        let req_id = self.allocate_id();
+        self.pending_revert_reqs.insert(req_id, kind);
+        effects.push(Effect::Request {
+            id: req_id,
+            method: method.to_string(),
             params: json!({ "sessionId": self.session_id }),
         });
     }

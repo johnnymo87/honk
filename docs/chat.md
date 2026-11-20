@@ -166,6 +166,8 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
+| `/undo` | `:undo` | Hide the last turn across all views and fill an empty composer with the undone prompt text (files not restored; `/redo` restores until next prompt). |
+| `/redo` | `:redo` | Restore the last undone turn (until the next prompt arrives from anyone). |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
 | `/quote [N]` | `:quote [N]` | Load the last N (default 3) replies into the composer, oldest first, each quoted with `> ` under a `# MM-DD HH:MM (trigger)` header, and maximize the composer in normal mode. A turn counts only if the agent wrote reply text in it; thoughts, tool calls and the message that started the turn (a stall-watch wake, a swarm message, or your own prompt) are left out, and `/compact` turns are skipped. N is capped at 50. The trigger is `you`, `wake: <reason>`, `swarm: <sender>`, `scheduled`, `goose` (a prompt goose wrote itself), or `start`; `in progress` marks a reply still streaming. `/quote` replaces the composer; `:quote` keeps your draft below the quotes. Never sent upstream. |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
@@ -239,6 +241,25 @@ When creating a new session with `honk chat --new`:
   - *Opting out and turning it off.* `_meta.honk.projectMcp: false` on `session/new` skips only the auto-enable for one session: the project's entries are still listed in `/mcp`, and a person (or an agent, with a reason) can enable them later. The project files are read again on every `/mcp` operation; without `--project-mcp` honkd reads no project files at all. The flag works with or without `--mcp-catalog`.
   - *After the fact.* `/mcp disable <name>` removes an extension that honk added even when its entry is gone from the catalog (the project file changed). Servers that failed at `session/new` are not retried when the session is reactivated; `/mcp enable <name>` does it by hand.
 - **Unsupported servers**: Remote MCP servers that need OAuth or headers (such as Datadog or Notion) are listed as `n/a` (or fail with the OAuth message above) and cannot be enabled in v1.
+
+---
+
+## Undo and Redo (`/undo`, `/redo`)
+
+`honk chat` supports rewinding conversation turns via `/undo` and restoring them via `/redo` (also available via `:undo` and `:redo` in command mode):
+
+- **Soft revert & multi-view hiding**: Running `/undo` hides the undone turn in every attached `honk chat` viewer (as well as tail views). `honkd` writes a new log generation and broadcasts `_honk/reset` followed by log replay, immediately updating all viewers without needing client-side transcript filtering.
+- **Composer recall**: On a successful undo, the undone prompt text is placed back into the composer if the composer is currently empty, allowing you to easily edit and re-submit your prompt.
+- **`/redo` restores until the next prompt**: An undone turn is preserved in a sidecar and can be brought back with `/redo`. However, the revert is soft: as soon as the next prompt reaches the session from **anyone** (a prompt typed in `honk chat`, an incoming Telegram reply, a stall-watch wake, or a swarm message), `honkd` commits the truncation upstream, deletes the redo sidecar, and permanently drops the undone turns.
+- **Undo stops**: Only your own human prompts serve as undo stops. Automated prompts (such as stall-watch coordinator wakes, swarm messages, or prompts that goose writes itself) are skipped and are undone or restored together with the human prompt they follow.
+- **Slash commands are not stops**: Slash commands (such as `/compact`, `/mcp`, `/turns`, etc.) run as client actions rather than session prompts and do not create undo stops.
+- **Busy state refusal**: Both `/undo` and `/redo` require the session to be idle. They are refused locally (and by `honkd`) while a turn is actively running, a prompt is in flight, a permission request is awaiting answer, or lines are queued or held.
+- **Compaction guard**: You cannot undo past a compaction. If a manual or automatic compaction occurred at or after the target prompt, undo is refused.
+- **Files are not restored**: `/undo` and `/redo` rewrite session conversation history and model context only. Any files created, modified, or deleted by tools during the undone turns remain unchanged on the filesystem.
+- **Patched goose requirement**: Undo requires `honkd` connected to a goose instance advertising the `truncateFromMessage` capability flag (goose `patched-1.54.0.10` or later).
+- **Wire protocol**:
+  - `_honk/undo {sessionId}`: Returns `{ "turns": <count>, "text": "<target prompt text>", "messageId": "<target id>" }`.
+  - `_honk/redo {sessionId}`: Returns `{ "restored": <count>, "cleared": <bool> }` where `cleared` is true when all undone turns have been restored and no further redo state remains.
 
 ---
 

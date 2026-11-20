@@ -175,6 +175,12 @@ pub(crate) struct InflightSteer {
     pub conversion_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingRevertReq {
+    Undo,
+    Redo,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingMcpReq {
     List {

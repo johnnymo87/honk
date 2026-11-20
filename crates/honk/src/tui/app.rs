@@ -360,6 +360,12 @@ impl App {
             cmd if cmd == "compact" || cmd.starts_with("compact ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
+            cmd if cmd == "undo" || cmd.starts_with("undo ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
+            cmd if cmd == "redo" || cmd.starts_with("redo ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             cmd if cmd == "mcp" || cmd.starts_with("mcp ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
@@ -1787,5 +1793,23 @@ mod tests {
         assert!(app.is_composer_empty());
         assert!(!app.composer_maximized);
         assert!(cmd_rx.try_recv().is_err(), "no interrupt sent");
+    }
+
+    #[test]
+    fn test_execute_app_command_undo_and_redo() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+
+        app.execute_app_command(":undo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/undo".into()));
+
+        app.execute_app_command("undo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/undo".into()));
+
+        app.execute_app_command(":redo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/redo".into()));
+
+        app.execute_app_command("redo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/redo".into()));
     }
 }

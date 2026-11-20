@@ -41,6 +41,7 @@ pub struct ChatCore {
     pub(crate) mcp_enabled: Vec<String>,
     pub(crate) mcp_available: bool,
     pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
+    pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
 }
 
 impl ChatCore {
@@ -92,6 +93,7 @@ impl ChatCore {
             mcp_enabled: Vec::new(),
             mcp_available: true,
             pending_mcp_reqs: HashMap::new(),
+            pending_revert_reqs: HashMap::new(),
         }
     }
 
@@ -164,6 +166,10 @@ impl ChatCore {
 
     pub fn held_steers(&self) -> &[(String, u32)] {
         &self.held_steers
+    }
+
+    pub fn pending_permissions(&self) -> &[PendingPermission] {
+        &self.pending_permissions
     }
 
     pub fn max_turns(&self) -> Option<u32> {
@@ -662,6 +668,59 @@ impl ChatCore {
             let requeued = self.handle_mcp_response(mcp_req, frame, effects);
             if !requeued {
                 self.check_queued_prompts(effects);
+            }
+            return;
+        }
+
+        if let Some(revert_req) = self.pending_revert_reqs.remove(&id) {
+            self.handle_revert_response(revert_req, frame, effects);
+        }
+    }
+
+    fn handle_revert_response(
+        &mut self,
+        req: super::types::PendingRevertReq,
+        frame: &Value,
+        effects: &mut Vec<Effect>,
+    ) {
+        let op = match req {
+            super::types::PendingRevertReq::Undo => "undo",
+            super::types::PendingRevertReq::Redo => "redo",
+        };
+
+        if let Some(err) = frame.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            effects.push(Effect::Notice(Notice::warning(format!("{op}: {msg}"))));
+            return;
+        }
+
+        let result = frame.get("result").unwrap_or(&Value::Null);
+        match req {
+            super::types::PendingRevertReq::Undo => {
+                let turns = result.get("turns").and_then(Value::as_u64).unwrap_or(1);
+                let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+                let s = if turns == 1 { "" } else { "s" };
+                let msg = format!(
+                    "undid {turns} turn{s}; files are not restored. /redo restores until the next prompt."
+                );
+                effects.push(Effect::Notice(Notice::returned(msg, text)));
+            }
+            super::types::PendingRevertReq::Redo => {
+                let restored = result.get("restored").and_then(Value::as_u64).unwrap_or(0);
+                let cleared = result
+                    .get("cleared")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let s = if restored == 1 { "" } else { "s" };
+                let msg = if cleared {
+                    format!("restored {restored} turn{s} — nothing left to redo")
+                } else {
+                    format!("restored {restored} turn{s}")
+                };
+                effects.push(Effect::Notice(Notice::info(msg)));
             }
         }
     }
