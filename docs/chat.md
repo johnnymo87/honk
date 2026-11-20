@@ -212,7 +212,7 @@ Every prompt submitted assigns a unique client request ID (`client_req_id`).
 - **Status bar**: The current model (e.g. `claude-opus-5-5`) is displayed in the status bar, dropped gracefully on narrower terminal widths.
 - **Commands & Shortcuts**:
   - `/model <id>` (or `:model <id>`): Switch the session to a specific model. Goose accepts any model ID within the session's provider. If entered while a turn is active, the command is queued (`queued: /model <id>`) and dispatched automatically when the turn ends.
-  - `/model` (or `:model`): Opens the filterable **model picker overlay** above the composer. Type to filter by model ID or display name (subsequence match), use `j`/`k` or arrow keys to navigate, `Enter` to switch, and `Esc` to close.
+  - `/model` (or `:model`): Opens the filterable **model picker overlay** above the composer. Type to filter by model ID or display name (subsequence match), use the arrow keys or `Ctrl-n`/`Ctrl-p` to navigate, `Enter` to switch, and `Esc` to close.
   - `Ctrl-X m`: Opens the model picker overlay directly from both Normal and Insert modes.
   - `F2` / `Shift-F2`: Cycle to the next or previous model in the recent models list from both Normal and Insert modes.
 - **Session creation flags**:

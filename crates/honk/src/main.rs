@@ -592,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
             opts.pigeon = pigeon;
             opts.tag = tag;
             opts.no_swarm = args.no_swarm;
-            opts.model = args.model;
+            opts.model = args.model.map(|m| m.trim().to_string());
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
