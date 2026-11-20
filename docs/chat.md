@@ -334,6 +334,7 @@ honk telegram 20261016_7
 
 - `--title <title>`: Session title, set before the first prompt (also sets the Telegram topic title).
 - `--model <id>`: Initial model for the session, set before the first prompt. Refuses IDs not present in honkd's model list (configured via honkd `--models-file`), aborting before prompting. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
+- `--effort <level>`: Thinking effort for the new session (`off`, `low`, `medium`, `high`, `max`), set after the model step before the first prompt. If setting the thinking effort fails, the launch aborts before prompting with a partial exit code and reports the created session ID. Default: goose-serve's `GOOSE_THINKING_EFFORT`.
 - `--tag <tag>`: Tag the session in session-tags (`goose:<id>`). Defaults to inheriting the launching session's tag; `--tag auto` opts out.
 - `--no-attach`: Do not auto-attach (do not open a tab running `honk chat`).
 - `--tmux-session <name>`: Target tmux session for auto-attach [default: nvim's session].
