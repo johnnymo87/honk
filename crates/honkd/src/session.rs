@@ -2290,6 +2290,54 @@ impl Session {
                     params,
                 } => {
                     let sid = self.sid.clone();
+                    let revert_opt = {
+                        let s = self.state_store.lock().await;
+                        s.state().reverts.get(&sid).cloned()
+                    };
+                    if let Some(revert) = revert_opt {
+                        let call_res = self
+                            .hub
+                            .session_call(
+                                &sid,
+                                "_goose/unstable/session/conversation/truncate_from_message",
+                                json!({
+                                    "sessionId": sid,
+                                    "messageId": revert.target,
+                                }),
+                                Duration::from_secs(30),
+                            )
+                            .await;
+
+                        match call_res {
+                            Ok(_) => {
+                                {
+                                    let mut s = self.state_store.lock().await;
+                                    let _ = s.mutate(|st| {
+                                        st.reverts.remove(&sid);
+                                    });
+                                }
+                                let _ = self.log.delete_redo_sidecar();
+                                self.turn.client_prompts = revert.prompts_before as usize;
+                                if let Some(inf) = self.turn.inflight.as_mut() {
+                                    inf.prompt_index = revert.prompts_before as usize;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Session {sid}: truncate_from_message failed before prompt POST: {e:#}; scheduling rebuild at turn end"
+                                );
+                                {
+                                    let mut s = self.state_store.lock().await;
+                                    let _ = s.mutate(|st| {
+                                        st.reverts.remove(&sid);
+                                    });
+                                }
+                                let _ = self.log.delete_redo_sidecar();
+                                self.rebuild_at_turn_end = true;
+                            }
+                        }
+                    }
+
                     if let Some(inf) = self.turn.inflight.as_ref() {
                         let persisted = inf.to_persisted();
                         let client_prompts = self.turn.client_prompts;
@@ -3038,6 +3086,15 @@ impl Session {
                         },
                     );
                     return;
+                }
+                if let Ok(guard) = self.state_store.try_lock()
+                    && guard.state().reverts.contains_key(&self.sid)
+                {
+                    tracing::warn!(
+                        "Session {}: steer forwarded while revert exists; steers never commit",
+                        self.sid
+                    );
+                    debug_assert!(false, "steer forwarded while revert exists");
                 }
                 let up_id = self.ids.next();
                 self.pending_requests.insert(
@@ -7808,5 +7865,328 @@ mod tests {
 
         // Redo sidecar must be deleted!
         assert!(!sidecar_p.exists());
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_happy_path() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_prompt_happy", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Put HeldSession in state store so mutate can find it
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_001";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 5,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec!["msg_honk_0".into(), target_msg_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+        session.turn.client_prompts = 5;
+
+        // Create redo sidecar file
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+        assert!(sidecar_p.exists());
+
+        // Send prompt
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // 1. Fake goose received truncate_from_message before session/prompt
+        let trunc_calls = fake.truncate_calls();
+        assert_eq!(trunc_calls.len(), 1);
+        assert_eq!(
+            trunc_calls[0]
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            trunc_calls[0]
+                .pointer("/params/messageId")
+                .and_then(Value::as_str),
+            Some(target_msg_id)
+        );
+
+        let prompt_calls = fake.received_prompts(&sid);
+        assert_eq!(prompt_calls.len(), 1);
+
+        // Verify order in inbound frames: truncate MUST be before prompt!
+        let inbound = fake.inbound();
+        let trunc_pos = inbound
+            .iter()
+            .position(|f| {
+                f.get("method").and_then(Value::as_str)
+                    == Some("_goose/unstable/session/conversation/truncate_from_message")
+            })
+            .expect("truncate call in inbound frames");
+        let prompt_pos = inbound
+            .iter()
+            .position(|f| f.get("method").and_then(Value::as_str) == Some("session/prompt"))
+            .expect("prompt call in inbound frames");
+        assert!(
+            trunc_pos < prompt_pos,
+            "truncate MUST be called before prompt"
+        );
+
+        // 2. Revert is cleared and sidecar is deleted
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+            // 3. client_prompts and inflight.prompt_index adjusted in persisted state
+            let held = s.state().sessions.get(&sid).unwrap();
+            assert_eq!(held.client_prompts, 1);
+            assert_eq!(held.inflight.as_ref().unwrap().prompt_index, 1);
+        }
+        assert!(!sidecar_p.exists());
+
+        // 4. In-memory turn.client_prompts and inflight.prompt_index adjusted
+        assert_eq!(session.turn.client_prompts, 1);
+        assert_eq!(session.turn.inflight.as_ref().unwrap().prompt_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_found_false_treated_as_success() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_found_false", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        fake.script_truncate_found(false);
+
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_002";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 3,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec![target_msg_id.into()],
+                        prompts_before: 0,
+                    },
+                );
+            })
+            .unwrap();
+        }
+        session.turn.client_prompts = 3;
+
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // Truncate was called
+        assert_eq!(fake.truncate_calls().len(), 1);
+        // Prompt was called
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
+
+        // Revert cleared and sidecar deleted
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+            let held = s.state().sessions.get(&sid).unwrap();
+            assert_eq!(held.client_prompts, 0);
+            assert_eq!(held.inflight.as_ref().unwrap().prompt_index, 0);
+        }
+        assert!(!sidecar_p.exists());
+        assert_eq!(session.turn.client_prompts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_error_path_forwards_prompt_and_schedules_rebuild() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_err_path", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Script truncate error in fake goose
+        fake.script_truncate_error(json!({
+            "code": -32603,
+            "message": "truncate error"
+        }));
+
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_003";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 4,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec![target_msg_id.into()],
+                        prompts_before: 2,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+
+        assert!(!session.rebuild_at_turn_end);
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // Truncate was called (and failed)
+        assert_eq!(fake.truncate_calls().len(), 1);
+        // Prompt was forwarded anyway!
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
+
+        // Revert cleared and sidecar deleted anyway
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+        }
+        assert!(!sidecar_p.exists());
+
+        // Rebuild scheduled at turn end!
+        assert!(session.rebuild_at_turn_end);
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_no_revert_no_truncate() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_no_revert", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        let sid = session.sid.clone();
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 0,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // No truncate call made!
+        assert_eq!(fake.truncate_calls().len(), 0);
+        // Prompt was called
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
     }
 }
