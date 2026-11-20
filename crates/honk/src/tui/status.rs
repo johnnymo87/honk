@@ -163,6 +163,10 @@ impl<'a> StatusBar<'a> {
             .unwrap_or(&[])
     }
 
+    pub fn model(&self) -> Option<&str> {
+        self.state_snapshot.and_then(|s| s.model.as_deref())
+    }
+
     pub fn to_line(&self, width: u16) -> Line<'static> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
 
@@ -171,7 +175,10 @@ impl<'a> StatusBar<'a> {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD);
 
-        let build_left_spans = |max_title_w: usize, mcp_text: Option<&str>| -> Vec<Span<'static>> {
+        let build_left_spans = |max_title_w: usize,
+                                model_text: Option<&str>,
+                                mcp_text: Option<&str>|
+         -> Vec<Span<'static>> {
             let mut spans = Vec::new();
 
             // Mode badge
@@ -223,6 +230,12 @@ impl<'a> StatusBar<'a> {
             });
             spans.push(Span::styled(format!("  {}", conn), conn_style));
 
+            // Model
+            if let Some(model) = model_text {
+                let model_style = Style::default().bg(Color::DarkGray).fg(Color::Magenta);
+                spans.push(Span::styled(format!("  {}", model), model_style));
+            }
+
             // MCP
             if let Some(mcp) = mcp_text {
                 let mcp_style = Style::default().bg(Color::DarkGray).fg(Color::Cyan);
@@ -230,6 +243,13 @@ impl<'a> StatusBar<'a> {
             }
 
             spans
+        };
+
+        let model_text = self.model();
+        let model_candidates: Vec<Option<String>> = if let Some(m) = model_text {
+            vec![Some(m.to_string()), None]
+        } else {
+            vec![None]
         };
 
         let mcp_enabled = self.mcp_enabled();
@@ -270,25 +290,32 @@ impl<'a> StatusBar<'a> {
             vec![None]
         };
 
-        let mut candidate_pairs = Vec::new();
-        for mcp in &mcp_candidates {
-            for usage in &usage_candidates {
-                if usage.is_some() {
-                    candidate_pairs.push((mcp.clone(), usage.clone()));
+        let mut candidate_tuples = Vec::new();
+        for model in &model_candidates {
+            for mcp in &mcp_candidates {
+                if model_text.is_some() && model.is_none() && mcp.is_some() {
+                    continue;
                 }
+                for usage in &usage_candidates {
+                    if usage.is_some() {
+                        candidate_tuples.push((model.clone(), mcp.clone(), usage.clone()));
+                    }
+                }
+                candidate_tuples.push((model.clone(), mcp.clone(), None));
             }
-        }
-        for mcp in &mcp_candidates {
-            candidate_pairs.push((mcp.clone(), None));
         }
 
         let mut chosen = None;
-        for (mcp_opt, usage_opt) in candidate_pairs {
+        for (model_opt, mcp_opt, usage_opt) in candidate_tuples {
+            let model_w = model_opt
+                .as_ref()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 2)
+                .unwrap_or(0);
             let mcp_w = mcp_opt
                 .as_ref()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 2)
                 .unwrap_or(0);
-            let non_title_left = base_non_title_left + mcp_w;
+            let non_title_left = base_non_title_left + model_w + mcp_w;
 
             let usage_w = usage_opt
                 .as_ref()
@@ -299,7 +326,8 @@ impl<'a> StatusBar<'a> {
             let max_title_w = (width as usize)
                 .saturating_sub(non_title_left + right_needed)
                 .max(10);
-            let left_spans = build_left_spans(max_title_w, mcp_opt.as_deref());
+            let left_spans =
+                build_left_spans(max_title_w, model_opt.as_deref(), mcp_opt.as_deref());
             let left_w: usize = left_spans
                 .iter()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
@@ -322,7 +350,7 @@ impl<'a> StatusBar<'a> {
             left_spans
         } else {
             let max_title_w = (width as usize).saturating_sub(base_non_title_left).max(10);
-            build_left_spans(max_title_w, None)
+            build_left_spans(max_title_w, None, None)
         };
 
         Line::from(spans).style(base_style)
@@ -359,6 +387,9 @@ mod tests {
             prompt_in_flight: false,
             connection,
             mcp_enabled: Vec::new(),
+            model: None,
+            known_models: Vec::new(),
+            models_listed: false,
         }
     }
 
@@ -878,5 +909,70 @@ mod tests {
         let line_25 = bar.to_line(25);
         let rendered_25: String = line_25.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!rendered_25.contains("mcp:"));
+    }
+
+    #[test]
+    fn test_status_line_with_model() {
+        let mut snapshot =
+            make_snapshot(RunState::Idle, Ownership::Unknown, 0, ConnectionState::Live);
+        snapshot.model = Some("claude-opus-5-5".into());
+
+        let bar = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: Some(&snapshot),
+            mode: EditorMode::Normal,
+            usage: None,
+        };
+
+        // Wide terminal: shows model bare id
+        let line_140 = bar.to_line(140);
+        let rendered_140: String = line_140.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_140.contains("claude-opus-5-5"));
+
+        // Narrow terminal where model still fits without squeezing title below min 10
+        let line_55 = bar.to_line(55);
+        let rendered_55: String = line_55.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_55.contains("claude-opus-5-5"));
+
+        // Very narrow terminal: model dropped before title gets squeezed below its minimum
+        let line_35 = bar.to_line(35);
+        let rendered_35: String = line_35.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!rendered_35.contains("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn test_status_line_with_model_and_mcp() {
+        let mut snapshot =
+            make_snapshot(RunState::Idle, Ownership::Unknown, 0, ConnectionState::Live);
+        snapshot.model = Some("claude-opus-5-5".into());
+        snapshot.mcp_enabled = vec!["slack-ro".into(), "atlassian".into()];
+
+        let bar = StatusBar {
+            session_id: "ses_1",
+            session_title: Some("Title"),
+            cwd: Some("/tmp/cwd"),
+            state_snapshot: Some(&snapshot),
+            mode: EditorMode::Normal,
+            usage: None,
+        };
+
+        // Wide terminal: both shown
+        let line_140 = bar.to_line(140);
+        let rendered_140: String = line_140.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_140.contains("claude-opus-5-5"));
+        assert!(rendered_140.contains("mcp:slack-ro,atlassian"));
+
+        // Medium width: mcp drops/shrinks, but model stays
+        let line_60 = bar.to_line(60);
+        let rendered_60: String = line_60.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered_60.contains("claude-opus-5-5"));
+
+        // Very narrow: both dropped
+        let line_30 = bar.to_line(30);
+        let rendered_30: String = line_30.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!rendered_30.contains("claude-opus-5-5"));
+        assert!(!rendered_30.contains("mcp:"));
     }
 }

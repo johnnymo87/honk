@@ -173,6 +173,7 @@ struct FakeGooseInner {
     run_announcement_delay: Mutex<Option<Duration>>,
     export_commit_delay: Mutex<Option<Duration>>,
     session_info_error: Mutex<Option<(i64, String)>>,
+    session_config_options: Mutex<HashMap<String, Vec<Value>>>,
     session_extensions: Mutex<HashMap<String, Vec<Value>>>,
     extension_fail_command: Mutex<Option<(String, String)>>,
     extension_add_delay: Mutex<Option<Duration>>,
@@ -237,6 +238,7 @@ impl FakeGoose {
             run_announcement_delay: Mutex::new(None),
             export_commit_delay: Mutex::new(None),
             session_info_error: Mutex::new(None),
+            session_config_options: Mutex::new(HashMap::new()),
             session_extensions: Mutex::new(HashMap::new()),
             extension_fail_command: Mutex::new(None),
             extension_add_delay: Mutex::new(None),
@@ -525,6 +527,24 @@ impl FakeGoose {
             .unwrap_or_default()
     }
 
+    pub fn get_session_config_options(&self, sid: &str) -> Vec<Value> {
+        self.state
+            .session_config_options
+            .lock()
+            .unwrap()
+            .get(sid)
+            .cloned()
+            .unwrap_or_else(default_config_options)
+    }
+
+    pub fn set_session_config_options(&self, sid: &str, options: Vec<Value>) {
+        self.state
+            .session_config_options
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), options);
+    }
+
     pub fn script_truncate_error(&self, error: Value) {
         *self.state.truncate_error.lock().unwrap() = Some(error);
     }
@@ -556,6 +576,31 @@ impl Drop for FakeGoose {
             let _ = tx.send(());
         }
     }
+}
+
+pub fn default_config_options() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "provider",
+            "name": "Provider",
+            "type": "select",
+            "currentValue": "gcp_vertex_ai",
+            "options": [
+                { "name": "Goose (Default)", "value": "goose" },
+                { "name": "GCP Vertex AI", "value": "gcp_vertex_ai" },
+            ]
+        }),
+        json!({
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "currentValue": "claude-opus-5-5",
+            "options": [
+                { "name": "Claude Opus 5.5", "value": "claude-opus-5-5" },
+                { "name": "Gemini 3.8 Flash", "value": "gemini-3.8-flash" },
+            ]
+        }),
+    ]
 }
 
 fn check_auth(state: &FakeGooseInner, headers: &HeaderMap, query: &AuthQuery) -> bool {
@@ -617,11 +662,19 @@ fn register_new_session(
     if let Some(conn) = conns.get_mut(conn_id) {
         conn.sessions.insert(sid.to_string(), StreamState::new());
         if let Some(id) = req_id {
+            let config_options = state
+                .session_config_options
+                .lock()
+                .unwrap()
+                .entry(sid.to_string())
+                .or_insert_with(default_config_options)
+                .clone();
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "sessionId": sid
+                    "sessionId": sid,
+                    "configOptions": config_options,
                 }
             });
             conn.conn_stream.push_frame(resp, patched, false);
@@ -875,10 +928,24 @@ async fn handle_post(
             if let Some(conn) = conns.get_mut(&conn_id)
                 && let Some(id) = req_id
             {
+                let config_options = target_session
+                    .as_ref()
+                    .map(|sid| {
+                        state
+                            .session_config_options
+                            .lock()
+                            .unwrap()
+                            .entry(sid.clone())
+                            .or_insert_with(default_config_options)
+                            .clone()
+                    })
+                    .unwrap_or_else(default_config_options);
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {}
+                    "result": {
+                        "configOptions": config_options,
+                    }
                 });
                 if let Some(sid) = &target_session {
                     let stream = conn
@@ -1541,6 +1608,66 @@ async fn handle_post(
                 && let Some(cancel) = state.active_prompt_cancels.lock().unwrap().get(&sid)
             {
                 cancel.store(true, Ordering::SeqCst);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("session/set_config_option") => {
+            let sid = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let config_id = frame.pointer("/params/configId").and_then(Value::as_str);
+            let value = frame.pointer("/params/value").and_then(Value::as_str);
+
+            let updated_options = {
+                let mut all_opts = state.session_config_options.lock().unwrap();
+                let opts = all_opts
+                    .entry(sid.clone())
+                    .or_insert_with(default_config_options);
+                if let (Some(cid), Some(val)) = (config_id, value) {
+                    for opt in opts.iter_mut() {
+                        if opt.get("id").and_then(Value::as_str) == Some(cid)
+                            && let Some(obj) = opt.as_object_mut()
+                        {
+                            obj.insert("currentValue".to_string(), Value::String(val.to_string()));
+                        }
+                    }
+                }
+                opts.clone()
+            };
+
+            // Emit session/update notification first
+            let update_frame = json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": updated_options,
+                    }
+                }
+            });
+            emit_session_frame(&state, &conn_id, &sid, update_frame);
+
+            // Respond with { configOptions }
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "configOptions": updated_options,
+                    }
+                });
+                let stream = conn
+                    .sessions
+                    .entry(sid.clone())
+                    .or_insert_with(StreamState::new);
+                stream.push_frame(resp, patched, false);
             }
             StatusCode::ACCEPTED.into_response()
         }

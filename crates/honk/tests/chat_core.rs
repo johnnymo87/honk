@@ -4861,6 +4861,1341 @@ fn test_mcp_queued_busy_requeues_bounded() {
 }
 
 #[test]
+fn test_model_parsed_from_load_result_no_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+
+    let load_reply = json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "result": {
+            "title": "My Goose Session",
+            "configOptions": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "type": "select",
+                    "currentValue": "gcp_vertex_ai",
+                    "options": [{"value": "gcp_vertex_ai", "name": "Google Cloud Vertex AI"}]
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "type": "select",
+                    "currentValue": "claude-opus-5-5",
+                    "options": [
+                        {"value": "claude-opus-5-5", "name": "Claude Opus 5.5"},
+                        {"value": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"}
+                    ]
+                }
+            ]
+        }
+    });
+
+    let effs = core.handle(Input::Frame(load_reply));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert_eq!(core.provider(), Some("gcp_vertex_ai"));
+    assert_eq!(
+        core.known_model_ids(),
+        &[
+            "claude-opus-5-5".to_string(),
+            "claude-sonnet-4-6".to_string()
+        ]
+    );
+    // No notice emitted on load
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_model_config_option_update_during_replay_no_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+    assert!(core.is_replaying());
+
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [{"value": "claude-opus-5-5"}]
+                    }
+                ]
+            }
+        }
+    });
+
+    let effs = core.handle(Input::Frame(frame));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+
+    // Second update during replay also has no notice
+    let frame2 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+
+    let effs2 = core.handle(Input::Frame(frame2));
+    assert_eq!(core.model(), Some("claude-sonnet-4-6"));
+    assert!(!effs2.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_model_config_option_update_live_notice() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    // End replay
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+    assert!(!core.is_replaying());
+
+    // Initial model learned live when previous was None -> no notice
+    let frame1 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [{"value": "claude-opus-5-5"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs1 = core.handle(Input::Frame(frame1));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+    assert!(!effs1.iter().any(|e| matches!(e, Effect::Notice(_))));
+
+    // Model changes live from claude-opus-5-5 to claude-sonnet-4-6 -> notice
+    let frame2 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs2 = core.handle(Input::Frame(frame2));
+    assert_eq!(core.model(), Some("claude-sonnet-4-6"));
+    let notice = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on live model change");
+    assert_eq!(notice.kind, NoticeKind::Info);
+    assert_eq!(notice.text, "model: claude-opus-5-5 → claude-sonnet-4-6");
+
+    // Same model received again live -> no notice
+    let frame3 = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs3 = core.handle(Input::Frame(frame3));
+    assert!(!effs3.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_help_command_includes_model() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/help".into()));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(&n.text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(notice.contains("/model [id]"));
+}
+
+#[test]
+fn test_model_command_bare_requests_list() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let (req_id, method, params) = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, params } => Some((*id, method.clone(), params.clone())),
+            _ => None,
+        })
+        .expect("expected Effect::Request for bare /model");
+    assert_eq!(method, "_honk/model/list");
+    assert_eq!(params["sessionId"], "test-session");
+
+    // Success response with models and warning
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "provider": "gcp_vertex_ai",
+            "current": "claude-opus-5-5",
+            "warning": "stale models file",
+            "models": [
+                { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured" },
+                { "id": "gemini-3.8-flash", "name": "gemini-3.8-flash", "source": "goose" }
+            ]
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+
+    // 1. Warning notice emitted
+    let warning_notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.kind == NoticeKind::Warning => Some(n),
+            _ => None,
+        })
+        .expect("expected warning notice");
+    assert_eq!(warning_notice.text, "stale models file");
+
+    // 2. Effect::ModelList emitted
+    let model_list = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::ModelList {
+                current,
+                models,
+                warning,
+            } => Some((current.clone(), models.clone(), warning.clone())),
+            _ => None,
+        })
+        .expect("expected Effect::ModelList");
+    assert_eq!(model_list.0, Some("claude-opus-5-5".to_string()));
+    assert_eq!(model_list.1.len(), 2);
+    assert_eq!(model_list.1[0].id, "claude-opus-5-5");
+    assert_eq!(model_list.1[0].name, "Claude Opus 5.5");
+    assert_eq!(model_list.1[0].source, "configured");
+    assert_eq!(model_list.2, Some("stale models file".to_string()));
+
+    // 3. ChatCore's known_model_ids refreshed
+    // Now /model gemini-3.8-flash shouldn't emit "not in goose's model list" warning
+    let set_effs = core.handle(Input::Line("/model gemini-3.8-flash".into()));
+    assert!(
+        !set_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning))
+    );
+}
+
+#[test]
+fn test_model_command_list_error_emits_error_notice() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .expect("expected Effect::Request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32601,
+            "message": "Method not found"
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let error_notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.kind == NoticeKind::Error => Some(n),
+            _ => None,
+        })
+        .expect("expected error notice");
+    assert_eq!(error_notice.text, "Method not found");
+}
+
+#[test]
+fn test_model_command_idle_sends_request() {
+    let (mut core, _) = new_test_core();
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "claude-sonnet-4-6",
+            "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+        }
+    ]));
+
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let req = effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/set_config_option"
+            )
+        })
+        .expect("should send session/set_config_option request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert_eq!(params["configId"], "model");
+    assert_eq!(params["value"], "claude-opus-5-5");
+
+    // Known model should not produce a warning
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning))
+    );
+}
+
+#[test]
+fn test_model_command_unknown_id_sends_request_and_warning() {
+    let (mut core, _) = new_test_core();
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "claude-opus-5-5",
+            "options": [{"value": "claude-opus-5-5"}]
+        }
+    ]));
+
+    let effs = core.handle(Input::Line("/model gemini-3.8-flash".into()));
+    // Should still send request
+    let req = effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/set_config_option"
+            )
+        })
+        .expect("should send session/set_config_option request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["value"], "gemini-3.8-flash");
+
+    // Should produce warning notice
+    let warning = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.kind == NoticeKind::Warning => Some(n),
+            _ => None,
+        })
+        .expect("expected warning for unknown model");
+    assert_eq!(
+        warning.text,
+        "gemini-3.8-flash is not in the model list; goose does not check it, a wrong id fails at the next turn"
+    );
+}
+
+#[test]
+fn test_model_command_queued_during_turn_and_flushed_at_turn_end() {
+    let (mut core, _) = new_test_core();
+
+    // Active run running
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_1" } }
+            }
+        }
+    })));
+
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Request { .. })));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected queued notice");
+    assert_eq!(notice.text, "queued: /model claude-opus-5-5");
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run ends -> queued /model claude-opus-5-5 dispatched
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+
+    let req = effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/set_config_option"
+            )
+        })
+        .expect("should dispatch queued model request on run end");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["value"], "claude-opus-5-5");
+}
+
+#[test]
+fn test_model_command_busy_32002_requeues_bounded() {
+    let (mut core, _) = new_test_core();
+
+    // Active run
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_1" } }
+            }
+        }
+    })));
+
+    // Queue /model claude-opus-5-5
+    core.handle(Input::Line("/model claude-opus-5-5".into()));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 1 ends -> queued /model claude-opus-5-5 dispatched (Attempt 1)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("should dispatch queued model request");
+
+    // Honkd returns -32002 session is busy (Attempt 1 fails -> requeue 1)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": {
+            "code": -32002,
+            "message": "session is busy; try after this turn",
+            "data": { "honk": "busy" }
+        }
+    })));
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/model claude-opus-5-5");
+
+    // Run 2 ends -> dispatched again (Attempt 2)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 2 fails -> requeue 2)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": {
+            "code": -32002,
+            "message": "session is busy; try after this turn",
+            "data": { "honk": "busy" }
+        }
+    })));
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 3 ends -> dispatched again (Attempt 3)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 3 fails -> requeue 3)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": {
+            "code": -32002,
+            "message": "session is busy; try after this turn",
+            "data": { "honk": "busy" }
+        }
+    })));
+    assert!(!has_notice(&effs, "session is busy"));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Run 4 ends -> dispatched again (Attempt 4)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Honkd returns -32002 again (Attempt 4 exceeds 3 requeues limit -> show error)
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": {
+            "code": -32002,
+            "message": "session is busy; try after this turn",
+            "data": { "honk": "busy" }
+        }
+    })));
+    assert!(has_notice(&effs, "session is busy; try after this turn"));
+    assert_eq!(core.local_queue().len(), 0);
+}
+
+#[test]
+fn test_model_command_success_updates_state_and_records_recent() {
+    let (mut core, _) = new_test_core();
+
+    // End replay
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/replay_done",
+        "params": { "sessionId": "test-session", "epoch": 1, "seq": 0 }
+    })));
+
+    // Initial model is claude-sonnet-4-6
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "claude-sonnet-4-6",
+            "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+        }
+    ]));
+    assert_eq!(core.model(), Some("claude-sonnet-4-6"));
+
+    // Send /model claude-opus-5-5
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Response arrives with updated configOptions
+    let reply_frame = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [
+                {
+                    "id": "model",
+                    "currentValue": "claude-opus-5-5",
+                    "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                }
+            ]
+        }
+    });
+
+    let effs = core.handle(Input::Frame(reply_frame));
+    assert_eq!(core.model(), Some("claude-opus-5-5"));
+
+    // Single notice emitted: model: claude-sonnet-4-6 → claude-opus-5-5
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on model change");
+    assert_eq!(notice.text, "model: claude-sonnet-4-6 → claude-opus-5-5");
+
+    // Effect::RecordRecentModel emitted
+    assert!(
+        effs.iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(m) if m == "claude-opus-5-5"))
+    );
+
+    // Subsequent live config_option_update notification does NOT emit double notice
+    let notif_frame = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [{"value": "claude-opus-5-5"}, {"value": "claude-sonnet-4-6"}]
+                    }
+                ]
+            }
+        }
+    });
+    let effs = core.handle(Input::Frame(notif_frame));
+    assert!(!effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_two_quick_model_commands_serialized() {
+    let (mut core, _) = new_test_core();
+    core.set_config_options(&json!([
+        {
+            "id": "model",
+            "currentValue": "model-0",
+            "options": [{"value": "model-a"}, {"value": "model-b"}]
+        }
+    ]));
+
+    // First command sent immediately
+    let effs1 = core.handle(Input::Line("/model model-a".into()));
+    let req_id_a = effs1
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("first /model should send request");
+
+    // Second command typed while first is pending -> queued
+    let effs2 = core.handle(Input::Line("/model model-b".into()));
+    assert!(!effs2.iter().any(|e| matches!(e, Effect::Request { .. })));
+    let notice = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("second /model should be queued");
+    assert_eq!(notice.text, "queued: /model model-b");
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Reply for first model arrives -> success, second model popped and dispatched
+    let effs3 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id_a,
+        "result": {
+            "configOptions": [
+                {
+                    "id": "model",
+                    "currentValue": "model-a",
+                    "options": [{"value": "model-a"}, {"value": "model-b"}]
+                }
+            ]
+        }
+    })));
+
+    let req_id_b = effs3
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("queued /model model-b should be dispatched after first completes");
+    assert_ne!(req_id_a, req_id_b);
+}
+
+#[test]
+fn test_model_command_error_emits_error_notice() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/model bad-model".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let error_reply = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": { "code": -32000, "message": "unknown model `bad-model`" }
+    });
+
+    let effs = core.handle(Input::Frame(error_reply));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected error notice");
+    assert_eq!(notice.kind, NoticeKind::Error);
+    assert_eq!(notice.text, "unknown model `bad-model`");
+
+    // Also sends silent _honk/model/list
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+}
+
+#[test]
+fn test_update_model_state_does_not_wipe_configured_models() {
+    let (mut core, _) = new_test_core();
+
+    // 1. Core receives _honk/model/list reply with configured models
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "claude-opus-5-5",
+            "models": [
+                {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured"},
+                {"id": "claude-fable-5-2", "name": "Claude Fable 5.2", "source": "configured"},
+            ]
+        }
+    })));
+
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-fable-5-2".to_string())
+    );
+
+    // 2. Later, a config_option_update arrives from goose containing only goose's stale options
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-opus-5-5",
+                        "options": [
+                            {"value": "claude-sonnet-4-6"}
+                        ]
+                    }
+                ]
+            }
+        }
+    })));
+
+    // 3. Known models should be the UNION, so claude-fable-5-2 is NOT wiped
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-opus-5-5".to_string())
+    );
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-fable-5-2".to_string())
+    );
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-sonnet-4-6".to_string())
+    );
+
+    // 4. Switching to claude-fable-5-2 does NOT warn
+    let set_effs = core.handle(Input::Line("/model claude-fable-5-2".into()));
+    assert!(
+        !set_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning))
+    );
+}
+
+#[test]
+fn test_attach_success_sends_silent_model_list() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+
+    let load_reply = json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "result": {
+            "title": "My Session",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "currentValue": "old-model",
+                    "options": [{"value": "old-model"}]
+                }
+            ]
+        }
+    });
+
+    let effs = core.handle(Input::Frame(load_reply));
+    assert!(effs.iter().any(|e| matches!(e, Effect::Attached { .. })));
+
+    // Emits silent _honk/model/list request
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .expect("attach should send silent _honk/model/list request");
+
+    // Reply to silent list arrives
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "new-model",
+            "models": [
+                {"id": "new-model", "name": "New Model", "source": "configured"}
+            ]
+        }
+    })));
+
+    // Silent reply should NOT emit ModelList effect and NOT emit any notice
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::ModelList { .. }))
+    );
+    assert!(!reply_effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+
+    // But should update current model and known_models
+    assert_eq!(core.model(), Some("new-model"));
+    assert!(core.known_model_ids().contains(&"new-model".to_string()));
+}
+
+#[test]
+fn test_attach_silent_model_list_ignores_error_silently() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let (load_id, _, _) = core.attach_request();
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": load_id,
+        "result": { "title": "My Session" }
+    })));
+
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .expect("attach should send silent _honk/model/list request");
+
+    // Reply is error (-32601)
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "error": { "code": -32601, "message": "Method not found" }
+    })));
+
+    // Should ignore error silently: no notices emitted
+    assert!(!reply_effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_on_session_new_sends_silent_model_list() {
+    let now = Instant::now();
+    let opts = ChatOpts::default();
+    let mut core = ChatCore::new("test-session".into(), opts, now);
+
+    let effs = core.on_session_new(&json!({
+        "sessionId": "test-session",
+        "configOptions": [
+            {
+                "id": "model",
+                "currentValue": "claude-opus-5-5",
+                "options": [{"value": "claude-opus-5-5"}]
+            }
+        ]
+    }));
+
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+}
+
+#[test]
+fn test_prompt_submitted_while_model_set_inflight_is_queued_and_flushed() {
+    let (mut core, _) = new_test_core();
+
+    // 1. Submit /model switch
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("should send set_config_option");
+
+    assert!(core.has_pending_model_mutation());
+
+    // 2. While switch is in-flight, user submits a prompt
+    let prompt_effs = core.handle(Input::Line("hello while model switching".into()));
+
+    // Prompt must NOT be sent immediately!
+    assert!(!prompt_effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "session/prompt"
+    )));
+    // Must emit notice that it is queued until switch completes
+    assert!(prompt_effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.text == "queued until the model switch completes"
+    )));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // 3. Model switch reply arrives
+    let set_reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "result": {
+            "configOptions": [
+                {
+                    "id": "model",
+                    "currentValue": "claude-opus-5-5",
+                    "options": [{"value": "claude-opus-5-5"}]
+                }
+            ]
+        }
+    })));
+
+    // Prompt is flushed!
+    let prompt_req = set_reply_effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/prompt"
+            )
+        })
+        .expect("queued prompt should be flushed after model switch completes");
+    let Effect::Request { params, .. } = prompt_req else {
+        panic!()
+    };
+    let prompt_text = params
+        .pointer("/prompt/0/text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    assert_eq!(prompt_text, "hello while model switching");
+}
+
+#[test]
+fn test_model_command_busy_32002_requires_data_honk_busy() {
+    let (mut core, _) = new_test_core();
+
+    // Active run running
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_1" } }
+            }
+        }
+    })));
+
+    // Queue /model
+    core.handle(Input::Line("/model claude-opus-5-5".into()));
+
+    // Run ends -> dispatches set_config_option
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // ACP ResourceNotFound: -32002 WITHOUT data: {"honk": "busy"}
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": { "code": -32002, "message": "Resource not found" }
+    })));
+
+    // Must NOT requeue
+    assert_eq!(core.local_queue().len(), 0);
+    // Must show error notice
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Error && n.text == "Resource not found"
+    )));
+    // Must send silent _honk/model/list to adopt current
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+}
+
+#[test]
+fn test_model_set_other_error_emits_notice_and_sends_silent_list_to_adopt_current() {
+    let (mut core, _) = new_test_core();
+
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Server returns error e.g. -32603
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": { "code": -32603, "message": "internal error" }
+    })));
+
+    // Shows error notice
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Error && n.text == "internal error"
+    )));
+
+    // Sends silent _honk/model/list
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .expect("must send silent _honk/model/list on set error");
+
+    // Silent list replies with current
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "adopted-model",
+            "models": []
+        }
+    })));
+
+    assert_eq!(core.model(), Some("adopted-model"));
+    assert!(!reply_effs.iter().any(|e| matches!(e, Effect::Notice(_))));
+}
+
+#[test]
+fn test_typo_model_id_not_recorded_in_recents() {
+    let (mut core, _) = new_test_core();
+
+    // Models listed reply received -> models_listed becomes true
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "claude-opus-5-5",
+            "models": [{"id": "claude-opus-5-5"}]
+        }
+    })));
+
+    // 1. Valid model -> recorded
+    let effs = core.handle(Input::Line("/model claude-opus-5-5".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "claude-opus-5-5"}]
+        }
+    })));
+    assert!(reply_effs.iter().any(|e| matches!(
+        e,
+        Effect::RecordRecentModel(m) if m == "claude-opus-5-5"
+    )));
+
+    // 2. Typo model -> NOT recorded
+    let effs = core.handle(Input::Line("/model typo-model-id".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "typo-model-id"}]
+        }
+    })));
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(_)))
+    );
+}
+
+#[test]
+fn test_model_set_with_empty_id_does_not_panic() {
+    let (mut core, _) = new_test_core();
+
+    // Bare /model requests list
+    let effs = core.handle(Input::Line("/model".into()));
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+
+    // /model with whitespace only requests list
+    let effs = core.handle(Input::Line("/model   ".into()));
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, .. } if method == "_honk/model/list"
+    )));
+
+    // handle_model_set_command with empty ID returns usage warning, does not panic
+    let effs = core.handle_model_set_command("", false);
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Warning && n.text == "usage: /model [id]"
+    )));
+
+    let effs = core.handle_model_set_command("   ", true);
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.kind == NoticeKind::Warning && n.text == "usage: /model [id]"
+    )));
+
+    // handle_queued_model_command and handle_queued_model_set with empty ID do not panic
+    let mut effs = Vec::new();
+    core.handle_queued_model_command("/model", 0, &mut effs);
+    core.handle_queued_model_command("/model   ", 0, &mut effs);
+    core.handle_queued_model_set("", 0, &mut effs);
+    core.handle_queued_model_set("   ", 0, &mut effs);
+}
+
+#[test]
+fn test_recents_recording_hygiene_before_and_after_models_listed() {
+    let (mut core, _) = new_test_core();
+    assert!(!core.models_listed());
+
+    // 1. Before models_listed, switching to ANY model succeeds and records recent (e.g. old honkd)
+    let effs = core.handle(Input::Line("/model custom-unlisted-model".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "custom-unlisted-model"}]
+        }
+    })));
+    // Should be recorded before models_listed
+    assert!(reply_effs.iter().any(|e| matches!(
+        e,
+        Effect::RecordRecentModel(m) if m == "custom-unlisted-model"
+    )));
+
+    // 2. Now receive _honk/model/list reply
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "current": "claude-opus-5-5",
+            "models": [{"id": "claude-opus-5-5"}]
+        }
+    })));
+    assert!(core.models_listed());
+
+    // 3. After models_listed, typo is NOT recorded
+    let effs = core.handle(Input::Line("/model typo-model-id".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let reply_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "configOptions": [{"id": "model", "currentValue": "typo-model-id"}]
+        }
+    })));
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(_)))
+    );
+}
+
+#[test]
 fn test_help_command_includes_undo_and_redo() {
     let (mut core, _) = new_test_core();
     let effs = core.handle(Input::Line("/help".into()));

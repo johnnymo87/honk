@@ -88,6 +88,10 @@ struct LaunchArgs {
     #[arg(long)]
     title: Option<String>,
 
+    /// Initial model for the session
+    #[arg(long)]
+    model: Option<String>,
+
     /// pigeon daemon URL
     #[arg(
         long = "pigeon-url",
@@ -147,6 +151,11 @@ fn launch_opts(
         Some(t) => Some(t.trim().to_string()),
         None => None,
     };
+    let model = match args.model {
+        Some(m) if m.trim().is_empty() => anyhow::bail!("--model is empty"),
+        Some(m) => Some(m.trim().to_string()),
+        None => None,
+    };
     let tag = match args.tag {
         None => honk::launch::TagRequest::Inherit,
         Some(honk::octags::TagArg::NoInherit) => honk::launch::TagRequest::Off,
@@ -172,6 +181,7 @@ fn launch_opts(
         dir,
         prompt,
         title,
+        model,
         tag,
         launcher: honk::octags::resolve_launcher_from(&env_get),
         tags_bin: honk::octags::resolve_bin_from(&env_get, honk::octags::on_path),
@@ -343,6 +353,10 @@ struct ChatArgs {
     #[arg(long, requires = "new", conflicts_with = "session", value_parser = honk::octags::parse_tag_arg)]
     tag: Option<honk::octags::TagArg>,
 
+    /// Initial model for a new session
+    #[arg(long, requires = "new", conflicts_with = "session")]
+    model: Option<String>,
+
     #[command(flatten)]
     pigeon: PigeonArgs,
 }
@@ -411,6 +425,11 @@ fn resolve_list_cwd(p: &std::path::Path) -> String {
 
 fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Target> {
     if args.new {
+        if let Some(m) = &args.model
+            && m.trim().is_empty()
+        {
+            anyhow::bail!("--model is empty");
+        }
         let cwd = match &args.cwd {
             Some(c) => c
                 .canonicalize()
@@ -440,6 +459,9 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
         }
         if !args.mcp.is_empty() {
             anyhow::bail!("--mcp requires --new");
+        }
+        if args.model.is_some() {
+            anyhow::bail!("--model requires --new");
         }
         Ok(honk::chat::driver::Target::Attach(
             args.session.clone().unwrap(),
@@ -570,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
             opts.pigeon = pigeon;
             opts.tag = tag;
             opts.no_swarm = args.no_swarm;
+            opts.model = args.model.map(|m| m.trim().to_string());
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
@@ -658,6 +681,7 @@ mod tests {
             no_telegram: false,
             no_swarm: false,
             tag: None,
+            model: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
                 pigeon_token_file: None,
@@ -682,6 +706,7 @@ mod tests {
             no_telegram: false,
             no_swarm: false,
             tag: None,
+            model: None,
             pigeon: PigeonArgs {
                 pigeon_url: None,
                 pigeon_token_file: None,
@@ -1243,5 +1268,66 @@ mod tests {
     fn test_resolve_list_cwd_nonexistent_verbatim() {
         let non_existent = PathBuf::from("/nonexistent/path/xyz/123");
         assert_eq!(resolve_list_cwd(&non_existent), "/nonexistent/path/xyz/123");
+    }
+
+    #[test]
+    fn test_cli_parse_chat_model() {
+        assert!(Cli::try_parse_from(["honk", "chat", "--model", "claude-opus-5-5"]).is_err());
+        assert!(
+            Cli::try_parse_from(["honk", "chat", "ses_123", "--model", "claude-opus-5-5"]).is_err()
+        );
+
+        let cli =
+            Cli::try_parse_from(["honk", "chat", "--new", "--model", "claude-opus-5-5"]).unwrap();
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.model.as_deref(), Some("claude-opus-5-5"));
+            }
+            _ => panic!("expected chat command"),
+        }
+
+        let cli_empty = Cli::try_parse_from(["honk", "chat", "--new", "--model", "   "]).unwrap();
+        match cli_empty.command {
+            Commands::Chat(args) => {
+                let err = resolve_chat_target(&args).unwrap_err();
+                assert!(err.to_string().contains("--model is empty"));
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_launch_model() {
+        let cli = Cli::try_parse_from([
+            "honk",
+            "launch",
+            "--model",
+            "claude-opus-5-5",
+            "--secret",
+            "s",
+            "/tmp",
+            "do it",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch(args) => {
+                assert_eq!(args.model.as_deref(), Some("claude-opus-5-5"));
+                let opts = launch_opts(args, |_| None, || unreachable!()).unwrap();
+                assert_eq!(opts.model.as_deref(), Some("claude-opus-5-5"));
+            }
+            _ => panic!("expected launch command"),
+        }
+
+        let cli_empty = Cli::try_parse_from([
+            "honk", "launch", "--model", "   ", "--secret", "s", "/tmp", "do it",
+        ])
+        .unwrap();
+        match cli_empty.command {
+            Commands::Launch(args) => {
+                let err = launch_opts(args, |_| None, || unreachable!()).unwrap_err();
+                assert!(err.to_string().contains("--model is empty"));
+            }
+            _ => panic!("expected launch command"),
+        }
     }
 }

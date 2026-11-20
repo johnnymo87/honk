@@ -1603,6 +1603,9 @@ async fn test_driver_shutdown_during_attach_backoff_returns_promptly() {
             .await
             .unwrap();
 
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
+            {
+            }
             let _ = ws.close(None).await;
             drop(ws);
 
@@ -1873,6 +1876,9 @@ async fn test_driver_attach_failed_auth_error_on_reconnect_is_fatal() {
             .await
             .unwrap();
 
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
+            {
+            }
             let _ = ws.close(None).await;
             drop(ws);
 
@@ -2234,8 +2240,15 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 3. session/list page 1 (50 dummy sessions)
-            let msg = ws.next().await.unwrap().unwrap();
-            let v1: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let mut v1 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if v1["method"] == "_honk/model/list" {
+                v1 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(v1["method"], "session/list");
             let mut p1_sessions = Vec::new();
             for i in 0..50 {
@@ -2261,8 +2274,15 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 4. session/list page 2 (50 dummy sessions)
-            let msg = ws.next().await.unwrap().unwrap();
-            let v2: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let mut v2 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if v2["method"] == "_honk/model/list" {
+                v2 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(v2["method"], "session/list");
             assert_eq!(v2["params"]["cursor"], "page2_cursor");
             let mut p2_sessions = Vec::new();
@@ -2289,8 +2309,15 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 5. session/list page 3 (contains target-ses)
-            let msg = ws.next().await.unwrap().unwrap();
-            let v3: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let mut v3 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if v3["method"] == "_honk/model/list" {
+                v3 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(v3["method"], "session/list");
             assert_eq!(v3["params"]["cursor"], "page3_cursor");
             ws.send(Message::Text(
@@ -2501,8 +2528,15 @@ async fn test_driver_session_info_terminates_on_repeated_cursor() {
             .unwrap();
 
             // 3. session/list page 1 returns loop_cursor
-            let msg = ws.next().await.unwrap().unwrap();
-            let v1: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let mut v1 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if v1["method"] == "_honk/model/list" {
+                v1 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(v1["method"], "session/list");
             ws.send(Message::Text(
                 json!({
@@ -2520,8 +2554,15 @@ async fn test_driver_session_info_terminates_on_repeated_cursor() {
             .unwrap();
 
             // 4. session/list page 2 returns loop_cursor again
-            let msg = ws.next().await.unwrap().unwrap();
-            let v2: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            let mut v2 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if v2["method"] == "_honk/model/list" {
+                v2 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
+            }
             assert_eq!(v2["method"], "session/list");
             assert_eq!(v2["params"]["cursor"], "loop_cursor");
             ws.send(Message::Text(
@@ -4105,6 +4146,253 @@ async fn test_new_session_swarm_meta_pending_skips_enable_and_shows_no_error() {
         swarm_notices.is_empty(),
         "expected no error notice for pending swarm: {swarm_notices:?}"
     );
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
+    let temp_xdg = tempfile::tempdir().unwrap();
+    let recent_dir = temp_xdg.path().join("honk");
+
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_model_new",
+                        "configOptions": [
+                            {"id": "model", "currentValue": "claude-opus-5-5"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/set_config_option
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            assert_eq!(v["params"]["sessionId"], "s_model_new");
+            assert_eq!(v["params"]["configId"], "model");
+            assert_eq!(v["params"]["value"], "gemini-3.8-flash");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "configOptions": [
+                            {"id": "model", "currentValue": "gemini-3.8-flash"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_model_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+    opts.no_swarm = true;
+    opts.model = Some("gemini-3.8-flash".into());
+    opts.recent_dir = Some(recent_dir.clone());
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut model_in_state = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::State(s) => {
+                    if s.model.is_some() {
+                        model_in_state = s.model;
+                        break;
+                    }
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(model_in_state.as_deref(), Some("gemini-3.8-flash"));
+    let recents = honk::chat::recent::load_from(&recent_dir);
+    assert_eq!(recents, vec!["gemini-3.8-flash".to_string()]);
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_model_err",
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. session/set_config_option -> error
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "error": {
+                        "code": -32602,
+                        "message": "unknown model: bad-model"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/load (must still happen, chat stays open!)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_model_err" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+    opts.no_swarm = true;
+    opts.model = Some("bad-model".into());
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut notice_seen = false;
+    let mut attached_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    if n.text.contains("unknown model: bad-model") {
+                        assert_eq!(n.kind, honk::chat::NoticeKind::Error);
+                        notice_seen = true;
+                    }
+                }
+                UiEvent::Attached { .. } => {
+                    attached_seen = true;
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+            if notice_seen && attached_seen {
+                break;
+            }
+        }
+    }
+
+    assert!(notice_seen, "expected error notice for failed model switch");
+    assert!(attached_seen, "session must stay open and attach");
+
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
 }

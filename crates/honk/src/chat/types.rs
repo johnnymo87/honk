@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -100,6 +101,12 @@ pub enum Effect {
     },
     Detach,
     Reattach,
+    RecordRecentModel(String),
+    ModelList {
+        current: Option<String>,
+        models: Vec<ModelItem>,
+        warning: Option<String>,
+    },
     Exit(i32),
 }
 
@@ -207,5 +214,26 @@ pub enum PendingMcpReq {
     Disable {
         names: Vec<String>,
         queued: Option<(String, u32)>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelItem {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingModelReq {
+    List {
+        silent: bool,
+    },
+    Set {
+        model: String,
+        queued: Option<(String, u32)>,
+        record_recent: bool,
     },
 }

@@ -2,7 +2,6 @@
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -208,6 +207,22 @@ pub fn normalize_ws_url(url: &str) -> String {
     parsed.to_string()
 }
 
+/// Resolves the base honk state directory from `$XDG_STATE_HOME/honk`
+/// (fallback `~/.local/state/honk`).
+pub fn honk_state_dir() -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
+        && !xdg.trim().is_empty()
+    {
+        Ok(std::path::PathBuf::from(xdg.trim()).join("honk"))
+    } else if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        Ok(std::path::PathBuf::from(home.trim()).join(".local/state/honk"))
+    } else {
+        anyhow::bail!("cannot resolve honk state dir: XDG_STATE_HOME and HOME unset");
+    }
+}
+
 /// Resolves the honkd secret from:
 /// 1. explicit `--secret` argument
 /// 2. `$HONK_SECRET` environment variable
@@ -224,17 +239,9 @@ pub fn resolve_secret(secret_arg: Option<&str>) -> anyhow::Result<String> {
     {
         return Ok(s.trim().to_string());
     }
-    let secret_path = if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
-        && !xdg.trim().is_empty()
-    {
-        PathBuf::from(xdg.trim()).join("honk/secret")
-    } else if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        PathBuf::from(home.trim()).join(".local/state/honk/secret")
-    } else {
-        anyhow::bail!("cannot find honk secret: HONK_SECRET unset and HOME unset");
-    };
+    let secret_path = honk_state_dir()
+        .map_err(|_| anyhow::anyhow!("cannot find honk secret: HONK_SECRET unset and HOME unset"))?
+        .join("secret");
 
     let content = std::fs::read_to_string(&secret_path).map_err(|e| {
         anyhow::anyhow!("failed to read secret from {}: {e}", secret_path.display())

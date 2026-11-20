@@ -25,6 +25,9 @@ honk chat --new
 # Start a new session in a specific directory
 honk chat --new --cwd /path/to/project
 
+# Start a new session with a specific model
+honk chat --new --model claude-opus-5-5
+
 # Enable MCP servers from catalog on session creation (repeatable, '!' confirms)
 honk chat --new --mcp slack-ro --mcp atlassian!
 
@@ -137,6 +140,9 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
 | `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
 | `z m` | Toggle a maximized composer. `/quote` turns it on; sending or clearing the composer turns it off. |
+| `Ctrl-X m` | Open model picker overlay (in both Normal and Insert modes). |
+| `F2` | Cycle to next recent model without reordering recents (in both Normal and Insert modes). |
+| `Shift-F2` | Cycle to previous recent model without reordering recents (in both Normal and Insert modes). |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
 | `Ctrl-C` | If composer has text and honk is idle or the composer is maximized: clears composer (and unmaximizes). Otherwise: interrupts active turn (`Action::Interrupt`). |
@@ -166,6 +172,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
+| `/model [id]` | `:model [id]` | Switch model (`/model <id>`), open model picker (`/model`), or cycle recent models with `F2`/`Shift-F2`. Switching to a model with a smaller context window mid-session may trigger goose auto-compaction on the next turn. `F2`/`Shift-F2` cycling does not reorder the recent models list. |
 | `/undo` | `:undo` | Hide the last turn across all views and fill an empty composer with the undone prompt text (files not restored; `/redo` restores until next prompt). |
 | `/redo` | `:redo` | Restore the last undone turn (until the next prompt arrives from anyone). |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
@@ -200,6 +207,24 @@ Every prompt submitted assigns a unique client request ID (`client_req_id`).
 - **Foreign turns**: Permission requests belonging to other clients are ignored by your viewer (a notice is shown), letting the owning client respond.
 - **/approve**: If an abandoned turn is stuck awaiting permission, `/approve` allows you to unblock it manually.
 - **Elicitation**: Form elicitation requests in own turns are declined with a notice (interactive forms are planned for a subsequent release).
+
+---
+
+## Model Switching (`/model`)
+
+`honk chat` tracks the current model and lets you switch models dynamically **per session**:
+
+- **Status bar**: The current model (e.g. `claude-opus-5-5`) is displayed in the status bar, dropped gracefully on narrower terminal widths.
+- **Commands & Shortcuts**:
+  - `/model <id>` (or `:model <id>`): Switch the session to a specific model. Goose accepts any model ID within the session's provider. If entered while a turn is active, the command is queued (`queued: /model <id>`) and dispatched automatically when the turn ends.
+  - `/model` (or `:model`): Opens the filterable **model picker overlay** above the composer. Type to filter by model ID or display name (subsequence match), use the arrow keys or `Ctrl-n`/`Ctrl-p` to navigate, `Enter` to switch, and `Esc` to close.
+  - `Ctrl-X m`: Opens the model picker overlay directly from both Normal and Insert modes.
+  - `F2` / `Shift-F2`: Cycle to the next or previous model in the recent models list from both Normal and Insert modes.
+- **Session creation flags**:
+  - `honk chat --new --model <id>`: Starts a new session directly on the specified model. If setting the model fails, an error notice is displayed in chat and the session remains open.
+  - `honk launch --model <id>`: Headlessly launches a new session on the specified model. Failure aborts before prompting.
+- **Configured models (`--models-file`)**: `honkd` reads an optional JSON configuration file specifying models per provider via `--models-file <path>` (e.g. `{"providers": {"gcp_vertex_ai": [{"id": "...", "name": "..."}]}}`). Configured models appear at the top of the picker in file order, followed by Goose's built-in options. The file is re-read on each `/model` request so edits take effect immediately without restarting `honkd`.
+- **Recent models**: Successful model switches are recorded in `$XDG_STATE_HOME/honk/model-recent.json` (falling back to `~/.local/state/honk/model-recent.json`), maintaining the 10 most recently used models across all `honk chat` sessions on the host.
 
 ---
 
@@ -305,6 +330,18 @@ honk telegram 20261016_7
 
 `honk launch <dir> <prompt>` starts a goose session headlessly through honkd, tags it, registers it with pigeon (Telegram topic), sends the initial prompt, and exits while the turn runs in the background. It is the goose analogue of `opencode-launch`.
 
+### Command-Line Flags
+
+- `--title <title>`: Session title, set before the first prompt (also sets the Telegram topic title).
+- `--model <id>`: Initial model for the session, set before the first prompt. Refuses IDs not present in honkd's model list (configured via honkd `--models-file`), aborting before prompting. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
+- `--tag <tag>`: Tag the session in session-tags (`goose:<id>`). Defaults to inheriting the launching session's tag; `--tag auto` opts out.
+- `--no-attach`: Do not auto-attach (do not open a tab running `honk chat`).
+- `--tmux-session <name>`: Target tmux session for auto-attach [default: nvim's session].
+- `--pigeon-url <url>`: pigeon daemon URL [default: `http://127.0.0.1:4731`].
+- `--pigeon-token-file <path>`: File holding pigeon's bearer token.
+- `--url <url>`: honkd WebSocket or HTTP endpoint [default: `http://127.0.0.1:4280/acp`].
+- `--secret <token>`: honkd secret auth token.
+
 ### Auto-Open / Auto-Attach
 
 After sending the prompt, `honk launch` auto-opens the new session in a new nvim/tmux tab running `honk chat <id>`:
@@ -363,5 +400,4 @@ set -g set-clipboard on
 - **No Interactive Permission UI**: Permissions on own turns are auto-approved (`allow_once`); foreign turns require their owner or manual `/approve`.
 - **No Elicitation Form UI**: Elicitation prompts are auto-declined.
 - **Duplicate User Line after Log Rebuild**: Following a `honkd` state rebuild from export, a user message may appear duplicated due to echo-reconciliation differences.
-- **Model Switching**: Mid-session model switching is not supported from the TUI.
 - **Per-Session Extension Toggles**: Platform extensions (`--ext`) are selected at creation time; catalog MCP servers can be dynamically toggled per session via `/mcp`.

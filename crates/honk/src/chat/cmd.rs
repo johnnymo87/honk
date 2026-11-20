@@ -6,7 +6,7 @@ impl ChatCore {
     pub(crate) fn handle_command(&mut self, line: &str, effects: &mut Vec<Effect>) -> bool {
         let trimmed = line.trim();
         if trimmed == "/help" {
-            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /undo       - hide the last turn (files are not restored; /redo brings it back until the next prompt)\n  /redo       - restore the last undone turn (until the next prompt arrives)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  /quote [N]  - load the last N (default 3) replies, quoted, into the composer (wake, swarm and your own messages left out); zm toggles a maximized composer\n  /yank       - copy the latest assistant message to the clipboard (OSC 52)\n  //text      - send literal '/text' as a prompt";
+            let help = "commands:\n  /help       - show this help\n  /quit       - detach and exit (session continues)\n  /cancel     - interrupt current turn (if own)\n  /cancel!    - cancel current turn regardless of owner\n  /drop       - discard locally queued messages\n  /approve    - approve oldest pending permission request\n  /turns      - set or clear turn cap (/turns N or /turns off)\n  /compact    - compact session context\n  /undo       - hide the last turn (files are not restored; /redo brings it back until the next prompt)\n  /redo       - restore the last undone turn (until the next prompt arrives)\n  /model [id] - switch model (/model <id>) or open model picker (/model, ctrl+x m; cycle with F2/shift+F2)\n  /mcp        - MCP servers: /mcp list, /mcp enable <names>, /mcp disable <names>; servers marked ! need a trailing ! to confirm (/mcp enable slack!); honkd decides which via --mcp-no-confirm\n  /quote [N]  - load the last N (default 3) replies, quoted, into the composer (wake, swarm and your own messages left out); zm toggles a maximized composer\n  /yank       - copy the latest assistant message to the clipboard (OSC 52)\n  //text      - send literal '/text' as a prompt";
             effects.push(Effect::Notice(Notice::info(help)));
             return true;
         }
@@ -130,6 +130,11 @@ impl ChatCore {
 
         if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
             self.handle_mcp_command(trimmed, effects);
+            return true;
+        }
+
+        if trimmed == "/model" || trimmed.starts_with("/model ") {
+            self.handle_model_command(trimmed, effects);
             return true;
         }
 
@@ -355,6 +360,147 @@ impl ChatCore {
                 params: json!({
                     "sessionId": self.session_id,
                     "names": names,
+                }),
+            });
+        }
+    }
+
+    pub(crate) fn handle_model_command(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        self.handle_model_command_inner(line, None, effects);
+    }
+
+    pub fn handle_model_set_command(&mut self, id: &str, record_recent: bool) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let id = id.trim();
+        if id.is_empty() {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return effects;
+        }
+        let line = if record_recent {
+            format!("/model {id}")
+        } else {
+            format!("\0model:{id}")
+        };
+        self.dispatch_model_set(&line, None, id, record_recent, &mut effects);
+        effects
+    }
+
+    pub fn handle_queued_model_set(&mut self, id: &str, requeues: u32, effects: &mut Vec<Effect>) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let line = format!("\0model:{id}");
+        self.dispatch_model_set(&line, Some((line.clone(), requeues)), id, false, effects);
+    }
+
+    pub fn handle_queued_model_command(
+        &mut self,
+        line: &str,
+        requeues: u32,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rest = line.strip_prefix("/model").unwrap_or("").trim();
+        let mut tokens = rest.split_whitespace();
+        let Some(id) = tokens.next() else {
+            return;
+        };
+        self.dispatch_model_set(line, Some((line.to_string(), requeues)), id, true, effects);
+    }
+
+    fn handle_model_command_inner(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rest = line.strip_prefix("/model").unwrap_or("").trim();
+        if rest.is_empty() {
+            self.dispatch_model_list(line, effects);
+            return;
+        }
+
+        let mut tokens = rest.split_whitespace();
+        let Some(id) = tokens.next() else {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return;
+        };
+        if tokens.next().is_some() {
+            effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
+            return;
+        }
+
+        self.dispatch_model_set(line, queued, id, true, effects);
+    }
+
+    fn dispatch_model_list(&mut self, line: &str, effects: &mut Vec<Effect>) {
+        if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+            return;
+        }
+        let req_id = self.allocate_id();
+        self.pending_model_reqs.insert(
+            req_id,
+            super::types::PendingModelReq::List { silent: false },
+        );
+        effects.push(Effect::Request {
+            id: req_id,
+            method: "_honk/model/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
+    }
+
+    fn must_queue_model(&self, queued_dispatch: bool) -> bool {
+        self.prompt_sent.is_some()
+            || self.run_state.is_running()
+            || self.has_pending_model_mutation()
+            || self.has_pending_mcp_mutation()
+            || (!queued_dispatch && !self.local_queue.is_empty())
+    }
+
+    fn dispatch_model_set(
+        &mut self,
+        line: &str,
+        queued: Option<(String, u32)>,
+        id: &str,
+        record_recent: bool,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.buffer_if_detached_or_replaying(line.to_string(), effects) {
+            return;
+        }
+
+        if self.must_queue_model(queued.is_some()) {
+            self.local_queue.push_back((line.to_string(), 0));
+            let notice_text = if line.starts_with('\0') {
+                format!("queued: /model {id}")
+            } else {
+                format!("queued: {line}")
+            };
+            effects.push(Effect::Notice(Notice::info(notice_text)));
+        } else {
+            let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
+            if requeues == 0 && !self.known_model_ids.iter().any(|k| k == id) {
+                effects.push(Effect::Notice(Notice::warning(format!(
+                    "{id} is not in the model list; goose does not check it, a wrong id fails at the next turn"
+                ))));
+            }
+
+            let req_id = self.allocate_id();
+            self.pending_model_reqs.insert(
+                req_id,
+                super::types::PendingModelReq::Set {
+                    model: id.to_string(),
+                    queued,
+                    record_recent,
+                },
+            );
+            effects.push(Effect::Request {
+                id: req_id,
+                method: "session/set_config_option".to_string(),
+                params: json!({
+                    "sessionId": self.session_id,
+                    "configId": "model",
+                    "value": id,
                 }),
             });
         }

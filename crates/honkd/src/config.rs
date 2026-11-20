@@ -47,6 +47,12 @@ pub struct Args {
     pub turn_hook_retry_secs: u64,
     #[arg(long)]
     pub mcp_catalog: Option<PathBuf>,
+    /// Path to JSON file defining configured models per provider
+    #[arg(
+        long,
+        help = "Path to JSON file defining configured models per provider"
+    )]
+    pub models_file: Option<PathBuf>,
     #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
     pub mcp_no_confirm: Vec<String>,
     #[arg(long, help = "Allow agents to self-grant MCP servers via POST /mcp/*")]
@@ -143,9 +149,23 @@ mod tests {
         let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
             .expect("parse args");
         assert_eq!(args.mcp_catalog, None);
+        assert_eq!(args.models_file, None);
         assert!(args.mcp_no_confirm.is_empty());
         assert!(!args.mcp_self_grant);
         assert!(!args.project_mcp);
+    }
+
+    #[test]
+    fn parsed_models_file_flag() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--models-file",
+            "/tmp/models.json",
+        ])
+        .expect("parse args");
+        assert_eq!(args.models_file, Some(PathBuf::from("/tmp/models.json")));
     }
 
     #[test]

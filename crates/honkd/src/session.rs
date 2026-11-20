@@ -243,6 +243,14 @@ pub enum SessionMsg {
         method: String,
         params: Value,
     },
+    ModelList {
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        is_honk_aware: bool,
+        id: Value,
+        configured: Option<crate::models::ModelsFile>,
+        warning: Option<String>,
+    },
     Internal {
         method: String,
         params: Value,
@@ -959,6 +967,7 @@ impl Session {
                 SessionMsg::Prompt { viewer_id, id, .. }
                 | SessionMsg::Steer { viewer_id, id, .. }
                 | SessionMsg::Forward { viewer_id, id, .. }
+                | SessionMsg::ModelList { viewer_id, id, .. }
                 | SessionMsg::McpOp { viewer_id, id, .. }
                 | SessionMsg::Revert { viewer_id, id, .. } => {
                     let err_resp =
@@ -1719,6 +1728,7 @@ impl Session {
                             SessionMsg::Prompt { viewer, id, .. }
                             | SessionMsg::Steer { viewer, id, .. }
                             | SessionMsg::Forward { viewer, id, .. }
+                            | SessionMsg::ModelList { viewer, id, .. }
                             | SessionMsg::McpOp { viewer, id, .. }
                             | SessionMsg::Revert { viewer, id, .. } => {
                                 let err_frame =
@@ -1892,6 +1902,14 @@ impl Session {
                     }
                 }
 
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("config_option_update")
+                    && let Some(config_options) =
+                        update.get("configOptions").and_then(Value::as_array)
+                {
+                    self.update_config_options(config_options).await;
+                }
+
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     if run_opt.is_some() {
                         self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
@@ -1923,6 +1941,14 @@ impl Session {
                         .and_then(Value::as_str)
                 {
                     self.turn.on_user_message(msg_id);
+                }
+
+                if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("config_option_update")
+                    && let Some(config_options) =
+                        update.get("configOptions").and_then(Value::as_array)
+                {
+                    self.update_config_options(config_options).await;
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
@@ -2235,6 +2261,35 @@ impl Session {
                     }
                 });
             }
+        }
+    }
+
+    async fn update_config_options(&mut self, config_options: &[Value]) {
+        let opts_val = Value::Array(config_options.to_vec());
+        if let Some(obj) = self.init_result.as_object_mut() {
+            obj.insert("configOptions".to_string(), opts_val.clone());
+        } else {
+            self.init_result = json!({ "configOptions": opts_val.clone() });
+        }
+        let sid = self.sid.clone();
+        let mut s = self.state_store.lock().await;
+        if !s.sessions.contains_key(&sid) {
+            return;
+        }
+        if let Err(e) = s.mutate(|st| {
+            if let Some(h) = st.sessions.get_mut(&sid) {
+                if let Some(ref mut ir) = h.init_result {
+                    if let Some(obj) = ir.as_object_mut() {
+                        obj.insert("configOptions".to_string(), opts_val);
+                    } else {
+                        *ir = json!({ "configOptions": opts_val });
+                    }
+                } else {
+                    h.init_result = Some(json!({ "configOptions": opts_val }));
+                }
+            }
+        }) {
+            tracing::error!("Session {sid}: failed to persist configOptions: {e:#}");
         }
     }
 
@@ -3259,6 +3314,16 @@ impl Session {
                     );
                     return;
                 }
+                if method == "session/set_config_option" && self.turn.is_running() {
+                    let err_resp = crate::rpc::error(
+                        id,
+                        -32002,
+                        "session is busy; try after this turn",
+                        Some(serde_json::json!({"honk": "busy"})),
+                    );
+                    self.send_to_viewer(viewer_id, err_resp);
+                    return;
+                }
                 let raw_extension_op = method == "_goose/unstable/session/extensions/add"
                     || method == "_goose/unstable/session/extensions/remove";
                 let up_id = self.ids.next();
@@ -3297,6 +3362,21 @@ impl Session {
                         Box::pin(self.handle_gone()).await;
                     }
                 }
+            }
+            SessionMsg::ModelList {
+                viewer_id,
+                viewer,
+                is_honk_aware,
+                id,
+                configured,
+                warning,
+            } => {
+                if !self.viewers.contains_key(&viewer_id) {
+                    self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
+                }
+                let reply =
+                    crate::models::list_reply(configured.as_ref(), warning, &self.init_result);
+                self.send_to_viewer(viewer_id, crate::rpc::response(id, reply));
             }
             SessionMsg::Internal {
                 method,
@@ -5705,6 +5785,35 @@ mod tests {
             })
             .await;
         assert_eq!(session.queued_msgs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_model_list_auto_attaches_unknown_viewer() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_model_list_attach", ActorState::Live).await;
+        assert!(!session.viewers.contains_key(&1));
+
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        session
+            .on_msg(SessionMsg::ModelList {
+                viewer_id: 1,
+                viewer: test_viewer_tx(v_tx),
+                is_honk_aware: true,
+                id: json!(42),
+                configured: None,
+                warning: None,
+            })
+            .await;
+
+        assert!(session.viewers.contains_key(&1));
+        let msg = v_rx.recv().await.expect("received frame");
+        match msg {
+            axum::extract::ws::Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v.get("id"), Some(&json!(42)));
+            }
+            other => panic!("expected Text message, got {other:?}"),
+        }
     }
 
     #[tokio::test]

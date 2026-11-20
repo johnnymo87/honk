@@ -92,6 +92,7 @@ pub struct Timeouts {
     pub session_new: Duration,
     pub swarm_enable: Duration,
     pub rename: Duration,
+    pub model: Duration,
     pub prompt_confirm: Duration,
     pub which: Duration,
     pub set: Duration,
@@ -104,6 +105,7 @@ impl Default for Timeouts {
             session_new: Duration::from_secs(30),
             swarm_enable: Duration::from_secs(30),
             rename: Duration::from_secs(10),
+            model: Duration::from_secs(10),
             prompt_confirm: Duration::from_secs(60),
             which: octags::DEFAULT_WHICH_TIMEOUT,
             set: octags::DEFAULT_TIMEOUT,
@@ -117,6 +119,7 @@ pub struct LaunchOpts {
     pub dir: PathBuf,
     pub prompt: String,
     pub title: Option<String>,
+    pub model: Option<String>,
     pub tag: TagRequest,
     /// The launching session as an oc-tags key (`ses_…` or `goose:<id>`).
     pub launcher: Option<String>,
@@ -158,6 +161,7 @@ impl std::fmt::Debug for LaunchOpts {
             .field("dir", &self.dir)
             .field("prompt", &self.prompt)
             .field("title", &self.title)
+            .field("model", &self.model)
             .field("tag", &self.tag)
             .field("launcher", &self.launcher)
             .field("tags_bin", &self.tags_bin)
@@ -345,6 +349,17 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
         step!(
             rename(&mut client, &native, title, opts.timeouts.rename).await,
             "setting the title failed"
+        );
+    }
+
+    if let Some(model) = &opts.model {
+        step!(
+            check_model_allowed(&mut client, &native, model, opts.timeouts.model).await,
+            "setting the model failed"
+        );
+        step!(
+            set_model(&mut client, &native, model, opts.timeouts.model).await,
+            "setting the model failed"
         );
     }
 
@@ -660,6 +675,77 @@ async fn rename(
     Ok(())
 }
 
+async fn check_model_allowed(
+    client: &mut Client,
+    sid: &str,
+    model: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let frame = match call_with_timeout(
+        client,
+        "_honk/model/list",
+        json!({ "sessionId": sid }),
+        timeout,
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({e})");
+            return Ok(());
+        }
+    };
+
+    if let Some(err) = frame.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if code == -32601 {
+            return Ok(());
+        }
+        eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({msg})");
+        return Ok(());
+    }
+
+    if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array)
+        && !models.is_empty()
+    {
+        let found = models
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(model));
+        if !found {
+            bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
+        }
+    }
+
+    Ok(())
+}
+
+async fn set_model(
+    client: &mut Client,
+    sid: &str,
+    model: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let frame = call_with_timeout(
+        client,
+        "session/set_config_option",
+        json!({
+            "sessionId": sid,
+            "configId": "model",
+            "value": model,
+        }),
+        timeout,
+    )
+    .await?;
+    if let Some(e) = rpc_error(&frame) {
+        bail!("session/set_config_option: {e}");
+    }
+    Ok(())
+}
+
 fn client_req_id(sid: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -960,6 +1046,7 @@ mod tests {
             dir: PathBuf::from("/tmp"),
             prompt: "p".into(),
             title: None,
+            model: None,
             tag: TagRequest::Off,
             launcher: None,
             tags_bin: "tags".into(),

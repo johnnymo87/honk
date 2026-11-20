@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -46,6 +46,10 @@ pub struct DriverOpts {
     pub tag: Option<crate::octags::TagAction>,
     /// When true, do not enable the swarm MCP server by default on a new session.
     pub no_swarm: bool,
+    /// When set, the initial model to set after session/new.
+    pub model: Option<String>,
+    /// When set, the directory to store/load recent models in.
+    pub recent_dir: Option<PathBuf>,
 }
 
 impl DriverOpts {
@@ -60,6 +64,8 @@ impl DriverOpts {
             pigeon: None,
             tag: None,
             no_swarm: false,
+            model: None,
+            recent_dir: None,
         }
     }
 }
@@ -155,6 +161,9 @@ pub struct StateSnapshot {
     pub prompt_in_flight: bool,
     pub connection: ConnectionState,
     pub mcp_enabled: Vec<String>,
+    pub model: Option<String>,
+    pub known_models: Vec<String>,
+    pub models_listed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +181,11 @@ pub enum UiEvent {
         cwd: Option<String>,
     },
     State(StateSnapshot),
+    ModelList {
+        current: Option<String>,
+        models: Vec<crate::chat::types::ModelItem>,
+        warning: Option<String>,
+    },
     Fatal(String),
     Exit(i32),
 }
@@ -192,6 +206,7 @@ pub enum UiCommand {
     Eof,
     RetryAttach,
     Shutdown,
+    SetModel { id: String, record_recent: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +318,9 @@ fn maybe_emit_state(
         prompt_in_flight: core.prompt_in_flight(),
         connection: connection.clone(),
         mcp_enabled: core.mcp_enabled().to_vec(),
+        model: core.model().map(str::to_string),
+        known_models: core.known_model_ids().to_vec(),
+        models_listed: core.models_listed(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -314,6 +332,16 @@ enum EffectAction {
     Continue,
     Reattach,
     Exit,
+}
+
+fn record_recent_model(recent_dir: Option<&Path>, id: &str) {
+    let res = match recent_dir {
+        Some(dir) => crate::chat::recent::record_in(dir, id),
+        None => crate::chat::recent::record(id),
+    };
+    if let Err(e) = res {
+        tracing::warn!("failed to record recent model {id}: {e}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -328,6 +356,7 @@ async fn process_effects(
     connection_state: &mut ConnectionState,
     list_paging: &mut ListPagingState,
     known_cwd: &mut Option<String>,
+    recent_dir: Option<&Path>,
 ) -> EffectAction {
     for effect in effects {
         match effect {
@@ -429,6 +458,20 @@ async fn process_effects(
             Effect::Reattach => {
                 return EffectAction::Reattach;
             }
+            Effect::RecordRecentModel(id) => {
+                record_recent_model(recent_dir, &id);
+            }
+            Effect::ModelList {
+                current,
+                models,
+                warning,
+            } => {
+                let _ = ui_tx.send(UiEvent::ModelList {
+                    current,
+                    models,
+                    warning,
+                });
+            }
             Effect::Exit(code) => {
                 if let Some(conn) = conn_opt.as_mut() {
                     let _ = conn.close().await;
@@ -511,6 +554,9 @@ async fn run_driver(
         prompt_in_flight: false,
         connection: connection_state.clone(),
         mcp_enabled: Vec::new(),
+        model: None,
+        known_models: Vec::new(),
+        models_listed: false,
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 
@@ -762,7 +808,69 @@ async fn run_driver(
                 }
             }
 
-            ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids)
+            let mut model_config_options = None;
+            if let Some(ref model_id) = opts.model {
+                let model_req_id = ids.allocate();
+                let model_params = json!({
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model_id,
+                });
+                if let Err(e) = conn
+                    .send_request(model_req_id, "session/set_config_option", model_params)
+                    .await
+                {
+                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                } else {
+                    let model_timeout = Duration::from_secs(5);
+                    let model_res = tokio::time::timeout(model_timeout, async {
+                        while let Some(frame) = frame_rx.recv().await {
+                            if frame.get("id") == Some(&json!(model_req_id))
+                                && crate::conn::is_response(&frame)
+                            {
+                                return Ok(frame);
+                            }
+                        }
+                        Err(anyhow::anyhow!(
+                            "stream closed while awaiting session/set_config_option response"
+                        ))
+                    })
+                    .await;
+
+                    match model_res {
+                        Ok(Ok(frame)) => {
+                            if let Some(err) = frame.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("model error");
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(msg)));
+                            } else {
+                                let res = frame.get("result").cloned().unwrap_or(Value::Null);
+                                model_config_options = Some(res);
+                                record_recent_model(opts.recent_dir.as_deref(), model_id);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            let _ =
+                                ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                        }
+                        Err(_) => {
+                            let _ = ui_tx.send(UiEvent::Notice(Notice::error(
+                                "model: timed out setting initial model",
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let mut core =
+                ChatCore::with_ids(session_id.to_string(), chat_opts, Instant::now(), ids);
+            core.set_config_options(result);
+            if let Some(ref m_res) = model_config_options {
+                core.set_config_options(m_res);
+            }
+            core
         }
         Target::Attach(session_id) => ChatCore::new(session_id, chat_opts, Instant::now()),
     };
@@ -820,6 +928,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -854,6 +963,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -888,11 +998,47 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
                         }
                         return;
+                    }
+                    UiCommand::SetModel { id, record_recent } => {
+                        let effects = core.handle_model_set_command(&id, record_recent);
+                        let action = process_effects(
+                            effects,
+                            &mut core,
+                            &mut conn_opt,
+                            &ui_tx,
+                            &mut is_first_attach,
+                            &mut attach_failed_attempts,
+                            &mut attach_retry_timer,
+                            &mut connection_state,
+                            &mut list_paging,
+                            &mut known_cwd,
+                            opts.recent_dir.as_deref(),
+                        ).await;
+                        if matches!(action, EffectAction::Exit) {
+                            return;
+                        }
+                        if matches!(action, EffectAction::Reattach) {
+                            trigger_disconnect(
+                                &mut core,
+                                &mut conn_opt,
+                                &mut frame_rx_opt,
+                                &mut attach_retry_timer,
+                                &mut reconnect_timer,
+                                &mut reconnect_attempt,
+                                &mut connection_state,
+                                &mut last_state,
+                                &ui_tx,
+                                &mut live_since,
+                                &mut list_paging,
+                            );
+                        }
+                        maybe_emit_state(&core, &connection_state, &mut last_state, &ui_tx);
                     }
                     UiCommand::Shutdown => {
                         if let Some(c) = conn_opt.as_mut() {
@@ -1099,6 +1245,7 @@ async fn run_driver(
                             &mut connection_state,
                             &mut list_paging,
                             &mut known_cwd,
+                            opts.recent_dir.as_deref(),
                         ).await;
                         if matches!(action, EffectAction::Exit) {
                             return;
@@ -1194,6 +1341,7 @@ async fn run_driver(
                                 &mut connection_state,
                                 &mut list_paging,
                                 &mut known_cwd,
+                                opts.recent_dir.as_deref(),
                             ).await;
                             if matches!(action, EffectAction::Exit) {
                                 return;
@@ -1246,6 +1394,7 @@ async fn run_driver(
                     &mut connection_state,
                     &mut list_paging,
                     &mut known_cwd,
+                    opts.recent_dir.as_deref(),
                 ).await;
                 if matches!(action, EffectAction::Exit) {
                     return;

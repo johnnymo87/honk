@@ -41,6 +41,13 @@ pub struct ChatCore {
     pub(crate) mcp_enabled: Vec<String>,
     pub(crate) mcp_available: bool,
     pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) goose_model_ids: Vec<String>,
+    pub(crate) listed_model_ids: Vec<String>,
+    pub(crate) known_model_ids: Vec<String>,
+    pub(crate) models_listed: bool,
+    pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
     pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
     pub(crate) undone_prompts: Vec<String>,
 }
@@ -94,6 +101,13 @@ impl ChatCore {
             mcp_enabled: Vec::new(),
             mcp_available: true,
             pending_mcp_reqs: HashMap::new(),
+            model: None,
+            provider: None,
+            goose_model_ids: Vec::new(),
+            listed_model_ids: Vec::new(),
+            known_model_ids: Vec::new(),
+            models_listed: false,
+            pending_model_reqs: HashMap::new(),
             pending_revert_reqs: HashMap::new(),
             undone_prompts: Vec::new(),
         }
@@ -180,6 +194,82 @@ impl ChatCore {
 
     pub fn mcp_enabled(&self) -> &[String] {
         &self.mcp_enabled
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn known_model_ids(&self) -> &[String] {
+        &self.known_model_ids
+    }
+
+    pub fn models_listed(&self) -> bool {
+        self.models_listed
+    }
+
+    fn recompute_known_model_ids(&mut self) {
+        let mut known = self.listed_model_ids.clone();
+        for id in &self.goose_model_ids {
+            if !known.contains(id) {
+                known.push(id.clone());
+            }
+        }
+        self.known_model_ids = known;
+    }
+
+    pub(crate) fn request_model_list_silent(&mut self, effects: &mut Vec<Effect>) {
+        let req_id = self.allocate_id();
+        self.pending_model_reqs
+            .insert(req_id, super::types::PendingModelReq::List { silent: true });
+        effects.push(Effect::Request {
+            id: req_id,
+            method: "_honk/model/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
+    }
+
+    pub fn on_session_new(&mut self, result: &Value) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.set_config_options(result);
+        self.request_model_list_silent(&mut effects);
+        effects
+    }
+
+    pub(crate) fn update_model_state(
+        &mut self,
+        val: &Value,
+        allow_notice: bool,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(p) = honk_wire::config_select_value(val, "provider") {
+            self.provider = Some(p);
+        }
+        let opts = honk_wire::config_select_options(val, "model");
+        if !opts.is_empty() {
+            self.goose_model_ids = opts;
+            self.recompute_known_model_ids();
+        }
+        if let Some(new_m) = honk_wire::config_select_value(val, "model") {
+            if allow_notice
+                && !self.is_replaying
+                && let Some(ref old_m) = self.model
+                && old_m != &new_m
+            {
+                effects.push(Effect::Notice(Notice::info(format!(
+                    "model: {old_m} → {new_m}"
+                ))));
+            }
+            self.model = Some(new_m);
+        }
+    }
+
+    pub fn set_config_options(&mut self, val: &Value) {
+        self.update_model_state(val, false, &mut Vec::new());
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
@@ -275,6 +365,14 @@ impl ChatCore {
             self.local_queue.push_back((text, conversion_count));
             effects.push(Effect::Notice(Notice::info(
                 "compaction running; message queued for after it ends",
+            )));
+            return;
+        }
+
+        if self.has_pending_model_mutation() {
+            self.local_queue.push_back((text, conversion_count));
+            effects.push(Effect::Notice(Notice::info(
+                "queued until the model switch completes",
             )));
             return;
         }
@@ -433,15 +531,26 @@ impl ChatCore {
         })
     }
 
+    pub fn has_pending_model_mutation(&self) -> bool {
+        self.pending_model_reqs
+            .values()
+            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }))
+    }
+
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
         if !self.is_replaying
             && !self.run_state.is_running()
             && self.prompt_sent.is_none()
             && !self.has_pending_mcp_mutation()
+            && !self.has_pending_model_mutation()
             && let Some((next_text, conv_count)) = self.local_queue.pop_front()
         {
             if next_text.starts_with("/mcp ") {
                 self.handle_queued_mcp_command(&next_text, conv_count, effects);
+            } else if next_text.starts_with("/model ") {
+                self.handle_queued_model_command(&next_text, conv_count, effects);
+            } else if let Some(id) = next_text.strip_prefix("\0model:") {
+                self.handle_queued_model_set(id, conv_count, effects);
             } else {
                 self.send_prompt(next_text, conv_count, effects);
             }
@@ -480,7 +589,9 @@ impl ChatCore {
                         effects.push(Effect::AttachFailed { error: err.clone() });
                     } else {
                         let result = frame.get("result").cloned().unwrap_or(Value::Null);
+                        self.set_config_options(&result);
                         effects.push(Effect::Attached { result });
+                        self.request_model_list_silent(effects);
                     }
                     return;
                 }
@@ -675,6 +786,15 @@ impl ChatCore {
             return;
         }
 
+        if let Some(model_req) = self.pending_model_reqs.remove(&id) {
+            let requeued = self.handle_model_response(model_req, frame, effects);
+            if !requeued {
+                self.check_queued_prompts(effects);
+            }
+            #[allow(clippy::needless_return)]
+            return;
+        }
+
         if let Some(revert_req) = self.pending_revert_reqs.remove(&id) {
             self.handle_revert_response(revert_req, frame, effects);
         }
@@ -797,6 +917,12 @@ impl ChatCore {
             }
             "session/update" => {
                 if let Some(u) = frame.pointer("/params/update") {
+                    if u.get("sessionUpdate").and_then(Value::as_str)
+                        == Some("config_option_update")
+                    {
+                        self.update_model_state(u, true, effects);
+                    }
+
                     if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
                     {
                         let msg_id = u
@@ -1072,6 +1198,16 @@ impl ChatCore {
                 "mcp: change may or may not have applied; run /mcp to check",
             )));
         }
+        let had_model_mutation = self
+            .pending_model_reqs
+            .values()
+            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }));
+        self.pending_model_reqs.clear();
+        if had_model_mutation {
+            effects.push(Effect::Notice(Notice::warning(
+                "model: change may or may not have applied; reconnect to check",
+            )));
+        }
     }
 
     pub fn auto_refresh_mcp(&mut self) -> Option<Effect> {
@@ -1222,6 +1358,123 @@ impl ChatCore {
             }
         }
         false
+    }
+
+    fn handle_model_response(
+        &mut self,
+        req: super::types::PendingModelReq,
+        frame: &Value,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        match req {
+            super::types::PendingModelReq::List { silent } => {
+                if let Some(err) = frame.get("error") {
+                    if !silent {
+                        let msg = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("model error");
+                        effects.push(Effect::Notice(Notice::error(msg)));
+                    }
+                    return false;
+                }
+
+                let result = frame.get("result").unwrap_or(&Value::Null);
+                let current = result
+                    .get("current")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| self.model().map(String::from));
+                if let Some(ref c) = current {
+                    self.model = Some(c.clone());
+                }
+                let warning = result
+                    .get("warning")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let models: Vec<super::types::ModelItem> = result
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                let id = m.get("id").and_then(Value::as_str)?.to_string();
+                                let name = m
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&id)
+                                    .to_string();
+                                let source = m
+                                    .get("source")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                Some(super::types::ModelItem { id, name, source })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                self.models_listed = true;
+                self.listed_model_ids = models.iter().map(|m| m.id.clone()).collect();
+                self.recompute_known_model_ids();
+
+                if !silent {
+                    if let Some(ref w) = warning {
+                        effects.push(Effect::Notice(Notice::warning(w.clone())));
+                    }
+
+                    effects.push(Effect::ModelList {
+                        current,
+                        models,
+                        warning,
+                    });
+                }
+                false
+            }
+            super::types::PendingModelReq::Set {
+                model,
+                queued,
+                record_recent,
+            } => {
+                if let Some(err) = frame.get("error") {
+                    let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                    let msg = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("model error");
+
+                    let is_busy = code == -32002
+                        && err.pointer("/data/honk").and_then(Value::as_str) == Some("busy");
+
+                    if is_busy
+                        && let Some((raw_line, count)) = queued
+                        && count < 3
+                    {
+                        self.local_queue.push_front((raw_line, count + 1));
+                        return true;
+                    }
+
+                    effects.push(Effect::Notice(Notice::error(msg)));
+                    self.request_model_list_silent(effects);
+                    return false;
+                }
+
+                let result = frame.get("result").unwrap_or(&Value::Null);
+                self.update_model_state(result, true, effects);
+                // If honkd's model list has been received, enforce recents hygiene by only
+                // recording models present in the known list (typos not recorded).
+                // Before a list reply arrives (or if honkd is too old to support _honk/model/list),
+                // record any successful model set so valid models aren't dropped.
+                let should_record =
+                    record_recent && (self.known_model_ids.contains(&model) || !self.models_listed);
+                if should_record {
+                    effects.push(Effect::RecordRecentModel(model));
+                }
+
+                false
+            }
+        }
     }
 }
 
