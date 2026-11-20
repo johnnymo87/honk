@@ -48,6 +48,8 @@ pub struct ChatCore {
     pub(crate) known_model_ids: Vec<String>,
     pub(crate) models_listed: bool,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
+    pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
+    pub(crate) undone_prompts: Vec<String>,
 }
 
 impl ChatCore {
@@ -106,6 +108,8 @@ impl ChatCore {
             known_model_ids: Vec::new(),
             models_listed: false,
             pending_model_reqs: HashMap::new(),
+            pending_revert_reqs: HashMap::new(),
+            undone_prompts: Vec::new(),
         }
     }
 
@@ -178,6 +182,10 @@ impl ChatCore {
 
     pub fn held_steers(&self) -> &[(String, u32)] {
         &self.held_steers
+    }
+
+    pub fn pending_permissions(&self) -> &[PendingPermission] {
+        &self.pending_permissions
     }
 
     pub fn max_turns(&self) -> Option<u32> {
@@ -448,6 +456,7 @@ impl ChatCore {
 
         let is_command = text == "/compact";
         self.run_is_command = is_command;
+        self.undone_prompts.clear();
         self.prompt_sent = Some(PromptSent {
             crid,
             text,
@@ -785,6 +794,67 @@ impl ChatCore {
             #[allow(clippy::needless_return)]
             return;
         }
+
+        if let Some(revert_req) = self.pending_revert_reqs.remove(&id) {
+            self.handle_revert_response(revert_req, frame, effects);
+        }
+    }
+
+    fn handle_revert_response(
+        &mut self,
+        req: super::types::PendingRevertReq,
+        frame: &Value,
+        effects: &mut Vec<Effect>,
+    ) {
+        let op = match req {
+            super::types::PendingRevertReq::Undo => "undo",
+            super::types::PendingRevertReq::Redo => "redo",
+        };
+
+        if let Some(err) = frame.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            effects.push(Effect::Notice(Notice::warning(format!("{op}: {msg}"))));
+            return;
+        }
+
+        let result = frame.get("result").unwrap_or(&Value::Null);
+        match req {
+            super::types::PendingRevertReq::Undo => {
+                let turns = result.get("turns").and_then(Value::as_u64).unwrap_or(1);
+                let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+                let s = if turns == 1 { "" } else { "s" };
+                let msg = format!(
+                    "undid {turns} turn{s}; files are not restored. /redo restores until the next prompt."
+                );
+                self.undone_prompts.push(text.to_string());
+                effects.push(Effect::Notice(Notice::returned(msg, text)));
+            }
+            super::types::PendingRevertReq::Redo => {
+                let restored = result.get("restored").and_then(Value::as_u64).unwrap_or(0);
+                let cleared = result
+                    .get("cleared")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let s = if restored == 1 { "" } else { "s" };
+                let msg = if cleared {
+                    format!("restored {restored} turn{s} — nothing left to redo")
+                } else {
+                    format!("restored {restored} turn{s}")
+                };
+                let clear_candidate = self.undone_prompts.pop();
+                if cleared {
+                    self.undone_prompts.clear();
+                }
+                if let Some(undone_text) = clear_candidate {
+                    effects.push(Effect::Notice(Notice::returned_clear(msg, undone_text)));
+                } else {
+                    effects.push(Effect::Notice(Notice::info(msg)));
+                }
+            }
+        }
     }
 
     fn handle_notification(&mut self, method: &str, frame: &Value, effects: &mut Vec<Effect>) {
@@ -1001,6 +1071,24 @@ impl ChatCore {
                 effects.push(Effect::Notice(Notice::info(
                     "session evicted; re-attaching...",
                 )));
+            }
+            honk_wire::method::NOTICE => {
+                if !self.is_replaying {
+                    let level = frame
+                        .pointer("/params/level")
+                        .and_then(Value::as_str)
+                        .unwrap_or("info");
+                    let msg = frame
+                        .pointer("/params/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let notice = match level {
+                        "warning" => Notice::warning(msg),
+                        "error" => Notice::error(msg),
+                        _ => Notice::info(msg),
+                    };
+                    effects.push(Effect::Notice(notice));
+                }
             }
             "_honk/mcp_changed" => {
                 if let Some(params) = frame.get("params") {

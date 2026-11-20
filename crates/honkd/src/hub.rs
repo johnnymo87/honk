@@ -953,7 +953,13 @@ impl Hub {
             .unwrap_or(false)
     }
 
-    pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
+    pub async fn session_call(
+        &self,
+        sid: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
         let init_opts = UpstreamOpts {
             allow_production: self.args.allow_production_upstream,
             client_capabilities: serde_json::json!({
@@ -979,7 +985,7 @@ impl Hub {
             &init_opts,
         )
         .await
-        .context("failed to initialize export side connection")?;
+        .context("failed to initialize side connection")?;
 
         let conn_id = side_up.conn_id().to_string();
 
@@ -996,7 +1002,7 @@ impl Hub {
         }
 
         // Guaranteed cleanup on every path after initialize
-        let export_result: anyhow::Result<Value> = async {
+        let call_result: anyhow::Result<Value> = async {
             side_up
                 .subscribe_with(
                     Some(sid),
@@ -1006,28 +1012,14 @@ impl Hub {
                     },
                 )
                 .await
-                .context("failed to subscribe export session stream")?;
+                .context("failed to subscribe session stream")?;
 
-            let export_res = side_up
-                .call(
-                    "_goose/unstable/session/export",
-                    serde_json::json!({
-                        "sessionId": sid,
-                        "format": "json"
-                    }),
-                    Some(sid),
-                    Duration::from_secs(30),
-                )
+            let res = side_up
+                .call(method, params, Some(sid), timeout)
                 .await
-                .context("failed to call export on side connection")?;
+                .context("failed to call method on side connection")?;
 
-            let data_str = export_res
-                .get("data")
-                .and_then(Value::as_str)
-                .context("export missing data string")?;
-            let session_val: Value =
-                serde_json::from_str(data_str).context("failed to parse export data JSON")?;
-            Ok(session_val)
+            Ok(res)
         }
         .await;
 
@@ -1039,7 +1031,30 @@ impl Hub {
             });
         }
 
-        export_result
+        call_result
+    }
+
+    pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
+        let export_res = self
+            .session_call(
+                sid,
+                "_goose/unstable/session/export",
+                serde_json::json!({
+                    "sessionId": sid,
+                    "format": "json"
+                }),
+                Duration::from_secs(30),
+            )
+            .await
+            .context("failed to call export on side connection")?;
+
+        let data_str = export_res
+            .get("data")
+            .and_then(Value::as_str)
+            .context("export missing data string")?;
+        let session_val: Value =
+            serde_json::from_str(data_str).context("failed to parse export data JSON")?;
+        Ok(session_val)
     }
 
     pub async fn recover_sidecar_text(&self, info: &crate::state::SidecarRecoveryInfo) {
@@ -1618,6 +1633,7 @@ impl Hub {
                 }
             }
 
+            let raw_client_prompts = honk_wire::export::client_prompts(&export_val).len();
             let (new_log, next_epoch) = crate::session::create_new_generation_from_export(
                 &sid_str,
                 &hub.state_dir,
@@ -1635,8 +1651,6 @@ impl Hub {
                 code: -32603,
                 message: format!("failed to create session log: {e:#}"),
             })?;
-
-            let client_prompts = honk_wire::export::client_prompts(&export_val).len();
 
             // Step 6: The session is now held
             let now = std::time::SystemTime::now()
@@ -1660,7 +1674,7 @@ impl Hub {
                             inflight: None,
                             last_active_unix: now,
                             init_result: Some(load_reply.clone()),
-                            client_prompts,
+                            client_prompts: raw_client_prompts,
                         },
                     );
                 })
@@ -1697,7 +1711,7 @@ impl Hub {
                 self_tx: session_tx.clone(),
                 log: new_log,
                 turn: crate::turn::TurnCore {
-                    client_prompts,
+                    client_prompts: raw_client_prompts,
                     ..Default::default()
                 },
                 state: crate::session::ActorState::Live,

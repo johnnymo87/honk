@@ -6194,3 +6194,555 @@ fn test_recents_recording_hygiene_before_and_after_models_listed() {
             .any(|e| matches!(e, Effect::RecordRecentModel(_)))
     );
 }
+
+#[test]
+fn test_help_command_includes_undo_and_redo() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/help".into()));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(&n.text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(notice.contains("/undo"));
+    assert!(notice.contains("/redo"));
+}
+
+#[test]
+fn test_undo_idle_sends_request() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/undo".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+        .expect("should send _honk/undo request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "/undo must never be sent as a prompt"
+    );
+}
+
+#[test]
+fn test_undo_success_returned_notice() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/undo".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/undo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/undo request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "turns": 1,
+            "text": "my previous prompt",
+            "messageId": "msg_honk_123"
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on undo success");
+
+    assert_eq!(notice.kind, NoticeKind::Returned);
+    assert_eq!(
+        notice.text,
+        "undid 1 turn; files are not restored. /redo restores until the next prompt."
+    );
+    assert_eq!(notice.returned_text.as_deref(), Some("my previous prompt"));
+
+    // Also test plural turns formatting
+    let effs2 = core.handle(Input::Line("/undo".into()));
+    let req_id2 = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/undo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/undo request");
+
+    let resp2 = json!({
+        "jsonrpc": "2.0",
+        "id": req_id2,
+        "result": {
+            "turns": 2,
+            "text": "another prompt",
+            "messageId": "msg_honk_456"
+        }
+    });
+
+    let resp_effs2 = core.handle(Input::Frame(resp2));
+    let notice2 = resp_effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        notice2.text,
+        "undid 2 turns; files are not restored. /redo restores until the next prompt."
+    );
+    assert_eq!(notice2.returned_text.as_deref(), Some("another prompt"));
+}
+
+#[test]
+fn test_undo_error_warning_notice() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/undo".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/undo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/undo request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32002,
+            "message": "nothing to undo"
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on undo error");
+
+    assert_eq!(notice.kind, NoticeKind::Warning);
+    assert_eq!(notice.text, "undo: nothing to undo");
+}
+
+#[test]
+fn test_undo_refused_while_busy() {
+    // 1. Refused while run is active
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+    assert!(core.run_state().is_running());
+
+    let effs = core.handle(Input::Line("/undo".into()));
+    assert!(has_notice(&effs, "can't undo while a turn is running"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+    );
+
+    // 2. Refused while prompt is in flight
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("run something".into()));
+    assert!(core.prompt_in_flight());
+
+    let effs = core.handle(Input::Line("/undo".into()));
+    assert!(has_notice(&effs, "can't undo while a prompt is in flight"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+    );
+
+    // 3. Refused while permission is pending
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "session/request_permission",
+        "params": {
+            "options": [{ "optionId": "opt1", "name": "Allow", "kind": "allow_once" }],
+            "toolCall": { "title": "shell" }
+        }
+    })));
+    assert!(!core.pending_permissions().is_empty());
+
+    let effs = core.handle(Input::Line("/undo".into()));
+    assert!(has_notice(
+        &effs,
+        "can't undo while a permission request is pending"
+    ));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+    );
+
+    // 4. Refused while prompts are queued
+    let (mut core, _) = new_test_core();
+    // Simulate foreign run then queue two lines
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+    core.handle(Input::Line("queued text 1".into()));
+    core.handle(Input::Line("queued text 2".into()));
+    // End the foreign run: first queued line is dispatched as prompt, second remains queued
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+    assert!(core.queued_len() > 0);
+
+    let effs = core.handle(Input::Line("/undo".into()));
+    assert!(has_notice(&effs, "can't undo while prompts are queued"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+    );
+}
+
+#[test]
+fn test_redo_idle_sends_request() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/redo".into()));
+    let req = effs
+        .iter()
+        .find(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/redo"))
+        .expect("should send _honk/redo request");
+    let Effect::Request { params, .. } = req else {
+        panic!()
+    };
+    assert_eq!(params["sessionId"], "test-session");
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt")),
+        "/redo must never be sent as a prompt"
+    );
+}
+
+#[test]
+fn test_redo_success_not_cleared() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/redo".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/redo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/redo request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "restored": 1,
+            "cleared": false
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on redo success");
+
+    assert_eq!(notice.kind, NoticeKind::Info);
+    assert_eq!(notice.text, "restored 1 turn");
+
+    // Also test plural restored formatting
+    let effs2 = core.handle(Input::Line("/redo".into()));
+    let req_id2 = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/redo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/redo request");
+
+    let resp2 = json!({
+        "jsonrpc": "2.0",
+        "id": req_id2,
+        "result": {
+            "restored": 3,
+            "cleared": false
+        }
+    });
+
+    let resp_effs2 = core.handle(Input::Frame(resp2));
+    let notice2 = resp_effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .unwrap();
+
+    assert_eq!(notice2.text, "restored 3 turns");
+}
+
+#[test]
+fn test_redo_success_cleared() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/redo".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/redo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/redo request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "restored": 1,
+            "cleared": true
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on redo success");
+
+    assert_eq!(notice.kind, NoticeKind::Info);
+    assert_eq!(notice.text, "restored 1 turn — nothing left to redo");
+}
+
+#[test]
+fn test_redo_error_warning_notice() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/redo".into()));
+    let req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/redo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/redo request");
+
+    let resp = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32002,
+            "message": "nothing to redo"
+        }
+    });
+
+    let resp_effs = core.handle(Input::Frame(resp));
+    let notice = resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on redo error");
+
+    assert_eq!(notice.kind, NoticeKind::Warning);
+    assert_eq!(notice.text, "redo: nothing to redo");
+}
+
+#[test]
+fn test_redo_refused_while_busy() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run_foreign" } }
+            }
+        }
+    })));
+    assert!(core.run_state().is_running());
+
+    let effs = core.handle(Input::Line("/redo".into()));
+    assert!(has_notice(&effs, "can't redo while a turn is running"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/redo"))
+    );
+}
+
+#[test]
+fn test_undo_and_redo_arguments_rejected() {
+    let (mut core, _) = new_test_core();
+    let effs = core.handle(Input::Line("/undo extra".into()));
+    assert!(has_notice(&effs, "/undo takes no arguments"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/undo"))
+    );
+
+    let effs = core.handle(Input::Line("/redo extra".into()));
+    assert!(has_notice(&effs, "/redo takes no arguments"));
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "_honk/redo"))
+    );
+}
+
+#[test]
+fn test_honk_notice_notification() {
+    let (mut core, _) = new_test_core();
+
+    // 1. Warning notice
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/notice",
+        "params": {
+            "sessionId": "ses_1",
+            "level": "warning",
+            "message": "undo could not be made permanent"
+        }
+    })));
+    let notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice effect");
+    assert_eq!(notice.kind, NoticeKind::Warning);
+    assert_eq!(notice.text, "undo could not be made permanent");
+
+    // 2. Info notice (default / level: "info")
+    let effs2 = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "_honk/notice",
+        "params": {
+            "sessionId": "ses_1",
+            "level": "info",
+            "message": "some info notice"
+        }
+    })));
+    let notice2 = effs2
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice effect");
+    assert_eq!(notice2.kind, NoticeKind::Info);
+    assert_eq!(notice2.text, "some info notice");
+}
+
+#[test]
+fn test_undo_then_redo_emits_returned_clear() {
+    let (mut core, _) = new_test_core();
+
+    // 1. Send /undo
+    let undo_effs = core.handle(Input::Line("/undo".into()));
+    let undo_req_id = undo_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/undo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/undo");
+
+    let undo_resp = json!({
+        "jsonrpc": "2.0",
+        "id": undo_req_id,
+        "result": {
+            "turns": 1,
+            "text": "my undone prompt text",
+            "messageId": "msg_1"
+        }
+    });
+    let undo_resp_effs = core.handle(Input::Frame(undo_resp));
+    let undo_notice = undo_resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on undo success");
+    assert_eq!(undo_notice.kind, NoticeKind::Returned);
+    assert_eq!(
+        undo_notice.returned_text.as_deref(),
+        Some("my undone prompt text")
+    );
+
+    // 2. Send /redo
+    let redo_effs = core.handle(Input::Line("/redo".into()));
+    let redo_req_id = redo_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/redo" => Some(*id),
+            _ => None,
+        })
+        .expect("should send _honk/redo");
+
+    let redo_resp = json!({
+        "jsonrpc": "2.0",
+        "id": redo_req_id,
+        "result": {
+            "restored": 1,
+            "cleared": true
+        }
+    });
+    let redo_resp_effs = core.handle(Input::Frame(redo_resp));
+    let redo_notice = redo_resp_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("expected notice on redo success");
+    assert_eq!(redo_notice.kind, NoticeKind::Info);
+    assert_eq!(
+        redo_notice.returned_clear.as_deref(),
+        Some("my undone prompt text")
+    );
+}

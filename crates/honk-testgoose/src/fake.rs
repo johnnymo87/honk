@@ -177,6 +177,8 @@ struct FakeGooseInner {
     session_extensions: Mutex<HashMap<String, Vec<Value>>>,
     extension_fail_command: Mutex<Option<(String, String)>>,
     extension_add_delay: Mutex<Option<Duration>>,
+    truncate_error: Mutex<Option<Value>>,
+    truncate_found: Mutex<Option<bool>>,
 }
 
 pub struct FakeGoose {
@@ -240,6 +242,8 @@ impl FakeGoose {
             session_extensions: Mutex::new(HashMap::new()),
             extension_fail_command: Mutex::new(None),
             extension_add_delay: Mutex::new(None),
+            truncate_error: Mutex::new(None),
+            truncate_found: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -541,6 +545,26 @@ impl FakeGoose {
             .insert(sid.to_string(), options);
     }
 
+    pub fn script_truncate_error(&self, error: Value) {
+        *self.state.truncate_error.lock().unwrap() = Some(error);
+    }
+
+    pub fn script_truncate_found(&self, found: bool) {
+        *self.state.truncate_found.lock().unwrap() = Some(found);
+    }
+
+    pub fn truncate_calls(&self) -> Vec<Value> {
+        let frames = self.state.inbound_frames.lock().unwrap();
+        frames
+            .iter()
+            .filter(|f| {
+                f.get("method").and_then(Value::as_str)
+                    == Some("_goose/unstable/session/conversation/truncate_from_message")
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn restart(&mut self) {
         self.state.connections.lock().unwrap().clear();
     }
@@ -611,6 +635,7 @@ fn method_requires_session(method: &str) -> bool {
             | "_goose/unstable/session/extensions/list"
             | "_goose/unstable/session/extensions/add"
             | "_goose/unstable/session/extensions/remove"
+            | "_goose/unstable/session/conversation/truncate_from_message"
     )
 }
 
@@ -1282,6 +1307,40 @@ async fn handle_post(
                     .entry(sid.clone())
                     .or_insert_with(StreamState::new);
                 stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("_goose/unstable/session/conversation/truncate_from_message") => {
+            let error_opt = state.truncate_error.lock().unwrap().take();
+            let found = state.truncate_found.lock().unwrap().take().unwrap_or(true);
+            let mut conns = state.connections.lock().unwrap();
+            if let Some(conn) = conns.get_mut(&conn_id)
+                && let Some(id) = req_id
+            {
+                let resp = if let Some(err) = error_opt {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": err
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "found": found
+                        }
+                    })
+                };
+                if let Some(sid) = &target_session {
+                    let stream = conn
+                        .sessions
+                        .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
+                } else {
+                    conn.conn_stream.push_frame(resp, patched, false);
+                }
             }
             StatusCode::ACCEPTED.into_response()
         }

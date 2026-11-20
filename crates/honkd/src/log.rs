@@ -372,6 +372,122 @@ impl SessionLog {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+
+    pub fn read_redo_sidecar(&self) -> Result<Vec<Value>> {
+        read_redo_sidecar(&self.path)
+    }
+
+    pub fn write_redo_sidecar(&self, frames: &[Value]) -> Result<()> {
+        write_redo_sidecar(&self.path, frames)
+    }
+
+    pub fn prepend_redo_sidecar(&self, frames: &[Value]) -> Result<()> {
+        prepend_redo_sidecar(&self.path, frames)
+    }
+
+    pub fn delete_redo_sidecar(&self) -> Result<()> {
+        delete_redo_sidecar(&self.path)
+    }
+}
+
+/// Returns the redo sidecar path for a session log: `<log stem>.redo.jsonl`.
+pub fn redo_sidecar_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
+    log_path.with_file_name(format!("{stem}.redo.jsonl"))
+}
+
+/// Reads all frames from the redo sidecar file, oldest first.
+/// Returns Ok(vec![]) if the file does not exist.
+pub fn read_redo_sidecar(log_path: &Path) -> Result<Vec<Value>> {
+    let path = redo_sidecar_path(log_path);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(&path)?;
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let mut frames = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame: Value = serde_json::from_str(trimmed)?;
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// Atomically writes frames to the redo sidecar file (or deletes it if frames is empty).
+pub fn write_redo_sidecar(log_path: &Path, frames: &[Value]) -> Result<()> {
+    let path = redo_sidecar_path(log_path);
+    if frames.is_empty() {
+        return delete_redo_sidecar(log_path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("redo.jsonl");
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut tmp_file = opts.open(&tmp_path)?;
+    for frame in frames {
+        serde_json::to_writer(&mut tmp_file, frame)?;
+        tmp_file.write_all(b"\n")?;
+    }
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+
+    std::fs::rename(&tmp_path, &path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir_file) = std::fs::File::open(parent)
+    {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// Prepends frames to the redo sidecar file (new frames become the oldest).
+pub fn prepend_redo_sidecar(log_path: &Path, new_frames: &[Value]) -> Result<()> {
+    if new_frames.is_empty() {
+        return Ok(());
+    }
+    let mut existing = read_redo_sidecar(log_path)?;
+    let mut combined = Vec::with_capacity(new_frames.len() + existing.len());
+    combined.extend_from_slice(new_frames);
+    combined.append(&mut existing);
+    write_redo_sidecar(log_path, &combined)
+}
+
+/// Deletes the redo sidecar file if it exists.
+pub fn delete_redo_sidecar(log_path: &Path) -> Result<()> {
+    let path = redo_sidecar_path(log_path);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 pub fn last_usage_frame(entries: &[Entry]) -> Option<&Value> {
@@ -693,5 +809,55 @@ mod tests {
             .unwrap();
         let log = SessionLog::open(&p).unwrap();
         assert_eq!(log.head().seq, 1);
+    }
+
+    #[test]
+    fn test_redo_sidecar_lifecycle() {
+        let d = tempfile::tempdir().unwrap();
+        let log_p = d.path().join("sessions").join("ses_test.jsonl");
+        let sidecar_p = redo_sidecar_path(&log_p);
+        assert_eq!(
+            sidecar_p,
+            d.path().join("sessions").join("ses_test.redo.jsonl")
+        );
+
+        // 1. Read nonexistent sidecar returns empty Vec
+        let empty = read_redo_sidecar(&log_p).unwrap();
+        assert!(empty.is_empty());
+
+        // 2. Prepend first batch (tail from undo 1)
+        let frame1 = serde_json::json!({
+            "method": "session/update",
+            "params": {"update": {"messageId": "msg_1"}}
+        });
+        prepend_redo_sidecar(&log_p, std::slice::from_ref(&frame1)).unwrap();
+        assert!(sidecar_p.exists());
+        let frames = read_redo_sidecar(&log_p).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], frame1);
+
+        // 3. Prepend second batch (tail from undo 2: older frames go to the front)
+        let frame0 = serde_json::json!({
+            "method": "session/update",
+            "params": {"update": {"messageId": "msg_0"}}
+        });
+        prepend_redo_sidecar(&log_p, std::slice::from_ref(&frame0)).unwrap();
+        let frames2 = read_redo_sidecar(&log_p).unwrap();
+        assert_eq!(frames2.len(), 2);
+        assert_eq!(frames2[0], frame0); // oldest first
+        assert_eq!(frames2[1], frame1);
+
+        // 4. Overwrite via write_redo_sidecar (e.g. after partial redo)
+        write_redo_sidecar(&log_p, std::slice::from_ref(&frame1)).unwrap();
+        let frames3 = read_redo_sidecar(&log_p).unwrap();
+        assert_eq!(frames3.len(), 1);
+        assert_eq!(frames3[0], frame1);
+
+        // 5. Delete sidecar
+        delete_redo_sidecar(&log_p).unwrap();
+        assert!(!sidecar_p.exists());
+
+        // 6. Delete again is idempotent (does not error)
+        delete_redo_sidecar(&log_p).unwrap();
     }
 }

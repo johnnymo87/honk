@@ -26,6 +26,7 @@ pub struct Notice {
     pub kind: NoticeKind,
     pub text: String,
     pub returned_text: Option<String>,
+    pub returned_clear: Option<String>,
 }
 
 impl Notice {
@@ -34,6 +35,7 @@ impl Notice {
             kind: NoticeKind::Info,
             text: text.into(),
             returned_text: None,
+            returned_clear: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl Notice {
             kind: NoticeKind::Warning,
             text: text.into(),
             returned_text: None,
+            returned_clear: None,
         }
     }
 
@@ -50,6 +53,7 @@ impl Notice {
             kind: NoticeKind::Error,
             text: text.into(),
             returned_text: None,
+            returned_clear: None,
         }
     }
 
@@ -58,6 +62,16 @@ impl Notice {
             kind: NoticeKind::Returned,
             text: text.into(),
             returned_text: Some(returned.into()),
+            returned_clear: None,
+        }
+    }
+
+    pub fn returned_clear(text: impl Into<String>, clear: impl Into<String>) -> Self {
+        Self {
+            kind: NoticeKind::Info,
+            text: text.into(),
+            returned_text: None,
+            returned_clear: Some(clear.into()),
         }
     }
 }
@@ -180,6 +194,12 @@ pub(crate) struct InflightSteer {
     pub text: String,
     pub expected_run_id: String,
     pub conversion_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingRevertReq {
+    Undo,
+    Redo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

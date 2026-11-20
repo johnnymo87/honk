@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 pub mod export;
+pub mod prompt_kind;
+
+pub use prompt_kind::{Trigger, classify, is_human_prompt};
 
 pub const PROTOCOL: u32 = 1;
 pub const FEATURE_RESUME_ONLY: &str = "resume_only";
@@ -15,6 +18,7 @@ pub mod method {
     pub const STEER_UNCONSUMED: &str = "_honk/steer_unconsumed";
     pub const GAP: &str = "_honk/gap";
     pub const EVICTED: &str = "_honk/evicted";
+    pub const NOTICE: &str = "_honk/notice";
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
