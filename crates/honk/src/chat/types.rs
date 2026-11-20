@@ -208,7 +208,9 @@ pub struct ModelItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingModelReq {
-    List,
+    List {
+        silent: bool,
+    },
     Set {
         model: String,
         queued: Option<(String, u32)>,

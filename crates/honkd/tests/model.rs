@@ -163,6 +163,7 @@ async fn test_model_switch_and_fresh_init_result() {
         busy_res["error"]["message"],
         "session is busy; try after this turn"
     );
+    assert_eq!(busy_res["error"]["data"], json!({"honk": "busy"}));
 
     // Await prompt completion
     let _ = v1.response(&prompt_id).await;

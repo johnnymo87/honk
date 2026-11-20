@@ -350,7 +350,7 @@ impl ChatCore {
         }
         let req_id = self.allocate_id();
         self.pending_model_reqs
-            .insert(req_id, super::types::PendingModelReq::List);
+            .insert(req_id, super::types::PendingModelReq::List { silent: false });
         effects.push(Effect::Request {
             id: req_id,
             method: "_honk/model/list".to_string(),
@@ -384,7 +384,7 @@ impl ChatCore {
             let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
             if requeues == 0 && !self.known_model_ids.iter().any(|k| k == id) {
                 effects.push(Effect::Notice(Notice::warning(format!(
-                    "{id} is not in goose's model list; goose does not check it, a wrong id fails at the next turn"
+                    "{id} is not in the model list; goose does not check it, a wrong id fails at the next turn"
                 ))));
             }
 

@@ -43,6 +43,8 @@ pub struct ChatCore {
     pub(crate) pending_mcp_reqs: HashMap<u64, super::types::PendingMcpReq>,
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
+    pub(crate) goose_model_ids: Vec<String>,
+    pub(crate) listed_model_ids: Vec<String>,
     pub(crate) known_model_ids: Vec<String>,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
 }
@@ -98,6 +100,8 @@ impl ChatCore {
             pending_mcp_reqs: HashMap::new(),
             model: None,
             provider: None,
+            goose_model_ids: Vec::new(),
+            listed_model_ids: Vec::new(),
             known_model_ids: Vec::new(),
             pending_model_reqs: HashMap::new(),
         }
@@ -194,6 +198,34 @@ impl ChatCore {
         &self.known_model_ids
     }
 
+    fn recompute_known_model_ids(&mut self) {
+        let mut known = self.listed_model_ids.clone();
+        for id in &self.goose_model_ids {
+            if !known.contains(id) {
+                known.push(id.clone());
+            }
+        }
+        self.known_model_ids = known;
+    }
+
+    pub(crate) fn request_model_list_silent(&mut self, effects: &mut Vec<Effect>) {
+        let req_id = self.allocate_id();
+        self.pending_model_reqs
+            .insert(req_id, super::types::PendingModelReq::List { silent: true });
+        effects.push(Effect::Request {
+            id: req_id,
+            method: "_honk/model/list".to_string(),
+            params: json!({ "sessionId": self.session_id }),
+        });
+    }
+
+    pub fn on_session_new(&mut self, result: &Value) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.set_config_options(result);
+        self.request_model_list_silent(&mut effects);
+        effects
+    }
+
     pub(crate) fn update_model_state(
         &mut self,
         val: &Value,
@@ -205,7 +237,8 @@ impl ChatCore {
         }
         let opts = honk_wire::config_select_options(val, "model");
         if !opts.is_empty() {
-            self.known_model_ids = opts;
+            self.goose_model_ids = opts;
+            self.recompute_known_model_ids();
         }
         if let Some(new_m) = honk_wire::config_select_value(val, "model") {
             if allow_notice
@@ -318,6 +351,14 @@ impl ChatCore {
             self.local_queue.push_back((text, conversion_count));
             effects.push(Effect::Notice(Notice::info(
                 "compaction running; message queued for after it ends",
+            )));
+            return;
+        }
+
+        if self.has_pending_model_mutation() {
+            self.local_queue.push_back((text, conversion_count));
+            effects.push(Effect::Notice(Notice::info(
+                "queued until the model switch completes",
             )));
             return;
         }
@@ -533,6 +574,7 @@ impl ChatCore {
                         let result = frame.get("result").cloned().unwrap_or(Value::Null);
                         self.set_config_options(&result);
                         effects.push(Effect::Attached { result });
+                        self.request_model_list_silent(effects);
                     }
                     return;
                 }
@@ -1229,13 +1271,15 @@ impl ChatCore {
         effects: &mut Vec<Effect>,
     ) -> bool {
         match req {
-            super::types::PendingModelReq::List => {
+            super::types::PendingModelReq::List { silent } => {
                 if let Some(err) = frame.get("error") {
-                    let msg = err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("model error");
-                    effects.push(Effect::Notice(Notice::error(msg)));
+                    if !silent {
+                        let msg = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("model error");
+                        effects.push(Effect::Notice(Notice::error(msg)));
+                    }
                     return false;
                 }
 
@@ -1245,6 +1289,9 @@ impl ChatCore {
                     .and_then(Value::as_str)
                     .map(String::from)
                     .or_else(|| self.model().map(String::from));
+                if let Some(ref c) = current {
+                    self.model = Some(c.clone());
+                }
                 let warning = result
                     .get("warning")
                     .and_then(Value::as_str)
@@ -1272,17 +1319,20 @@ impl ChatCore {
                     })
                     .unwrap_or_default();
 
-                self.known_model_ids = models.iter().map(|m| m.id.clone()).collect();
+                self.listed_model_ids = models.iter().map(|m| m.id.clone()).collect();
+                self.recompute_known_model_ids();
 
-                if let Some(ref w) = warning {
-                    effects.push(Effect::Notice(Notice::warning(w.clone())));
+                if !silent {
+                    if let Some(ref w) = warning {
+                        effects.push(Effect::Notice(Notice::warning(w.clone())));
+                    }
+
+                    effects.push(Effect::ModelList {
+                        current,
+                        models,
+                        warning,
+                    });
                 }
-
-                effects.push(Effect::ModelList {
-                    current,
-                    models,
-                    warning,
-                });
                 false
             }
             super::types::PendingModelReq::Set { model, queued } => {
@@ -1293,7 +1343,10 @@ impl ChatCore {
                         .and_then(Value::as_str)
                         .unwrap_or("model error");
 
-                    if code == -32002
+                    let is_busy = code == -32002
+                        && err.pointer("/data/honk").and_then(Value::as_str) == Some("busy");
+
+                    if is_busy
                         && let Some((raw_line, count)) = queued
                         && count < 3
                     {
@@ -1302,6 +1355,7 @@ impl ChatCore {
                     }
 
                     effects.push(Effect::Notice(Notice::error(msg)));
+                    self.request_model_list_silent(effects);
                     return false;
                 }
 
