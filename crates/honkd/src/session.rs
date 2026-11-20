@@ -195,6 +195,12 @@ pub struct ReactivationData {
     pub client_prompts: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertDir {
+    Undo,
+    Redo,
+}
+
 pub enum SessionMsg {
     // from viewers / hub
     Attach {
@@ -268,6 +274,13 @@ pub enum SessionMsg {
         changed: bool,
         target: McpTarget,
         outcome: Result<McpOpOutput, crate::mcp::ops::OpError>,
+    },
+    Revert {
+        dir: RevertDir,
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        is_honk_aware: bool,
+        id: Value,
     },
     // from spawned recovery / helper tasks (I1)
     Reattached {
@@ -396,12 +409,40 @@ pub struct Session {
     pub queued_mcp_launches: VecDeque<QueuedMcpLaunch>,
 }
 
+pub async fn bump_epoch(
+    sid: &str,
+    log_path: &Path,
+    state_store: &Arc<Mutex<crate::state::StateStore>>,
+) -> anyhow::Result<u64> {
+    let log_header_epoch = if log_path.exists() {
+        crate::log::read_header_epoch(log_path).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut next_epoch = 1;
+    let mut s = state_store.lock().await;
+    s.mutate(|st| {
+        if let Some(h) = st.sessions.get_mut(sid) {
+            next_epoch = h.epoch.max(log_header_epoch) + 1;
+            h.epoch = next_epoch;
+        } else if let Some(ret) = st.retired_epochs.get_mut(sid) {
+            next_epoch = (*ret).max(log_header_epoch) + 1;
+            *ret = next_epoch;
+        } else {
+            next_epoch = log_header_epoch + 1;
+            st.retired_epochs.insert(sid.to_string(), next_epoch);
+        }
+    })?;
+    Ok(next_epoch)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn create_new_generation_from_export(
     sid: &str,
     state_dir: &Path,
     state_store: &Arc<Mutex<crate::state::StateStore>>,
-    frames: Vec<Value>,
+    mut frames: Vec<Value>,
     keys: HashSet<honk_wire::BlockKey>,
     buffered_frames: Vec<(Option<u64>, Value)>,
     carried_usage: Option<Value>,
@@ -410,28 +451,44 @@ pub async fn create_new_generation_from_export(
     last_processed_session_id: Option<u64>,
 ) -> anyhow::Result<(SessionLog, u64)> {
     let log_path = state_dir.join("sessions").join(format!("{sid}.jsonl"));
-    let log_header_epoch = if log_path.exists() {
-        crate::log::read_header_epoch(&log_path).unwrap_or(0)
-    } else {
-        0
-    };
 
-    let mut next_epoch = 1;
-    {
-        let mut s = state_store.lock().await;
-        s.mutate(|st| {
-            if let Some(h) = st.sessions.get_mut(sid) {
-                next_epoch = h.epoch.max(log_header_epoch) + 1;
-                h.epoch = next_epoch;
-            } else if let Some(ret) = st.retired_epochs.get_mut(sid) {
-                next_epoch = (*ret).max(log_header_epoch) + 1;
-                *ret = next_epoch;
-            } else {
-                next_epoch = log_header_epoch + 1;
-                st.retired_epochs.insert(sid.to_string(), next_epoch);
-            }
-        })?;
+    let revert = {
+        let s = state_store.lock().await;
+        s.state().reverts.get(sid).cloned()
+    };
+    if let Some(r) = revert {
+        let target = &r.target;
+        let cut_idx = frames.iter().position(|f| {
+            f.pointer("/params/update")
+                .and_then(|u| {
+                    if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                    {
+                        u.get("messageId")
+                            .or_else(|| u.pointer("/_meta/goose/messageId"))
+                            .and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .is_some_and(|m| m == target)
+        });
+        if let Some(pos) = cut_idx {
+            frames.truncate(pos);
+            // Note: buffered_frames are kept (new live activity after export)
+        } else {
+            let mut s = state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.reverts.remove(sid);
+            });
+            let _ = crate::log::delete_redo_sidecar(&log_path);
+        }
+    } else {
+        // Orphaned sidecar: when building a generation and `reverts` has no entry for the sid,
+        // delete `<log>.redo.jsonl` if present (crash between sidecar write and state persist).
+        let _ = crate::log::delete_redo_sidecar(&log_path);
     }
+
+    let next_epoch = bump_epoch(sid, &log_path, state_store).await?;
 
     let mut combined: Vec<(Option<u64>, Value)> = Vec::with_capacity(
         frames.len() + buffered_frames.len() + if carried_usage.is_some() { 1 } else { 0 },
@@ -902,7 +959,8 @@ impl Session {
                 SessionMsg::Prompt { viewer_id, id, .. }
                 | SessionMsg::Steer { viewer_id, id, .. }
                 | SessionMsg::Forward { viewer_id, id, .. }
-                | SessionMsg::McpOp { viewer_id, id, .. } => {
+                | SessionMsg::McpOp { viewer_id, id, .. }
+                | SessionMsg::Revert { viewer_id, id, .. } => {
                     let err_resp =
                         crate::rpc::error(id, -32000, format!("Session is gone: {reason}"), None);
                     self.send_to_viewer(viewer_id, err_resp);
@@ -1240,7 +1298,7 @@ impl Session {
 
                 let export_val = hub.export(&sid).await?;
                 let export_used = honk_wire::export::export_used_tokens(&export_val);
-                let client_prompts = honk_wire::export::client_prompts(&export_val).len();
+                let raw_client_prompts = honk_wire::export::client_prompts(&export_val).len();
                 let frames = honk_wire::export::to_updates(&export_val, &sid);
                 let mut keys = HashSet::new();
                 for f in &frames {
@@ -1288,7 +1346,7 @@ impl Session {
                                 inflight: None,
                                 last_active_unix: now,
                                 init_result: Some(load_reply_clone),
-                                client_prompts,
+                                client_prompts: raw_client_prompts,
                             },
                         );
                     })?;
@@ -1309,7 +1367,7 @@ impl Session {
                     load_reply,
                     keys,
                     initial_events,
-                    client_prompts,
+                    client_prompts: raw_client_prompts,
                 })
             }
             .await;
@@ -1493,7 +1551,6 @@ impl Session {
         {
             self.last_usage = Some(u);
         }
-        let head = self.log.head();
         let _ = std::fs::remove_file(
             self.state_dir
                 .join("sessions")
@@ -1503,48 +1560,7 @@ impl Session {
         self.turn.client_prompts = client_prompts;
         self.sync_inflight().await;
 
-        let reset_frame = json!({
-            "jsonrpc": "2.0",
-            "method": "_honk/reset",
-            "params": {
-                "sessionId": self.sid,
-                "epoch": head.epoch,
-            }
-        });
-        let replay_done_frame = json!({
-            "jsonrpc": "2.0",
-            "method": "_honk/replay_done",
-            "params": {
-                "sessionId": self.sid,
-                "epoch": head.epoch,
-                "seq": head.seq,
-            }
-        });
-
-        let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
-        msgs.push(axum::extract::ws::Message::Text(
-            reset_frame.to_string().into(),
-        ));
-        for entry in self.log.entries() {
-            msgs.push(axum::extract::ws::Message::Text(
-                entry.frame.to_string().into(),
-            ));
-        }
-        msgs.push(axum::extract::ws::Message::Text(
-            replay_done_frame.to_string().into(),
-        ));
-
-        for (tx, is_honk_aware) in self.viewers.values() {
-            if *is_honk_aware {
-                let batch = crate::viewer::ReplayBatch {
-                    session_id: self.sid.clone(),
-                    head: head.clone(),
-                    msgs: msgs.clone(),
-                    done_tx: None,
-                };
-                let _ = tx.send_replay(batch);
-            }
-        }
+        self.fan_out_reset_and_replay();
 
         self.suppressed_keys = keys;
         self.state = ActorState::Live;
@@ -1703,7 +1719,8 @@ impl Session {
                             SessionMsg::Prompt { viewer, id, .. }
                             | SessionMsg::Steer { viewer, id, .. }
                             | SessionMsg::Forward { viewer, id, .. }
-                            | SessionMsg::McpOp { viewer, id, .. } => {
+                            | SessionMsg::McpOp { viewer, id, .. }
+                            | SessionMsg::Revert { viewer, id, .. } => {
                                 let err_frame =
                                     crate::rpc::error(id, e.code, e.message.clone(), None);
                                 let _ = viewer.send_frame(axum::extract::ws::Message::Text(
@@ -1784,6 +1801,17 @@ impl Session {
         }
     }
 
+    fn fan_out_honk_aware(&mut self, frame: &Value) {
+        let honk_vids: Vec<ViewerId> = self
+            .viewers
+            .iter()
+            .filter_map(|(vid, (_, is_honk))| if *is_honk { Some(*vid) } else { None })
+            .collect();
+        for vid in honk_vids {
+            self.send_to_viewer(vid, frame.clone());
+        }
+    }
+
     async fn on_upstream(&mut self, ev: Event) {
         let (key, frame, id_opt) = match ev {
             Event::Frame(key, frame, id_opt) => (key, frame, id_opt),
@@ -1855,6 +1883,13 @@ impl Session {
                         .and_then(Value::as_str)
                 {
                     self.turn.on_user_message(msg_id);
+                    if self.turn.current_prompt_msg_id() == Some(msg_id) {
+                        if let Some(id) = id_opt {
+                            let _ = self.log.mark_processed(id);
+                            self.last_processed_session_id = Some(id);
+                        }
+                        return;
+                    }
                 }
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
@@ -2140,10 +2175,30 @@ impl Session {
             }
         }
 
+        let is_echo = is_session_stream
+            && kind == crate::rpc::Kind::Notification
+            && frame
+                .pointer("/params/update")
+                .and_then(|u| {
+                    if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk")
+                    {
+                        u.get("messageId")
+                            .or_else(|| u.pointer("/_meta/goose/messageId"))
+                            .and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .is_some_and(|msg_id| self.turn.current_prompt_msg_id() == Some(msg_id));
+
         // 3. Record & 4. Fan out stamped frame
         if is_session_stream {
             if kind == crate::rpc::Kind::Notification {
-                if is_suppressed {
+                if is_echo {
+                    if let Some(id) = id_opt {
+                        let _ = self.log.mark_processed(id);
+                    }
+                } else if is_suppressed {
                     if let Some(id) = id_opt {
                         let _ = self.log.mark_processed(id);
                     }
@@ -2241,6 +2296,7 @@ impl Session {
                     params,
                 } => {
                     let sid = self.sid.clone();
+
                     if let Some(inf) = self.turn.inflight.as_ref() {
                         let persisted = inf.to_persisted();
                         let client_prompts = self.turn.client_prompts;
@@ -2267,6 +2323,68 @@ impl Session {
                                 "Session {}: failed to persist inflight before POST: {e:#}",
                                 sid
                             );
+                        }
+                    }
+
+                    let revert_opt = {
+                        let s = self.state_store.lock().await;
+                        s.state().reverts.get(&sid).cloned()
+                    };
+                    if let Some(revert) = revert_opt {
+                        let call_res = self
+                            .hub
+                            .session_call(
+                                &sid,
+                                "_goose/unstable/session/conversation/truncate_from_message",
+                                json!({
+                                    "sessionId": sid,
+                                    "messageId": revert.target,
+                                }),
+                                Duration::from_secs(10),
+                            )
+                            .await;
+
+                        match call_res {
+                            Ok(_) => {
+                                {
+                                    let mut s = self.state_store.lock().await;
+                                    let _ = s.mutate(|st| {
+                                        st.reverts.remove(&sid);
+                                    });
+                                }
+                                let _ = self.log.delete_redo_sidecar();
+                                self.turn.client_prompts = revert.prompts_before as usize;
+                                if let Some(inf) = self.turn.inflight.as_mut() {
+                                    inf.prompt_index = revert.prompts_before as usize;
+                                }
+                                self.sync_inflight().await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Session {sid}: truncate_from_message failed before prompt POST: {e:#}; scheduling rebuild at turn end"
+                                );
+                                {
+                                    let mut s = self.state_store.lock().await;
+                                    let _ = s.mutate(|st| {
+                                        st.reverts.remove(&sid);
+                                    });
+                                }
+                                let _ = self.log.delete_redo_sidecar();
+                                self.rebuild_at_turn_end = true;
+
+                                let notice_frame = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": honk_wire::method::NOTICE,
+                                    "params": {
+                                        "sessionId": sid,
+                                        "level": "warning",
+                                        "message": format!(
+                                            "undo could not be made permanent ({e:#}); the undone turns are still in the model's context and will reappear after this turn"
+                                        ),
+                                    }
+                                });
+                                self.fan_out_honk_aware(&notice_frame);
+                            }
                         }
                     }
 
@@ -2422,10 +2540,15 @@ impl Session {
 
                     let user_text = crate::rpc::extract_user_text(&params);
                     let crid = owner.client_req_id.clone();
-                    let msg_id = crid
-                        .as_ref()
-                        .map(|c| format!("synth_{c}"))
-                        .unwrap_or_else(|| format!("synth_{}", self.ids.next()));
+                    let msg_id = params
+                        .pointer("/_meta/goose/messageId")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            crid.as_ref()
+                                .map(|c| format!("synth_{c}"))
+                                .unwrap_or_else(|| format!("synth_{}", self.ids.next()))
+                        });
                     let mut synth_frame = json!({
                         "jsonrpc": "2.0",
                         "method": "session/update",
@@ -2985,6 +3108,15 @@ impl Session {
                     );
                     return;
                 }
+                if let Ok(guard) = self.state_store.try_lock()
+                    && guard.state().reverts.contains_key(&self.sid)
+                {
+                    tracing::warn!(
+                        "Session {}: steer forwarded while revert exists; steers never commit",
+                        self.sid
+                    );
+                    debug_assert!(false, "steer forwarded while revert exists");
+                }
                 let up_id = self.ids.next();
                 self.pending_requests.insert(
                     up_id.clone(),
@@ -3425,6 +3557,29 @@ impl Session {
                     self.do_reattach().await;
                 }
             }
+            SessionMsg::Revert {
+                dir,
+                viewer_id,
+                viewer,
+                is_honk_aware,
+                id,
+            } => {
+                if !self.viewers.contains_key(&viewer_id) {
+                    self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
+                }
+                if matches!(self.state, ActorState::Reattaching | ActorState::Rebuilding) {
+                    let err = crate::rpc::error(
+                        id,
+                        -32002,
+                        "the session is rebuilding; try again in a moment",
+                        None,
+                    );
+                    self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                    return;
+                }
+
+                self.handle_revert(dir, viewer_id, viewer, id).await;
+            }
             SessionMsg::Rebuilt {
                 token,
                 frames,
@@ -3660,49 +3815,7 @@ impl Session {
                 self.sync_inflight().await;
                 self.fail_pending_requests("connection_replaced");
 
-                let head = self.log.head();
-                let reset_frame = json!({
-                    "jsonrpc": "2.0",
-                    "method": "_honk/reset",
-                    "params": {
-                        "sessionId": self.sid,
-                        "epoch": head.epoch,
-                    }
-                });
-                let replay_done_frame = json!({
-                    "jsonrpc": "2.0",
-                    "method": "_honk/replay_done",
-                    "params": {
-                        "sessionId": self.sid,
-                        "epoch": head.epoch,
-                        "seq": head.seq,
-                    }
-                });
-
-                let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
-                msgs.push(axum::extract::ws::Message::Text(
-                    reset_frame.to_string().into(),
-                ));
-                for entry in self.log.entries() {
-                    msgs.push(axum::extract::ws::Message::Text(
-                        entry.frame.to_string().into(),
-                    ));
-                }
-                msgs.push(axum::extract::ws::Message::Text(
-                    replay_done_frame.to_string().into(),
-                ));
-
-                for (tx, is_honk_aware) in self.viewers.values() {
-                    if *is_honk_aware {
-                        let batch = crate::viewer::ReplayBatch {
-                            session_id: self.sid.clone(),
-                            head: head.clone(),
-                            msgs: msgs.clone(),
-                            done_tx: None,
-                        };
-                        let _ = tx.send_replay(batch);
-                    }
-                }
+                self.fan_out_reset_and_replay();
 
                 for ev in initial_events {
                     self.on_upstream(ev).await;
@@ -4308,6 +4421,629 @@ impl Session {
             self.send_to_viewer(vid, frame);
         }
     }
+
+    fn fan_out_reset_and_replay(&self) {
+        let head = self.log.head();
+        let reset_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/reset",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
+            }
+        });
+        let replay_done_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "_honk/replay_done",
+            "params": {
+                "sessionId": self.sid,
+                "epoch": head.epoch,
+                "seq": head.seq,
+            }
+        });
+
+        let mut msgs = Vec::with_capacity(self.log.entries().len() + 2);
+        msgs.push(axum::extract::ws::Message::Text(
+            reset_frame.to_string().into(),
+        ));
+        for entry in self.log.entries() {
+            msgs.push(axum::extract::ws::Message::Text(
+                entry.frame.to_string().into(),
+            ));
+        }
+        msgs.push(axum::extract::ws::Message::Text(
+            replay_done_frame.to_string().into(),
+        ));
+
+        for (tx, is_honk_aware) in self.viewers.values() {
+            if *is_honk_aware {
+                let batch = crate::viewer::ReplayBatch {
+                    session_id: self.sid.clone(),
+                    head: head.clone(),
+                    msgs: msgs.clone(),
+                    done_tx: None,
+                };
+                let _ = tx.send_replay(batch);
+            }
+        }
+    }
+
+    fn send_to_viewer_or_fallback(&mut self, viewer_id: ViewerId, viewer: &ViewerTx, frame: Value) {
+        if !self.send_to_viewer(viewer_id, frame.clone()) {
+            let _ = viewer.send_frame(axum::extract::ws::Message::Text(frame.to_string().into()));
+        }
+    }
+
+    async fn handle_revert(
+        &mut self,
+        dir: RevertDir,
+        viewer_id: ViewerId,
+        viewer: ViewerTx,
+        id: Value,
+    ) {
+        let supported = {
+            let init_lock = self.hub.control_init_result.read().unwrap();
+            let res = init_lock.get("result").unwrap_or(&*init_lock);
+            res.pointer("/agentCapabilities/_meta/goose/truncateFromMessage")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        if !supported {
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                "goose does not support undo (needs patched goose with truncateFromMessage)",
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        if self.state != ActorState::Live || self.reactivating {
+            let err = crate::rpc::error(id, -32002, "session is not live", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+        if self.turn.is_running() {
+            let err = crate::rpc::error(id, -32002, "a turn is running", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+        if !self.pending_server_requests.is_empty() {
+            let err = crate::rpc::error(id, -32002, "a permission request is pending", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+        if !self.pending_requests.is_empty()
+            || !self.turn.steers.is_empty()
+            || !self.queued_msgs.is_empty()
+        {
+            let err = crate::rpc::error(id, -32002, "prompts are queued", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+        if self.mcp_op_running {
+            let err = crate::rpc::error(id, -32002, "an mcp operation is in progress", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        match dir {
+            RevertDir::Undo => self.handle_undo(viewer_id, viewer, id).await,
+            RevertDir::Redo => self.handle_redo(viewer_id, viewer, id).await,
+        }
+    }
+
+    /// Handles `_honk/undo` requests.
+    ///
+    /// Reply shape:
+    /// ```json
+    /// {
+    ///   "turns": <count>,   // distinct user prompt messageIds removed
+    ///   "text": "<text>",   // target prompt text
+    ///   "messageId": "<id>" // target goose message id
+    /// }
+    /// ```
+    async fn handle_undo(&mut self, viewer_id: ViewerId, viewer: ViewerTx, id: Value) {
+        let export_val = match self.hub.export(&self.sid).await {
+            Ok(v) => v,
+            Err(e) => {
+                let err =
+                    crate::rpc::error(id, -32002, format!("failed to export session: {e:#}"), None);
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        let conversation = match export_val.get("conversation").and_then(Value::as_array) {
+            Some(c) => c,
+            None => {
+                let err = crate::rpc::error(id, -32002, "nothing to undo", None);
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        let stops: Vec<String> = conversation
+            .iter()
+            .filter(|m| is_human_stop(m))
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+            .collect();
+
+        let current_target = {
+            let s = self.state_store.lock().await;
+            s.state().reverts.get(&self.sid).map(|r| r.target.clone())
+        };
+
+        let target = match current_target {
+            Some(cur) => {
+                let cur_pos = stops.iter().position(|s| s == &cur);
+                match cur_pos {
+                    Some(p) if p > 0 => Some(stops[p - 1].clone()),
+                    Some(_) => None,
+                    None => {
+                        let cur_conv_idx = conversation
+                            .iter()
+                            .position(|m| m.get("id").and_then(Value::as_str) == Some(&cur));
+                        match cur_conv_idx {
+                            Some(c_idx) => conversation[..c_idx]
+                                .iter()
+                                .rev()
+                                .find(|m| is_human_stop(m))
+                                .and_then(|m| {
+                                    m.get("id").and_then(Value::as_str).map(String::from)
+                                }),
+                            None => None,
+                        }
+                    }
+                }
+            }
+            None => stops.last().cloned(),
+        };
+
+        let Some(target) = target else {
+            let err = crate::rpc::error(id, -32002, "nothing to undo", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        };
+
+        let target_conv_idx = conversation
+            .iter()
+            .position(|m| m.get("id").and_then(Value::as_str) == Some(&target));
+        let Some(target_conv_idx) = target_conv_idx else {
+            let err = crate::rpc::error(id, -32002, "nothing to undo", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        };
+
+        let target_row = &conversation[target_conv_idx];
+        let target_agent_invisible = target_row
+            .pointer("/metadata/agentVisible")
+            .or_else(|| target_row.pointer("/metadata/agent_visible"))
+            .and_then(Value::as_bool)
+            == Some(false);
+        if target_agent_invisible {
+            let err = crate::rpc::error(id, -32002, "can't undo past a compaction", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        let target_text = extract_msg_text(&conversation[target_conv_idx]);
+        let prompts_before = honk_wire::export::client_prompt_entries(conversation)
+            .filter(|(i, _)| *i < target_conv_idx)
+            .count() as u64;
+
+        let cut_idx = self
+            .log
+            .entries()
+            .iter()
+            .position(|e| is_user_message_chunk_with_id(&e.frame, &target));
+        let Some(cut_idx) = cut_idx else {
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                "turn not found in the transcript; try again after it is rebuilt",
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        };
+
+        let kept_entries = &self.log.entries()[..cut_idx];
+        let tail_entries = &self.log.entries()[cut_idx..];
+        let tail_frames: Vec<Value> = tail_entries.iter().map(|e| e.frame.clone()).collect();
+        let kept_frames: Vec<(Option<u64>, Value)> = kept_entries
+            .iter()
+            .map(|e| (e.upstream_id, e.frame.clone()))
+            .collect();
+        let turns = tail_entries
+            .iter()
+            .filter_map(|e| user_message_chunk_id(&e.frame))
+            .collect::<HashSet<_>>()
+            .len();
+
+        let prev_sidecar = self.log.read_redo_sidecar().unwrap_or_default();
+
+        // Crash safety write order:
+        // 1. Write redo sidecar with the undone tail frames.
+        // 2. Bump epoch and create the new log generation without the undone tail.
+        // 3. Persist the revert state in state store LAST.
+        // If a crash occurs between step 1 and step 3, state store has no revert entry,
+        // and create_new_generation_from_export cleans up any orphaned sidecar on restart/rebuild.
+        if let Err(e) = self.log.prepend_redo_sidecar(&tail_frames) {
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                format!("failed to update redo sidecar: {e:#}"),
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        let next_epoch = match bump_epoch(&self.sid, self.log.path(), &self.state_store).await {
+            Ok(ep) => ep,
+            Err(e) => {
+                restore_sidecar(&self.log, &prev_sidecar);
+                let err =
+                    crate::rpc::error(id, -32002, format!("failed to bump epoch: {e:#}"), None);
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        let new_log = match crate::log::SessionLog::create(
+            self.log.path(),
+            next_epoch,
+            self.last_processed_session_id,
+            kept_frames,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                restore_sidecar(&self.log, &prev_sidecar);
+                let err = crate::rpc::error(
+                    id,
+                    -32002,
+                    format!("failed to create log generation: {e:#}"),
+                    None,
+                );
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        self.log = new_log;
+        self.last_processed_session_id = self.log.last_upstream_id();
+        if let Some(u) = crate::log::last_usage_frame(self.log.entries())
+            .and_then(|f| honk_wire::usage(f.pointer("/params/update")?))
+        {
+            self.last_usage = Some(u);
+        }
+        let _ = std::fs::remove_file(
+            self.state_dir
+                .join("sessions")
+                .join(format!("{}.replies.jsonl", self.sid)),
+        );
+        self.sync_inflight().await;
+        self.fan_out_reset_and_replay();
+
+        let save_res = {
+            let mut s = self.state_store.lock().await;
+            s.mutate(|st| {
+                st.reverts.insert(
+                    self.sid.clone(),
+                    crate::state::Revert {
+                        target: target.clone(),
+                        stops,
+                        prompts_before,
+                    },
+                );
+            })
+        };
+        if let Err(e) = save_res {
+            restore_sidecar(&self.log, &prev_sidecar);
+            // The log already swapped to new_log with the undone tail removed.
+            // Since saving the revert state in state store failed, rebuild from goose
+            // so the log transcript is restored to the full upstream state.
+            self.start_rebuild().await;
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                format!("failed to persist revert state: {e:#}"),
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        let reply = json!({
+            "turns": turns,
+            "text": target_text,
+            "messageId": target,
+        });
+        let resp = crate::rpc::response(id, reply);
+        self.send_to_viewer_or_fallback(viewer_id, &viewer, resp);
+    }
+
+    /// Handles `_honk/redo` requests.
+    ///
+    /// Reply shape:
+    /// ```json
+    /// {
+    ///   "restored": <count>, // count of user prompts restored to the log
+    ///   "cleared": <bool>    // true iff all undone turns have been restored and revert is cleared
+    /// }
+    /// ```
+    async fn handle_redo(&mut self, viewer_id: ViewerId, viewer: ViewerTx, id: Value) {
+        let revert = {
+            let s = self.state_store.lock().await;
+            s.state().reverts.get(&self.sid).cloned()
+        };
+        let Some(revert) = revert else {
+            let err = crate::rpc::error(id, -32002, "nothing to redo", None);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        };
+
+        let sidecar_frames = match self.log.read_redo_sidecar() {
+            Ok(f) => f,
+            Err(e) => {
+                let err = crate::rpc::error(
+                    id,
+                    -32002,
+                    format!("failed to read redo sidecar: {e:#}"),
+                    None,
+                );
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        if sidecar_frames.is_empty() {
+            {
+                let mut s = self.state_store.lock().await;
+                let _ = s.mutate(|st| {
+                    st.reverts.remove(&self.sid);
+                });
+            }
+            let _ = self.log.delete_redo_sidecar();
+            let reply = json!({ "restored": 0, "cleared": true });
+            let resp = crate::rpc::response(id, reply);
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, resp);
+            return;
+        }
+
+        let cur_pos = revert.stops.iter().position(|s| s == &revert.target);
+        let candidate_stops = match cur_pos {
+            Some(p) => &revert.stops[p + 1..],
+            None => &revert.stops[..],
+        };
+
+        let next_stop_and_idx = candidate_stops.iter().find_map(|stop_id| {
+            let idx = sidecar_frames
+                .iter()
+                .position(|f| is_user_message_chunk_with_id(f, stop_id));
+            idx.map(|i| (stop_id.clone(), i))
+        });
+
+        let (frames_to_restore, frames_to_keep, next_opt) = match next_stop_and_idx {
+            Some((next, idx)) => (&sidecar_frames[..idx], &sidecar_frames[idx..], Some(next)),
+            None => (&sidecar_frames[..], &[][..], None),
+        };
+
+        let new_prompts_before = if let Some(ref next) = next_opt {
+            let export_val = match self.hub.export(&self.sid).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = crate::rpc::error(
+                        id,
+                        -32002,
+                        format!("failed to export session: {e:#}"),
+                        None,
+                    );
+                    self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                    return;
+                }
+            };
+            let conversation = export_val.get("conversation").and_then(Value::as_array);
+            let target_conv_idx = conversation.and_then(|conv| {
+                conv.iter()
+                    .position(|m| m.get("id").and_then(Value::as_str) == Some(next))
+            });
+            match (conversation, target_conv_idx) {
+                (Some(conv), Some(idx)) => honk_wire::export::client_prompt_entries(conv)
+                    .filter(|(i, _)| *i < idx)
+                    .count() as u64,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
+        let restored = frames_to_restore
+            .iter()
+            .filter_map(|f| user_message_chunk_id(f))
+            .collect::<HashSet<_>>()
+            .len();
+
+        let prev_sidecar = self.log.read_redo_sidecar().unwrap_or_default();
+
+        let mut combined_frames: Vec<(Option<u64>, Value)> = self
+            .log
+            .entries()
+            .iter()
+            .map(|e| (e.upstream_id, e.frame.clone()))
+            .collect();
+        for f in frames_to_restore {
+            combined_frames.push((None, f.clone()));
+        }
+
+        let next_epoch = match bump_epoch(&self.sid, self.log.path(), &self.state_store).await {
+            Ok(ep) => ep,
+            Err(e) => {
+                let err =
+                    crate::rpc::error(id, -32002, format!("failed to bump epoch: {e:#}"), None);
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        let new_log = match crate::log::SessionLog::create(
+            self.log.path(),
+            next_epoch,
+            self.last_processed_session_id,
+            combined_frames,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let err = crate::rpc::error(
+                    id,
+                    -32002,
+                    format!("failed to create log generation: {e:#}"),
+                    None,
+                );
+                self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+                return;
+            }
+        };
+
+        self.log = new_log;
+        self.last_processed_session_id = self.log.last_upstream_id();
+        if let Some(u) = crate::log::last_usage_frame(self.log.entries())
+            .and_then(|f| honk_wire::usage(f.pointer("/params/update")?))
+        {
+            self.last_usage = Some(u);
+        }
+        let _ = std::fs::remove_file(
+            self.state_dir
+                .join("sessions")
+                .join(format!("{}.replies.jsonl", self.sid)),
+        );
+        self.sync_inflight().await;
+        self.fan_out_reset_and_replay();
+
+        let cleared = next_opt.is_none();
+        let sidecar_res = if next_opt.is_some() {
+            self.log.write_redo_sidecar(frames_to_keep)
+        } else {
+            self.log.delete_redo_sidecar()
+        };
+        if let Err(e) = sidecar_res {
+            restore_sidecar(&self.log, &prev_sidecar);
+            // The log already swapped to new_log with restored turns.
+            // Since updating the sidecar failed, rebuild from goose to ensure clean state.
+            self.start_rebuild().await;
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                format!("failed to update redo sidecar: {e:#}"),
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        let state_res = {
+            let mut s = self.state_store.lock().await;
+            s.mutate(|st| {
+                if let Some(next) = next_opt {
+                    if let Some(r) = st.reverts.get_mut(&self.sid) {
+                        r.target = next;
+                        r.prompts_before = new_prompts_before;
+                    }
+                } else {
+                    st.reverts.remove(&self.sid);
+                }
+            })
+        };
+        if let Err(e) = state_res {
+            restore_sidecar(&self.log, &prev_sidecar);
+            // The log already swapped. Since saving state failed, rebuild from goose.
+            self.start_rebuild().await;
+            let err = crate::rpc::error(
+                id,
+                -32002,
+                format!("failed to persist revert state: {e:#}"),
+                None,
+            );
+            self.send_to_viewer_or_fallback(viewer_id, &viewer, err);
+            return;
+        }
+
+        let reply = json!({
+            "restored": restored,
+            "cleared": cleared,
+        });
+        let resp = crate::rpc::response(id, reply);
+        self.send_to_viewer_or_fallback(viewer_id, &viewer, resp);
+    }
+}
+
+fn restore_sidecar(log: &crate::log::SessionLog, prev: &[Value]) {
+    if prev.is_empty() {
+        let _ = log.delete_redo_sidecar();
+    } else {
+        let _ = log.write_redo_sidecar(prev);
+    }
+}
+
+fn is_human_stop(msg: &Value) -> bool {
+    if msg.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match msg.get("id").and_then(Value::as_str) {
+        Some(s) if s.starts_with("msg_honk_") => {}
+        _ => return false,
+    };
+    if msg.pointer("/metadata/steer").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if !honk_wire::export::is_message_user_visible(msg) {
+        return false;
+    }
+    let text = extract_msg_text(msg);
+    if text.trim().starts_with('/') {
+        return false;
+    }
+    honk_wire::is_human_prompt(&text)
+}
+
+fn user_message_chunk_id(frame: &Value) -> Option<&str> {
+    frame.pointer("/params/update").and_then(|u| {
+        if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk") {
+            u.get("messageId")
+                .or_else(|| u.pointer("/_meta/goose/messageId"))
+                .and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
+}
+
+fn extract_msg_text(msg: &Value) -> String {
+    let mut text = String::new();
+    if let Some(content) = msg.get("content").and_then(Value::as_array) {
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(t) = block.get("text").and_then(Value::as_str)
+            {
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
+fn is_user_message_chunk_with_id(frame: &Value, expected_id: &str) -> bool {
+    frame.pointer("/params/update").and_then(|u| {
+        if u.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk") {
+            u.get("messageId")
+                .or_else(|| u.pointer("/_meta/goose/messageId"))
+                .and_then(Value::as_str)
+        } else {
+            None
+        }
+    }) == Some(expected_id)
 }
 
 pub(crate) fn append_reply_sidecar(
@@ -4364,6 +5100,7 @@ pub(crate) fn load_reply_sidecar(path: &Path) -> HashMap<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::Inflight;
     use serde_json::json;
 
     fn text_frame(sid: &str, text: &str) -> Value {
@@ -4783,6 +5520,20 @@ mod tests {
         let (replay_tx, _replay_rx) = tokio::sync::mpsc::channel(1);
         let evict = Arc::new(tokio::sync::Notify::new());
         crate::viewer::ViewerTx::new(tx, replay_tx, evict)
+    }
+
+    fn test_viewer_tx_with_replay(
+        tx: tokio::sync::mpsc::Sender<axum::extract::ws::Message>,
+    ) -> (
+        crate::viewer::ViewerTx,
+        tokio::sync::mpsc::Receiver<crate::viewer::ReplayBatch>,
+    ) {
+        let (replay_tx, replay_rx) = tokio::sync::mpsc::channel(10);
+        let evict = Arc::new(tokio::sync::Notify::new());
+        (
+            crate::viewer::ViewerTx::new(tx, replay_tx, evict),
+            replay_rx,
+        )
     }
 
     #[tokio::test]
@@ -5794,5 +6545,2002 @@ mod tests {
 
         assert!(!session.mcp_op_running, "mcp_op_running must stay false");
         assert!(session.rx.try_recv().is_err(), "no task should be spawned");
+    }
+
+    #[tokio::test]
+    async fn test_synth_user_block_message_id() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_synth_id_test", ActorState::Live).await;
+
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_42".to_string()),
+        };
+
+        // Case 1: Prompt params carry injected messageId
+        let params_with_id = json!({
+            "prompt": "hello with id",
+            "_meta": {
+                "goose": {
+                    "messageId": "msg_honk_abcdef1234567890abcdef1234567890"
+                }
+            }
+        });
+
+        session
+            .execute_actions(vec![Action::SynthUser {
+                params: params_with_id,
+                owner: owner.clone(),
+                upstream_id: Some("up_1".to_string()),
+            }])
+            .await;
+
+        let entries = session.log.entries();
+        assert_eq!(entries.len(), 1);
+        let update = entries[0].frame.pointer("/params/update").unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(Value::as_str),
+            Some("user_message_chunk")
+        );
+        assert_eq!(
+            update.get("messageId").and_then(Value::as_str),
+            Some("msg_honk_abcdef1234567890abcdef1234567890")
+        );
+
+        // Case 2: Prompt params do NOT carry injected messageId -> fallback to synth_{crid}
+        let params_without_id = json!({
+            "prompt": "hello fallback"
+        });
+
+        session
+            .execute_actions(vec![Action::SynthUser {
+                params: params_without_id,
+                owner,
+                upstream_id: Some("up_2".to_string()),
+            }])
+            .await;
+
+        let entries = session.log.entries();
+        assert_eq!(entries.len(), 2);
+        let update2 = entries[1].frame.pointer("/params/update").unwrap();
+        assert_eq!(
+            update2.get("messageId").and_then(Value::as_str),
+            Some("synth_req_42")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_goose_echo_live() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_echo_live_test", ActorState::Live).await;
+
+        // Simulate prompt in flight
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_1".to_string()),
+        };
+        let params = json!({"prompt": "compact"});
+        let _ = session.turn.on_prompt(owner, params, &mut session.ids);
+        let prompt_id = session
+            .turn
+            .current_prompt_msg_id()
+            .expect("prompt id present")
+            .to_string();
+
+        // 1. Goose echoes the prompt back with matching messageId
+        let echo_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": prompt_id,
+                    "content": { "type": "text", "text": "compact" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                echo_frame,
+                Some(101),
+            ))
+            .await;
+
+        // Verify echo is NOT in log
+        assert_eq!(session.log.entries().len(), 0);
+        // Verify upstream event id was marked processed
+        assert_eq!(session.last_processed_session_id, Some(101));
+        assert_eq!(session.log.last_upstream_id(), Some(101));
+
+        // 2. A different user_message_chunk arrives (e.g. steer or different id)
+        let other_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_other_9999",
+                    "content": { "type": "text", "text": "other text" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                other_frame,
+                Some(102),
+            ))
+            .await;
+
+        // Verify other frame IS in log
+        assert_eq!(session.log.entries().len(), 1);
+        assert_eq!(
+            session.log.entries()[0]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("msg_other_9999")
+        );
+        assert_eq!(session.last_processed_session_id, Some(102));
+        assert_eq!(session.log.last_upstream_id(), Some(102));
+    }
+
+    #[tokio::test]
+    async fn test_drop_goose_echo_rebuilding() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_echo_rebuild_test", ActorState::Rebuilding).await;
+
+        let owner = OwnerRef {
+            viewer: Some(1),
+            downstream_id: json!(10),
+            client_req_id: Some("req_1".to_string()),
+        };
+        let params = json!({"prompt": "compact"});
+        let _ = session.turn.on_prompt(owner, params, &mut session.ids);
+        let prompt_id = session
+            .turn
+            .current_prompt_msg_id()
+            .expect("prompt id present")
+            .to_string();
+
+        // 1. Goose echo arrives during rebuilding
+        let echo_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": prompt_id,
+                    "content": { "type": "text", "text": "compact" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                echo_frame,
+                Some(201),
+            ))
+            .await;
+
+        // Verify echo is NOT in rebuilding_buffered_frames
+        assert_eq!(session.rebuilding_buffered_frames.len(), 0);
+        // Verify upstream event id was marked processed
+        assert_eq!(session.last_processed_session_id, Some(201));
+        assert_eq!(session.log.last_upstream_id(), Some(201));
+
+        // 2. A different user_message_chunk arrives during rebuilding
+        let other_frame = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session.sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_other_7777",
+                    "content": { "type": "text", "text": "other" }
+                }
+            }
+        });
+
+        session
+            .on_upstream(honk_upstream::Event::Frame(
+                honk_upstream::StreamKey::Session(session.sid.clone()),
+                other_frame,
+                Some(202),
+            ))
+            .await;
+
+        // Verify other frame IS in rebuilding_buffered_frames
+        assert_eq!(session.rebuilding_buffered_frames.len(), 1);
+        assert_eq!(session.last_processed_session_id, Some(202));
+    }
+
+    #[tokio::test]
+    async fn test_undo_missing_capability_refusal() {
+        let (mut session, _d, _fake) = create_test_session("ses_undo_cap", ActorState::Live).await;
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Capability is not set in control_init_result
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(10),
+            })
+            .await;
+
+        let resp_msg = v_rx.recv().await.expect("response received");
+        let axum::extract::ws::Message::Text(t) = resp_msg else {
+            panic!("expected text message");
+        };
+        let resp: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(resp["id"], 10);
+        assert_eq!(resp["error"]["code"], -32002);
+        assert_eq!(
+            resp["error"]["message"].as_str().unwrap(),
+            "goose does not support undo (needs patched goose with truncateFromMessage)"
+        );
+    }
+
+    fn enable_truncate_capability(session: &Session) {
+        *session.hub.control_init_result.write().unwrap() = json!({
+            "result": {
+                "agentCapabilities": {
+                    "_meta": {
+                        "goose": {
+                            "truncateFromMessage": true
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_undo_busy_refusals() {
+        let (mut session, _d, _fake) = create_test_session("ses_undo_busy", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // 1. Run active -> "a turn is running"
+        session.turn.run = Some("run_1".to_string());
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(1),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "a turn is running");
+        session.turn.run = None;
+
+        // 2. Inflight prompt -> "a turn is running"
+        session.turn.inflight = Some(Inflight {
+            upstream_id: "up_1".into(),
+            owners: vec![],
+            params: json!({"prompt": "p"}),
+            announced: true,
+            run_id: None,
+            prompt_index: 0,
+        });
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(2),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "a turn is running");
+        session.turn.inflight = None;
+
+        // 3. Parked prompt -> "a turn is running"
+        session
+            .turn
+            .parked
+            .push((vec![], json!({"prompt": "parked"})));
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(3),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "a turn is running");
+        session.turn.parked.clear();
+
+        // 4. Pending server requests -> "a permission request is pending"
+        session
+            .pending_server_requests
+            .push(crate::state::PendingRequest {
+                id: json!(1),
+                method: "requestPermission".into(),
+                params: json!({}),
+                received_unix: 1234,
+            });
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(4),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "a permission request is pending");
+        session.pending_server_requests.clear();
+
+        // 5. Unconsumed steers -> "prompts are queued"
+        session.turn.steers.push(("msg_steer".into(), 1));
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(5),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "prompts are queued");
+        session.turn.steers.clear();
+
+        // 6. Queued msgs -> "prompts are queued"
+        session.queued_msgs.push_back(SessionMsg::Cancel);
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(6),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "prompts are queued");
+        session.queued_msgs.clear();
+
+        // 7. MCP op running -> "an mcp operation is in progress"
+        session.mcp_op_running = true;
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(7),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "an mcp operation is in progress");
+        session.mcp_op_running = false;
+
+        // 8. Reactivating -> "session is not live"
+        session.reactivating = true;
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(8),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "session is not live");
+        session.reactivating = false;
+    }
+
+    #[tokio::test]
+    async fn test_undo_nothing_to_undo_and_compaction_guard() {
+        let (mut session, _d, fake) =
+            create_test_session("ses_undo_guards", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Case 1: Empty conversation -> "nothing to undo"
+        fake.set_export_data(&session.sid, json!({ "conversation": [] }));
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(1),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "nothing to undo");
+
+        // Case 2: Conversation has only non-human stops (wake, swarm, goose prompt, steer, non-msg_honk id, slash commands)
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": "msg_honk_1",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "[sw wake run=r reason=x] wake text"}]
+                    },
+                    {
+                        "id": "msg_honk_2",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "<swarm_message from=\"ses_a\">msg</swarm_message>"}]
+                    },
+                    {
+                        "id": "msg_honk_3",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "You are goose session 123"}]
+                    },
+                    {
+                        "id": "msg_honk_4",
+                        "role": "user",
+                        "metadata": {"steer": true},
+                        "content": [{"type": "text", "text": "human text but steer"}]
+                    },
+                    {
+                        "id": "non_honk_id",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "human text but wrong id prefix"}]
+                    },
+                    {
+                        "id": "msg_honk_5",
+                        "role": "user",
+                        "metadata": {"userVisible": false},
+                        "content": [{"type": "text", "text": "human text but userVisible false"}]
+                    },
+                    {
+                        "id": "msg_honk_6",
+                        "role": "user",
+                        "content": [{"type": "text", "text": "   /goal write tests"}]
+                    }
+                ]
+            }),
+        );
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(2),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "nothing to undo");
+
+        // Case 3a: Compacted target (target row has metadata.agentVisible: false) -> refuses!
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": "msg_honk_compacted",
+                        "role": "user",
+                        "metadata": {"agentVisible": false},
+                        "content": [{"type": "text", "text": "compacted prompt"}]
+                    }
+                ]
+            }),
+        );
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(3),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "can't undo past a compaction");
+
+        // Case 3b: Slash-command or agent-invisible row after the target does NOT block undo!
+        let target_id = "msg_honk_target_visible";
+        session
+            .log
+            .append(vec![(
+                Some(1),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session.sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": target_id,
+                            "content": { "type": "text", "text": "visible target" }
+                        }
+                    }
+                }),
+            )])
+            .unwrap();
+
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": target_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "visible target"}]
+                    },
+                    {
+                        "id": "msg_slash_reply",
+                        "role": "assistant",
+                        "metadata": {"agentVisible": false},
+                        "content": [{"type": "text", "text": "slash reply with agentVisible false"}]
+                    }
+                ]
+            }),
+        );
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(32),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["id"], 32);
+        assert_eq!(r["result"]["messageId"], target_id);
+
+        // Case 4: Redo when nothing to redo
+        // Clear reverts first
+        {
+            let mut s = session.state_store.lock().await;
+            let _ = s.mutate(|st| {
+                st.reverts.remove(&session.sid);
+            });
+        }
+        let _ = session.log.delete_redo_sidecar();
+
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Redo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(4),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["error"]["message"], "nothing to redo");
+    }
+
+    #[tokio::test]
+    async fn test_undo_and_redo_full_flow() {
+        let (mut session, _d, fake) =
+            create_test_session("ses_undo_redo_flow", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(100);
+        let (viewer, mut replay_rx) = test_viewer_tx_with_replay(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Helper to construct frames
+        let user_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session.sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+        let asst_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session.sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+
+        // Populate initial log with Turn 1 and Turn 2
+        let h1_id = "msg_honk_00000000000000000000000000000001";
+        let h2_id = "msg_honk_00000000000000000000000000000002";
+        session
+            .log
+            .append(vec![
+                (Some(1), user_frame(h1_id, "first prompt")),
+                (Some(2), asst_frame("asst_1", "reply 1")),
+                (Some(3), user_frame(h2_id, "second prompt")),
+                (Some(4), asst_frame("asst_2", "reply 2")),
+            ])
+            .unwrap();
+
+        // Populate export in fake goose
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": h1_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first prompt"}]
+                    },
+                    {
+                        "id": "asst_1",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 1"}]
+                    },
+                    {
+                        "id": h2_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "second prompt"}]
+                    },
+                    {
+                        "id": "asst_2",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 2"}]
+                    }
+                ]
+            }),
+        );
+
+        // Drain any attach frames
+        while v_rx.try_recv().is_ok() {}
+
+        // --- 1. Undo once: undoes Turn 2 ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(10),
+            })
+            .await;
+
+        // Verify response to viewer
+        let resp_msg = v_rx.recv().await.unwrap();
+        let axum::extract::ws::Message::Text(t) = resp_msg else {
+            panic!()
+        };
+        let resp: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(resp["id"], 10);
+        assert!(resp["result"].get("undone").is_none());
+        assert_eq!(resp["result"]["turns"], 1);
+        assert_eq!(resp["result"]["text"], "second prompt");
+        assert_eq!(resp["result"]["messageId"], h2_id);
+
+        // Verify log has only Turn 1 (2 entries)
+        assert_eq!(session.log.entries().len(), 2);
+        assert_eq!(
+            session.log.entries()[0]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+
+        // Verify sidecar has Turn 2 (2 entries)
+        let sidecar = session.log.read_redo_sidecar().unwrap();
+        assert_eq!(sidecar.len(), 2);
+        assert_eq!(
+            sidecar[0]
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h2_id)
+        );
+
+        // Verify state has revert
+        {
+            let s = session.state_store.lock().await;
+            let rev = s.state().reverts.get(&session.sid).unwrap();
+            assert_eq!(rev.target, h2_id);
+            assert_eq!(rev.stops, vec![h1_id, h2_id]);
+            assert_eq!(rev.prompts_before, 1);
+        }
+
+        // Verify fan-out: _honk/reset first, kept entries, _honk/replay_done last
+        let batch1 = replay_rx.recv().await.expect("replay batch 1");
+        assert_eq!(batch1.session_id, session.sid);
+        assert_eq!(batch1.msgs.len(), 4);
+        let axum::extract::ws::Message::Text(reset_t1) = &batch1.msgs[0] else {
+            panic!()
+        };
+        let reset_v1: Value = serde_json::from_str(reset_t1).unwrap();
+        assert_eq!(reset_v1["method"], "_honk/reset");
+        assert_eq!(reset_v1["params"]["sessionId"], session.sid);
+        assert_eq!(reset_v1["params"]["epoch"], 2);
+
+        let axum::extract::ws::Message::Text(e1) = &batch1.msgs[1] else {
+            panic!()
+        };
+        let e1_v: Value = serde_json::from_str(e1).unwrap();
+        assert_eq!(
+            e1_v.pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+
+        let axum::extract::ws::Message::Text(e2) = &batch1.msgs[2] else {
+            panic!()
+        };
+        let e2_v: Value = serde_json::from_str(e2).unwrap();
+        assert_eq!(
+            e2_v.pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("asst_1")
+        );
+
+        let axum::extract::ws::Message::Text(done_t1) = &batch1.msgs[3] else {
+            panic!()
+        };
+        let done_v1: Value = serde_json::from_str(done_t1).unwrap();
+        assert_eq!(done_v1["method"], "_honk/replay_done");
+        assert_eq!(done_v1["params"]["sessionId"], session.sid);
+        assert_eq!(done_v1["params"]["epoch"], 2);
+        assert_eq!(done_v1["params"]["seq"], 2);
+
+        // --- 2. Undo twice: undoes Turn 1 ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(20),
+            })
+            .await;
+
+        let resp_msg2 = v_rx.recv().await.unwrap();
+        let axum::extract::ws::Message::Text(t2) = resp_msg2 else {
+            panic!()
+        };
+        let resp2: Value = serde_json::from_str(&t2).unwrap();
+        assert_eq!(resp2["id"], 20);
+        assert!(resp2["result"].get("undone").is_none());
+        assert_eq!(resp2["result"]["turns"], 1);
+        assert_eq!(resp2["result"]["text"], "first prompt");
+        assert_eq!(resp2["result"]["messageId"], h1_id);
+
+        // Verify log is empty (0 entries)
+        assert_eq!(session.log.entries().len(), 0);
+
+        // Verify sidecar has Turn 1 then Turn 2 (4 entries, oldest first!)
+        let sidecar2 = session.log.read_redo_sidecar().unwrap();
+        assert_eq!(sidecar2.len(), 4);
+        assert_eq!(
+            sidecar2[0]
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+        assert_eq!(
+            sidecar2[2]
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h2_id)
+        );
+
+        // Verify state revert updated
+        {
+            let s = session.state_store.lock().await;
+            let rev = s.state().reverts.get(&session.sid).unwrap();
+            assert_eq!(rev.target, h1_id);
+            assert_eq!(rev.stops, vec![h1_id, h2_id]);
+            assert_eq!(rev.prompts_before, 0);
+        }
+
+        // Verify fan-out: _honk/reset first, 0 entries, _honk/replay_done last
+        let batch2 = replay_rx.recv().await.expect("replay batch 2");
+        assert_eq!(batch2.session_id, session.sid);
+        assert_eq!(batch2.msgs.len(), 2);
+        let axum::extract::ws::Message::Text(reset_t2) = &batch2.msgs[0] else {
+            panic!()
+        };
+        let reset_v2: Value = serde_json::from_str(reset_t2).unwrap();
+        assert_eq!(reset_v2["method"], "_honk/reset");
+        assert_eq!(reset_v2["params"]["epoch"], 3);
+
+        let axum::extract::ws::Message::Text(done_t2) = &batch2.msgs[1] else {
+            panic!()
+        };
+        let done_v2: Value = serde_json::from_str(done_t2).unwrap();
+        assert_eq!(done_v2["method"], "_honk/replay_done");
+        assert_eq!(done_v2["params"]["epoch"], 3);
+        assert_eq!(done_v2["params"]["seq"], 0);
+
+        // --- 3. Undo third time: nothing to undo ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(30),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t3) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let resp3: Value = serde_json::from_str(&t3).unwrap();
+        assert_eq!(resp3["error"]["message"], "nothing to undo");
+
+        // --- 4. Redo once (partial redo: restores Turn 1) ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Redo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(40),
+            })
+            .await;
+
+        let resp_msg4 = v_rx.recv().await.unwrap();
+        let axum::extract::ws::Message::Text(t4) = resp_msg4 else {
+            panic!()
+        };
+        let resp4: Value = serde_json::from_str(&t4).unwrap();
+        assert_eq!(resp4["id"], 40);
+        assert_eq!(resp4["result"]["restored"], 1);
+        assert_eq!(resp4["result"]["cleared"], false);
+
+        // Verify log has Turn 1 restored (2 entries)
+        assert_eq!(session.log.entries().len(), 2);
+        assert_eq!(
+            session.log.entries()[0]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+
+        // Verify sidecar still has Turn 2
+        let sidecar3 = session.log.read_redo_sidecar().unwrap();
+        assert_eq!(sidecar3.len(), 2);
+        assert_eq!(
+            sidecar3[0]
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h2_id)
+        );
+
+        // Verify revert target moved to h2_id AND prompts_before recomputed (item 1)
+        {
+            let s = session.state_store.lock().await;
+            let rev = s.state().reverts.get(&session.sid).unwrap();
+            assert_eq!(rev.target, h2_id);
+            assert_eq!(rev.prompts_before, 1);
+        }
+
+        // Verify fan-out for partial redo
+        let batch3 = replay_rx.recv().await.expect("replay batch 3");
+        assert_eq!(batch3.session_id, session.sid);
+        assert_eq!(batch3.msgs.len(), 4);
+        let axum::extract::ws::Message::Text(reset_t3) = &batch3.msgs[0] else {
+            panic!()
+        };
+        let reset_v3: Value = serde_json::from_str(reset_t3).unwrap();
+        assert_eq!(reset_v3["method"], "_honk/reset");
+        assert_eq!(reset_v3["params"]["epoch"], 4);
+
+        let axum::extract::ws::Message::Text(done_t3) = &batch3.msgs[3] else {
+            panic!()
+        };
+        let done_v3: Value = serde_json::from_str(done_t3).unwrap();
+        assert_eq!(done_v3["method"], "_honk/replay_done");
+        assert_eq!(done_v3["params"]["epoch"], 4);
+        assert_eq!(done_v3["params"]["seq"], 2);
+
+        // --- 5. Redo twice (full redo: restores Turn 2, clears revert) ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Redo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(50),
+            })
+            .await;
+
+        let resp_msg5 = v_rx.recv().await.unwrap();
+        let axum::extract::ws::Message::Text(t5) = resp_msg5 else {
+            panic!()
+        };
+        let resp5: Value = serde_json::from_str(&t5).unwrap();
+        assert_eq!(resp5["id"], 50);
+        assert_eq!(resp5["result"]["restored"], 1);
+        assert_eq!(resp5["result"]["cleared"], true);
+
+        // Verify log has all 4 entries
+        assert_eq!(session.log.entries().len(), 4);
+
+        // Verify sidecar is deleted
+        assert!(!crate::log::redo_sidecar_path(session.log.path()).exists());
+
+        // Verify revert is removed from state store
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&session.sid));
+        }
+
+        // Verify fan-out for full redo
+        let batch4 = replay_rx.recv().await.expect("replay batch 4");
+        assert_eq!(batch4.session_id, session.sid);
+        assert_eq!(batch4.msgs.len(), 6);
+        let axum::extract::ws::Message::Text(reset_t4) = &batch4.msgs[0] else {
+            panic!()
+        };
+        let reset_v4: Value = serde_json::from_str(reset_t4).unwrap();
+        assert_eq!(reset_v4["method"], "_honk/reset");
+        assert_eq!(reset_v4["params"]["epoch"], 5);
+
+        let axum::extract::ws::Message::Text(done_t4) = &batch4.msgs[5] else {
+            panic!()
+        };
+        let done_v4: Value = serde_json::from_str(done_t4).unwrap();
+        assert_eq!(done_v4["method"], "_honk/replay_done");
+        assert_eq!(done_v4["params"]["epoch"], 5);
+        assert_eq!(done_v4["params"]["seq"], 4);
+
+        // --- 6. Redo third time: nothing to redo ---
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Redo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(60),
+            })
+            .await;
+        let axum::extract::ws::Message::Text(t6) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let resp6: Value = serde_json::from_str(&t6).unwrap();
+        assert_eq!(resp6["error"]["message"], "nothing to redo");
+    }
+
+    #[tokio::test]
+    async fn test_client_prompts_after_undo_rebuild_and_redo() {
+        let (mut session, _d, fake) =
+            create_test_session("ses_undo_rebuild_redo", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(100);
+        let (viewer, mut replay_rx) = test_viewer_tx_with_replay(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        let sid = session.sid.clone();
+        let user_frame = {
+            let sid = sid.clone();
+            move |mid: &str, text: &str| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": mid,
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                })
+            }
+        };
+        let asst_frame = {
+            let sid = sid.clone();
+            move |mid: &str, text: &str| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": mid,
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                })
+            }
+        };
+
+        let h1_id = "msg_honk_00000000000000000000000000000001";
+        let h2_id = "msg_honk_00000000000000000000000000000002";
+        session
+            .log
+            .append(vec![
+                (Some(1), user_frame(h1_id, "first prompt")),
+                (Some(2), asst_frame("asst_1", "reply 1")),
+                (Some(3), user_frame(h2_id, "second prompt")),
+                (Some(4), asst_frame("asst_2", "reply 2")),
+            ])
+            .unwrap();
+
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": h1_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first prompt"}]
+                    },
+                    {
+                        "id": "asst_1",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 1"}]
+                    },
+                    {
+                        "id": h2_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "second prompt"}]
+                    },
+                    {
+                        "id": "asst_2",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 2"}]
+                    }
+                ]
+            }),
+        );
+        session.turn.client_prompts = 2;
+
+        while v_rx.try_recv().is_ok() {}
+
+        // 1. Undo once: undoes Turn 2
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(10),
+            })
+            .await;
+        let _ = v_rx.recv().await.unwrap();
+        let _ = replay_rx.recv().await.unwrap();
+
+        // 2. Rebuild/reactivate: create a new generation from export while revert is active
+        let export_frames = vec![
+            user_frame(h1_id, "first prompt"),
+            asst_frame("asst_1", "reply 1"),
+            user_frame(h2_id, "second prompt"),
+            asst_frame("asst_2", "reply 2"),
+        ];
+        let mut keys = HashSet::new();
+        for f in &export_frames {
+            if let Some(k) = f.pointer("/params/update").and_then(honk_wire::block_key) {
+                keys.insert(k);
+            }
+        }
+        session.on_rebuilt(export_frames, keys, None, None, 2).await;
+
+        // 3. Redo fully: restores Turn 2
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Redo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(20),
+            })
+            .await;
+        let _ = v_rx.recv().await.unwrap();
+
+        assert_eq!(session.turn.client_prompts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_undo_failure_rolls_back_sidecar() {
+        let (mut session, d, fake) =
+            create_test_session("ses_undo_rollback", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        let sid = session.sid.clone();
+        let user_frame = {
+            let sid = sid.clone();
+            move |mid: &str, text: &str| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "messageId": mid,
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                })
+            }
+        };
+        let asst_frame = {
+            let sid = sid.clone();
+            move |mid: &str, text: &str| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": mid,
+                            "content": { "type": "text", "text": text }
+                        }
+                    }
+                })
+            }
+        };
+
+        let h1_id = "msg_honk_00000000000000000000000000000001";
+        let h2_id = "msg_honk_00000000000000000000000000000002";
+        session
+            .log
+            .append(vec![
+                (Some(1), user_frame(h1_id, "first prompt")),
+                (Some(2), asst_frame("asst_1", "reply 1")),
+                (Some(3), user_frame(h2_id, "second prompt")),
+                (Some(4), asst_frame("asst_2", "reply 2")),
+            ])
+            .unwrap();
+
+        fake.set_export_data(
+            &session.sid,
+            json!({
+                "conversation": [
+                    {
+                        "id": h1_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first prompt"}]
+                    },
+                    {
+                        "id": "asst_1",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 1"}]
+                    },
+                    {
+                        "id": h2_id,
+                        "role": "user",
+                        "content": [{"type": "text", "text": "second prompt"}]
+                    },
+                    {
+                        "id": "asst_2",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "reply 2"}]
+                    }
+                ]
+            }),
+        );
+
+        let sidecar_p = crate::log::redo_sidecar_path(session.log.path());
+        assert!(!sidecar_p.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            session
+                .on_msg(SessionMsg::Revert {
+                    dir: RevertDir::Undo,
+                    viewer_id: 1,
+                    viewer: viewer.clone(),
+                    is_honk_aware: true,
+                    id: json!(10),
+                })
+                .await;
+
+            let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+                panic!()
+            };
+            let resp: Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(resp["id"], 10);
+            assert!(resp.get("error").is_some());
+
+            assert!(!sidecar_p.exists(), "sidecar must be deleted on rollback");
+
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_revert_while_rebuilding_refused_immediately() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_revert_rebuilding", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        session.state = ActorState::Rebuilding;
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 1,
+                viewer: viewer.clone(),
+                is_honk_aware: true,
+                id: json!(99),
+            })
+            .await;
+
+        let axum::extract::ws::Message::Text(t) = v_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        let r: Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(r["id"], 99);
+        assert_eq!(r["error"]["code"], -32002);
+        assert_eq!(
+            r["error"]["message"],
+            "the session is rebuilding; try again in a moment"
+        );
+        assert!(session.queued_msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_revert_auto_attaches_unregistered_viewer() {
+        let (mut session, _d, _fake) =
+            create_test_session("ses_revert_attach", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(10);
+        let viewer = test_viewer_tx(v_tx);
+
+        assert!(!session.viewers.contains_key(&2));
+        session
+            .on_msg(SessionMsg::Revert {
+                dir: RevertDir::Undo,
+                viewer_id: 2,
+                viewer,
+                is_honk_aware: true,
+                id: json!(101),
+            })
+            .await;
+
+        assert!(session.viewers.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_drops_hidden_tail_when_revert_active() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_gen_revert_test";
+        let h1_id = "msg_honk_11111111111111111111111111111111";
+        let h2_id = "msg_honk_22222222222222222222222222222222";
+
+        // Setup revert in state store targeting h2_id
+        {
+            let mut s = state_store.lock().await;
+            s.mutate(|st| {
+                st.reverts.insert(
+                    sid.into(),
+                    crate::state::Revert {
+                        target: h2_id.into(),
+                        stops: vec![h1_id.into(), h2_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        let user_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+        let asst_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+
+        // Export frames contain both Turn 1 and Turn 2
+        let export_frames = vec![
+            user_frame(h1_id, "prompt 1"),
+            asst_frame("asst_1", "reply 1"),
+            user_frame(h2_id, "prompt 2"),
+            asst_frame("asst_2", "reply 2"),
+        ];
+
+        let (new_log, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Must drop Turn 2 frames! Log must contain only Turn 1 (2 entries).
+        assert_eq!(new_log.entries().len(), 2);
+        assert_eq!(
+            new_log.entries()[0]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some(h1_id)
+        );
+
+        // Revert must still be in state store because target was found
+        {
+            let s = state_store.lock().await;
+            assert!(s.state().reverts.contains_key(sid));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_cleans_orphaned_sidecar_when_no_revert_in_state() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_orphaned_sidecar_test";
+        let log_p = d.path().join("sessions").join(format!("{sid}.jsonl"));
+        crate::log::write_redo_sidecar(&log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(&log_p);
+        assert!(sidecar_p.exists());
+
+        let export_frames = vec![json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "msg_honk_1",
+                    "content": { "type": "text", "text": "hello" }
+                }
+            }
+        })];
+
+        let (_new_log, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!sidecar_p.exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_preserves_buffered_frames_when_revert_active() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_buffered_preserve_test";
+        let h1_id = "msg_honk_11111111111111111111111111111111";
+        let h2_id = "msg_honk_22222222222222222222222222222222";
+
+        {
+            let mut s = state_store.lock().await;
+            s.mutate(|st| {
+                st.reverts.insert(
+                    sid.into(),
+                    crate::state::Revert {
+                        target: h2_id.into(),
+                        stops: vec![h1_id.into(), h2_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        let user_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+        let asst_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+
+        let export_frames = vec![
+            user_frame(h1_id, "prompt 1"),
+            asst_frame("asst_1", "reply 1"),
+            user_frame(h2_id, "prompt 2"),
+            asst_frame("asst_2", "reply 2"),
+        ];
+
+        let live_frame = (
+            Some(100),
+            asst_frame("asst_live", "live reply after export"),
+        );
+
+        let (new_log, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            vec![live_frame],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Must contain Turn 1 (2 entries) + live buffered frame (1 entry) = 3 entries!
+        assert_eq!(new_log.entries().len(), 3);
+        assert_eq!(
+            new_log.entries()[2]
+                .frame
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str),
+            Some("asst_live")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_new_generation_clears_revert_when_target_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(tokio::sync::Mutex::new(
+            crate::state::StateStore::open(d.path(), None, false).unwrap(),
+        ));
+        let sid = "ses_gen_missing_test";
+        let h1_id = "msg_honk_11111111111111111111111111111111";
+        let h2_id = "msg_honk_22222222222222222222222222222222";
+
+        // Setup revert in state store targeting h2_id
+        {
+            let mut s = state_store.lock().await;
+            s.mutate(|st| {
+                st.reverts.insert(
+                    sid.into(),
+                    crate::state::Revert {
+                        target: h2_id.into(),
+                        stops: vec![h1_id.into(), h2_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        // Also create a dummy redo sidecar file
+        let log_p = d.path().join("sessions").join(format!("{sid}.jsonl"));
+        crate::log::write_redo_sidecar(&log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(&log_p);
+        assert!(sidecar_p.exists());
+
+        let user_frame = |mid: &str, text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "messageId": mid,
+                        "content": { "type": "text", "text": text }
+                    }
+                }
+            })
+        };
+
+        // Export frames contain ONLY Turn 1 (Turn 2 was committed/truncated on goose!)
+        let export_frames = vec![user_frame(h1_id, "prompt 1")];
+
+        let (new_log, _epoch) = create_new_generation_from_export(
+            sid,
+            d.path(),
+            &state_store,
+            export_frames,
+            HashSet::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_log.entries().len(), 1);
+
+        // Revert must be removed from state store!
+        {
+            let s = state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(sid));
+        }
+
+        // Redo sidecar must be deleted!
+        assert!(!sidecar_p.exists());
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_happy_path() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_prompt_happy", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        // Put HeldSession in state store so mutate can find it
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_001";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 5,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec!["msg_honk_0".into(), target_msg_id.into()],
+                        prompts_before: 1,
+                    },
+                );
+            })
+            .unwrap();
+        }
+        session.turn.client_prompts = 5;
+
+        // Create redo sidecar file
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+        assert!(sidecar_p.exists());
+
+        // Send prompt
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // 1. Fake goose received truncate_from_message before session/prompt
+        let trunc_calls = fake.truncate_calls();
+        assert_eq!(trunc_calls.len(), 1);
+        assert_eq!(
+            trunc_calls[0]
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            trunc_calls[0]
+                .pointer("/params/messageId")
+                .and_then(Value::as_str),
+            Some(target_msg_id)
+        );
+
+        let prompt_calls = fake.received_prompts(&sid);
+        assert_eq!(prompt_calls.len(), 1);
+
+        // Verify order in inbound frames: truncate MUST be before prompt!
+        let inbound = fake.inbound();
+        let trunc_pos = inbound
+            .iter()
+            .position(|f| {
+                f.get("method").and_then(Value::as_str)
+                    == Some("_goose/unstable/session/conversation/truncate_from_message")
+            })
+            .expect("truncate call in inbound frames");
+        let prompt_pos = inbound
+            .iter()
+            .position(|f| f.get("method").and_then(Value::as_str) == Some("session/prompt"))
+            .expect("prompt call in inbound frames");
+        assert!(
+            trunc_pos < prompt_pos,
+            "truncate MUST be called before prompt"
+        );
+
+        // 2. Revert is cleared and sidecar is deleted
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+            // 3. client_prompts and inflight.prompt_index adjusted in persisted state
+            let held = s.state().sessions.get(&sid).unwrap();
+            assert_eq!(held.client_prompts, 1);
+            assert_eq!(held.inflight.as_ref().unwrap().prompt_index, 1);
+        }
+        assert!(!sidecar_p.exists());
+
+        // 4. In-memory turn.client_prompts and inflight.prompt_index adjusted
+        assert_eq!(session.turn.client_prompts, 1);
+        assert_eq!(session.turn.inflight.as_ref().unwrap().prompt_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_found_false_treated_as_success() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_found_false", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        fake.script_truncate_found(false);
+
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_002";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 3,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec![target_msg_id.into()],
+                        prompts_before: 0,
+                    },
+                );
+            })
+            .unwrap();
+        }
+        session.turn.client_prompts = 3;
+
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // Truncate was called
+        assert_eq!(fake.truncate_calls().len(), 1);
+        // Prompt was called
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
+
+        // Revert cleared and sidecar deleted
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+            let held = s.state().sessions.get(&sid).unwrap();
+            assert_eq!(held.client_prompts, 0);
+            assert_eq!(held.inflight.as_ref().unwrap().prompt_index, 0);
+        }
+        assert!(!sidecar_p.exists());
+        assert_eq!(session.turn.client_prompts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_error_path_forwards_prompt_and_schedules_rebuild() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_err_path", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, mut v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        let (legacy_tx, mut legacy_rx) = tokio::sync::mpsc::channel(100);
+        session.attach_live(2, test_viewer_tx(legacy_tx), false);
+
+        // Script truncate error in fake goose
+        fake.script_truncate_error(json!({
+            "code": -32603,
+            "message": "truncate error"
+        }));
+
+        let sid = session.sid.clone();
+        let target_msg_id = "msg_honk_target_003";
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 4,
+                    },
+                );
+                st.reverts.insert(
+                    sid.clone(),
+                    crate::state::Revert {
+                        target: target_msg_id.into(),
+                        stops: vec![target_msg_id.into()],
+                        prompts_before: 2,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        let log_p = session.log.path();
+        crate::log::write_redo_sidecar(log_p, &[json!({"dummy": true})]).unwrap();
+        let sidecar_p = crate::log::redo_sidecar_path(log_p);
+
+        assert!(!session.rebuild_at_turn_end);
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // Truncate was called (and failed)
+        assert_eq!(fake.truncate_calls().len(), 1);
+        // Prompt was forwarded anyway!
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
+
+        // Inflight was persisted in state store before truncate call!
+        {
+            let s = session.state_store.lock().await;
+            assert!(!s.state().reverts.contains_key(&sid));
+            let held = s.state().sessions.get(&sid).unwrap();
+            assert!(
+                held.inflight.is_some(),
+                "inflight must be persisted in state even when truncate fails"
+            );
+        }
+        assert!(!sidecar_p.exists());
+
+        // Rebuild scheduled at turn end!
+        assert!(session.rebuild_at_turn_end);
+
+        // Honk-aware viewer received _honk/notice notification with warning level
+        let mut found_notice = false;
+        while let Ok(msg) = v_rx.try_recv() {
+            if let axum::extract::ws::Message::Text(t) = msg {
+                let val: Value = serde_json::from_str(&t).unwrap();
+                if val.get("method").and_then(Value::as_str) == Some(honk_wire::method::NOTICE) {
+                    assert_eq!(val["params"]["sessionId"], sid);
+                    assert_eq!(val["params"]["level"], "warning");
+                    let message = val["params"]["message"].as_str().unwrap();
+                    assert!(message.contains("undo could not be made permanent"));
+                    assert!(message.contains("undone turns are still in the model's context"));
+                    found_notice = true;
+                }
+            }
+        }
+        assert!(
+            found_notice,
+            "honk-aware viewer must receive _honk/notice on truncate commit failure"
+        );
+
+        // Legacy viewer must NOT receive _honk/notice
+        while let Ok(msg) = legacy_rx.try_recv() {
+            if let axum::extract::ws::Message::Text(t) = msg {
+                let val: Value = serde_json::from_str(&t).unwrap();
+                assert_ne!(
+                    val.get("method").and_then(Value::as_str),
+                    Some(honk_wire::method::NOTICE)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_before_prompt_no_revert_no_truncate() {
+        let (mut session, d, fake) =
+            create_test_session("ses_commit_no_revert", ActorState::Live).await;
+        enable_truncate_capability(&session);
+        let (v_tx, _v_rx) = tokio::sync::mpsc::channel(100);
+        let viewer = test_viewer_tx(v_tx);
+        session.attach_live(1, viewer.clone(), true);
+
+        let sid = session.sid.clone();
+        {
+            let mut s = session.state_store.lock().await;
+            s.mutate(|st| {
+                st.sessions.insert(
+                    sid.clone(),
+                    crate::state::HeldSession {
+                        conn_id: "conn_1".into(),
+                        cwd: d.path().to_str().unwrap().into(),
+                        epoch: 1,
+                        last_conn_event_id: None,
+                        pending: Vec::new(),
+                        inflight: None,
+                        last_active_unix: 12345,
+                        init_result: None,
+                        client_prompts: 0,
+                    },
+                );
+            })
+            .unwrap();
+        }
+
+        session
+            .on_msg(SessionMsg::Prompt {
+                viewer_id: 1,
+                viewer,
+                is_honk_aware: true,
+                id: json!(1),
+                params: json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            })
+            .await;
+
+        // No truncate call made!
+        assert_eq!(fake.truncate_calls().len(), 0);
+        // Prompt was called
+        assert_eq!(fake.received_prompts(&sid).len(), 1);
     }
 }

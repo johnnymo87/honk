@@ -380,6 +380,12 @@ impl App {
             cmd if cmd == "compact" || cmd.starts_with("compact ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
+            cmd if cmd == "undo" || cmd.starts_with("undo ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
+            cmd if cmd == "redo" || cmd.starts_with("redo ") => {
+                let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
+            }
             cmd if cmd == "mcp" || cmd.starts_with("mcp ") => {
                 let _ = self.cmd_tx.send(UiCommand::Line(format!("/{cmd}")));
             }
@@ -604,6 +610,11 @@ impl App {
                 {
                     self.set_composer_text(text);
                     self.composer.mode = EditorMode::Insert;
+                }
+                if let Some(ref text) = notice.returned_clear
+                    && self.get_composer_text() == *text
+                {
+                    self.set_composer_text("");
                 }
             }
             UiEvent::Fatal(err) => {
@@ -969,7 +980,7 @@ mod tests {
         );
         assert!(unseen_warnings(&mut rx).is_empty());
     }
-    use crate::chat::types::{NoticeKind, Ownership, RunState};
+    use crate::chat::types::{Ownership, RunState};
     use crate::tui::BlockKind;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use ratatui::Terminal;
@@ -1050,28 +1061,44 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_1", cmd_tx);
 
-        let notice = Notice {
-            kind: NoticeKind::Returned,
-            text: "Your message did not run".into(),
-            returned_text: Some("my rejected prompt".into()),
-        };
+        let notice = Notice::returned("Your message did not run", "my rejected prompt");
 
         // When empty: fills composer
-        app.handle_ui_event(UiEvent::Notice(notice.clone()));
+        app.handle_ui_event(UiEvent::Notice(notice));
         assert_eq!(app.get_composer_text(), "my rejected prompt");
 
         // When not empty: does NOT overwrite composer
         app.set_composer_text("user is currently typing something else");
-        let notice2 = Notice {
-            kind: NoticeKind::Returned,
-            text: "Another failure".into(),
-            returned_text: Some("another rejected prompt".into()),
-        };
+        let notice2 = Notice::returned("Another failure", "another rejected prompt");
         app.handle_ui_event(UiEvent::Notice(notice2));
         assert_eq!(
             app.get_composer_text(),
             "user is currently typing something else"
         );
+    }
+
+    #[test]
+    fn test_returned_clear_clears_matching_composer_text() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+
+        // When composer matches returned_clear: clears composer
+        app.set_composer_text("undone prompt");
+        let notice = Notice::returned_clear("restored 1 turn", "undone prompt");
+        app.handle_ui_event(UiEvent::Notice(notice));
+        assert_eq!(app.get_composer_text(), "");
+
+        // When composer has been modified: does NOT clear composer
+        app.set_composer_text("undone prompt with user edit");
+        let notice2 = Notice::returned_clear("restored 1 turn", "undone prompt");
+        app.handle_ui_event(UiEvent::Notice(notice2));
+        assert_eq!(app.get_composer_text(), "undone prompt with user edit");
+
+        // When composer is already empty: remains empty
+        app.set_composer_text("");
+        let notice3 = Notice::returned_clear("restored 1 turn", "undone prompt");
+        app.handle_ui_event(UiEvent::Notice(notice3));
+        assert_eq!(app.get_composer_text(), "");
     }
 
     #[test]
@@ -1869,5 +1896,23 @@ mod tests {
         assert!(app.is_composer_empty());
         assert!(!app.composer_maximized);
         assert!(cmd_rx.try_recv().is_err(), "no interrupt sent");
+    }
+
+    #[test]
+    fn test_execute_app_command_undo_and_redo() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+
+        app.execute_app_command(":undo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/undo".into()));
+
+        app.execute_app_command("undo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/undo".into()));
+
+        app.execute_app_command(":redo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/redo".into()));
+
+        app.execute_app_command("redo");
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("/redo".into()));
     }
 }

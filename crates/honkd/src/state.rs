@@ -23,6 +23,20 @@ pub struct State {
     /// still load.
     #[serde(default)]
     pub turn_errors: BTreeMap<String, TurnErrorRecord>,
+    /// Soft undo revert state for sessions with hidden turns pending commit.
+    /// Survives eviction and restarts.
+    #[serde(default)]
+    pub reverts: BTreeMap<String, Revert>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Revert {
+    /// Goose message id of the earliest undone human prompt.
+    pub target: String,
+    /// All human-prompt stop ids in session order, from the export at the last undo.
+    pub stops: Vec<String>,
+    /// Number of `client_prompt_entries` strictly before `target`.
+    pub prompts_before: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -517,6 +531,7 @@ mod tests {
         let s = StateStore::open(d.path(), None, false).unwrap();
         assert_eq!(s.boot, 4);
         assert!(s.turn_errors.is_empty());
+        assert!(s.reverts.is_empty());
     }
 
     #[test]
@@ -832,5 +847,40 @@ mod tests {
             assert_eq!(s.boot, 1);
             std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn test_revert_serde_and_backward_compat() {
+        let old_json = json!({
+            "version": 1,
+            "boot": 1,
+            "upstream_url": null,
+            "control_conn": null,
+            "orphan_conns": [],
+            "sessions": {},
+            "retired_epochs": {},
+            "ledger": {}
+        });
+        let state: State = serde_json::from_value(old_json).unwrap();
+        assert!(state.reverts.is_empty());
+
+        let mut state = State::default();
+        state.reverts.insert(
+            "ses_1".into(),
+            Revert {
+                target: "msg_honk_123".into(),
+                stops: vec!["msg_honk_100".into(), "msg_honk_123".into()],
+                prompts_before: 2,
+            },
+        );
+        let ser = serde_json::to_string(&state).unwrap();
+        let de: State = serde_json::from_str(&ser).unwrap();
+        assert_eq!(state, de);
+        assert_eq!(de.reverts["ses_1"].target, "msg_honk_123");
+        assert_eq!(
+            de.reverts["ses_1"].stops,
+            vec!["msg_honk_100", "msg_honk_123"]
+        );
+        assert_eq!(de.reverts["ses_1"].prompts_before, 2);
     }
 }

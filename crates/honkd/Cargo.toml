@@ -21,6 +21,7 @@ subtle = "2.6.1"
 tokio.workspace = true
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
+uuid.workspace = true
 
 [dev-dependencies]
 honk = { path = "../honk" }
