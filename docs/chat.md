@@ -141,8 +141,8 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
 | `z m` | Toggle a maximized composer. `/quote` turns it on; sending or clearing the composer turns it off. |
 | `Ctrl-X m` | Open model picker overlay (in both Normal and Insert modes). |
-| `F2` | Cycle to next recent model (in both Normal and Insert modes). |
-| `Shift-F2` | Cycle to previous recent model (in both Normal and Insert modes). |
+| `F2` | Cycle to next recent model without reordering recents (in both Normal and Insert modes). |
+| `Shift-F2` | Cycle to previous recent model without reordering recents (in both Normal and Insert modes). |
 | `:` | Open command line bar. |
 | `Ctrl-P` / `Ctrl-N` | Recall previous / next prompt history. |
 | `Ctrl-C` | If composer has text and honk is idle or the composer is maximized: clears composer (and unmaximizes). Otherwise: interrupts active turn (`Action::Interrupt`). |
@@ -172,7 +172,7 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/approve` | `:approve` | Approve the oldest pending permission request with `allow_once`. |
 | `/turns` | `:turns` | Set or clear model calls cap per prompt (`/turns N` or `/turns off`). |
 | `/compact` | `:compact` | Compact session context (queued if a turn is running; lines typed during compaction are queued; /cancel cannot interrupt a compaction already running). |
-| `/model [id]` | `:model [id]` | Switch model (`/model <id>`), open model picker (`/model`), or cycle recent models with `F2`/`Shift-F2`. |
+| `/model [id]` | `:model [id]` | Switch model (`/model <id>`), open model picker (`/model`), or cycle recent models with `F2`/`Shift-F2`. Switching to a model with a smaller context window mid-session may trigger goose auto-compaction on the next turn. `F2`/`Shift-F2` cycling does not reorder the recent models list. |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
 | `/quote [N]` | `:quote [N]` | Load the last N (default 3) replies into the composer, oldest first, each quoted with `> ` under a `# MM-DD HH:MM (trigger)` header, and maximize the composer in normal mode. A turn counts only if the agent wrote reply text in it; thoughts, tool calls and the message that started the turn (a stall-watch wake, a swarm message, or your own prompt) are left out, and `/compact` turns are skipped. N is capped at 50. The trigger is `you`, `wake: <reason>`, `swarm: <sender>`, `scheduled`, `goose` (a prompt goose wrote itself), or `start`; `in progress` marks a reply still streaming. `/quote` replaces the composer; `:quote` keeps your draft below the quotes. Never sent upstream. |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
@@ -311,7 +311,7 @@ honk telegram 20261016_7
 ### Command-Line Flags
 
 - `--title <title>`: Session title, set before the first prompt (also sets the Telegram topic title).
-- `--model <id>`: Initial model for the session, set before the first prompt. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
+- `--model <id>`: Initial model for the session, set before the first prompt. Refuses IDs not present in honkd's model list (configured via honkd `--models-file`), aborting before prompting. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
 - `--tag <tag>`: Tag the session in session-tags (`goose:<id>`). Defaults to inheriting the launching session's tag; `--tag auto` opts out.
 - `--no-attach`: Do not auto-attach (do not open a tab running `honk chat`).
 - `--tmux-session <name>`: Target tmux session for auto-attach [default: nvim's session].
