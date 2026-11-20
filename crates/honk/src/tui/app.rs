@@ -719,16 +719,16 @@ impl App {
                 self.should_quit = true;
             }
             UiEvent::Transcript(_) => {}
-        UiEvent::ModelList {
-            current,
-            models,
-            warning: _,
-        } => {
-            self.pending_prefix = None;
-            self.command_line = None;
-            let recent = self.load_recent();
-            self.model_picker = Some(ModelPicker::new(current, models, recent));
-        }
+            UiEvent::ModelList {
+                current,
+                models,
+                warning: _,
+            } => {
+                self.pending_prefix = None;
+                self.command_line = None;
+                let recent = self.load_recent();
+                self.model_picker = Some(ModelPicker::new(current, models, recent));
+            }
         }
     }
 
@@ -2043,7 +2043,11 @@ mod tests {
         app.state_snapshot = Some(make_snapshot("model-b"));
         assert_eq!(
             app.load_recent(),
-            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+            vec![
+                "model-a".to_string(),
+                "model-b".to_string(),
+                "model-c".to_string()
+            ]
         );
 
         // 2nd F2: next after B in [A, B, C] is C
@@ -2060,7 +2064,11 @@ mod tests {
         app.state_snapshot = Some(make_snapshot("model-c"));
         assert_eq!(
             app.load_recent(),
-            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+            vec![
+                "model-a".to_string(),
+                "model-b".to_string(),
+                "model-c".to_string()
+            ]
         );
 
         // 3rd F2: next after C in [A, B, C] wraps to A
@@ -2077,7 +2085,11 @@ mod tests {
         app.state_snapshot = Some(make_snapshot("model-a"));
         assert_eq!(
             app.load_recent(),
-            vec!["model-a".to_string(), "model-b".to_string(), "model-c".to_string()]
+            vec![
+                "model-a".to_string(),
+                "model-b".to_string(),
+                "model-c".to_string()
+            ]
         );
     }
 

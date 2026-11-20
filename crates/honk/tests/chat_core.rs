@@ -5669,7 +5669,10 @@ fn test_update_model_state_does_not_wipe_configured_models() {
         }
     })));
 
-    assert!(core.known_model_ids().contains(&"claude-fable-5-2".to_string()));
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-fable-5-2".to_string())
+    );
 
     // 2. Later, a config_option_update arrives from goose containing only goose's stale options
     core.handle(Input::Frame(json!({
@@ -5692,15 +5695,26 @@ fn test_update_model_state_does_not_wipe_configured_models() {
     })));
 
     // 3. Known models should be the UNION, so claude-fable-5-2 is NOT wiped
-    assert!(core.known_model_ids().contains(&"claude-opus-5-5".to_string()));
-    assert!(core.known_model_ids().contains(&"claude-fable-5-2".to_string()));
-    assert!(core.known_model_ids().contains(&"claude-sonnet-4-6".to_string()));
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-opus-5-5".to_string())
+    );
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-fable-5-2".to_string())
+    );
+    assert!(
+        core.known_model_ids()
+            .contains(&"claude-sonnet-4-6".to_string())
+    );
 
     // 4. Switching to claude-fable-5-2 does NOT warn
     let set_effs = core.handle(Input::Line("/model claude-fable-5-2".into()));
-    assert!(!set_effs
-        .iter()
-        .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning)));
+    assert!(
+        !set_effs
+            .iter()
+            .any(|e| matches!(e, Effect::Notice(n) if n.kind == NoticeKind::Warning))
+    );
 }
 
 #[test]
@@ -5751,7 +5765,11 @@ fn test_attach_success_sends_silent_model_list() {
     })));
 
     // Silent reply should NOT emit ModelList effect and NOT emit any notice
-    assert!(!reply_effs.iter().any(|e| matches!(e, Effect::ModelList { .. })));
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::ModelList { .. }))
+    );
     assert!(!reply_effs.iter().any(|e| matches!(e, Effect::Notice(_))));
 
     // But should update current model and known_models
@@ -5823,7 +5841,9 @@ fn test_prompt_submitted_while_model_set_inflight_is_queued_and_flushed() {
     let model_req_id = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
             _ => None,
         })
         .expect("should send set_config_option");
@@ -5863,13 +5883,20 @@ fn test_prompt_submitted_while_model_set_inflight_is_queued_and_flushed() {
     // Prompt is flushed!
     let prompt_req = set_reply_effs
         .iter()
-        .find(|e| matches!(
-            e,
-            Effect::Request { method, .. } if method == "session/prompt"
-        ))
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/prompt"
+            )
+        })
         .expect("queued prompt should be flushed after model switch completes");
-    let Effect::Request { params, .. } = prompt_req else { panic!() };
-    let prompt_text = params.pointer("/prompt/0/text").and_then(serde_json::Value::as_str).unwrap();
+    let Effect::Request { params, .. } = prompt_req else {
+        panic!()
+    };
+    let prompt_text = params
+        .pointer("/prompt/0/text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
     assert_eq!(prompt_text, "hello while model switching");
 }
 
@@ -5906,7 +5933,9 @@ fn test_model_command_busy_32002_requires_data_honk_busy() {
     let model_req_id = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
             _ => None,
         })
         .unwrap();
@@ -5940,7 +5969,9 @@ fn test_model_set_other_error_emits_notice_and_sends_silent_list_to_adopt_curren
     let model_req_id = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
             _ => None,
         })
         .unwrap();
@@ -5998,7 +6029,9 @@ fn test_typo_model_id_not_recorded_in_recents() {
     let req_id = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
             _ => None,
         })
         .unwrap();
@@ -6019,7 +6052,9 @@ fn test_typo_model_id_not_recorded_in_recents() {
     let req_id = effs
         .iter()
         .find_map(|e| match e {
-            Effect::Request { id, method, .. } if method == "session/set_config_option" => Some(*id),
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
             _ => None,
         })
         .unwrap();
@@ -6030,8 +6065,9 @@ fn test_typo_model_id_not_recorded_in_recents() {
             "configOptions": [{"id": "model", "currentValue": "typo-model-id"}]
         }
     })));
-    assert!(!reply_effs.iter().any(|e| matches!(
-        e,
-        Effect::RecordRecentModel(_)
-    )));
+    assert!(
+        !reply_effs
+            .iter()
+            .any(|e| matches!(e, Effect::RecordRecentModel(_)))
+    );
 }

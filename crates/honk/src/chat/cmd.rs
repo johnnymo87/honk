@@ -319,11 +319,7 @@ impl ChatCore {
         self.handle_model_command_inner(line, None, effects);
     }
 
-    pub fn handle_model_set_command(
-        &mut self,
-        id: &str,
-        record_recent: bool,
-    ) -> Vec<Effect> {
+    pub fn handle_model_set_command(&mut self, id: &str, record_recent: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
         let line = if record_recent {
             format!("/model {id}")
@@ -348,7 +344,13 @@ impl ChatCore {
         };
         let mut tokens = rest.split_whitespace();
         let id = tokens.next().unwrap();
-        self.dispatch_model_set(line, Some((line.to_string(), requeues)), id, record_recent, effects);
+        self.dispatch_model_set(
+            line,
+            Some((line.to_string(), requeues)),
+            id,
+            record_recent,
+            effects,
+        );
     }
 
     fn handle_model_command_inner(
@@ -378,8 +380,10 @@ impl ChatCore {
             return;
         }
         let req_id = self.allocate_id();
-        self.pending_model_reqs
-            .insert(req_id, super::types::PendingModelReq::List { silent: false });
+        self.pending_model_reqs.insert(
+            req_id,
+            super::types::PendingModelReq::List { silent: false },
+        );
         effects.push(Effect::Request {
             id: req_id,
             method: "_honk/model/list".to_string(),

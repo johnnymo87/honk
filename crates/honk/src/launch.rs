@@ -701,14 +701,14 @@ async fn check_model_allowed(
         return Ok(());
     }
 
-    if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array) {
-        if !models.is_empty() {
-            let found = models
-                .iter()
-                .any(|m| m.get("id").and_then(Value::as_str) == Some(model));
-            if !found {
-                bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
-            }
+    if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array)
+        && !models.is_empty()
+    {
+        let found = models
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(model));
+        if !found {
+            bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
         }
     }
 

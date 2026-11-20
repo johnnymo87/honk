@@ -936,7 +936,9 @@ async fn launch_with_model_refuses_id_not_in_honkd_list() {
         "error must mention setting the model failed: {msg}"
     );
     assert!(
-        msg.contains("typo-model is not in honkd's model list (configured via honkd --models-file)"),
+        msg.contains(
+            "typo-model is not in honkd's model list (configured via honkd --models-file)"
+        ),
         "error must contain honkd list message: {msg}"
     );
     assert_eq!(

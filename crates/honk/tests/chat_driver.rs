@@ -1603,9 +1603,9 @@ async fn test_driver_shutdown_during_attach_backoff_returns_promptly() {
             .await
             .unwrap();
 
-            while let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(50), ws.next()).await
-            {}
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
+            {
+            }
             let _ = ws.close(None).await;
             drop(ws);
 
@@ -1876,9 +1876,9 @@ async fn test_driver_attach_failed_auth_error_on_reconnect_is_fatal() {
             .await
             .unwrap();
 
-            while let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(50), ws.next()).await
-            {}
+            while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), ws.next()).await
+            {
+            }
             let _ = ws.close(None).await;
             drop(ws);
 
@@ -2240,9 +2240,14 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 3. session/list page 1 (50 dummy sessions)
-            let mut v1 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let mut v1 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             if v1["method"] == "_honk/model/list" {
-                v1 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                v1 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
             }
             assert_eq!(v1["method"], "session/list");
             let mut p1_sessions = Vec::new();
@@ -2269,9 +2274,14 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 4. session/list page 2 (50 dummy sessions)
-            let mut v2 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let mut v2 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             if v2["method"] == "_honk/model/list" {
-                v2 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                v2 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
             }
             assert_eq!(v2["method"], "session/list");
             assert_eq!(v2["params"]["cursor"], "page2_cursor");
@@ -2299,9 +2309,14 @@ async fn test_driver_session_info_finds_target_on_page_3() {
             .unwrap();
 
             // 5. session/list page 3 (contains target-ses)
-            let mut v3 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let mut v3 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             if v3["method"] == "_honk/model/list" {
-                v3 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                v3 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
             }
             assert_eq!(v3["method"], "session/list");
             assert_eq!(v3["params"]["cursor"], "page3_cursor");
@@ -2513,9 +2528,14 @@ async fn test_driver_session_info_terminates_on_repeated_cursor() {
             .unwrap();
 
             // 3. session/list page 1 returns loop_cursor
-            let mut v1 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let mut v1 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             if v1["method"] == "_honk/model/list" {
-                v1 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                v1 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
             }
             assert_eq!(v1["method"], "session/list");
             ws.send(Message::Text(
@@ -2534,9 +2554,14 @@ async fn test_driver_session_info_terminates_on_repeated_cursor() {
             .unwrap();
 
             // 4. session/list page 2 returns loop_cursor again
-            let mut v2 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let mut v2 =
+                serde_json::from_str::<Value>(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             if v2["method"] == "_honk/model/list" {
-                v2 = serde_json::from_str::<Value>(&ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                v2 = serde_json::from_str::<Value>(
+                    ws.next().await.unwrap().unwrap().to_text().unwrap(),
+                )
+                .unwrap();
             }
             assert_eq!(v2["method"], "session/list");
             assert_eq!(v2["params"]["cursor"], "loop_cursor");
