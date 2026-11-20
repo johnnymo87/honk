@@ -600,6 +600,19 @@ pub fn default_config_options() -> Vec<Value> {
                 { "name": "Gemini 3.8 Flash", "value": "gemini-3.8-flash" },
             ]
         }),
+        json!({
+            "id": "thinking_effort",
+            "name": "Thinking Effort",
+            "type": "select",
+            "currentValue": "off",
+            "options": [
+                { "name": "Off", "value": "off" },
+                { "name": "Low", "value": "low" },
+                { "name": "Medium", "value": "medium" },
+                { "name": "High", "value": "high" },
+                { "name": "Max", "value": "max" },
+            ]
+        }),
     ]
 }
 

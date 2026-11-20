@@ -93,6 +93,7 @@ pub struct Timeouts {
     pub swarm_enable: Duration,
     pub rename: Duration,
     pub model: Duration,
+    pub effort: Duration,
     pub prompt_confirm: Duration,
     pub which: Duration,
     pub set: Duration,
@@ -106,6 +107,7 @@ impl Default for Timeouts {
             swarm_enable: Duration::from_secs(30),
             rename: Duration::from_secs(10),
             model: Duration::from_secs(10),
+            effort: Duration::from_secs(10),
             prompt_confirm: Duration::from_secs(60),
             which: octags::DEFAULT_WHICH_TIMEOUT,
             set: octags::DEFAULT_TIMEOUT,
@@ -120,6 +122,7 @@ pub struct LaunchOpts {
     pub prompt: String,
     pub title: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub tag: TagRequest,
     /// The launching session as an oc-tags key (`ses_…` or `goose:<id>`).
     pub launcher: Option<String>,
@@ -162,6 +165,7 @@ impl std::fmt::Debug for LaunchOpts {
             .field("prompt", &self.prompt)
             .field("title", &self.title)
             .field("model", &self.model)
+            .field("effort", &self.effort)
             .field("tag", &self.tag)
             .field("launcher", &self.launcher)
             .field("tags_bin", &self.tags_bin)
@@ -360,6 +364,13 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
         step!(
             set_model(&mut client, &native, model, opts.timeouts.model).await,
             "setting the model failed"
+        );
+    }
+
+    if let Some(effort) = &opts.effort {
+        step!(
+            set_effort(&mut client, &native, effort, opts.timeouts.effort).await,
+            "setting the thinking effort failed"
         );
     }
 
@@ -746,6 +757,29 @@ async fn set_model(
     Ok(())
 }
 
+async fn set_effort(
+    client: &mut Client,
+    sid: &str,
+    effort: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let frame = call_with_timeout(
+        client,
+        "session/set_config_option",
+        json!({
+            "sessionId": sid,
+            "configId": "thinking_effort",
+            "value": effort,
+        }),
+        timeout,
+    )
+    .await?;
+    if let Some(e) = rpc_error(&frame) {
+        bail!("session/set_config_option: {e}");
+    }
+    Ok(())
+}
+
 fn client_req_id(sid: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1047,6 +1081,7 @@ mod tests {
             prompt: "p".into(),
             title: None,
             model: None,
+            effort: None,
             tag: TagRequest::Off,
             launcher: None,
             tags_bin: "tags".into(),

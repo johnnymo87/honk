@@ -38,6 +38,7 @@ struct Script {
     enable: Value,
     prompt: PromptReply,
     model_error: Option<&'static str>,
+    effort_error: Option<&'static str>,
     model_list: Option<Value>,
 }
 
@@ -48,6 +49,7 @@ impl Default for Script {
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
             model_error: None,
+            effort_error: None,
             model_list: None,
         }
     }
@@ -121,7 +123,13 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                 }
                 "_goose/unstable/session/rename" => out.push(json!({"id": id, "result": {}})),
                 "session/set_config_option" => {
-                    if let Some(err) = script.model_error {
+                    let config_id = v["params"]["configId"].as_str();
+                    let err = match config_id {
+                        Some("model") => script.model_error,
+                        Some("thinking_effort") => script.effort_error,
+                        _ => None,
+                    };
+                    if let Some(err) = err {
                         out.push(json!({"id": id, "error": {"code": -32602, "message": err}}));
                     } else {
                         out.push(json!({"id": id, "result": {"configOptions": []}}));
@@ -226,6 +234,7 @@ fn opts(r: &Rig, tag: TagRequest, launcher: Option<&str>, title: Option<&str>) -
         prompt: "do the thing".into(),
         title: title.map(str::to_string),
         model: None,
+        effort: None,
         tag,
         launcher: launcher.map(str::to_string),
         tags_bin: r.tags_bin.clone(),
@@ -905,6 +914,134 @@ async fn launch_with_model_failure_aborts_before_prompt() {
             "session/set_config_option",
         ],
         "prompt must not be sent if set_config_option fails"
+    );
+}
+
+#[tokio::test]
+async fn launch_with_effort_sets_config_option_before_prompt() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    o.effort = Some("medium".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_goose/unstable/session/rename",
+            "session/set_config_option",
+            "session/prompt"
+        ],
+        "set_config_option must be called after rename and before prompt"
+    );
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let m = &reqs[3];
+    assert_eq!(
+        m.params,
+        json!({
+            "sessionId": SID,
+            "configId": "thinking_effort",
+            "value": "medium",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_with_model_and_effort_orders_effort_after_model() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    o.model = Some("gemini-3.8-flash".into());
+    o.effort = Some("medium".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_goose/unstable/session/rename",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/set_config_option",
+            "session/prompt"
+        ],
+        "both set_config_option calls must be before prompt, with effort after model"
+    );
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let model_req = &reqs[4];
+    assert_eq!(
+        model_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "gemini-3.8-flash",
+        })
+    );
+    let effort_req = &reqs[5];
+    assert_eq!(
+        effort_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "thinking_effort",
+            "value": "medium",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_without_effort_sends_no_thinking_effort() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let effort_calls = reqs
+        .iter()
+        .filter(|req| {
+            req.method == "session/set_config_option"
+                && req.params.get("configId").and_then(Value::as_str) == Some("thinking_effort")
+        })
+        .count();
+    assert_eq!(
+        effort_calls, 0,
+        "launch without --effort must send no thinking_effort option"
+    );
+}
+
+#[tokio::test]
+async fn launch_with_effort_failure_aborts_before_prompt() {
+    let script = Script {
+        effort_error: Some("unsupported thinking effort"),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.effort = Some("high".into());
+    let err = run(&o).await.unwrap_err();
+    assert_eq!(err.exit_code(), honk::launch::EXIT_PARTIAL);
+    let LaunchError::Partial { launched, error } = err else {
+        panic!("expected partial error");
+    };
+    assert_eq!(launched.native, SID);
+    assert_eq!(launched.prompt, honk::launch::PromptState::No);
+    let msg = format!("{error:#}");
+    assert!(
+        msg.contains("setting the thinking effort failed"),
+        "error must mention setting the thinking effort failed: {msg}"
+    );
+    assert!(
+        msg.contains("unsupported thinking effort"),
+        "error must contain upstream message: {msg}"
+    );
+
+    assert_eq!(
+        methods(&r),
+        ["initialize", "session/new", "session/set_config_option",],
+        "prompt must not be sent if setting effort fails"
     );
 }
 

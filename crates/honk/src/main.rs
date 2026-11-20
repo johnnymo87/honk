@@ -92,6 +92,10 @@ struct LaunchArgs {
     #[arg(long)]
     model: Option<String>,
 
+    /// Thinking effort for the new session (goose session/set_config_option thinking_effort); default: goose-serve's GOOSE_THINKING_EFFORT
+    #[arg(long, value_parser = ["off", "low", "medium", "high", "max"])]
+    effort: Option<String>,
+
     /// pigeon daemon URL
     #[arg(
         long = "pigeon-url",
@@ -156,6 +160,11 @@ fn launch_opts(
         Some(m) => Some(m.trim().to_string()),
         None => None,
     };
+    let effort = match args.effort {
+        Some(e) if e.trim().is_empty() => anyhow::bail!("--effort is empty"),
+        Some(e) => Some(e.trim().to_string()),
+        None => None,
+    };
     let tag = match args.tag {
         None => honk::launch::TagRequest::Inherit,
         Some(honk::octags::TagArg::NoInherit) => honk::launch::TagRequest::Off,
@@ -182,6 +191,7 @@ fn launch_opts(
         prompt,
         title,
         model,
+        effort,
         tag,
         launcher: honk::octags::resolve_launcher_from(&env_get),
         tags_bin: honk::octags::resolve_bin_from(&env_get, honk::octags::on_path),
@@ -1329,5 +1339,30 @@ mod tests {
             }
             _ => panic!("expected launch command"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_launch_effort() {
+        for valid in ["off", "low", "medium", "high", "max"] {
+            let cli = Cli::try_parse_from([
+                "honk", "launch", "--effort", valid, "--secret", "s", "/tmp", "do it",
+            ])
+            .unwrap();
+            match cli.command {
+                Commands::Launch(args) => {
+                    assert_eq!(args.effort.as_deref(), Some(valid));
+                    let opts = launch_opts(args, |_| None, || unreachable!()).unwrap();
+                    assert_eq!(opts.effort.as_deref(), Some(valid));
+                }
+                _ => panic!("expected launch command"),
+            }
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "honk", "launch", "--effort", "bogus", "--secret", "s", "/tmp", "do it",
+            ])
+            .is_err()
+        );
     }
 }
