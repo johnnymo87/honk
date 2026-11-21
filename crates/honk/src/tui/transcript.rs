@@ -1090,11 +1090,8 @@ fn needs_separator(prev_kind: BlockKind, curr_kind: BlockKind) -> bool {
     if prev_kind == curr_kind {
         return false;
     }
-    // Consecutive tools form a group: no separator between tools
-    // Thought before assistant: keep tight
-    if prev_kind == BlockKind::Thought && curr_kind == BlockKind::Assistant {
-        return false;
-    }
+    // Consecutive tools form a group: no separator between tools. A thought gets
+    // a blank line before the reply too: expanded, it can run to many lines.
     true
 }
 
@@ -1882,6 +1879,10 @@ fn thought_title(raw: &str) -> (Option<&str>, &str) {
     {
         let title = &rest[..end];
         let after = &rest[end + 2..];
+        // As opencode's /^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/
+        if title.trim().is_empty() || title.contains(['*', '\n']) {
+            return (None, content);
+        }
         let body = if after.is_empty() {
             Some("")
         } else {
@@ -1889,11 +1890,11 @@ fn thought_title(raw: &str) -> (Option<&str>, &str) {
                 .strip_prefix("\r\n\r\n")
                 .or_else(|| after.strip_prefix("\n\n"))
         };
-        if !title.is_empty()
-            && !title.contains('\n')
-            && let Some(body) = body
-        {
-            return (Some(title.trim()), body.trim_end());
+        if let Some(body) = body {
+            return (
+                Some(title.trim()),
+                body.trim_matches(['\r', '\n']).trim_end(),
+            );
         }
     }
     (None, content)
@@ -3236,6 +3237,14 @@ mod tests {
         let lines = render_thought("**Note** this is inline\n", true, 80);
         assert_eq!(plain(&lines[0]), "- Thought");
         assert_eq!(plain(&lines[1]), "**Note** this is inline");
+
+        // Extra blank lines after the title are dropped; '*' or blank titles aren't titles.
+        let lines = render_thought("**T**\n\n\n\nbody\n", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought: T · 1 line");
+        let lines = render_thought("**a*b**\n\nx", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought · 3 lines");
+        let lines = render_thought("**   **\n\nx", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought · 3 lines");
 
         // No text at all (a provider that withholds thinking)
         for expanded in [true, false] {
