@@ -93,7 +93,7 @@ The user interface consists of three distinct vertical areas:
 
 2. **Status Bar** (single row):
    - Displays session title (or session ID), working directory (`cwd`), run state, `queued: N`, and connection status (`live`, `reconnecting…`, or `stopped`).
-   - **Activity indicator**: while a turn is busy, the run state is an animated spinner, what the session is doing, and how long the turn has run: `[⠹ thinking 12s]`, `[⠼ shell · cargo test 40s]`. The states are `needs approval` (another client's turn waits on `/approve`), `compacting`, `waiting` (prompt sent, turn not started), `thinking`, `replying`, the running tool's title, and `working` (between steps). A turn another client started adds `· other client`. Idle shows `[idle]`. Every attached view shows it; nothing is sent to honkd, pigeon or Telegram. When you attach mid-turn, the timer counts from the turn's user message. The bar is redrawn only when the indicator changes (10 times a second while busy, never while idle); set `HONK_NO_ANIM=1` for a static `⋯` on slow links.
+   - **Activity indicator**: while a turn is busy, the run state is an animated spinner, what the session is doing, and how long the turn has run: `[⠹ thinking 12s]`, `[⠼ shell · cargo test 40s]`. The states are `needs approval` (another client's turn waits on `/approve`), `compacting`, `waiting` (prompt sent, turn not started), `thinking`, `replying`, the running tool's title, and `working` (between steps). A turn another client started adds `· other client`. Idle shows `[idle]`. Every attached view shows it; nothing is sent to honkd or pigeon. When you attach mid-turn, the timer counts from the turn's user message. The bar is redrawn only when the indicator changes (10 times a second while busy, never while idle); set `HONK_NO_ANIM=1` for a static `⋯` on slow links.
 
 3. **Composer / Command Bar** (bottom):
    - Multiline editor with modal vim navigation.
@@ -306,7 +306,7 @@ a honkd that died mid-call is deleted at the next start.
 
 ## Chat channels via pigeon
 
-If you run a [pigeon](https://github.com/johnnymo87/pigeon) daemon, `honk chat --new` can register the new session with it so the session gets a pigeon chat channel (a Slack channel; a Telegram topic on a machine still on Telegram):
+If you run a [pigeon](https://github.com/johnnymo87/pigeon) daemon, `honk chat --new` can register the new session with it so the session gets a pigeon chat channel (a Slack channel):
 
 ```bash
 export HONK_PIGEON_URL=http://127.0.0.1:4731          # or --pigeon-url
@@ -321,7 +321,7 @@ honk pigeon 20261016_7
 - Registration is off unless a pigeon URL is configured. It runs in the background; the outcome is shown as a notice, and a failure is only a warning, never a reason the chat stops.
 - honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), the working directory, and the honkd secret honk connected with (pigeon stores it and presents it to honkd; it refuses messages typed in a session's channel when it stored no secret for it). pigeon creates a channel only when it sends a notification, so honk then posts one short announcement (`POST /stop`), which creates the channel.
 - Replies typed in the channel prompt the session, and pigeon posts those turns' results there. Prompts and replies from every client (honk chat included) appear in the channel when honkd runs with `--turn-hook-url` pointing at pigeon's `/goose/turn-event` (see [docs/turn-hook.md](turn-hook.md)).
-- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk pigeon <id>`. `honk pigeon` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides. `honk telegram` and `--no-telegram` are the old names of the subcommand and flag and still work.
+- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk pigeon <id>`. `honk pigeon` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides.
 - The bearer token and the honkd secret travel in the request, so keep the pigeon URL on loopback or use `https://`.
 - The honkd URL is sent as honk sees it, so pigeon must be able to reach honkd at the same address (normally both on localhost).
 

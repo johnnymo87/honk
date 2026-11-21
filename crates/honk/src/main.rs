@@ -23,8 +23,7 @@ enum Commands {
     Chat(ChatArgs),
     /// Register an existing session with pigeon so it gets a pigeon chat channel
     #[command(
-        alias = "telegram",
-        long_about = "Register an existing session with a pigeon daemon so it gets a pigeon chat channel (a Slack channel; a Telegram topic on a machine still on Telegram).\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Replies typed in the channel prompt the session; turns typed in honk chat appear there only when honkd's turn hook is enabled. pigeon is given the honkd secret so it can reach the session.\n\n`honk telegram` is the old name and still works."
+        long_about = "Register an existing session with a pigeon daemon so it gets a pigeon chat channel (a Slack channel).\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Replies typed in the channel prompt the session; turns typed in honk chat appear there only when honkd's turn hook is enabled. pigeon is given the honkd secret so it can reach the session."
     )]
     Pigeon(PigeonCmdArgs),
     /// Run the swarm MCP server over stdio for goose
@@ -350,7 +349,7 @@ struct ChatArgs {
     secret: Option<String>,
 
     /// Do not register a new session with pigeon, even if HONK_PIGEON_URL is set
-    #[arg(long = "no-pigeon", alias = "no-telegram")]
+    #[arg(long = "no-pigeon")]
     no_pigeon: bool,
 
     /// Do not enable the swarm MCP server by default on a new session (sends _meta.honk.swarm: false)
@@ -1082,40 +1081,44 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parse_pigeon_subcommand_and_telegram_alias() {
-        // `telegram` is the old name of the subcommand; scripts (stall-watch's
-        // error hint) still run it.
-        for name in ["pigeon", "telegram"] {
-            let cli = Cli::try_parse_from([
-                "honk",
-                name,
-                "20261016_1",
-                "--pigeon-url",
-                "http://p",
-                "--cwd",
-                "/w",
-                "--force",
-            ])
-            .unwrap();
-            match cli.command {
-                Commands::Pigeon(a) => {
-                    assert_eq!(a.session, "20261016_1");
-                    assert_eq!(a.cwd, Some(PathBuf::from("/w")));
-                    assert!(a.force);
-                    assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
-                }
-                _ => panic!("expected pigeon command for `honk {name}`"),
+    fn test_cli_parse_pigeon_subcommand() {
+        let cli = Cli::try_parse_from([
+            "honk",
+            "pigeon",
+            "20261016_1",
+            "--pigeon-url",
+            "http://p",
+            "--cwd",
+            "/w",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Pigeon(a) => {
+                assert_eq!(a.session, "20261016_1");
+                assert_eq!(a.cwd, Some(PathBuf::from("/w")));
+                assert!(a.force);
+                assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
             }
+            _ => panic!("expected pigeon command for `honk pigeon`"),
         }
     }
 
     #[test]
-    fn test_chat_no_pigeon_flag_and_no_telegram_alias() {
-        for flag in ["--no-pigeon", "--no-telegram"] {
-            let args = chat(&["--new", flag, "--pigeon-url", "http://p"]);
-            assert!(args.no_pigeon, "{flag} must set no_pigeon");
-            assert_eq!(chat_pigeon_settings(&args), None);
-        }
+    fn test_telegram_names_are_gone() {
+        // pigeon is Slack-only (pigeon-4ogz.30): the old `honk telegram` and `--no-telegram`
+        // names were dropped once nothing called them.
+        assert!(Cli::try_parse_from(["honk", "pigeon", "20261016_1"]).is_ok());
+        assert!(Cli::try_parse_from(["honk", "telegram", "20261016_1"]).is_err());
+        assert!(Cli::try_parse_from(["honk", "chat", "--new", "--no-pigeon"]).is_ok());
+        assert!(Cli::try_parse_from(["honk", "chat", "--new", "--no-telegram"]).is_err());
+    }
+
+    #[test]
+    fn test_chat_no_pigeon_flag() {
+        let args = chat(&["--new", "--no-pigeon", "--pigeon-url", "http://p"]);
+        assert!(args.no_pigeon);
+        assert_eq!(chat_pigeon_settings(&args), None);
         assert!(!chat(&["--new", "--pigeon-url", "http://p"]).no_pigeon);
     }
 
