@@ -4415,9 +4415,10 @@ async fn test_quote_trim_call_through_honkd() {
         &["--allow-unpatched-upstream"],
     )
     .await;
-    let (text, model) = honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into())
-        .await
-        .expect("trim answer");
+    let (text, model) =
+        honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into(), None)
+            .await
+            .expect("trim answer");
     assert_eq!(text, "{\"keep\":[]}");
     assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
     let sys = fake
@@ -4427,7 +4428,7 @@ async fn test_quote_trim_call_through_honkd() {
         .expect("system prompt set");
     assert_eq!(sys["params"]["text"], honk::tui::trim::SYSTEM);
 
-    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "  ".into())
+    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "  ".into(), None)
         .await
         .unwrap_err();
     assert!(err.contains("prompt is empty"), "{err}");
@@ -4462,7 +4463,7 @@ async fn trim_real_log() {
     let prompt = trim::prompt(&sent, q.your_prompt.as_deref());
     eprintln!("== {} replies, {} bytes quoted", q.count, q.text.len());
     let started = std::time::Instant::now();
-    let (answer, model) = honk::tui::app::run_trim(url, secret, prompt)
+    let (answer, model) = honk::tui::app::run_trim(url, secret, prompt, None)
         .await
         .expect("trim");
     eprintln!("== answer in {:?}: {answer}", started.elapsed());

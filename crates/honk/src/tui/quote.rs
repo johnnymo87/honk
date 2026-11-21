@@ -1,4 +1,4 @@
-//! `/quote [N]`: the coordinator's replies, quoted for the composer.
+//! `/quote [full] [N|prev]`: the coordinator's replies, quoted for the composer.
 //!
 //! A turn is a user block plus every block after it up to the next user block. Its reply is
 //! the text of its assistant blocks (thoughts, tools and notices are left out). Turns with no
@@ -6,7 +6,8 @@
 //! turn: stall-watch wakes, swarm messages and Jonathan's own prompts are never quoted.
 //!
 //! `/quote N` takes the last N such turns. Bare `/quote` takes every such turn from
-//! Jonathan's own last prompt (`Trigger::You`) onward, the reply to that prompt included.
+//! Jonathan's own last prompt (`Trigger::You`) onward, the reply to that prompt included;
+//! `/quote prev` does the same from the prompt before that one.
 //! A `/compact` is not his prompt: stall-watch sends them too, and nothing tells the two apart.
 //! See docs/plans/2026-11-19-quote-replies.md.
 
@@ -20,6 +21,20 @@ pub enum Pick {
     Last(usize),
     /// Every turn with reply text from your last prompt on, at most this many (the newest).
     SinceYou(usize),
+    /// `SinceYou`, but counted from your previous prompt (the one before your last).
+    SincePrev(usize),
+}
+
+impl Pick {
+    /// Which replies this picks, for notices: "since your last prompt", "the last 5".
+    pub fn describe(self) -> String {
+        match self {
+            Pick::Last(1) => "the last reply".into(),
+            Pick::Last(n) => format!("the last {n} replies"),
+            Pick::SinceYou(_) => "since your last prompt".into(),
+            Pick::SincePrev(_) => "since your previous prompt".into(),
+        }
+    }
 }
 
 /// Why nothing was quoted.
@@ -31,6 +46,8 @@ pub enum Empty {
     NeverSpoke,
     /// `SinceYou`, but no turn from your last prompt on has reply text yet.
     NothingSince,
+    /// `SincePrev`, but the transcript has only one prompt of yours.
+    OnePrompt,
 }
 
 /// The quoted replies, how many turns they cover, and how many matched before the cap.
@@ -124,12 +141,19 @@ pub fn build(
     let mut your_prompt = None;
     let (start, n, empty) = match pick {
         Pick::Last(n) => (0, n, Empty::NoReplies),
-        Pick::SinceYou(cap) => {
-            let Some(start) = turns
+        Pick::SinceYou(cap) | Pick::SincePrev(cap) => {
+            let back = usize::from(matches!(pick, Pick::SincePrev(_)));
+            let yours: Vec<usize> = turns
                 .iter()
-                .rposition(|t| t.trigger == Trigger::You && !t.is_compact)
-            else {
+                .enumerate()
+                .filter(|(_, t)| t.trigger == Trigger::You && !t.is_compact)
+                .map(|(i, _)| i)
+                .collect();
+            if yours.is_empty() {
                 return Err(Empty::NeverSpoke);
+            }
+            let Some(&start) = yours.iter().rev().nth(back) else {
+                return Err(Empty::OnePrompt);
             };
             your_prompt = Some(turns[start].prompt.clone());
             (start, cap, Empty::NothingSince)
@@ -393,6 +417,35 @@ mod tests {
         let blocks = vec![user("me"), ast("partial", 1)];
         let q = since(&blocks, 50, true).unwrap();
         assert_eq!(q.text, "# T1 (you, in progress)\n> partial");
+    }
+
+    #[test]
+    fn since_prev_counts_from_the_prompt_before_your_last() {
+        let blocks = vec![
+            user("first"),
+            ast("a", 1),
+            user("[sw wake run=r reason=x] x"),
+            ast("w", 2),
+            user("/compact"),
+            ast("c", 3),
+            user("second"),
+            ast("b", 4),
+        ];
+        let q = build(&blocks, Pick::SincePrev(50), false, fmt).unwrap();
+        assert_eq!(
+            q.text,
+            "# T1 (you)\n> a\n\n# T2 (wake: x)\n> w\n\n# T4 (you)\n> b"
+        );
+        assert_eq!(q.your_prompt.as_deref(), Some("first"));
+        let one = vec![user("only"), ast("a", 1)];
+        assert_eq!(
+            build(&one, Pick::SincePrev(50), false, fmt),
+            Err(Empty::OnePrompt)
+        );
+        assert_eq!(
+            build(&[ast("a", 1)], Pick::SincePrev(50), false, fmt),
+            Err(Empty::NeverSpoke)
+        );
     }
 
     fn since(blocks: &[Block], cap: usize, running: bool) -> Result<Quoted, Empty> {

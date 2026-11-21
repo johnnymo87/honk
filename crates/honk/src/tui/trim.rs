@@ -1,5 +1,5 @@
-//! `/quote`'s model trim (honk-9qf.31.4): the default model picks which lines of the replies
-//! since your last prompt you need to see, and honk quotes those lines from the source.
+//! `/quote`'s model trim (honk-9qf.31.4, .5): the default model picks which lines of the
+//! picked replies (since your last prompt, the last N, or since your previous prompt) you need to see, and honk quotes those lines from the source.
 //!
 //! The model only ever answers with line numbers (see [`SYSTEM`]); every quoted word is copied
 //! from the transcript, so nothing it writes can reach the composer as a quote. The lines honk
@@ -39,11 +39,14 @@ pub fn sendable(replies: &[Reply]) -> Vec<&Reply> {
 pub fn prompt(replies: &[&Reply], your_prompt: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(p) = your_prompt.map(str::trim).filter(|p| !p.is_empty()) {
-        out.push_str("Jonathan's last prompt (context only, not selectable):\n<<<\n");
+        out.push_str(
+            "Jonathan's prompt these replies follow (context only, not selectable):\n<<<\n",
+        );
         out.push_str(p);
-        out.push_str("\n>>>\n\n");
+        out.push_str("\n>>>\n\nThe replies since then:\n");
+    } else {
+        out.push_str("The replies:\n");
     }
-    out.push_str("The replies since then:\n");
     for (i, r) in replies.iter().enumerate() {
         let label = r.header.trim_start_matches('#').trim();
         out.push_str(&format!("\nR{} {label}\n", i + 1));
