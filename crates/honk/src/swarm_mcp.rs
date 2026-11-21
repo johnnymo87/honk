@@ -354,7 +354,7 @@ async fn ensure_mailbox(
         .ok_or_else(|| format!("pigeon response missing session_id: {body}"))?;
     if !session_id.starts_with("gse_") {
         return Err(format!(
-            "session '{}' has legacy pigeon session id '{}' (expected 'gse_…'); re-register with `honk telegram {} --force`",
+            "session '{}' has legacy pigeon session id '{}' (expected 'gse_…'); re-register with `honk pigeon {} --force`",
             config.session, session_id, config.session
         ));
     }

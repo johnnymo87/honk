@@ -21,11 +21,12 @@ enum Commands {
         long_about = "Interactive ratatui TUI client for a goose session.\n\nSee docs/chat.md for key map, commands, shared session rules, and tmux configuration."
     )]
     Chat(ChatArgs),
-    /// Register an existing session with pigeon so it gets a Telegram topic
+    /// Register an existing session with pigeon so it gets a pigeon chat channel
     #[command(
-        long_about = "Register an existing session with a pigeon daemon so it gets a Telegram topic.\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Telegram replies prompt the session; turns typed in honk chat are not mirrored to Telegram. pigeon is given the honkd secret so it can reach the session."
+        alias = "telegram",
+        long_about = "Register an existing session with a pigeon daemon so it gets a pigeon chat channel (a Slack channel; a Telegram topic on a machine still on Telegram).\n\nhonk chat --new does this automatically when HONK_PIGEON_URL is set. Replies typed in the channel prompt the session; turns typed in honk chat appear there only when honkd's turn hook is enabled. pigeon is given the honkd secret so it can reach the session.\n\n`honk telegram` is the old name and still works."
     )]
-    Telegram(TelegramArgs),
+    Pigeon(PigeonCmdArgs),
     /// Run the swarm MCP server over stdio for goose
     #[command(name = "swarm-mcp")]
     SwarmMcp(SwarmMcpArgs),
@@ -38,7 +39,7 @@ const LAUNCH_LONG_ABOUT: &str = "\
 Start a goose session headlessly, the goose analogue of opencode-launch.
 
 Creates the session through honkd with swarm tools on, tags it in session-tags \
-as goose:<id>, registers it with pigeon (a Telegram topic, notify on, honkd as \
+as goose:<id>, registers it with pigeon (a chat channel, notify on, honkd as \
 its push endpoint, so swarm_send reaches it), sends the prompt, and exits while \
 the turn runs.
 
@@ -84,7 +85,7 @@ struct LaunchArgs {
     #[arg(long, value_parser = honk::octags::parse_tag_arg)]
     tag: Option<honk::octags::TagArg>,
 
-    /// Session title, set before the first prompt (also names the Telegram topic)
+    /// Session title, set before the first prompt (also names the pigeon channel)
     #[arg(long)]
     title: Option<String>,
 
@@ -266,7 +267,7 @@ impl PigeonArgs {
 }
 
 #[derive(Args, Debug)]
-struct TelegramArgs {
+struct PigeonCmdArgs {
     /// Session ID to register
     session: String,
 
@@ -349,8 +350,8 @@ struct ChatArgs {
     secret: Option<String>,
 
     /// Do not register a new session with pigeon, even if HONK_PIGEON_URL is set
-    #[arg(long = "no-telegram")]
-    no_telegram: bool,
+    #[arg(long = "no-pigeon", alias = "no-telegram")]
+    no_pigeon: bool,
 
     /// Do not enable the swarm MCP server by default on a new session (sends _meta.honk.swarm: false)
     #[arg(long = "no-swarm")]
@@ -480,10 +481,10 @@ fn resolve_chat_target(args: &ChatArgs) -> anyhow::Result<honk::chat::driver::Ta
 }
 
 /// Only a session this invocation creates is registered: attaching to an
-/// existing one would re-announce it on every attach (`honk telegram` exists
+/// existing one would re-announce it on every attach (`honk pigeon` exists
 /// for that).
 fn chat_pigeon_settings(args: &ChatArgs) -> Option<honk::pigeon::PigeonSettings> {
-    if args.new && !args.no_telegram {
+    if args.new && !args.no_pigeon {
         args.pigeon.settings()
     } else {
         None
@@ -607,7 +608,7 @@ async fn main() -> anyhow::Result<()> {
             let app = honk::tui::App::new(session_id, handle.cmd_tx());
             honk::tui::app::run_app(app, ui_rx, handle).await?;
         }
-        Commands::Telegram(args) => {
+        Commands::Pigeon(args) => {
             let Some(settings) = args.pigeon.settings() else {
                 anyhow::bail!(
                     "no pigeon daemon configured: set HONK_PIGEON_URL or pass --pigeon-url"
@@ -688,7 +689,7 @@ mod tests {
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
-            no_telegram: false,
+            no_pigeon: false,
             no_swarm: false,
             tag: None,
             model: None,
@@ -713,7 +714,7 @@ mod tests {
             max_turns: None,
             url: "http://127.0.0.1:4280/acp".into(),
             secret: None,
-            no_telegram: false,
+            no_pigeon: false,
             no_swarm: false,
             tag: None,
             model: None,
@@ -1066,12 +1067,7 @@ mod tests {
             None
         );
         assert_eq!(
-            chat_pigeon_settings(&chat(&[
-                "--new",
-                "--no-telegram",
-                "--pigeon-url",
-                "http://p"
-            ])),
+            chat_pigeon_settings(&chat(&["--new", "--no-pigeon", "--pigeon-url", "http://p"])),
             None
         );
         assert_eq!(
@@ -1081,25 +1077,41 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parse_telegram_subcommand() {
-        let cli = Cli::try_parse_from([
-            "honk",
-            "telegram",
-            "20261016_1",
-            "--pigeon-url",
-            "http://p",
-            "--cwd",
-            "/w",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Telegram(a) => {
-                assert_eq!(a.session, "20261016_1");
-                assert_eq!(a.cwd, Some(PathBuf::from("/w")));
-                assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
+    fn test_cli_parse_pigeon_subcommand_and_telegram_alias() {
+        // `telegram` is the old name of the subcommand; scripts (stall-watch's
+        // error hint) still run it.
+        for name in ["pigeon", "telegram"] {
+            let cli = Cli::try_parse_from([
+                "honk",
+                name,
+                "20261016_1",
+                "--pigeon-url",
+                "http://p",
+                "--cwd",
+                "/w",
+                "--force",
+            ])
+            .unwrap();
+            match cli.command {
+                Commands::Pigeon(a) => {
+                    assert_eq!(a.session, "20261016_1");
+                    assert_eq!(a.cwd, Some(PathBuf::from("/w")));
+                    assert!(a.force);
+                    assert_eq!(a.pigeon.settings().unwrap().url, "http://p");
+                }
+                _ => panic!("expected pigeon command for `honk {name}`"),
             }
-            _ => panic!("expected telegram command"),
         }
+    }
+
+    #[test]
+    fn test_chat_no_pigeon_flag_and_no_telegram_alias() {
+        for flag in ["--no-pigeon", "--no-telegram"] {
+            let args = chat(&["--new", flag, "--pigeon-url", "http://p"]);
+            assert!(args.no_pigeon, "{flag} must set no_pigeon");
+            assert_eq!(chat_pigeon_settings(&args), None);
+        }
+        assert!(!chat(&["--new", "--pigeon-url", "http://p"]).no_pigeon);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # honkd Turn Hook (v1)
 
-honkd features an optional, generic turn hook that reports the start and end of every turn across all active sessions to an HTTP receiver. This allows external services—such as the [pigeon](https://github.com/johnnymo87/pigeon) daemon—to mirror prompt submissions and assistant replies into external notification streams (like Telegram topics) regardless of which client initiated the turn.
+honkd features an optional, generic turn hook that reports the start and end of every turn across all active sessions to an HTTP receiver. This allows external services—such as the [pigeon](https://github.com/johnnymo87/pigeon) daemon—to mirror prompt submissions and assistant replies into external notification streams (like a pigeon chat channel) regardless of which client initiated the turn.
 
 ## Configuration Flags
 
