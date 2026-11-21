@@ -1,5 +1,6 @@
 use crate::chat::driver::{ConnectionState, StateSnapshot};
 use crate::chat::types::Ownership;
+use crate::tui::activity::Indicator;
 use edtui::EditorMode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -99,8 +100,8 @@ impl<'a> StatusBar<'a> {
             title.to_string()
         };
 
-        if full.len() > max_width && max_width > 3 {
-            format!("{}…", &full[..max_width - 1])
+        if unicode_width::UnicodeWidthStr::width(full.as_str()) > max_width && max_width > 3 {
+            crate::tui::activity::cut_to_width(&full, max_width)
         } else {
             full
         }
@@ -168,6 +169,11 @@ impl<'a> StatusBar<'a> {
     }
 
     pub fn to_line(&self, width: u16) -> Line<'static> {
+        self.to_line_with(width, None)
+    }
+
+    /// The status line, with `activity` in place of the static run state.
+    pub fn to_line_with(&self, width: u16, activity: Option<&Indicator>) -> Line<'static> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
 
         let title_style = Style::default()
@@ -176,6 +182,7 @@ impl<'a> StatusBar<'a> {
             .add_modifier(Modifier::BOLD);
 
         let build_left_spans = |max_title_w: usize,
+                                activity_text: Option<&str>,
                                 model_text: Option<&str>,
                                 mcp_text: Option<&str>|
          -> Vec<Span<'static>> {
@@ -199,14 +206,21 @@ impl<'a> StatusBar<'a> {
             let display_title = self.title_and_cwd(max_title_w);
             spans.push(Span::styled(display_title, title_style));
 
-            // Run state
-            let run_state = self.run_state_text();
-            let run_style = Style::default().bg(Color::DarkGray).fg(match run_state {
-                "running" => Color::Green,
-                "running (other client)" => Color::Yellow,
-                "waiting" => Color::Cyan,
-                _ => Color::DarkGray,
-            });
+            // Run state, or the activity indicator while busy
+            let (run_state, run_color) = match (activity, activity_text) {
+                (Some(a), Some(text)) => (text, a.color),
+                _ => {
+                    let text = self.run_state_text();
+                    let color = match text {
+                        "running" => Color::Green,
+                        "running (other client)" => Color::Yellow,
+                        "waiting" => Color::Cyan,
+                        _ => Color::DarkGray,
+                    };
+                    (text, color)
+                }
+            };
+            let run_style = Style::default().bg(Color::DarkGray).fg(run_color);
             spans.push(Span::styled(format!("  [{}]", run_state), run_style));
 
             // Queued
@@ -265,14 +279,22 @@ impl<'a> StatusBar<'a> {
 
         let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
         let spacer_w = 1;
-        let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
+        // The indicator's full form, then its short form for narrow terminals.
+        let activity_candidates: Vec<Option<&str>> = match activity {
+            Some(a) => vec![Some(a.text.as_str()), Some(a.short.as_str())],
+            None => vec![None],
+        };
+        let run_state_w = |activity_text: Option<&str>| {
+            unicode_width::UnicodeWidthStr::width(activity_text.unwrap_or(self.run_state_text()))
+                + 4
+        };
         let queued_w = self
             .queued_text()
             .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
             .unwrap_or(0);
         let conn_text = self.connection_text();
         let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
-        let base_non_title_left = badge_w + spacer_w + run_state_w + queued_w + conn_w;
+        let base_non_title_left = badge_w + spacer_w + queued_w + conn_w;
 
         let usage_candidates: Vec<Option<String>> = if let Some(u) = self.usage {
             let levels = [UsageLevel::Full, UsageLevel::NoCost, UsageLevel::TokensOnly];
@@ -290,23 +312,28 @@ impl<'a> StatusBar<'a> {
             vec![None]
         };
 
+        // The indicator shrinks before the model, mcp or usage drop, so those
+        // stay put as tool titles and elapsed time change.
         let mut candidate_tuples = Vec::new();
         for model in &model_candidates {
             for mcp in &mcp_candidates {
                 if model_text.is_some() && model.is_none() && mcp.is_some() {
                     continue;
                 }
-                for usage in &usage_candidates {
-                    if usage.is_some() {
-                        candidate_tuples.push((model.clone(), mcp.clone(), usage.clone()));
+                for usage in usage_candidates
+                    .iter()
+                    .filter(|u| u.is_some())
+                    .chain([&None])
+                {
+                    for act in &activity_candidates {
+                        candidate_tuples.push((*act, model.clone(), mcp.clone(), usage.clone()));
                     }
                 }
-                candidate_tuples.push((model.clone(), mcp.clone(), None));
             }
         }
 
         let mut chosen = None;
-        for (model_opt, mcp_opt, usage_opt) in candidate_tuples {
+        for (act_opt, model_opt, mcp_opt, usage_opt) in candidate_tuples {
             let model_w = model_opt
                 .as_ref()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 2)
@@ -315,7 +342,7 @@ impl<'a> StatusBar<'a> {
                 .as_ref()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 2)
                 .unwrap_or(0);
-            let non_title_left = base_non_title_left + model_w + mcp_w;
+            let non_title_left = base_non_title_left + run_state_w(act_opt) + model_w + mcp_w;
 
             let usage_w = usage_opt
                 .as_ref()
@@ -326,8 +353,12 @@ impl<'a> StatusBar<'a> {
             let max_title_w = (width as usize)
                 .saturating_sub(non_title_left + right_needed)
                 .max(10);
-            let left_spans =
-                build_left_spans(max_title_w, model_opt.as_deref(), mcp_opt.as_deref());
+            let left_spans = build_left_spans(
+                max_title_w,
+                act_opt,
+                model_opt.as_deref(),
+                mcp_opt.as_deref(),
+            );
             let left_w: usize = left_spans
                 .iter()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
@@ -349,22 +380,31 @@ impl<'a> StatusBar<'a> {
         } else if let Some((left_spans, _, None)) = chosen {
             left_spans
         } else {
-            let max_title_w = (width as usize).saturating_sub(base_non_title_left).max(10);
-            build_left_spans(max_title_w, None, None)
+            let act = activity_candidates.last().copied().flatten();
+            let max_title_w = (width as usize)
+                .saturating_sub(base_non_title_left + run_state_w(act))
+                .max(10);
+            build_left_spans(max_title_w, act, None, None)
         };
 
         Line::from(spans).style(base_style)
     }
 }
 
-impl<'a> Widget for StatusBar<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl<'a> StatusBar<'a> {
+    pub fn render_with(&self, area: Rect, buf: &mut Buffer, activity: Option<&Indicator>) {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let line = self.to_line(area.width);
+        let line = self.to_line_with(area.width, activity);
         buf.set_style(area, Style::default().bg(Color::DarkGray));
         buf.set_line(area.x, area.y, &line, area.width);
+    }
+}
+
+impl<'a> Widget for StatusBar<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_with(area, buf, None);
     }
 }
 
@@ -390,6 +430,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         }
     }
 
@@ -431,6 +473,46 @@ mod tests {
             assert_eq!(shorten_home(&home), "~");
         }
         assert_eq!(shorten_home("/var/log"), "/var/log");
+    }
+
+    #[test]
+    fn test_activity_indicator_never_panics_and_keeps_connection() {
+        let snap = make_snapshot(
+            RunState::Running("run_1".into()),
+            Ownership::Foreign,
+            0,
+            ConnectionState::Reconnecting { attempt: 2 },
+        );
+        let bar = StatusBar {
+            session_id: "ses",
+            session_title: Some("fix the activity indicator — ünïcode"),
+            cwd: Some("/home/dev/projects/honk/.worktrees/activity-indicator"),
+            state_snapshot: Some(&snap),
+            mode: EditorMode::Insert,
+            usage: None,
+        };
+        for label in ["x", "shell · cargo test --workspace --all-features", "ab"] {
+            for secs in [5, 42, 185] {
+                let text = format!("⠹ {label} · other client {secs}s");
+                let a = Indicator {
+                    short: format!("⠹ {} {secs}s", crate::tui::activity::truncate(label, 12)),
+                    text,
+                    color: Color::Yellow,
+                };
+                for width in 20..=160u16 {
+                    let line = bar.to_line_with(width, Some(&a));
+                    let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    if width >= 80 {
+                        assert!(
+                            rendered.contains("reconnecting (2)"),
+                            "width {width}: {rendered}"
+                        );
+                        let w = unicode_width::UnicodeWidthStr::width(rendered.as_str());
+                        assert!(w <= width as usize, "width {width}: {w} {rendered}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

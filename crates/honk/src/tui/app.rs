@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::chat::driver::{ConnectionState, StateSnapshot, UiCommand, UiEvent};
 use crate::chat::types::Notice;
+use crate::tui::activity;
 use crate::tui::composer;
 use crate::tui::keys::{Action, configure_key_handler, resolve};
 use crate::tui::model_picker::{ModelPicker, PickerOutcome};
@@ -91,6 +93,12 @@ pub struct App {
     pub recent_dir: Option<PathBuf>,
     /// `zm`: the composer takes most of the screen (see `/quote`).
     pub composer_maximized: bool,
+    /// When the current busy stretch began (see `tui::activity`).
+    pub activity_clock: activity::Clock,
+    /// Spinner animates (off with `HONK_NO_ANIM=1`).
+    pub animate: bool,
+    /// The activity indicator text as last drawn, to redraw only when it changes.
+    drawn_activity: Option<String>,
 }
 
 impl App {
@@ -127,6 +135,9 @@ impl App {
             composer_scroll: 0,
             composer_maximized: false,
             recent_dir: None,
+            activity_clock: activity::Clock::default(),
+            animate: activity::animation_enabled(),
+            drawn_activity: None,
         }
     }
 
@@ -173,6 +184,27 @@ impl App {
             Some(s) => !s.run_state.is_running() && !s.prompt_in_flight,
             None => true,
         }
+    }
+
+    /// The status bar's activity indicator for this instant, `None` when idle.
+    pub fn activity(&self) -> Option<activity::Indicator> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        activity::indicator(
+            self.state_snapshot.as_ref(),
+            &self.transcript,
+            &self.activity_clock,
+            self.animate,
+            Instant::now(),
+            now_unix,
+        )
+    }
+
+    /// Whether the indicator has moved on since the last draw (a spinner frame
+    /// or a second ticked), so the render loop redraws only then.
+    pub fn activity_changed(&self) -> bool {
+        self.activity().map(|a| a.text) != self.drawn_activity
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
@@ -761,6 +793,7 @@ impl App {
                 }
             }
             UiEvent::State(snapshot) => {
+                self.activity_clock.observe(&snapshot, Instant::now());
                 self.state_snapshot = Some(snapshot);
             }
             UiEvent::Notice(notice) => {
@@ -864,7 +897,9 @@ impl App {
             mode: self.composer.mode,
             usage: self.transcript.usage(),
         };
-        frame.render_widget(status_bar, status_area);
+        let activity = self.activity();
+        status_bar.render_with(status_area, frame.buffer_mut(), activity.as_ref());
+        self.drawn_activity = activity.map(|a| a.text);
 
         // 3. Composer
         let composer_cursor =
@@ -1012,7 +1047,7 @@ pub async fn run_app(
 
         tokio::select! {
             _ = render_interval.tick() => {
-                if dirty {
+                if dirty || app.activity_changed() {
                     terminal.draw(|f| app.draw(f))?;
                     dirty = false;
                 }
@@ -1558,6 +1593,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         });
 
         // Any key sends RetryAttach AND performs normal key
@@ -1619,6 +1656,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         });
         app.handle_key(ctrl('c'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
@@ -1663,6 +1702,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         }));
 
         let backend = TestBackend::new(100, 20);
@@ -1674,7 +1715,7 @@ mod tests {
         let buffer_str: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
 
         assert!(buffer_str.contains("My Active Session — /tmp/test-work"));
-        assert!(buffer_str.contains("running (other client)"));
+        assert!(buffer_str.contains("working · other client"));
         assert!(buffer_str.contains("queued: 2"));
         assert!(buffer_str.contains("live"));
         assert!(buffer_str.contains("INSERT"));
@@ -2024,6 +2065,8 @@ mod tests {
             model: Some("single-model".to_string()),
             known_models: vec!["single-model".to_string()],
             models_listed: true,
+            compacting: false,
+            awaiting_permission: false,
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -2055,6 +2098,8 @@ mod tests {
             model: Some("model-1".to_string()),
             known_models: vec!["model-1".to_string(), "model-2".to_string()],
             models_listed: true,
+            compacting: false,
+            awaiting_permission: false,
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -2112,6 +2157,8 @@ mod tests {
                 "model-c".to_string(),
             ],
             models_listed: true,
+            compacting: false,
+            awaiting_permission: false,
         };
 
         // Starting with current model A
@@ -2199,6 +2246,8 @@ mod tests {
             model: Some("custom-author-model-1".to_string()),
             known_models: vec!["goose-stale-model".to_string()],
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         });
 
         let temp = tempfile::tempdir().unwrap();
@@ -2516,6 +2565,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         });
         // Running: the quote's last turn is marked in progress.
         app.transcript

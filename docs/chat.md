@@ -92,7 +92,8 @@ The user interface consists of three distinct vertical areas:
    - **Honk notices**: informational and warning notices (e.g. queue state, extension warnings).
 
 2. **Status Bar** (single row):
-   - Displays session title (or session ID), working directory (`cwd`), run state (`idle`, `running`, `running (other client)`, or `queued: N`), and connection status (`live`, `reconnecting…`, or `stopped`).
+   - Displays session title (or session ID), working directory (`cwd`), run state, `queued: N`, and connection status (`live`, `reconnecting…`, or `stopped`).
+   - **Activity indicator**: while a turn is busy, the run state is an animated spinner, what the session is doing, and how long the turn has run: `[⠹ thinking 12s]`, `[⠼ shell · cargo test 40s]`. The states are `needs approval` (another client's turn waits on `/approve`), `compacting`, `waiting` (prompt sent, turn not started), `thinking`, `replying`, the running tool's title, and `working` (between steps). A turn another client started adds `· other client`. Idle shows `[idle]`. Every attached view shows it; nothing is sent to honkd, pigeon or Telegram. When you attach mid-turn, the timer counts from the turn's user message. The bar is redrawn only when the indicator changes (10 times a second while busy, never while idle); set `HONK_NO_ANIM=1` for a static `⋯` on slow links.
 
 3. **Composer / Command Bar** (bottom):
    - Multiline editor with modal vim navigation.
