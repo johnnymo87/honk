@@ -275,7 +275,7 @@ When creating a new session with `honk chat --new`:
 
 - **Soft revert & multi-view hiding**: Running `/undo` hides the undone turn in every attached `honk chat` viewer (as well as tail views). `honkd` writes a new log generation and broadcasts `_honk/reset` followed by log replay, immediately updating all viewers without needing client-side transcript filtering.
 - **Composer recall**: On a successful undo, the undone prompt text is placed back into the composer if the composer is currently empty, allowing you to easily edit and re-submit your prompt.
-- **`/redo` restores until the next prompt**: An undone turn is preserved in a sidecar and can be brought back with `/redo`. However, the revert is soft: as soon as the next prompt reaches the session from **anyone** (a prompt typed in `honk chat`, an incoming Telegram reply, a stall-watch wake, or a swarm message), `honkd` commits the truncation upstream, deletes the redo sidecar, and permanently drops the undone turns.
+- **`/redo` restores until the next prompt**: An undone turn is preserved in a sidecar and can be brought back with `/redo`. However, the revert is soft: as soon as the next prompt reaches the session from **anyone** (a prompt typed in `honk chat`, an incoming reply typed in its pigeon channel, a stall-watch wake, or a swarm message), `honkd` commits the truncation upstream, deletes the redo sidecar, and permanently drops the undone turns.
 - **Undo stops**: Only your own human prompts serve as undo stops. Automated prompts (such as stall-watch coordinator wakes, swarm messages, or prompts that goose writes itself) are skipped and are undone or restored together with the human prompt they follow.
 - **Slash commands are not stops**: Slash commands (such as `/compact`, `/mcp`, `/turns`, etc.) run as client actions rather than session prompts and do not create undo stops.
 - **Busy state refusal**: Both `/undo` and `/redo` require the session to be idle. They are refused locally (and by `honkd`) while a turn is actively running, a prompt is in flight, a permission request is awaiting answer, or lines are queued or held.
@@ -289,24 +289,24 @@ When creating a new session with `honk chat --new`:
 
 ---
 
-## Telegram via pigeon
+## Chat channels via pigeon
 
-If you run a [pigeon](https://github.com/johnnymo87/pigeon) daemon, `honk chat --new` can register the new session with it so the session gets a Telegram topic:
+If you run a [pigeon](https://github.com/johnnymo87/pigeon) daemon, `honk chat --new` can register the new session with it so the session gets a pigeon chat channel (a Slack channel; a Telegram topic on a machine still on Telegram):
 
 ```bash
 export HONK_PIGEON_URL=http://127.0.0.1:4731          # or --pigeon-url
 export HONK_PIGEON_TOKEN_FILE=/path/to/pigeon-token   # or --pigeon-token-file; only if the daemon requires auth
 honk chat --new                  # registers in the background
-honk chat --new --no-telegram    # skip it for this session
+honk chat --new --no-pigeon      # skip it for this session
 
 # Register a session that already exists (cwd and title come from honkd's session list)
-honk telegram 20261016_7
+honk pigeon 20261016_7
 ```
 
 - Registration is off unless a pigeon URL is configured. It runs in the background; the outcome is shown as a notice, and a failure is only a warning, never a reason the chat stops.
-- honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), the working directory, and the honkd secret honk connected with (pigeon stores it and presents it to honkd; it refuses Telegram messages for a session stored without one). pigeon creates a topic only when it sends a notification, so honk then posts one short announcement (`POST /stop`), which creates the topic.
-- Replies in the topic prompt the session, and pigeon posts those turns' results there. Prompts and replies from every client (honk chat included) appear in the topic when honkd runs with `--turn-hook-url` pointing at pigeon's `/goose/turn-event` (see [docs/turn-hook.md](turn-hook.md)).
-- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk telegram <id>`. `honk telegram` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides.
+- honk calls pigeon's `POST /goose/sessions` with the goose session id, the honkd URL (as `ws://` or `wss://`), the working directory, and the honkd secret honk connected with (pigeon stores it and presents it to honkd; it refuses messages typed in a session's channel when it stored no secret for it). pigeon creates a channel only when it sends a notification, so honk then posts one short announcement (`POST /stop`), which creates the channel.
+- Replies typed in the channel prompt the session, and pigeon posts those turns' results there. Prompts and replies from every client (honk chat included) appear in the channel when honkd runs with `--turn-hook-url` pointing at pigeon's `/goose/turn-event` (see [docs/turn-hook.md](turn-hook.md)).
+- Attaching with `honk chat <id>` never registers (it would re-announce on every attach); use `honk pigeon <id>`. `honk pigeon` refuses a session pigeon already has, because registering again overwrites pigeon's record of it (including the token of a session pigeon launched); `--force` overrides. `honk telegram` and `--no-telegram` are the old names of the subcommand and flag and still work.
 - The bearer token and the honkd secret travel in the request, so keep the pigeon URL on loopback or use `https://`.
 - The honkd URL is sent as honk sees it, so pigeon must be able to reach honkd at the same address (normally both on localhost).
 
@@ -328,11 +328,11 @@ honk telegram 20261016_7
 
 ## Headless Launch (`honk launch`)
 
-`honk launch <dir> <prompt>` starts a goose session headlessly through honkd, tags it, registers it with pigeon (Telegram topic), sends the initial prompt, and exits while the turn runs in the background. It is the goose analogue of `opencode-launch`.
+`honk launch <dir> <prompt>` starts a goose session headlessly through honkd, tags it, registers it with pigeon (pigeon chat channel), sends the initial prompt, and exits while the turn runs in the background. It is the goose analogue of `opencode-launch`.
 
 ### Command-Line Flags
 
-- `--title <title>`: Session title, set before the first prompt (also sets the Telegram topic title).
+- `--title <title>`: Session title, set before the first prompt (also sets the pigeon channel title).
 - `--model <id>`: Initial model for the session, set before the first prompt. Refuses IDs not present in honkd's model list (configured via honkd `--models-file`), aborting before prompting. If setting the model fails, the launch aborts before prompting with a partial exit code and reports the created session ID.
 - `--effort <level>`: Thinking effort for the new session (`off`, `low`, `medium`, `high`, `max`), set after the model step before the first prompt. If setting the thinking effort fails, the launch aborts before prompting with a partial exit code and reports the created session ID. Default: goose-serve's `GOOSE_THINKING_EFFORT`.
 - `--tag <tag>`: Tag the session in session-tags (`goose:<id>`). Defaults to inheriting the launching session's tag; `--tag auto` opts out.

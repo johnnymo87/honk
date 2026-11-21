@@ -18,7 +18,7 @@
 //! 4. `session-tags set -- <tag> goose:<id>`.
 //! 5. Register it with pigeon (`POST /goose/sessions`: `notify` on, honkd as the
 //!    push-capable `backend_endpoint`) and announce it, which creates its
-//!    Telegram topic.
+//!    pigeon chat channel.
 //! 6. `session/prompt`, wait until honkd shows the turn started, and disconnect.
 //!    A viewer leaving does not cancel a turn in honkd.
 //!
@@ -411,11 +411,11 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
     launched.gse = Some(gse.clone());
     let announced = step!(
         pigeon::announce(&opts.pigeon, &gse, &reg).await,
-        "registered with pigeon, but announcing it (which creates its Telegram topic) failed"
+        "registered with pigeon, but announcing it (which creates its pigeon channel) failed"
     );
     if !announced.announced {
         eprintln!(
-            "honk launch: pigeon registered {gse} but did not announce it ({}); its topic appears on its first turn notification",
+            "honk launch: pigeon registered {gse} but did not announce it ({}); its channel appears on its first turn notification",
             announced
                 .not_announced_reason
                 .as_deref()

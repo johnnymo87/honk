@@ -4263,7 +4263,7 @@ async fn test_ensure_mailbox_rejects_non_gse_session_id() {
     assert_eq!(resp["result"]["isError"], true);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("honk telegram 20261020_owner --force"),
+        text.contains("honk pigeon 20261020_owner --force"),
         "expected re-register instructions in error text: {text}"
     );
 

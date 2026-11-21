@@ -41,7 +41,7 @@ async fn registers_then_announces_with_bearer_token() {
             "label": "20261016_7",
             "auth_token": "honkd-secret",
         }),
-        "pigeon refuses Telegram messages for a session stored without a token"
+        "pigeon refuses messages typed in its channel for a session stored without a token"
     );
 
     assert_eq!(seen[1].path, "/stop");
@@ -192,7 +192,7 @@ async fn find_registered_skips_notify_false_rows() {
     assert_eq!(
         find_registered(&cfg, "20261020_1").await.unwrap(),
         None,
-        "notify: false row must be skipped so honk telegram can upgrade it"
+        "notify: false row must be skipped so honk pigeon can upgrade it"
     );
     assert_eq!(
         find_registered(&cfg, "20261020_2")

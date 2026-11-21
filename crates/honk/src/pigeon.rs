@@ -1,20 +1,21 @@
-//! Registering a goose session with a pigeon daemon so it gets a Telegram topic.
+//! Registering a goose session with a pigeon daemon so it gets a pigeon chat channel
+//! (a Slack channel; a Telegram topic on a machine still on Telegram).
 //!
 //! pigeon learns about a goose session only when it launches one itself or when
 //! something calls its `POST /goose/sessions`. Registering is not enough to make
-//! the session visible, though: pigeon creates the forum topic lazily, on the
+//! the session visible, though: pigeon creates the channel lazily, on the
 //! first notification it sends for the session, and it only sends notifications
 //! for turns it prompted. So honk registers the session and then posts one
-//! notification (`POST /stop`) announcing it, which is what creates the topic.
+//! notification (`POST /stop`) announcing it, which is what creates the channel.
 //!
-//! Prompts and replies from honk chat appear in the topic when honkd runs with
+//! Prompts and replies from honk chat appear in the channel when honkd runs with
 //! its turn hook enabled (`--turn-hook-url`); without the hook, pigeon only
 //! reports the turns it starts.
 //!
 //! honk hands pigeon the honkd secret it connected with, as the session's
 //! `auth_token`. pigeon checks that honkd is reachable with the session's stored
-//! token before it delivers each Telegram message, and refuses the message if no
-//! token is stored, so a session registered without one gets a topic that
+//! token before it delivers each message typed in the channel, and refuses the message if no
+//! token is stored, so a session registered without one gets a channel that
 //! cannot be used. It is the same credential pigeon stores for the sessions it
 //! launches through honkd itself.
 
@@ -72,7 +73,7 @@ pub struct Registration {
     /// The honkd secret pigeon must present at `endpoint`.
     pub auth_token: String,
     pub cwd: String,
-    /// Session title, when known. pigeon names the topic after it.
+    /// Session title, when known. pigeon names the channel after it.
     pub title: Option<String>,
     /// Why the announcement is being sent; shapes its wording.
     pub reason: Reason,
@@ -95,7 +96,7 @@ impl std::fmt::Debug for Registration {
 pub enum Reason {
     /// `honk chat --new` just created the session.
     NewChat,
-    /// `honk telegram` for an existing session.
+    /// `honk pigeon` for an existing session.
     Existing,
     /// `honk launch` just created the session and is about to prompt it.
     Launch,
@@ -107,7 +108,7 @@ pub struct Registered {
     /// pigeon's own id for the session (`gse_…`).
     pub pigeon_session_id: String,
     /// Whether pigeon queued the announcement. `false` means pigeon accepted
-    /// the session but declined to notify (e.g. a quiet policy), so no topic
+    /// the session but declined to notify (e.g. a quiet policy), so no channel
     /// appears until pigeon next notifies about it.
     pub announced: bool,
     /// pigeon's reason for not announcing, when it gave one.
@@ -118,10 +119,10 @@ impl Registered {
     /// A one-line summary for the TUI or stdout.
     pub fn summary(&self) -> String {
         if self.announced {
-            "Telegram: registered with pigeon; its topic appears shortly. Replies there prompt this session; turns typed here appear in the topic when honkd's turn hook is enabled.".to_string()
+            "pigeon: registered with pigeon; its channel appears shortly. Replies there prompt this session; turns typed here appear in the channel when honkd's turn hook is enabled.".to_string()
         } else {
             format!(
-                "Telegram: registered with pigeon, but it did not announce the session ({}); no topic yet.",
+                "pigeon: registered with pigeon, but it did not announce the session ({}); no channel yet.",
                 self.not_announced_reason
                     .as_deref()
                     .unwrap_or("no reason given")
@@ -164,7 +165,7 @@ fn announcement(reg: &Registration) -> String {
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registers the session with pigeon and posts the announcement that creates
-/// its topic. pigeon reuses its row for the same goose id but overwrites it
+/// its channel. pigeon reuses its row for the same goose id but overwrites it
 /// wholesale; see [`find_registered`].
 pub async fn register(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<Registered> {
     let pigeon_id = register_row(cfg, reg).await?;
@@ -182,7 +183,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 
 /// `POST /goose/sessions`: creates (or refreshes) pigeon's row for the session,
 /// with `notify` on and `reg.endpoint` as its `backend_endpoint`, and returns
-/// pigeon's id for it (`gse_…`). No topic exists until [`announce`].
+/// pigeon's id for it (`gse_…`). No channel exists until [`announce`].
 pub async fn register_row(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Result<String> {
     let http = http_client()?;
     let body = json!({
@@ -199,7 +200,7 @@ pub async fn register_row(cfg: &PigeonConfig, reg: &Registration) -> anyhow::Res
     Ok(pigeon_id.to_string())
 }
 
-/// Posts the one notification that makes pigeon create the session's topic.
+/// Posts the one notification that makes pigeon create the session's channel.
 pub async fn announce(
     cfg: &PigeonConfig,
     pigeon_id: &str,
@@ -234,9 +235,9 @@ pub async fn announce(
 /// pigeon's id for the goose session, if pigeon already has it registered.
 ///
 /// Registering again overwrites pigeon's row wholesale (token, label, cwd,
-/// title), which can break a session pigeon launched itself, so `honk telegram`
+/// title), which can break a session pigeon launched itself, so `honk pigeon`
 /// checks first. Rows with `notify: false` (e.g. swarm mailbox-only rows) are
-/// skipped so `honk telegram` proceeds to register and upgrade them.
+/// skipped so `honk pigeon` proceeds to register and upgrade them.
 pub async fn find_registered(
     cfg: &PigeonConfig,
     goose_session_id: &str,
@@ -248,7 +249,7 @@ pub async fn find_registered(
             let id = |k: &str| s.get(k).and_then(Value::as_str);
             // Rows from before pigeon minted its own ids carry goose's id as
             // `session_id` and no `backend_session_id`. Swarm mailbox-only rows
-            // have `notify: false` and are skipped so `honk telegram` can upgrade them.
+            // have `notify: false` and are skipped so `honk pigeon` can upgrade them.
             s.get("notify") != Some(&Value::Bool(false))
                 && id("backend_kind") == Some("goose-acp")
                 && (id("backend_session_id") == Some(goose_session_id)

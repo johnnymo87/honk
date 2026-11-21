@@ -2645,7 +2645,7 @@ async fn new_session_pigeon_notice(
                     .map(str::to_string);
             }
             UiEvent::Attached { .. } => attached = true,
-            UiEvent::Notice(n) if n.text.starts_with("Telegram:") => notice = Some(n),
+            UiEvent::Notice(n) if n.text.starts_with("pigeon:") => notice = Some(n),
             UiEvent::Fatal(f) => panic!("fatal: {f}"),
             _ => {}
         }

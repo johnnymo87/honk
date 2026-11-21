@@ -37,7 +37,7 @@ pub struct DriverOpts {
     pub idle_timeout: Option<Duration>,
     pub max_turns: Option<u32>,
     /// When set, a session created by `Target::New` is registered with this
-    /// pigeon daemon (so it gets a Telegram topic). Runs in the background;
+    /// pigeon daemon (so it gets a pigeon chat channel). Runs in the background;
     /// its outcome arrives as a `UiEvent::Notice` and never blocks the chat.
     pub pigeon: Option<crate::pigeon::PigeonSettings>,
     /// When set, a session created by `Target::New` is tagged in oc-tags as
@@ -72,7 +72,7 @@ impl DriverOpts {
 
 /// Registers a just-created session with pigeon in the background and reports
 /// the outcome as a notice. A failure is a warning, never fatal: the chat works
-/// the same without a Telegram topic.
+/// the same without a pigeon channel.
 fn spawn_pigeon_registration(
     settings: crate::pigeon::PigeonSettings,
     honk_url: &str,
@@ -85,7 +85,7 @@ fn spawn_pigeon_registration(
     let auth_token = honk_secret.to_string();
     tokio::spawn(async move {
         let notice = match endpoint.and_then(|ep| Ok((ep, settings.load()?))) {
-            Err(e) => Notice::warning(format!("Telegram: not registered with pigeon: {e:#}")),
+            Err(e) => Notice::warning(format!("pigeon: not registered with pigeon: {e:#}")),
             Ok((endpoint, cfg)) => {
                 let reg = crate::pigeon::Registration {
                     goose_session_id,
@@ -98,9 +98,7 @@ fn spawn_pigeon_registration(
                 match crate::pigeon::register(&cfg, &reg).await {
                     Ok(r) if r.announced => Notice::info(r.summary()),
                     Ok(r) => Notice::warning(r.summary()),
-                    Err(e) => {
-                        Notice::warning(format!("Telegram: not registered with pigeon: {e:#}"))
-                    }
+                    Err(e) => Notice::warning(format!("pigeon: not registered with pigeon: {e:#}")),
                 }
             }
         };
@@ -708,7 +706,7 @@ async fn run_driver(
                     ui_tx.clone(),
                 );
                 let unconfirmed = format!(
-                    "Telegram: registering {session_id} with pigeon was not confirmed before exit; `honk telegram {session_id}` registers it (it refuses if pigeon already has it)"
+                    "pigeon: registering {session_id} with pigeon was not confirmed before exit; `honk pigeon {session_id}` registers it (it refuses if pigeon already has it)"
                 );
                 background
                     .lock()
