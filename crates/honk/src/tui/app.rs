@@ -322,9 +322,13 @@ impl App {
             let _ = self.cmd_tx.send(UiCommand::RetryAttach);
         }
 
+        // While trimming, Ctrl-C on an empty composer cancels the trim instead of the run. With
+        // text in the composer it does what it always does (leave insert mode, clear a
+        // maximized draft); the trim result then lands above that text.
         if self.trim.is_some()
             && self.model_picker.is_none()
             && self.command_line.is_none()
+            && self.is_composer_empty()
             && key_event.code == KeyCode::Char('c')
             && key_event.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -536,6 +540,10 @@ impl App {
                     let mut stdout = std::io::stdout();
                     self.yank_last_assistant(&mut stdout);
                 } else if !trimmed.is_empty() {
+                    if !trimmed.starts_with('/') || trimmed.starts_with("//") {
+                        // You answered; a quote of what came before would arrive stale.
+                        self.drop_trim("trim cancelled: you sent a prompt");
+                    }
                     let _ = self.cmd_tx.send(UiCommand::Line(text.clone()));
                     self.history.push(text);
                     self.reset_history_recall();
@@ -699,9 +707,12 @@ impl App {
         };
         if trim && self.trim.is_some() {
             self.transcript.apply_notice(Notice::warning(
-                "/quote is already trimming; Ctrl-C cancels it",
+                "/quote is already trimming; Ctrl-C on an empty composer cancels it",
             ));
             return;
+        }
+        if !trim {
+            self.drop_trim("trim cancelled for the untrimmed quote");
         }
         let Some(q) = self.pick_quote(pick) else {
             return;
@@ -848,13 +859,16 @@ impl App {
     /// Ctrl-C while trimming: stop the model call (honkd cancels it when the connection
     /// closes) and quote nothing.
     pub fn cancel_trim(&mut self) {
+        self.drop_trim("trim cancelled; /quote all quotes everything without the model");
+    }
+
+    /// Stops a pending trim, if any, saying why.
+    fn drop_trim(&mut self, why: &str) {
         if let Some(t) = self.trim.take() {
             if let Some(a) = t.abort {
                 a.abort();
             }
-            self.transcript.apply_notice(Notice::info(
-                "trim cancelled; /quote all quotes everything without the model",
-            ));
+            self.transcript.apply_notice(Notice::info(why));
         }
     }
 
@@ -864,7 +878,9 @@ impl App {
             return;
         }
         let t = self.trim.take().expect("checked");
-        if let Ok((answer, model)) = &done.result {
+        if let Ok((answer, model)) = &done.result
+            && quote_trim::parse(answer, &quote_trim::sendable(&t.quoted.replies)).is_ok()
+        {
             self.trim_cache = Some((t.key, answer.clone(), model.clone()));
         }
         self.finish_trim(t.quoted, done.result);
@@ -2903,6 +2919,52 @@ mod tests {
         assert!(text.ends_with("> head1\n\ntyping"), "{text}");
         assert_eq!(app.composer.mode, EditorMode::Insert, "mode left alone");
         assert_eq!(app.composer.cursor, edtui::Index2::new(5, 6));
+    }
+
+    #[test]
+    fn test_ctrl_c_with_a_draft_while_trimming_keeps_its_usual_meaning() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        type_str(&mut app, "draft");
+        app.handle_key(ctrl('c'));
+        assert!(app.trim.is_some(), "the trim keeps running");
+        assert_eq!(
+            app.composer.mode,
+            EditorMode::Normal,
+            "Ctrl-C left insert mode"
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_sending_a_prompt_or_an_untrimmed_quote_cancels_the_trim() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        type_str(&mut app, "go ahead");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.trim.is_none());
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("go ahead".into())
+        );
+        assert!(last_notice(&app).contains("you sent a prompt"));
+
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        app.execute_app_command("quote 1");
+        assert!(app.trim.is_none());
+        assert!(app.get_composer_text().contains("QUESTION2?"));
+        assert!(!app.get_composer_text().contains("QUESTION0?"));
+    }
+
+    #[test]
+    fn test_unusable_answers_are_not_cached() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        answer(&mut app, Ok(("Ran into this error", None)));
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        assert!(app.trim.is_some(), "asks the model again");
     }
 
     #[test]

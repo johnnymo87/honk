@@ -231,6 +231,10 @@ impl Hub {
             tracing::warn!(%sid, "oneshot thinking_effort {effort} not set: {e:#}");
         }
 
+        // A cancel during setup must not start the (paid) prompt.
+        if !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+            return Err(OneshotError::Cancelled);
+        }
         let prompt_id = up
             .request(
                 "session/prompt",
@@ -297,6 +301,16 @@ impl Hub {
                             .unwrap_or("");
                         if stop == "cancelled" {
                             return Err(OneshotError::Cancelled);
+                        }
+                        // goose reports a provider failure as ordinary agent text ("Ran into
+                        // this error: ...") with the error in _meta; that text is no answer.
+                        if let Some(err) = frame.pointer("/result/_meta/goose/turnError") {
+                            let msg = err
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| err.to_string());
+                            return Err(OneshotError::Failed(format!("model: {msg}")));
                         }
                         if text.trim().is_empty() {
                             return Err(OneshotError::Failed(format!(

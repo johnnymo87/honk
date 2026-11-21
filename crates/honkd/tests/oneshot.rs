@@ -213,3 +213,26 @@ async fn oneshot_against_real_goose_uses_no_tools_and_our_system_prompt() {
         "oneshot session not listed: {list}"
     );
 }
+
+/// goose reports a provider failure as agent text plus `_meta.goose.turnError`; that is an
+/// error, not an answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn oneshot_turn_error_is_an_error_not_an_answer() {
+    let fake = FakeGoose::start().await;
+    fake.script_prompt(vec!["Ran into this error: overloaded".into()]);
+    fake.set_prompt_result_meta(Some(json!({
+        "goose": { "turnError": { "kind": "provider", "message": "overloaded" } }
+    })));
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let res = v
+        .call("_honk/oneshot", json!({ "system": "", "prompt": "P" }))
+        .await;
+    assert_eq!(res["error"]["message"], "model: overloaded", "{res}");
+    wait_until("state clean", || state(&h)["oneshot_sessions"] == json!([])).await;
+}

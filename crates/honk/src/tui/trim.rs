@@ -246,7 +246,7 @@ pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
     }
     let by = model.map(|m| format!(" by {m}")).unwrap_or_default();
     let mut out = format!(
-        "# honk: trimmed{by}, kept {kept_lines} of {total_lines} lines from {} of {} replies (/quote all for everything)",
+        "# honk: trimmed{by}, kept {kept_lines} of {total_lines} lines from {} of {} replies",
         blocks.len(),
         sent.len()
     );
@@ -273,6 +273,15 @@ mod tests {
             header: format!("# {header}"),
             text: text.to_string(),
             in_progress: false,
+        }
+    }
+
+    /// goose renders a system prompt override as a template; a render failure silently falls
+    /// back to its own prompt and the JSON contract would be lost.
+    #[test]
+    fn system_prompt_has_no_template_syntax() {
+        for d in ["{{", "}}", "{%", "%}", "{#", "#}"] {
+            assert!(!SYSTEM.contains(d), "SYSTEM contains {d}");
         }
     }
 
@@ -357,7 +366,7 @@ mod tests {
         }];
         assert_eq!(
             render(&rs, &kept, Some("claude-opus-5-5")),
-            "# honk: trimmed by claude-opus-5-5, kept 2 of 5 lines from 1 of 2 replies (/quote all for everything)\n\n\
+            "# honk: trimmed by claude-opus-5-5, kept 2 of 5 lines from 1 of 2 replies\n\n\
              # T1 (wake: x) · ask\n> keep one\n# …\n> keep two\n\n\
              # T3 (wake: z, in progress) · untrimmed\n> partial"
         );
