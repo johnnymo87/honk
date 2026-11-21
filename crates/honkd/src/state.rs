@@ -27,6 +27,10 @@ pub struct State {
     /// Survives eviction and restarts.
     #[serde(default)]
     pub reverts: BTreeMap<String, Revert>,
+    /// Throwaway goose sessions `_honk/oneshot` created and has not yet deleted
+    /// (honk-9qf.31.4). Swept at startup.
+    #[serde(default)]
+    pub oneshot_sessions: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

@@ -6,6 +6,7 @@ pub mod model_picker;
 pub mod quote;
 pub mod status;
 pub mod transcript;
+pub mod trim;
 
 pub use app::App;
 pub use keys::{Action, resolve};

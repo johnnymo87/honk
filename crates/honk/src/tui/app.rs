@@ -20,6 +20,7 @@ use crate::tui::model_picker::{ModelPicker, PickerOutcome};
 use crate::tui::quote;
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
+use crate::tui::trim as quote_trim;
 
 /// Most replies `/quote` loads; the composer re-renders its whole content every frame.
 const MAX_QUOTE: usize = 50;
@@ -99,6 +100,106 @@ pub struct App {
     pub animate: bool,
     /// The activity indicator text as last drawn, to redraw only when it changes.
     drawn_activity: Option<String>,
+    /// Where `/quote`'s model trim runs (see `tui::trim`).
+    pub trim_backend: TrimBackend,
+    /// The trim in flight, if any.
+    pub trim: Option<PendingTrim>,
+    trim_seq: u64,
+    trim_tx: mpsc::UnboundedSender<TrimDone>,
+    trim_rx: Option<mpsc::UnboundedReceiver<TrimDone>>,
+    /// The last answer, by a hash of its prompt: re-running `/quote` on the same replies is free.
+    trim_cache: Option<(u64, String, Option<String>)>,
+    /// Last elapsed second drawn in the status bar, so the tick only redraws when it changes.
+    trim_drawn_secs: Option<u64>,
+}
+
+/// Where `/quote`'s model call goes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TrimBackend {
+    /// No model call: bare `/quote` quotes everything, as `/quote all` does.
+    #[default]
+    None,
+    /// honkd's `_honk/oneshot`, on a connection of its own.
+    Honkd { url: String, secret: String },
+    /// Tests: record the prompt instead of calling anything.
+    #[cfg(test)]
+    Record,
+}
+
+/// A trim in flight: what it was asked about, and how to stop it.
+pub struct PendingTrim {
+    pub seq: u64,
+    pub started: std::time::Instant,
+    pub quoted: quote::Quoted,
+    pub key: u64,
+    pub prompt: String,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+/// A finished model call: the answer text and the model, or why it failed.
+#[derive(Debug)]
+pub struct TrimDone {
+    pub seq: u64,
+    pub result: Result<(String, Option<String>), String>,
+}
+
+/// How long honk waits for honkd's answer (honkd's own limit is 90 s).
+const TRIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
+
+/// Asks honkd's `_honk/oneshot` to trim; the answer text and the model that wrote it.
+pub async fn run_trim(
+    url: String,
+    secret: String,
+    prompt: String,
+) -> Result<(String, Option<String>), String> {
+    let call = async {
+        let mut client = crate::client::Client::connect(&url, &secret)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let res = client
+            .call(
+                "_honk/oneshot",
+                serde_json::json!({
+                    "system": quote_trim::SYSTEM,
+                    "prompt": prompt,
+                    "effort": "low",
+                    "timeoutMs": 90_000,
+                }),
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(err) = res.get("error") {
+            if err.get("code").and_then(Value::as_i64) == Some(-32601) {
+                return Err("honkd is too old for /quote's trim".to_string());
+            }
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("error");
+            return Err(msg.to_string());
+        }
+        let text = res
+            .pointer("/result/text")
+            .and_then(Value::as_str)
+            .ok_or("honkd's answer had no text")?
+            .to_string();
+        let model = res
+            .pointer("/result/model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((text, model))
+    };
+    match tokio::time::timeout(TRIM_TIMEOUT, call).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("no answer within {}s", TRIM_TIMEOUT.as_secs())),
+    }
+}
+
+fn hash_of(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 impl App {
@@ -106,6 +207,7 @@ impl App {
         let mut key_handler = edtui::events::KeyEventHandler::vim_mode();
         configure_key_handler(&mut key_handler);
         let event_handler = edtui::EditorEventHandler::new(key_handler);
+        let (trim_tx, trim_rx) = mpsc::unbounded_channel();
 
         let mut composer = edtui::EditorState::default();
         composer.mode = EditorMode::Insert;
@@ -138,6 +240,13 @@ impl App {
             activity_clock: activity::Clock::default(),
             animate: activity::animation_enabled(),
             drawn_activity: None,
+            trim_backend: TrimBackend::None,
+            trim: None,
+            trim_seq: 0,
+            trim_tx,
+            trim_rx: Some(trim_rx),
+            trim_cache: None,
+            trim_drawn_secs: None,
         }
     }
 
@@ -211,6 +320,20 @@ impl App {
         // Stopped state + any key -> UiCommand::RetryAttach (in addition to key's normal effect)
         if matches!(self.connection_state(), ConnectionState::Stopped { .. }) {
             let _ = self.cmd_tx.send(UiCommand::RetryAttach);
+        }
+
+        // While trimming, Ctrl-C on an empty composer cancels the trim instead of the run. With
+        // text in the composer it does what it always does (leave insert mode, clear a
+        // maximized draft); the trim result then lands above that text.
+        if self.trim.is_some()
+            && self.model_picker.is_none()
+            && self.command_line.is_none()
+            && self.is_composer_empty()
+            && key_event.code == KeyCode::Char('c')
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.cancel_trim();
+            return;
         }
 
         // If model picker is active
@@ -417,6 +540,10 @@ impl App {
                     let mut stdout = std::io::stdout();
                     self.yank_last_assistant(&mut stdout);
                 } else if !trimmed.is_empty() {
+                    if !trimmed.starts_with('/') || trimmed.starts_with("//") {
+                        // You answered; a quote of what came before would arrive stale.
+                        self.drop_trim("trim cancelled: you sent a prompt");
+                    }
                     let _ = self.cmd_tx.send(UiCommand::Line(text.clone()));
                     self.history.push(text);
                     self.reset_history_recall();
@@ -552,11 +679,14 @@ impl App {
         self.history_stash.clear();
     }
 
-    /// `/quote [N]` / `:quote [N]`: loads coordinator replies, quoted, into the composer (see
-    /// `tui::quote`): the last N, or with no N every reply since your own last prompt.
+    /// `/quote [all|N]` / `:quote [all|N]`: loads coordinator replies, quoted, into the
+    /// composer (see `tui::quote`). `N`: the last N. `all`: every reply since your own last
+    /// prompt. Bare: the same replies, trimmed by the default model to what you need to see
+    /// (see `tui::trim`), when they are long enough for that to help.
     /// `keep_draft` keeps the current composer text below them.
     pub fn quote(&mut self, arg: &str, keep_draft: bool) {
-        let pick = if arg.is_empty() {
+        let trim = arg.is_empty();
+        let pick = if arg.is_empty() || arg == "all" {
             quote::Pick::SinceYou(MAX_QUOTE)
         } else {
             match arg.parse::<usize>() {
@@ -569,17 +699,100 @@ impl App {
                 Ok(n) if n >= 1 => quote::Pick::Last(n),
                 _ => {
                     self.transcript.apply_notice(Notice::warning(
-                        "invalid /quote argument: must be a positive integer",
+                        "invalid /quote argument: use all or a positive integer",
                     ));
                     return;
                 }
             }
         };
+        if trim && self.trim.is_some() {
+            self.transcript.apply_notice(Notice::warning(
+                "/quote is already trimming; Ctrl-C on an empty composer cancels it",
+            ));
+            return;
+        }
+        if !trim {
+            self.drop_trim("trim cancelled for the untrimmed quote");
+        }
+        let Some(q) = self.pick_quote(pick) else {
+            return;
+        };
+        let draft = if keep_draft {
+            self.get_composer_text()
+        } else {
+            String::new()
+        };
+        if !trim || q.your_prompt.is_none() {
+            self.load_quote(&q.text, &draft);
+            return;
+        }
+        if q.text.len() <= quote_trim::MIN_BYTES {
+            self.transcript.apply_notice(Notice::info(
+                "quoted in full: too short for trimming to help",
+            ));
+            self.load_quote(&q.text, &draft);
+            return;
+        }
+        let sent = quote_trim::sendable(&q.replies);
+        if sent.is_empty() {
+            self.load_quote(&q.text, &draft);
+            return;
+        }
+        let prompt = quote_trim::prompt(&sent, q.your_prompt.as_deref());
+        let key = hash_of(&prompt);
+        if let Some((k, answer, model)) = self.trim_cache.clone()
+            && k == key
+        {
+            self.finish_trim(q, Ok((answer, model)));
+            return;
+        }
+        let abort = match &self.trim_backend {
+            TrimBackend::None => {
+                self.transcript.apply_notice(Notice::warning(
+                    "no model to trim with; quoting everything since your last prompt",
+                ));
+                self.load_quote(&q.text, &draft);
+                return;
+            }
+            TrimBackend::Honkd { url, secret } => {
+                let (url, secret, p) = (url.clone(), secret.clone(), prompt.clone());
+                let tx = self.trim_tx.clone();
+                let seq = self.trim_seq + 1;
+                Some(
+                    tokio::spawn(async move {
+                        let result = run_trim(url, secret, p).await;
+                        let _ = tx.send(TrimDone { seq, result });
+                    })
+                    .abort_handle(),
+                )
+            }
+            #[cfg(test)]
+            TrimBackend::Record => None,
+        };
+        self.trim_seq += 1;
+        let n = sent.len();
+        let noun = if n == 1 { "reply" } else { "replies" };
+        self.transcript.apply_notice(Notice::info(format!(
+            "trimming {n} {noun} to what needs you; Ctrl-C cancels, /quote all skips the model",
+        )));
+        self.trim = Some(PendingTrim {
+            seq: self.trim_seq,
+            started: std::time::Instant::now(),
+            quoted: q,
+            key,
+            prompt,
+            abort,
+        });
+        self.trim_drawn_secs = None;
+    }
+
+    /// The replies `pick` selects, after posting any notice about them; None if none.
+    fn pick_quote(&mut self, pick: quote::Pick) -> Option<quote::Quoted> {
         // The core's run state, not the transcript's: the transcript's `active_run` is not
         // carried across a replay swap, so right after attaching it can read idle mid-run.
         let running = !self.is_idle();
         let blocks = &self.transcript.blocks;
-        let q = match quote::build(blocks, pick, running, quote::local_time) {
+        match quote::build(blocks, pick, running, quote::local_time) {
             Ok(q) => {
                 match pick {
                     quote::Pick::Last(n) if q.count < n => {
@@ -596,20 +809,20 @@ impl App {
                     }
                     _ => {}
                 }
-                q
+                Some(q)
             }
             Err(quote::Empty::NeverSpoke) => {
                 let fallback = quote::Pick::Last(QUOTE_FALLBACK);
                 let Ok(q) = quote::build(blocks, fallback, running, quote::local_time) else {
                     self.transcript
                         .apply_notice(Notice::warning("no replies to quote"));
-                    return;
+                    return None;
                 };
                 self.transcript.apply_notice(Notice::info(format!(
                     "no prompt of yours in this session; quoting the last {} replies",
                     q.count
                 )));
-                q
+                Some(q)
             }
             Err(quote::Empty::NothingSince) => {
                 let msg = if running {
@@ -618,23 +831,22 @@ impl App {
                     "no replies since your last prompt"
                 };
                 self.transcript.apply_notice(Notice::warning(msg));
-                return;
+                None
             }
             Err(quote::Empty::NoReplies) => {
                 self.transcript
                     .apply_notice(Notice::warning("no replies to quote"));
-                return;
+                None
             }
-        };
-        let draft = if keep_draft {
-            self.get_composer_text()
-        } else {
-            String::new()
-        };
+        }
+    }
+
+    /// Puts `text` in the composer ahead of `draft`, maximized, in normal mode at the top.
+    fn load_quote(&mut self, text: &str, draft: &str) {
         let text = if draft.trim().is_empty() {
-            q.text
+            text.to_string()
         } else {
-            format!("{}\n\n{}", q.text, draft)
+            format!("{text}\n\n{draft}")
         };
         self.set_composer_text(&text);
         self.composer.cursor = edtui::Index2::new(0, 0);
@@ -642,6 +854,79 @@ impl App {
         self.composer_scroll = 0;
         self.composer_maximized = true;
         self.reset_history_recall();
+    }
+
+    /// Ctrl-C while trimming: stop the model call (honkd cancels it when the connection
+    /// closes) and quote nothing.
+    pub fn cancel_trim(&mut self) {
+        self.drop_trim("trim cancelled; /quote all quotes everything without the model");
+    }
+
+    /// Stops a pending trim, if any, saying why.
+    fn drop_trim(&mut self, why: &str) {
+        if let Some(t) = self.trim.take() {
+            if let Some(a) = t.abort {
+                a.abort();
+            }
+            self.transcript.apply_notice(Notice::info(why));
+        }
+    }
+
+    /// The model call finished: quote what it kept, or everything if it failed.
+    pub fn on_trim_done(&mut self, done: TrimDone) {
+        if self.trim.as_ref().is_none_or(|t| t.seq != done.seq) {
+            return;
+        }
+        let t = self.trim.take().expect("checked");
+        if let Ok((answer, model)) = &done.result
+            && quote_trim::parse(answer, &quote_trim::sendable(&t.quoted.replies)).is_ok()
+        {
+            self.trim_cache = Some((t.key, answer.clone(), model.clone()));
+        }
+        self.finish_trim(t.quoted, done.result);
+    }
+
+    fn finish_trim(&mut self, q: quote::Quoted, result: Result<(String, Option<String>), String>) {
+        let sent = quote_trim::sendable(&q.replies);
+        let kept = result
+            .and_then(|(answer, model)| quote_trim::parse(&answer, &sent).map(|k| (k, model)));
+        let text = match kept {
+            Ok((kept, _)) if kept.is_empty() && !q.replies.iter().any(|r| r.in_progress) => {
+                self.transcript.apply_notice(Notice::info(
+                    "the model found nothing that needs you; /quote all quotes everything",
+                ));
+                return;
+            }
+            Ok((kept, model)) => quote_trim::render(&q.replies, &kept, model.as_deref()),
+            Err(why) => {
+                self.transcript.apply_notice(Notice::warning(format!(
+                    "trim failed ({why}); quoting everything since your last prompt"
+                )));
+                q.text.clone()
+            }
+        };
+        // Text typed while the model ran stays below, where it was, and so does the cursor.
+        let draft = self.get_composer_text();
+        if draft.trim().is_empty() {
+            self.load_quote(&text, "");
+        } else {
+            let rows = text.lines().count() + 1;
+            let cursor = self.composer.cursor;
+            self.set_composer_text(&format!("{text}\n\n{draft}"));
+            self.composer.cursor = edtui::Index2::new(cursor.row + rows, cursor.col);
+            self.composer_scroll = 0;
+            self.composer_maximized = true;
+        }
+    }
+
+    /// Render tick: whether the trim's elapsed seconds changed since the last draw.
+    pub fn trim_tick(&mut self) -> bool {
+        let secs = self.trim.as_ref().map(|t| t.started.elapsed().as_secs());
+        if secs != self.trim_drawn_secs {
+            self.trim_drawn_secs = secs;
+            return true;
+        }
+        false
     }
 
     pub fn yank_last_assistant<W: Write>(&mut self, writer: &mut W) {
@@ -896,6 +1181,7 @@ impl App {
             state_snapshot: self.state_snapshot.as_ref(),
             mode: self.composer.mode,
             usage: self.transcript.usage(),
+            trimming: self.trim.as_ref().map(|t| t.started.elapsed().as_secs()),
         };
         let activity = self.activity();
         status_bar.render_with(status_area, frame.buffer_mut(), activity.as_ref());
@@ -1039,6 +1325,10 @@ pub async fn run_app(
 
     terminal.draw(|f| app.draw(f))?;
     let mut dirty = false;
+    let mut trim_rx = app
+        .trim_rx
+        .take()
+        .expect("run_app takes the trim receiver once");
 
     loop {
         if app.should_quit {
@@ -1047,6 +1337,9 @@ pub async fn run_app(
 
         tokio::select! {
             _ = render_interval.tick() => {
+                if app.trim_tick() {
+                    dirty = true;
+                }
                 if dirty || app.activity_changed() {
                     terminal.draw(|f| app.draw(f))?;
                     dirty = false;
@@ -1085,6 +1378,10 @@ pub async fn run_app(
                     }
                     None => break,
                 }
+            }
+            Some(done) = trim_rx.recv() => {
+                app.on_trim_done(done);
+                dirty = true;
             }
             maybe_ui_event = ui_rx.recv() => {
                 match maybe_ui_event {
@@ -2470,13 +2767,238 @@ mod tests {
                 app.transcript.apply_frame(&f);
             }
         }
-        app.execute_app_command("quote");
+        app.execute_app_command("quote all");
         let text = app.get_composer_text();
         assert_eq!(text.matches("\n> r").count(), MAX_QUOTE, "{text}");
         assert!(!text.contains("> r1.") && text.contains("> r2.") && text.ends_with("> r51."));
         assert!(
             last_notice(&app).contains("52 replies since your last prompt; quoting the last 50")
         );
+    }
+
+    /// Your prompt, then three long wake replies (well over `trim::MIN_BYTES`).
+    fn long_app(backend: TrimBackend) -> (App, mpsc::UnboundedReceiver<UiCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        app.trim_backend = backend;
+        app.transcript
+            .apply_frame(&update("user_message_chunk", "me", "status?", 1));
+        for i in 0..3 {
+            let t = 100 * (i + 1);
+            let body = format!(
+                "head{i}\n\n{}\nQUESTION{i}?",
+                format!("filler line {i} with plenty of words\n").repeat(40)
+            );
+            app.transcript.apply_frame(&update(
+                "user_message_chunk",
+                &format!("u{i}"),
+                "[sw wake run=r reason=mail] Woken",
+                t,
+            ));
+            app.transcript.apply_frame(&update(
+                "agent_message_chunk",
+                &format!("a{i}"),
+                &body,
+                t + 1,
+            ));
+        }
+        (app, cmd_rx)
+    }
+
+    fn answer(app: &mut App, result: Result<(&str, Option<&str>), &str>) {
+        let seq = app.trim.as_ref().expect("a trim is pending").seq;
+        app.on_trim_done(TrimDone {
+            seq,
+            result: result
+                .map(|(a, m)| (a.to_string(), m.map(str::to_string)))
+                .map_err(str::to_string),
+        });
+    }
+
+    #[test]
+    fn test_bare_quote_trims_long_replies_and_quotes_only_kept_lines() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        type_str(&mut app, "/quote");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
+        let t = app.trim.as_ref().expect("trimming");
+        assert!(t.prompt.contains("<<<\nstatus?\n>>>"), "{}", t.prompt);
+        assert!(t.prompt.contains("R3 ") && t.prompt.contains("L44: QUESTION2?"));
+        assert!(last_notice(&app).contains("trimming 3 replies"));
+        assert!(app.is_composer_empty());
+
+        answer(
+            &mut app,
+            Ok((
+                r#"{"keep":[{"reply":1,"lines":[[1,1]],"tag":"fyi"},{"reply":3,"lines":[[44,44]],"tag":"ask"}]}"#,
+                Some("claude-opus-5-5"),
+            )),
+        );
+        assert!(app.trim.is_none());
+        let text = app.get_composer_text();
+        assert!(
+            text.starts_with(
+                "# honk: trimmed by claude-opus-5-5, kept 2 of 126 lines from 2 of 3 replies"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("(wake: mail) · fyi\n> head0\n\n# "), "{text}");
+        assert!(text.ends_with("(wake: mail) · ask\n> QUESTION2?"), "{text}");
+        assert!(!text.contains("filler") && !text.contains("QUESTION0"));
+        assert_eq!(app.composer.mode, EditorMode::Normal);
+        assert_eq!(app.composer.cursor, edtui::Index2::new(0, 0));
+        assert!(app.composer_maximized);
+
+        // The same replies again: the cached answer, no model call.
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        assert!(app.trim.is_none());
+        assert!(
+            app.get_composer_text()
+                .starts_with("# honk: trimmed by claude-opus-5-5")
+        );
+    }
+
+    #[test]
+    fn test_trim_failure_or_bad_answer_quotes_everything() {
+        for result in [Err("model: overloaded"), Ok(("Sure! Read R1.", None))] {
+            let (mut app, _rx) = long_app(TrimBackend::Record);
+            app.execute_app_command("quote");
+            answer(&mut app, result);
+            let text = app.get_composer_text();
+            assert!(text.contains("QUESTION0?") && text.contains("filler line 2"));
+            assert!(!text.contains("# honk: trimmed"));
+            assert!(
+                last_notice(&app).contains("trim failed"),
+                "{}",
+                last_notice(&app)
+            );
+        }
+    }
+
+    #[test]
+    fn test_trim_keeping_nothing_says_so_and_leaves_the_composer() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        answer(&mut app, Ok((r#"{"keep":[]}"#, None)));
+        assert!(app.is_composer_empty());
+        assert!(last_notice(&app).contains("nothing that needs you"));
+    }
+
+    #[test]
+    fn test_ctrl_c_cancels_the_trim_without_interrupting_the_run() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        let seq = app.trim.as_ref().unwrap().seq;
+        app.handle_key(ctrl('c'));
+        assert!(app.trim.is_none());
+        assert!(cmd_rx.try_recv().is_err(), "no Interrupt");
+        assert!(last_notice(&app).contains("trim cancelled"));
+        // A late answer for the cancelled trim is ignored.
+        app.on_trim_done(TrimDone {
+            seq,
+            result: Ok((r#"{"keep":[{"reply":1,"all":true}]}"#.into(), None)),
+        });
+        assert!(app.is_composer_empty());
+        // The next Ctrl-C is an ordinary interrupt again.
+        app.handle_key(ctrl('c'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
+    }
+
+    #[test]
+    fn test_text_typed_while_trimming_stays_below_with_its_cursor() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        type_str(&mut app, "typing");
+        assert_eq!(app.composer.mode, EditorMode::Insert);
+        answer(
+            &mut app,
+            Ok((r#"{"keep":[{"reply":2,"lines":[[1,1]]}]}"#, None)),
+        );
+        let text = app.get_composer_text();
+        assert!(text.ends_with("> head1\n\ntyping"), "{text}");
+        assert_eq!(app.composer.mode, EditorMode::Insert, "mode left alone");
+        assert_eq!(app.composer.cursor, edtui::Index2::new(5, 6));
+    }
+
+    #[test]
+    fn test_ctrl_c_with_a_draft_while_trimming_keeps_its_usual_meaning() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        type_str(&mut app, "draft");
+        app.handle_key(ctrl('c'));
+        assert!(app.trim.is_some(), "the trim keeps running");
+        assert_eq!(
+            app.composer.mode,
+            EditorMode::Normal,
+            "Ctrl-C left insert mode"
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_sending_a_prompt_or_an_untrimmed_quote_cancels_the_trim() {
+        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        type_str(&mut app, "go ahead");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.trim.is_none());
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("go ahead".into())
+        );
+        assert!(last_notice(&app).contains("you sent a prompt"));
+
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        app.execute_app_command("quote 1");
+        assert!(app.trim.is_none());
+        assert!(app.get_composer_text().contains("QUESTION2?"));
+        assert!(!app.get_composer_text().contains("QUESTION0?"));
+    }
+
+    #[test]
+    fn test_unusable_answers_are_not_cached() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        answer(&mut app, Ok(("Ran into this error", None)));
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        assert!(app.trim.is_some(), "asks the model again");
+    }
+
+    #[test]
+    fn test_second_bare_quote_while_trimming_warns() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote");
+        let seq = app.trim.as_ref().unwrap().seq;
+        app.execute_app_command("quote");
+        assert_eq!(app.trim.as_ref().unwrap().seq, seq);
+        assert!(last_notice(&app).contains("already trimming"));
+    }
+
+    #[test]
+    fn test_bare_quote_skips_the_model_when_short_or_unavailable() {
+        let (mut app, _rx) = quote_app();
+        app.trim_backend = TrimBackend::Record;
+        app.execute_app_command("quote");
+        assert!(app.trim.is_none());
+        assert!(app.get_composer_text().contains("> reply one"));
+        assert!(last_notice(&app).contains("quoted in full"));
+
+        let (mut app, _rx) = long_app(TrimBackend::None);
+        app.execute_app_command("quote");
+        assert!(app.trim.is_none());
+        assert!(app.get_composer_text().contains("filler line 2"));
+        assert!(last_notice(&app).contains("no model to trim with"));
+    }
+
+    #[test]
+    fn test_quote_all_never_trims() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote all");
+        assert!(app.trim.is_none());
+        assert!(app.get_composer_text().contains("filler line 2"));
     }
 
     #[test]

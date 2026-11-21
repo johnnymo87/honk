@@ -144,6 +144,7 @@ struct FakeGooseInner {
     gap_on_next_resume: Mutex<HashSet<String>>,
     inbound_frames: Mutex<Vec<Value>>,
     deleted_connections: Mutex<Vec<String>>,
+    deleted_sessions: Mutex<Vec<String>>,
     connections: Mutex<HashMap<String, ConnectionState>>,
     next_conn_num: AtomicU64,
     next_session_num: AtomicU64,
@@ -209,6 +210,7 @@ impl FakeGoose {
             gap_on_next_resume: Mutex::new(HashSet::new()),
             inbound_frames: Mutex::new(Vec::new()),
             deleted_connections: Mutex::new(Vec::new()),
+            deleted_sessions: Mutex::new(Vec::new()),
             connections: Mutex::new(HashMap::new()),
             next_conn_num: AtomicU64::new(1),
             next_session_num: AtomicU64::new(1),
@@ -345,6 +347,11 @@ impl FakeGoose {
 
     pub fn deletes(&self) -> Vec<String> {
         self.state.deleted_connections.lock().unwrap().clone()
+    }
+
+    /// Session ids that received `session/delete`, in order.
+    pub fn deleted_sessions(&self) -> Vec<String> {
+        self.state.deleted_sessions.lock().unwrap().clone()
     }
 
     pub fn script_prompt(&self, chunks: Vec<String>) {
@@ -1681,6 +1688,25 @@ async fn handle_post(
                     .entry(sid.clone())
                     .or_insert_with(StreamState::new);
                 stream.push_frame(resp, patched, false);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Some("session/delete" | "_goose/unstable/session/system-prompt/set") => {
+            let sid = target_session
+                .as_deref()
+                .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if frame.get("method").and_then(Value::as_str) == Some("session/delete") {
+                state.deleted_sessions.lock().unwrap().push(sid.clone());
+            }
+            if let Some(id) = req_id {
+                emit_session_frame(
+                    &state,
+                    &conn_id,
+                    &sid,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                );
             }
             StatusCode::ACCEPTED.into_response()
         }

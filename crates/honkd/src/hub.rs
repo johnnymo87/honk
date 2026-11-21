@@ -294,6 +294,9 @@ impl Hub {
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));
 
+        let hub_sweep = hub.clone();
+        tokio::spawn(async move { hub_sweep.sweep_oneshot_sessions().await });
+
         let pending_clone = hub.pending_control.clone();
         let hub_for_rx = hub.clone();
         tokio::spawn(async move {

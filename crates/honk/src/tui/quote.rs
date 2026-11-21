@@ -39,11 +39,42 @@ pub struct Quoted {
     pub text: String,
     pub count: usize,
     pub total: usize,
+    /// The picked replies, oldest first, unquoted (for `/quote`'s model trim, `tui::trim`).
+    pub replies: Vec<Reply>,
+    /// `SinceYou`: the text of the prompt counted from.
+    pub your_prompt: Option<String>,
+}
+
+/// One picked reply: its `# <time> (<label>)` header line and its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub header: String,
+    pub text: String,
+    /// The run is still writing it.
+    pub in_progress: bool,
+}
+
+/// `text` as quote lines: `> line`, and a bare `>` for a blank line.
+pub fn quote_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.into_iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.is_empty() {
+            out.push('>');
+        } else {
+            out.push_str("> ");
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 struct Turn {
     trigger: Trigger,
     is_compact: bool,
+    prompt: String,
     reply: Vec<String>,
     created: Option<i64>,
 }
@@ -63,6 +94,7 @@ pub fn build(
             BlockKind::User => turns.push(Turn {
                 trigger: classify(&b.text),
                 is_compact: b.text.trim() == "/compact",
+                prompt: b.text.clone(),
                 reply: Vec::new(),
                 created: None,
             }),
@@ -71,6 +103,7 @@ pub fn build(
                     turns.push(Turn {
                         trigger: Trigger::Start,
                         is_compact: false,
+                        prompt: String::new(),
                         reply: Vec::new(),
                         created: None,
                     });
@@ -88,6 +121,7 @@ pub fn build(
         }
     }
     let last_idx = turns.len().checked_sub(1);
+    let mut your_prompt = None;
     let (start, n, empty) = match pick {
         Pick::Last(n) => (0, n, Empty::NoReplies),
         Pick::SinceYou(cap) => {
@@ -97,6 +131,7 @@ pub fn build(
             else {
                 return Err(Empty::NeverSpoke);
             };
+            your_prompt = Some(turns[start].prompt.clone());
             (start, cap, Empty::NothingSince)
         }
     };
@@ -112,35 +147,38 @@ pub fn build(
         return Err(empty);
     }
 
-    let mut out = String::new();
-    for (i, (idx, turn)) in picked.iter().enumerate() {
-        if i > 0 {
-            out.push_str("\n\n");
-        }
-        let mut label = turn.trigger.label();
-        if running && Some(*idx) == last_idx {
-            label.push_str(", in progress");
-        }
-        out.push_str("# ");
-        if let Some(time) = turn.created.and_then(&fmt_time) {
-            out.push_str(&time);
-            out.push(' ');
-        }
-        out.push_str(&format!("({label})"));
-        for line in turn.reply.join("\n\n").lines() {
-            out.push('\n');
-            if line.is_empty() {
-                out.push('>');
-            } else {
-                out.push_str("> ");
-                out.push_str(line);
+    let replies: Vec<Reply> = picked
+        .iter()
+        .map(|(idx, turn)| {
+            let in_progress = running && Some(*idx) == last_idx;
+            let mut label = turn.trigger.label();
+            if in_progress {
+                label.push_str(", in progress");
             }
-        }
-    }
+            let mut header = String::from("# ");
+            if let Some(time) = turn.created.and_then(&fmt_time) {
+                header.push_str(&time);
+                header.push(' ');
+            }
+            header.push_str(&format!("({label})"));
+            Reply {
+                header,
+                text: turn.reply.join("\n\n"),
+                in_progress,
+            }
+        })
+        .collect();
+    let text = replies
+        .iter()
+        .map(|r| format!("{}\n{}", r.header, quote_lines(r.text.lines())))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     Ok(Quoted {
-        text: out,
+        text,
         count: picked.len(),
         total,
+        replies,
+        your_prompt,
     })
 }
 

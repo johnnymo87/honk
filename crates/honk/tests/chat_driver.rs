@@ -4396,3 +4396,76 @@ async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
 }
+
+/// `/quote`'s trim call (honk-9qf.31.4) through a real honkd: the answer and model come back,
+/// and a honkd error comes back as an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quote_trim_call_through_honkd() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.script_prompt(vec!["{\"keep\":[]}".into()]);
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let (text, model) = honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into())
+        .await
+        .expect("trim answer");
+    assert_eq!(text, "{\"keep\":[]}");
+    assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+    let sys = fake
+        .inbound()
+        .into_iter()
+        .find(|f| f["method"] == "_goose/unstable/session/system-prompt/set")
+        .expect("system prompt set");
+    assert_eq!(sys["params"]["text"], honk::tui::trim::SYSTEM);
+
+    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "  ".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("prompt is empty"), "{err}");
+}
+
+/// Manual check of `/quote`'s trim on a real session log against a live honkd:
+/// `HONK_TRIM_LOG=~/.local/state/honk/sessions/<sid>.jsonl HONK_TRIM_URL=ws://127.0.0.1:4280
+/// HONK_SECRET=... cargo test -p honk --test chat_driver trim_real_log -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn trim_real_log() {
+    use honk::tui::{quote, trim};
+    let log = std::env::var("HONK_TRIM_LOG").expect("HONK_TRIM_LOG");
+    let url = std::env::var("HONK_TRIM_URL").expect("HONK_TRIM_URL");
+    let secret = honk::client::resolve_secret(None).expect("secret");
+    let mut t = honk::tui::Transcript::new();
+    for line in std::fs::read_to_string(&log).unwrap().lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(f) = v.get("frame")
+        {
+            t.apply_frame(f);
+        }
+    }
+    let q = quote::build(
+        &t.blocks,
+        quote::Pick::SinceYou(50),
+        false,
+        quote::local_time,
+    )
+    .expect("replies since your last prompt");
+    let sent = trim::sendable(&q.replies);
+    let prompt = trim::prompt(&sent, q.your_prompt.as_deref());
+    eprintln!("== {} replies, {} bytes quoted", q.count, q.text.len());
+    let started = std::time::Instant::now();
+    let (answer, model) = honk::tui::app::run_trim(url, secret, prompt)
+        .await
+        .expect("trim");
+    eprintln!("== answer in {:?}: {answer}", started.elapsed());
+    let kept = trim::parse(&answer, &sent).expect("usable answer");
+    eprintln!("{}", trim::render(&q.replies, &kept, model.as_deref()));
+}
