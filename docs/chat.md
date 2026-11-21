@@ -87,7 +87,7 @@ The user interface consists of three distinct vertical areas:
    - Renders session turns chronologically.
    - **User messages**: labeled user turns (`> text`). Consecutive identical user messages automatically collapse into a single line with a `×N` suffix. When a user message's full content parses as a JSON object or array (such as recipe or coordinator wake payloads), it renders collapsed by default to a single dim summary line (e.g. `▸ structured input · program=example-program · wake_reason=activity · 18 KB`); `zj` or `:json` toggles full structural expansion.
    - **Assistant messages**: markdown rendered with syntax highlighting and newline-gated streaming. When the response parses as a JSON object or array, it renders structurally: top-level keys appear as bold/dim labels, string values are unescaped and rendered as markdown, string arrays appear as bullet lists, arrays of objects appear as indented sub-blocks, inline scalars appear beside keys, and empty strings/arrays/objects are omitted. In-progress streaming JSON displays `◌ receiving structured reply (N KB)…` until the full object arrives.
-   - **Thinking blocks**: internal model reasoning, displayed dim and collapsed to a single line by default (`zt` toggles full visibility).
+   - **Thinking blocks**: the model's reasoning, shown in full by default under a dim yellow `- Thought` header, the reasoning itself dim italic. When the reasoning opens with a `**Title**` paragraph (as summarized thinking often does), the title moves into the header: `- Thought: Title`. `zt` collapses every thinking block to its header with a line count (`+ Thought: Title · 3 lines`) and expands them again. A block with no reasoning text shows `Thought (no text)`; that is what a provider sends when it returns only a thinking signature, as Claude does when thinking is requested without `display: "summarized"`.
    - **Tool calls**: compact status row displaying the glyph, title (formatted with recognizable command/path details such as `shell · ls` or `write · notes.md`), and live tool notification output (`za` toggles full input/output view). Tools ending in `final_output` (e.g. `recipe__final_output`) render as a dim one-liner `◆ final output` without dumping duplicate inputs.
    - **Honk notices**: informational and warning notices (e.g. queue state, extension warnings).
 
@@ -137,7 +137,7 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 | `g g` | Scroll to top of transcript (when composer is empty). |
 | `G` (Shift-G) | Scroll to bottom of transcript (when composer is empty). |
 | `z a` | Toggle tool call expansion (expand/collapse tool arguments and outputs). |
-| `z t` | Toggle thoughts expansion (expand/collapse model reasoning blocks). |
+| `z t` | Toggle thoughts expansion (collapse/expand model reasoning blocks; expanded by default). |
 | `z j` | Toggle JSON payload expansion (expand/collapse structured user messages). |
 | `z m` | Toggle a maximized composer. `/quote` turns it on; sending or clearing the composer turns it off. |
 | `Ctrl-X m` | Open model picker overlay (in both Normal and Insert modes). |

@@ -100,7 +100,7 @@ impl Transcript {
         Self {
             blocks: Vec::new(),
             block_indices: HashMap::new(),
-            thoughts_expanded: false,
+            thoughts_expanded: true,
             tools_expanded: false,
             json_expanded: false,
             active_run: None,
@@ -1090,11 +1090,8 @@ fn needs_separator(prev_kind: BlockKind, curr_kind: BlockKind) -> bool {
     if prev_kind == curr_kind {
         return false;
     }
-    // Consecutive tools form a group: no separator between tools
-    // Thought before assistant: keep tight
-    if prev_kind == BlockKind::Thought && curr_kind == BlockKind::Assistant {
-        return false;
-    }
+    // Consecutive tools form a group: no separator between tools. A thought gets
+    // a blank line before the reply too: expanded, it can run to many lines.
     true
 }
 
@@ -1873,26 +1870,71 @@ fn render_assistant(raw: &str, is_streaming: bool, width: u16) -> Vec<Line<'stat
     out_lines
 }
 
+/// Split a leading `**Title**` paragraph off reasoning text, the way opencode's
+/// `reasoningSummary` does: summarized thinking often opens with one.
+fn thought_title(raw: &str) -> (Option<&str>, &str) {
+    let content = raw.trim();
+    if let Some(rest) = content.strip_prefix("**")
+        && let Some(end) = rest.find("**")
+    {
+        let title = &rest[..end];
+        let after = &rest[end + 2..];
+        // As opencode's /^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/
+        if title.trim().is_empty() || title.contains(['*', '\n']) {
+            return (None, content);
+        }
+        let body = if after.is_empty() {
+            Some("")
+        } else {
+            after
+                .strip_prefix("\r\n\r\n")
+                .or_else(|| after.strip_prefix("\n\n"))
+        };
+        if let Some(body) = body {
+            return (
+                Some(title.trim()),
+                body.trim_matches(['\r', '\n']).trim_end(),
+            );
+        }
+    }
+    (None, content)
+}
+
+/// A thinking block: a header (`- Thought: <title>` expanded, `+ Thought: <title> · N
+/// lines` collapsed, after opencode's reasoning header) and, when expanded, the
+/// reasoning text. A block with no text says so instead of looking like one blank line.
 fn render_thought(raw: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
-    let dim_italic = Style::default()
+    let header_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::DIM);
+    let body_style = Style::default()
         .add_modifier(Modifier::DIM)
         .add_modifier(Modifier::ITALIC);
-    if !expanded {
-        let n = raw.lines().count().max(1);
-        let text = format!("thinking… {} lines", n);
-        let line = Line::from(Span::styled(text, dim_italic));
-        wrap_line(line, width as usize)
-    } else {
-        let mut out = Vec::new();
-        for l in raw.lines() {
-            let line = Line::from(Span::styled(l.to_string(), dim_italic));
+    let (title, body) = thought_title(raw);
+    let n = body.lines().count();
+
+    let mut header = format!("{} Thought", if expanded { "-" } else { "+" });
+    if let Some(title) = title {
+        header.push_str(": ");
+        header.push_str(title);
+    }
+    if title.is_none() && n == 0 {
+        header.push_str(" (no text)");
+    } else if !expanded && n > 0 {
+        header.push_str(&format!(" · {n} line{}", if n == 1 { "" } else { "s" }));
+    }
+
+    let mut out = wrap_line(
+        Line::from(Span::styled(header, header_style)),
+        width as usize,
+    );
+    if expanded {
+        for l in body.lines() {
+            let line = Line::from(Span::styled(l.to_string(), body_style));
             out.extend(wrap_line(line, width as usize));
         }
-        if out.is_empty() {
-            out.push(Line::from(Span::styled("thinking…", dim_italic)));
-        }
-        out
     }
+    out
 }
 
 fn truncate_tool_text(text: &str) -> (Vec<String>, usize) {
@@ -3156,20 +3198,60 @@ mod tests {
         });
         transcript.apply_frame(&thought_frame);
 
-        // Collapsed
+        // Expanded by default: header plus the five lines
+        assert!(transcript.thoughts_expanded);
+        let lines_expanded = transcript.render_block(0, 80);
+        assert_eq!(lines_expanded.len(), 6);
+        assert_eq!(plain(&lines_expanded[0]), "- Thought");
+        assert_eq!(plain(&lines_expanded[1]), "line 1");
+        assert_eq!(plain(&lines_expanded[5]), "line 5");
+
+        // zt collapses to the header alone
+        transcript.toggle_thoughts();
         let lines_collapsed = transcript.render_block(0, 80);
         assert_eq!(lines_collapsed.len(), 1);
-        let plain_c: String = lines_collapsed[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(plain_c.contains("thinking… 5 lines"));
+        assert_eq!(plain(&lines_collapsed[0]), "+ Thought · 5 lines");
+    }
 
-        // Expanded
-        transcript.toggle_thoughts();
-        let lines_expanded = transcript.render_block(0, 80);
-        assert_eq!(lines_expanded.len(), 5);
+    fn plain(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn test_render_thought_title_singular_and_empty() {
+        // A leading **Title** paragraph becomes the header, as in opencode.
+        let raw = "**Checking the plan**\n\nOne line of reasoning.\n";
+        let lines = render_thought(raw, true, 80);
+        assert_eq!(plain(&lines[0]), "- Thought: Checking the plan");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(plain(&lines[1]), "One line of reasoning.");
+        let lines = render_thought(raw, false, 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(plain(&lines[0]), "+ Thought: Checking the plan · 1 line");
+
+        // A title alone, no body
+        let lines = render_thought("**Only a title**", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought: Only a title");
+
+        // Bold text that is not a standalone paragraph stays in the body.
+        let lines = render_thought("**Note** this is inline\n", true, 80);
+        assert_eq!(plain(&lines[0]), "- Thought");
+        assert_eq!(plain(&lines[1]), "**Note** this is inline");
+
+        // Extra blank lines after the title are dropped; '*' or blank titles aren't titles.
+        let lines = render_thought("**T**\n\n\n\nbody\n", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought: T · 1 line");
+        let lines = render_thought("**a*b**\n\nx", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought · 3 lines");
+        let lines = render_thought("**   **\n\nx", false, 80);
+        assert_eq!(plain(&lines[0]), "+ Thought · 3 lines");
+
+        // No text at all (a provider that withholds thinking)
+        for expanded in [true, false] {
+            let lines = render_thought("", expanded, 80);
+            assert_eq!(lines.len(), 1);
+            assert!(plain(&lines[0]).ends_with("Thought (no text)"));
+        }
     }
 
     #[test]
