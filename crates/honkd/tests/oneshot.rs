@@ -1,4 +1,5 @@
-//! `_honk/oneshot` (honk-9qf.31.4): a model call on a throwaway, deleted goose session.
+//! `_honk/oneshot` (honk-9qf.31.4, .5): a model call on a throwaway goose session, archived
+//! afterwards (so session-tags still counts its spend) and tagged like the session it serves.
 
 use common::{Honkd, Viewer};
 use honk_testgoose::FakeGoose;
@@ -28,7 +29,7 @@ async fn wait_until(what: &str, f: impl Fn() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oneshot_returns_text_and_deletes_its_session() {
+async fn oneshot_returns_text_and_archives_its_session() {
     let fake = FakeGoose::start().await;
     fake.script_prompt(vec!["{\"keep\"".into(), ":[]}".into()]);
     let h = Honkd::spawn(
@@ -71,7 +72,14 @@ async fn oneshot_returns_text_and_deletes_its_session() {
         .as_str()
         .unwrap()
         .to_string();
-    wait_until("session deleted", || fake.deleted_sessions().contains(&sid)).await;
+    wait_until("session archived", || {
+        fake.archived_sessions().contains(&sid)
+    })
+    .await;
+    assert!(
+        fake.deleted_sessions().is_empty(),
+        "deleting drops its usage records"
+    );
     wait_until("state clean", || {
         let st = state(&h);
         st["oneshot_sessions"] == json!([]) && st["orphan_conns"] == json!([])
@@ -113,12 +121,60 @@ async fn oneshot_cancel_cancels_the_prompt_and_still_cleans_up() {
         .as_str()
         .unwrap()
         .to_string();
-    wait_until("session deleted", || fake.deleted_sessions().contains(&sid)).await;
+    wait_until("session archived", || {
+        fake.archived_sessions().contains(&sid)
+    })
+    .await;
 
     let c = v
         .call("_honk/oneshot/cancel", json!({ "oneshotId": "nope" }))
         .await;
     assert_eq!(c["result"]["cancelled"], false);
+}
+
+/// With `--session-tags-bin`, the oneshot session gets the tag of the session it serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn oneshot_tags_its_session_like_tag_from() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls");
+    let bin = dir.path().join("session-tags");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\n[ \"$1\" = which ] && printf 'prog-x\\tmanual\\t%s\\tsession\\n' \"$2\"\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fake = FakeGoose::start().await;
+    fake.script_prompt(vec!["ok".into()]);
+    let bin_arg = bin.to_string_lossy().to_string();
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream", "--session-tags-bin", &bin_arg],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let res = v
+        .call(
+            "_honk/oneshot",
+            json!({ "system": "", "prompt": "P", "tagFrom": "20261111_19" }),
+        )
+        .await;
+    assert_eq!(res["result"]["text"], "ok", "{res}");
+    let sid = sent(&fake, "session/prompt")[0]["params"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls,
+        format!("which goose:20261111_19\nset prog-x goose:{sid}\n"),
+        "tagged before the call returns"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -152,7 +208,7 @@ async fn startup_sweeps_oneshot_sessions_a_dead_honkd_left() {
     std::fs::write(&path, st.to_string()).unwrap();
     h.restart().await;
     wait_until("swept", || {
-        fake.deleted_sessions().contains(&"ses_left".to_string())
+        fake.archived_sessions().contains(&"ses_left".to_string())
     })
     .await;
     wait_until("state clean", || state(&h)["oneshot_sessions"] == json!([])).await;

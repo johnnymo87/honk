@@ -67,6 +67,11 @@ pub struct Args {
         help = "Enable the session cwd's opencode.json MCP servers on session/new (loopback remote servers only)"
     )]
     pub project_mcp: bool,
+    #[arg(
+        long,
+        help = "session-tags binary: tag each _honk/oneshot session like the session it serves (tagFrom), so its spend lands under that program"
+    )]
+    pub session_tags_bin: Option<PathBuf>,
     #[arg(long, help = "Path to honk binary for built-in swarm MCP server")]
     pub swarm_mcp_bin: Option<PathBuf>,
     #[arg(long, help = "Pigeon daemon base URL for swarm MCP")]

@@ -4,8 +4,11 @@
 //! the text landing in the chat session's conversation. goose has no stateless completion over
 //! ACP, so this runs a throwaway goose session on a side connection: hidden, no extensions,
 //! goose's base system prompt replaced, no model override (goose's configured default). The
-//! session is deleted afterwards. Its id sits in `State::oneshot_sessions` while it exists, so a
-//! honkd that dies mid-call deletes it at the next start.
+//! session is archived afterwards, not deleted: deleting would delete its usage records too, and
+//! session-tags counts spend from them (honk-9qf.31.5). With `--session-tags-bin` and a
+//! `tagFrom` session, it is tagged with that session's tag. Its id sits in
+//! `State::oneshot_sessions` until it is archived, so a honkd that dies mid-call archives it at
+//! the next start.
 
 use anyhow::Context;
 use honk_upstream::{Event, Recorder, Redactor, SubscribeOpts, Upstream, UpstreamOpts};
@@ -24,6 +27,8 @@ const CANCEL_GRACE: Duration = Duration::from_secs(10);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SESSION_TITLE: &str = "honk oneshot";
+/// Ends a oneshot session but keeps its messages and usage records (unlike `session/delete`).
+pub const ARCHIVE: &str = "_goose/unstable/session/archive";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OneshotReq {
@@ -32,10 +37,12 @@ pub struct OneshotReq {
     /// A goose `thinking_effort` value (off, low, medium, high, max). None keeps goose's.
     pub effort: Option<String>,
     pub timeout: Duration,
+    /// The goose session this call serves: its session-tags tag goes on the oneshot session.
+    pub tag_from: Option<String>,
 }
 
 impl OneshotReq {
-    /// Parses `_honk/oneshot` params: `{system, prompt, effort?, timeoutMs?}`.
+    /// Parses `_honk/oneshot` params: `{system, prompt, effort?, timeoutMs?, tagFrom?}`.
     pub fn from_params(params: &Value) -> Result<Self, String> {
         let text = |key: &str| {
             params
@@ -62,6 +69,11 @@ impl OneshotReq {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             timeout,
+            tag_from: params
+                .get("tagFrom")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         })
     }
 }
@@ -117,24 +129,30 @@ impl Hub {
         }
 
         let mut sid: Option<String> = None;
-        let result = self.oneshot_on(&mut up, &mut sid, req, cancel).await;
+        let mut tagging = None;
+        let result = self
+            .oneshot_on(&mut up, &mut sid, &mut tagging, req, cancel)
+            .await;
 
         if let Some(sid) = sid {
-            let deleted = up
+            let archived = up
                 .call(
-                    "session/delete",
+                    ARCHIVE,
                     json!({ "sessionId": sid }),
                     Some(&sid),
                     CLEANUP_TIMEOUT,
                 )
                 .await;
-            match deleted {
+            match archived {
                 Ok(_) => {
                     let mut s = self.state.lock().await;
                     let _ = s.mutate(|st| st.oneshot_sessions.retain(|x| x != &sid));
                 }
-                Err(e) => tracing::warn!(%sid, "oneshot session/delete failed: {e:#}"),
+                Err(e) => tracing::warn!(%sid, "oneshot session archive failed: {e:#}"),
             }
+        }
+        if let Some(t) = tagging {
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, t).await;
         }
         if up.delete().await.is_ok() {
             let mut s = self.state.lock().await;
@@ -147,6 +165,7 @@ impl Hub {
         &self,
         up: &mut Upstream,
         sid_out: &mut Option<String>,
+        tagging: &mut Option<tokio::task::JoinHandle<()>>,
         req: OneshotReq,
         mut cancel: oneshot::Receiver<()>,
     ) -> Result<OneshotAnswer, OneshotError> {
@@ -200,6 +219,13 @@ impl Hub {
                 .map_err(|e| fail("state", e))?;
         }
         *sid_out = Some(sid.clone());
+        if let (Some(bin), Some(from)) = (&self.args.session_tags_bin, &req.tag_from) {
+            *tagging = Some(tokio::spawn(tag_like(
+                bin.clone(),
+                from.clone(),
+                sid.clone(),
+            )));
+        }
 
         up.subscribe_with(
             Some(&sid),
@@ -327,17 +353,12 @@ impl Hub {
         }
     }
 
-    /// Deletes oneshot sessions a previous honkd left behind. Best effort, at startup.
+    /// Archives oneshot sessions a previous honkd left behind. Best effort, at startup.
     pub async fn sweep_oneshot_sessions(&self) {
         let left: Vec<String> = self.state.lock().await.oneshot_sessions.clone();
         for sid in left {
             match self
-                .session_call(
-                    &sid,
-                    "session/delete",
-                    json!({ "sessionId": sid }),
-                    CLEANUP_TIMEOUT,
-                )
+                .session_call(&sid, ARCHIVE, json!({ "sessionId": sid }), CLEANUP_TIMEOUT)
                 .await
             {
                 Ok(_) => {
@@ -347,6 +368,57 @@ impl Hub {
                 Err(e) => tracing::warn!(%sid, "sweep of oneshot session failed: {e:#}"),
             }
         }
+    }
+}
+
+/// Gives goose session `sid` the session-tags tag of goose session `from`. Best effort: an
+/// untagged session (an `auto:` tag) or a failing binary leaves `sid` to session-tags' own
+/// `auto:goose/honk-oneshot`. A one-time copy: a later retag of `from` does not follow, and a
+/// session swept after a honkd crash is archived untagged.
+async fn tag_like(bin: std::path::PathBuf, from: String, sid: String) {
+    let run = |args: Vec<String>| {
+        let bin = bin.clone();
+        async move {
+            let out = tokio::time::timeout(
+                CLEANUP_TIMEOUT,
+                tokio::process::Command::new(&bin)
+                    .args(&args)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out"))??;
+            anyhow::ensure!(
+                out.status.success(),
+                "{}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    };
+    let which = match run(vec!["which".into(), format!("goose:{from}")]).await {
+        Ok(out) => out,
+        Err(e) => return tracing::warn!(%sid, %from, "session-tags which failed: {e:#}"),
+    };
+    let Some(tag) = which_tag(&which) else {
+        return tracing::debug!(%sid, %from, "oneshot not tagged: {from} has no tag");
+    };
+    if let Err(e) = run(vec!["set".into(), tag.clone(), format!("goose:{sid}")]).await {
+        tracing::warn!(%sid, %tag, "session-tags set failed: {e:#}");
+    }
+}
+
+/// The tag in `session-tags which` output (`tag<TAB>source<TAB>root<TAB>kind`), when it is
+/// one to inherit: kind `session` (an `auto` kind, or an older three-column session-tags, is
+/// not), the rule honk's own launch inheritance follows (`crates/honk/src/octags.rs`).
+fn which_tag(out: &str) -> Option<String> {
+    let cols: Vec<&str> = out.lines().next()?.split('\t').map(str::trim).collect();
+    match cols.as_slice() {
+        [tag, _, _, "session", ..] if !tag.is_empty() && !tag.starts_with("auto:") => {
+            Some(tag.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -368,6 +440,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn which_tag_takes_manual_tags_only() {
+        assert_eq!(
+            which_tag("stall-watcher-runs\tmanual\tgoose:20261111_19\tsession\n"),
+            Some("stall-watcher-runs".into())
+        );
+        assert_eq!(which_tag("auto:goose/x\tauto\tgoose:1\tsession\n"), None);
+        assert_eq!(which_tag(""), None);
+        assert_eq!(
+            which_tag("prog\tmanual\tgoose:1\n"),
+            None,
+            "old 3-column output"
+        );
+    }
+
+    #[test]
     fn params_parse_and_cap_timeout() {
         let r = OneshotReq::from_params(&json!({
             "system": "s", "prompt": "p", "effort": "low", "timeoutMs": 999_999_999u64
@@ -376,8 +463,13 @@ mod tests {
         assert_eq!(r.system, "s");
         assert_eq!(r.effort.as_deref(), Some("low"));
         assert_eq!(r.timeout, MAX_TIMEOUT);
-        let r = OneshotReq::from_params(&json!({ "system": "", "prompt": "p" })).unwrap();
+        assert_eq!(r.tag_from, None);
+        let r = OneshotReq::from_params(
+            &json!({ "system": "", "prompt": "p", "tagFrom": "20261111_19" }),
+        )
+        .unwrap();
         assert_eq!(r.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(r.tag_from.as_deref(), Some("20261111_19"));
         assert!(OneshotReq::from_params(&json!({ "system": "s" })).is_err());
         assert!(OneshotReq::from_params(&json!({ "system": "s", "prompt": " " })).is_err());
     }

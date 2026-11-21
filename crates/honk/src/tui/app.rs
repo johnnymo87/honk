@@ -116,7 +116,7 @@ pub struct App {
 /// Where `/quote`'s model call goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TrimBackend {
-    /// No model call: bare `/quote` quotes everything, as `/quote all` does.
+    /// No model call: the trimmed forms quote everything, as `/quote full` does.
     #[default]
     None,
     /// honkd's `_honk/oneshot`, on a connection of its own.
@@ -131,6 +131,8 @@ pub struct PendingTrim {
     pub seq: u64,
     pub started: std::time::Instant,
     pub quoted: quote::Quoted,
+    /// The untrimmed form of the same pick (`/quote full 5`), for notices.
+    pub full: String,
     pub key: u64,
     pub prompt: String,
     abort: Option<tokio::task::AbortHandle>,
@@ -147,10 +149,13 @@ pub struct TrimDone {
 const TRIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
 
 /// Asks honkd's `_honk/oneshot` to trim; the answer text and the model that wrote it.
+/// `tag_from`: the session being quoted; honkd tags the model call's session like it, so the
+/// call's spend lands under the same program in session-tags.
 pub async fn run_trim(
     url: String,
     secret: String,
     prompt: String,
+    tag_from: Option<String>,
 ) -> Result<(String, Option<String>), String> {
     let call = async {
         let mut client = crate::client::Client::connect(&url, &secret)
@@ -164,6 +169,7 @@ pub async fn run_trim(
                     "prompt": prompt,
                     "effort": "low",
                     "timeoutMs": 90_000,
+                    "tagFrom": tag_from,
                 }),
             )
             .await
@@ -192,6 +198,26 @@ pub async fn run_trim(
     match tokio::time::timeout(TRIM_TIMEOUT, call).await {
         Ok(r) => r,
         Err(_) => Err(format!("no answer within {}s", TRIM_TIMEOUT.as_secs())),
+    }
+}
+
+/// What a quote loaded, for notices: "3 replies since your last prompt", "the last 5 replies".
+fn quoted_what(q: &quote::Quoted, pick: quote::Pick) -> String {
+    match pick {
+        quote::Pick::Last(_) => quote::Pick::Last(q.count).describe(),
+        _ => {
+            let noun = if q.count == 1 { "reply" } else { "replies" };
+            format!("{} {noun} {}", q.count, pick.describe())
+        }
+    }
+}
+
+/// The untrimmed command for the same replies.
+fn full_form(pick: quote::Pick) -> String {
+    match pick {
+        quote::Pick::Last(n) => format!("/quote full {n}"),
+        quote::Pick::SinceYou(_) => "/quote full".to_string(),
+        quote::Pick::SincePrev(_) => "/quote full prev".to_string(),
     }
 }
 
@@ -679,31 +705,19 @@ impl App {
         self.history_stash.clear();
     }
 
-    /// `/quote [all|N]` / `:quote [all|N]`: loads coordinator replies, quoted, into the
+    /// `/quote [full|all] [N|prev]` / `:quote ...`: loads coordinator replies, quoted, into the
     /// composer (see `tui::quote`). `N`: the last N. `all`: every reply since your own last
     /// prompt. Bare: the same replies, trimmed by the default model to what you need to see
     /// (see `tui::trim`), when they are long enough for that to help.
     /// `keep_draft` keeps the current composer text below them.
     pub fn quote(&mut self, arg: &str, keep_draft: bool) {
-        let trim = arg.is_empty();
-        let pick = if arg.is_empty() || arg == "all" {
-            quote::Pick::SinceYou(MAX_QUOTE)
-        } else {
-            match arg.parse::<usize>() {
-                Ok(n) if n > MAX_QUOTE => {
-                    self.transcript.apply_notice(Notice::info(format!(
-                        "/quote is capped at {MAX_QUOTE} replies"
-                    )));
-                    quote::Pick::Last(MAX_QUOTE)
-                }
-                Ok(n) if n >= 1 => quote::Pick::Last(n),
-                _ => {
-                    self.transcript.apply_notice(Notice::warning(
-                        "invalid /quote argument: use all or a positive integer",
-                    ));
-                    return;
-                }
-            }
+        let Some((pick, trim)) = self.parse_quote_arg(arg) else {
+            self.transcript.apply_notice(Notice::warning(format!(
+                "invalid /quote argument {:?}: use /quote, /quote N or /quote prev (trimmed by \
+                 the model), or /quote full, /quote full N or /quote full prev (every line)",
+                arg.trim()
+            )));
+            return;
         };
         if trim && self.trim.is_some() {
             self.transcript.apply_notice(Notice::warning(
@@ -714,7 +728,8 @@ impl App {
         if !trim {
             self.drop_trim("trim cancelled for the untrimmed quote");
         }
-        let Some(q) = self.pick_quote(pick) else {
+        let asked = pick;
+        let Some((q, pick, note)) = self.pick_quote(pick) else {
             return;
         };
         let draft = if keep_draft {
@@ -722,17 +737,27 @@ impl App {
         } else {
             String::new()
         };
-        if !trim || q.your_prompt.is_none() {
+        let what = quoted_what(&q, pick);
+        let note = note.map(|n| format!("{n}; ")).unwrap_or_default();
+        if !trim {
+            self.transcript
+                .apply_notice(Notice::info(format!("{note}quoted {what}, untrimmed")));
             self.load_quote(&q.text, &draft);
             return;
         }
         if q.text.len() <= quote_trim::MIN_BYTES {
-            self.transcript.apply_notice(Notice::info(
-                "quoted in full: too short for trimming to help",
-            ));
+            let mut msg = format!("{note}quoted {what} in full: too short for trimming to help");
+            if matches!(asked, quote::Pick::SinceYou(_)) {
+                msg.push_str(
+                    "; if you already replied, /quote N trims the last N replies and \
+                     /quote prev counts from your previous prompt",
+                );
+            }
+            self.transcript.apply_notice(Notice::info(msg));
             self.load_quote(&q.text, &draft);
             return;
         }
+        let full = full_form(pick);
         let sent = quote_trim::sendable(&q.replies);
         if sent.is_empty() {
             self.load_quote(&q.text, &draft);
@@ -743,24 +768,29 @@ impl App {
         if let Some((k, answer, model)) = self.trim_cache.clone()
             && k == key
         {
-            self.finish_trim(q, Ok((answer, model)));
+            if !note.is_empty() {
+                self.transcript
+                    .apply_notice(Notice::info(note.trim_end_matches("; ")));
+            }
+            self.finish_trim(q, &full, Ok((answer, model)));
             return;
         }
         let abort = match &self.trim_backend {
             TrimBackend::None => {
-                self.transcript.apply_notice(Notice::warning(
-                    "no model to trim with; quoting everything since your last prompt",
-                ));
+                self.transcript.apply_notice(Notice::warning(format!(
+                    "{note}no model to trim with; quoted {what}, untrimmed"
+                )));
                 self.load_quote(&q.text, &draft);
                 return;
             }
             TrimBackend::Honkd { url, secret } => {
                 let (url, secret, p) = (url.clone(), secret.clone(), prompt.clone());
+                let from = Some(self.session_id.clone());
                 let tx = self.trim_tx.clone();
                 let seq = self.trim_seq + 1;
                 Some(
                     tokio::spawn(async move {
-                        let result = run_trim(url, secret, p).await;
+                        let result = run_trim(url, secret, p, from).await;
                         let _ = tx.send(TrimDone { seq, result });
                     })
                     .abort_handle(),
@@ -770,15 +800,14 @@ impl App {
             TrimBackend::Record => None,
         };
         self.trim_seq += 1;
-        let n = sent.len();
-        let noun = if n == 1 { "reply" } else { "replies" };
         self.transcript.apply_notice(Notice::info(format!(
-            "trimming {n} {noun} to what needs you; Ctrl-C cancels, /quote all skips the model",
+            "{note}trimming {what} to what needs you; Ctrl-C cancels, {full} skips the model",
         )));
         self.trim = Some(PendingTrim {
             seq: self.trim_seq,
             started: std::time::Instant::now(),
             quoted: q,
+            full,
             key,
             prompt,
             abort,
@@ -786,54 +815,95 @@ impl App {
         self.trim_drawn_secs = None;
     }
 
-    /// The replies `pick` selects, after posting any notice about them; None if none.
-    fn pick_quote(&mut self, pick: quote::Pick) -> Option<quote::Quoted> {
+    /// `[full|all] [N|prev]` as (which replies, whether to trim them); None if malformed.
+    fn parse_quote_arg(&mut self, arg: &str) -> Option<(quote::Pick, bool)> {
+        // `full` (or `all`) may come before or after the rest: `/quote all 20`, `/quote 20 all`.
+        let all: Vec<&str> = arg.split_whitespace().collect();
+        let words: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|w| !matches!(*w, "full" | "all"))
+            .collect();
+        let trim = match all.len() - words.len() {
+            0 => true,
+            1 => false,
+            _ => return None,
+        };
+        let pick = match words.as_slice() {
+            [] => quote::Pick::SinceYou(MAX_QUOTE),
+            ["prev"] => quote::Pick::SincePrev(MAX_QUOTE),
+            [n] => match n.parse::<usize>().ok()? {
+                0 => return None,
+                n if n > MAX_QUOTE => {
+                    self.transcript.apply_notice(Notice::info(format!(
+                        "/quote is capped at {MAX_QUOTE} replies"
+                    )));
+                    quote::Pick::Last(MAX_QUOTE)
+                }
+                n => quote::Pick::Last(n),
+            },
+            _ => return None,
+        };
+        Some((pick, trim))
+    }
+
+    /// The replies `pick` selects, the pick actually used (a fallback may replace it), and a
+    /// note on how they were picked; None, after a warning, if there are none.
+    fn pick_quote(
+        &mut self,
+        pick: quote::Pick,
+    ) -> Option<(quote::Quoted, quote::Pick, Option<String>)> {
         // The core's run state, not the transcript's: the transcript's `active_run` is not
         // carried across a replay swap, so right after attaching it can read idle mid-run.
         let running = !self.is_idle();
         let blocks = &self.transcript.blocks;
-        match quote::build(blocks, pick, running, quote::local_time) {
-            Ok(q) => {
-                match pick {
-                    quote::Pick::Last(n) if q.count < n => {
-                        self.transcript.apply_notice(Notice::info(format!(
-                            "only {} replies to quote",
-                            q.count
-                        )));
-                    }
-                    quote::Pick::SinceYou(_) if q.total > q.count => {
-                        self.transcript.apply_notice(Notice::info(format!(
-                            "{} replies since your last prompt; quoting the last {}",
-                            q.total, q.count
-                        )));
-                    }
-                    _ => {}
-                }
-                Some(q)
-            }
+        let build = |p| quote::build(blocks, p, running, quote::local_time);
+        let (result, pick, note) = match build(pick) {
+            Err(quote::Empty::OnePrompt) => (
+                build(quote::Pick::SinceYou(MAX_QUOTE)),
+                quote::Pick::SinceYou(MAX_QUOTE),
+                Some("only one prompt of yours in this session, so counting from it".to_string()),
+            ),
             Err(quote::Empty::NeverSpoke) => {
                 let fallback = quote::Pick::Last(QUOTE_FALLBACK);
-                let Ok(q) = quote::build(blocks, fallback, running, quote::local_time) else {
-                    self.transcript
-                        .apply_notice(Notice::warning("no replies to quote"));
-                    return None;
-                };
-                self.transcript.apply_notice(Notice::info(format!(
-                    "no prompt of yours in this session; quoting the last {} replies",
-                    q.count
-                )));
-                Some(q)
+                let r = build(fallback);
+                let note = r.as_ref().ok().map(|q| {
+                    format!(
+                        "no prompt of yours in this session, so the last {}",
+                        q.count
+                    )
+                });
+                (r.map_err(|_| quote::Empty::NoReplies), fallback, note)
+            }
+            r => (r, pick, None),
+        };
+        match result {
+            Ok(q) => {
+                let note = note.or_else(|| match pick {
+                    quote::Pick::Last(n) if q.count < n => {
+                        Some(format!("only {} replies to quote", q.count))
+                    }
+                    quote::Pick::SinceYou(_) | quote::Pick::SincePrev(_) if q.total > q.count => {
+                        Some(format!(
+                            "{} replies {}; quoting the last {}",
+                            q.total,
+                            pick.describe(),
+                            q.count
+                        ))
+                    }
+                    _ => None,
+                });
+                Some((q, pick, note))
             }
             Err(quote::Empty::NothingSince) => {
-                let msg = if running {
-                    "no replies since your last prompt yet"
-                } else {
-                    "no replies since your last prompt"
-                };
-                self.transcript.apply_notice(Notice::warning(msg));
+                let yet = if running { " yet" } else { "" };
+                self.transcript.apply_notice(Notice::warning(format!(
+                    "no replies {}{yet}; /quote N quotes the last N replies",
+                    pick.describe()
+                )));
                 None
             }
-            Err(quote::Empty::NoReplies) => {
+            Err(_) => {
                 self.transcript
                     .apply_notice(Notice::warning("no replies to quote"));
                 None
@@ -859,7 +929,11 @@ impl App {
     /// Ctrl-C while trimming: stop the model call (honkd cancels it when the connection
     /// closes) and quote nothing.
     pub fn cancel_trim(&mut self) {
-        self.drop_trim("trim cancelled; /quote all quotes everything without the model");
+        if let Some(full) = self.trim.as_ref().map(|t| t.full.clone()) {
+            self.drop_trim(&format!(
+                "trim cancelled; {full} quotes the same replies without the model"
+            ));
+        }
     }
 
     /// Stops a pending trim, if any, saying why.
@@ -883,24 +957,30 @@ impl App {
         {
             self.trim_cache = Some((t.key, answer.clone(), model.clone()));
         }
-        self.finish_trim(t.quoted, done.result);
+        self.finish_trim(t.quoted, &t.full, done.result);
     }
 
-    fn finish_trim(&mut self, q: quote::Quoted, result: Result<(String, Option<String>), String>) {
+    /// `full`: the untrimmed form of the same pick, for notices.
+    fn finish_trim(
+        &mut self,
+        q: quote::Quoted,
+        full: &str,
+        result: Result<(String, Option<String>), String>,
+    ) {
         let sent = quote_trim::sendable(&q.replies);
         let kept = result
             .and_then(|(answer, model)| quote_trim::parse(&answer, &sent).map(|k| (k, model)));
         let text = match kept {
             Ok((kept, _)) if kept.is_empty() && !q.replies.iter().any(|r| r.in_progress) => {
-                self.transcript.apply_notice(Notice::info(
-                    "the model found nothing that needs you; /quote all quotes everything",
-                ));
+                self.transcript.apply_notice(Notice::info(format!(
+                    "the model found nothing that needs you; {full} quotes them all"
+                )));
                 return;
             }
             Ok((kept, model)) => quote_trim::render(&q.replies, &kept, model.as_deref()),
             Err(why) => {
                 self.transcript.apply_notice(Notice::warning(format!(
-                    "trim failed ({why}); quoting everything since your last prompt"
+                    "trim failed ({why}); quoted them all, untrimmed"
                 )));
                 q.text.clone()
             }
@@ -2737,9 +2817,7 @@ mod tests {
             text.contains("wake reply 1") && text.ends_with("> wake reply 3"),
             "{text}"
         );
-        assert!(
-            last_notice(&app).contains("no prompt of yours in this session; quoting the last 3")
-        );
+        assert!(last_notice(&app).contains("no prompt of yours in this session, so the last 3"));
     }
 
     #[test]
@@ -2951,7 +3029,7 @@ mod tests {
 
         let (mut app, _rx) = long_app(TrimBackend::Record);
         app.execute_app_command("quote");
-        app.execute_app_command("quote 1");
+        app.execute_app_command("quote full 1");
         assert!(app.trim.is_none());
         assert!(app.get_composer_text().contains("QUESTION2?"));
         assert!(!app.get_composer_text().contains("QUESTION0?"));
@@ -2984,7 +3062,7 @@ mod tests {
         app.execute_app_command("quote");
         assert!(app.trim.is_none());
         assert!(app.get_composer_text().contains("> reply one"));
-        assert!(last_notice(&app).contains("quoted in full"));
+        assert!(last_notice(&app).contains("in full: too short"));
 
         let (mut app, _rx) = long_app(TrimBackend::None);
         app.execute_app_command("quote");
@@ -2994,18 +3072,146 @@ mod tests {
     }
 
     #[test]
-    fn test_quote_all_never_trims() {
+    fn test_quote_full_and_its_alias_all_never_trim() {
+        for arg in [
+            "quote full",
+            "quote all",
+            "quote full 2",
+            "quote all 2",
+            "quote full prev",
+        ] {
+            let (mut app, _rx) = long_app(TrimBackend::Record);
+            app.transcript
+                .apply_frame(&update("user_message_chunk", "me2", "later", 900));
+            app.transcript
+                .apply_frame(&update("agent_message_chunk", "a9", "late reply", 901));
+            app.execute_app_command(arg);
+            assert!(app.trim.is_none(), "{arg}");
+            let text = app.get_composer_text();
+            assert!(text.ends_with("> late reply"), "{arg}: {text}");
+            let reaches_back = !matches!(arg, "quote full" | "quote all");
+            assert_eq!(
+                text.contains("filler line 2"),
+                reaches_back,
+                "{arg}: {text}"
+            );
+            assert!(
+                last_notice(&app).contains("untrimmed"),
+                "{arg}: {}",
+                last_notice(&app)
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_n_trims_the_last_n_replies() {
         let (mut app, _rx) = long_app(TrimBackend::Record);
-        app.execute_app_command("quote all");
+        // You already replied: bare /quote finds only the short answer to that.
+        app.transcript
+            .apply_frame(&update("user_message_chunk", "me2", "ok", 900));
+        app.transcript
+            .apply_frame(&update("agent_message_chunk", "a9", "noted", 901));
+        app.execute_app_command("quote");
         assert!(app.trim.is_none());
-        assert!(app.get_composer_text().contains("filler line 2"));
+        let text = app.get_composer_text();
+        assert!(
+            text.ends_with("(you)\n> noted") && !text.contains("filler"),
+            "{text}"
+        );
+        let hint = last_notice(&app);
+        assert!(
+            hint.contains("/quote N") && hint.contains("/quote prev"),
+            "{hint}"
+        );
+
+        app.set_composer_text("");
+        app.execute_app_command("quote 4");
+        let t = app.trim.as_ref().expect("trimming");
+        assert!(!t.prompt.contains("status?"), "{}", t.prompt);
+        assert!(
+            t.prompt
+                .contains("prompt that R4 answers (context only, not selectable):\n<<<\nok\n>>>"),
+            "{}",
+            t.prompt
+        );
+        assert!(
+            t.prompt.contains("R4 ") && t.prompt.contains("L1: noted"),
+            "{}",
+            t.prompt
+        );
+        assert!(
+            !t.prompt.contains("R5 ") && !t.prompt.contains("since then"),
+            "{}",
+            t.prompt
+        );
+        let n = last_notice(&app);
+        assert!(
+            n.contains("trimming the last 4 replies") && n.contains("/quote full 4"),
+            "{n}"
+        );
+        answer(
+            &mut app,
+            Ok((
+                r#"{"keep":[{"reply":3,"lines":[[44,44]],"tag":"ask"}]}"#,
+                None,
+            )),
+        );
+        assert!(app.get_composer_text().ends_with("· ask\n> QUESTION2?"));
+    }
+
+    #[test]
+    fn test_quote_prev_trims_since_your_previous_prompt() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.transcript
+            .apply_frame(&update("user_message_chunk", "me2", "ok", 900));
+        app.transcript
+            .apply_frame(&update("agent_message_chunk", "a9", "noted", 901));
+        app.execute_app_command("quote prev");
+        let t = app.trim.as_ref().expect("trimming");
+        assert!(t.prompt.contains("<<<\nstatus?\n>>>"), "{}", t.prompt);
+        assert!(
+            t.prompt.contains("R4 ") && t.prompt.contains("L1: noted"),
+            "{}",
+            t.prompt
+        );
+        let n = last_notice(&app);
+        assert!(
+            n.contains("since your previous prompt") && n.contains("/quote full prev"),
+            "{n}"
+        );
+        answer(&mut app, Err("boom"));
+        let n = last_notice(&app);
+        assert!(n.contains("trim failed") && n.contains("untrimmed"), "{n}");
+        assert!(app.get_composer_text().contains("filler line 0"));
+    }
+
+    #[test]
+    fn test_quote_prev_with_one_prompt_counts_from_it() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.execute_app_command("quote prev");
+        assert!(app.trim.is_some());
+        let n = last_notice(&app);
+        assert!(
+            n.contains("only one prompt of yours")
+                && n.contains("trimming 3 replies since your last prompt"),
+            "{n}"
+        );
     }
 
     #[test]
     fn test_quote_bad_arg_and_literal_escape() {
         let (mut app, mut cmd_rx) = quote_app();
-        app.execute_app_command("quote zero");
-        assert!(app.is_composer_empty());
+        for bad in [
+            "quote zero",
+            "quote 0",
+            "quote full full",
+            "quote 2 3",
+            "quote prev 2",
+        ] {
+            app.execute_app_command(bad);
+            assert!(app.is_composer_empty(), "{bad}");
+            assert!(last_notice(&app).contains("invalid /quote"), "{bad}");
+        }
         assert!(
             app.transcript
                 .blocks

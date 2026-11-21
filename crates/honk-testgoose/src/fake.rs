@@ -145,6 +145,7 @@ struct FakeGooseInner {
     inbound_frames: Mutex<Vec<Value>>,
     deleted_connections: Mutex<Vec<String>>,
     deleted_sessions: Mutex<Vec<String>>,
+    archived_sessions: Mutex<Vec<String>>,
     connections: Mutex<HashMap<String, ConnectionState>>,
     next_conn_num: AtomicU64,
     next_session_num: AtomicU64,
@@ -211,6 +212,7 @@ impl FakeGoose {
             inbound_frames: Mutex::new(Vec::new()),
             deleted_connections: Mutex::new(Vec::new()),
             deleted_sessions: Mutex::new(Vec::new()),
+            archived_sessions: Mutex::new(Vec::new()),
             connections: Mutex::new(HashMap::new()),
             next_conn_num: AtomicU64::new(1),
             next_session_num: AtomicU64::new(1),
@@ -352,6 +354,11 @@ impl FakeGoose {
     /// Session ids that received `session/delete`, in order.
     pub fn deleted_sessions(&self) -> Vec<String> {
         self.state.deleted_sessions.lock().unwrap().clone()
+    }
+
+    /// Session ids that received `_goose/unstable/session/archive`, in order.
+    pub fn archived_sessions(&self) -> Vec<String> {
+        self.state.archived_sessions.lock().unwrap().clone()
     }
 
     pub fn script_prompt(&self, chunks: Vec<String>) {
@@ -644,6 +651,7 @@ fn method_requires_session(method: &str) -> bool {
             | "session/cancel"
             | "session/close"
             | "session/delete"
+            | "_goose/unstable/session/archive"
             | "session/fork"
             | "session/load"
             | "session/resume"
@@ -1691,7 +1699,11 @@ async fn handle_post(
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Some("session/delete" | "_goose/unstable/session/system-prompt/set") => {
+        Some(
+            "session/delete"
+            | "_goose/unstable/session/archive"
+            | "_goose/unstable/session/system-prompt/set",
+        ) => {
             let sid = target_session
                 .as_deref()
                 .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
@@ -1699,6 +1711,11 @@ async fn handle_post(
                 .to_string();
             if frame.get("method").and_then(Value::as_str) == Some("session/delete") {
                 state.deleted_sessions.lock().unwrap().push(sid.clone());
+            }
+            if frame.get("method").and_then(Value::as_str)
+                == Some("_goose/unstable/session/archive")
+            {
+                state.archived_sessions.lock().unwrap().push(sid.clone());
             }
             if let Some(id) = req_id {
                 emit_session_frame(
