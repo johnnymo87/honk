@@ -30,6 +30,8 @@ pub struct StatusBar<'a> {
     pub state_snapshot: Option<&'a StateSnapshot>,
     pub mode: EditorMode,
     pub usage: Option<&'a honk_wire::Usage>,
+    /// `/quote`'s model trim is running: seconds so far.
+    pub trimming: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +230,13 @@ impl<'a> StatusBar<'a> {
                 spans.push(Span::styled(
                     format!("  [{}]", queued),
                     Style::default().bg(Color::DarkGray).fg(Color::LightYellow),
+                ));
+            }
+
+            if let Some(secs) = self.trimming {
+                spans.push(Span::styled(
+                    format!("  [trimming {secs}s, Ctrl-C cancels]"),
+                    Style::default().bg(Color::DarkGray).fg(Color::Cyan),
                 ));
             }
 
@@ -444,6 +453,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.title_text(), "My Special Session");
         assert_eq!(bar.cwd_text(), "/tmp/test-project");
@@ -459,6 +469,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar_fallback.title_text(), "ses_123");
         assert_eq!(bar_fallback.cwd_text(), "");
@@ -490,6 +501,7 @@ mod tests {
             state_snapshot: Some(&snap),
             mode: EditorMode::Insert,
             usage: None,
+            trimming: None,
         };
         for label in ["x", "shell · cargo test --workspace --all-features", "ab"] {
             for secs in [5, 42, 185] {
@@ -524,6 +536,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         let line = bar.to_line(140);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -549,6 +562,7 @@ mod tests {
             state_snapshot: Some(&snap_pending),
             mode: EditorMode::Insert,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.run_state_text(), "waiting");
 
@@ -566,6 +580,7 @@ mod tests {
             state_snapshot: Some(&snap_own),
             mode: EditorMode::Insert,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.run_state_text(), "running");
 
@@ -583,6 +598,7 @@ mod tests {
             state_snapshot: Some(&snap_foreign),
             mode: EditorMode::Insert,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.run_state_text(), "running (other client)");
 
@@ -595,6 +611,7 @@ mod tests {
             state_snapshot: Some(&snap_idle),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.run_state_text(), "idle");
     }
@@ -610,6 +627,7 @@ mod tests {
             state_snapshot: Some(&snap_queued),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.queued_text(), Some("queued: 3".into()));
 
@@ -621,6 +639,7 @@ mod tests {
             state_snapshot: Some(&snap_zero),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.queued_text(), None);
     }
@@ -640,6 +659,7 @@ mod tests {
             state_snapshot: Some(&snap_reconnecting),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.connection_text(), "reconnecting (2)");
 
@@ -658,6 +678,7 @@ mod tests {
             state_snapshot: Some(&snap_stopped),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(
             bar.connection_text(),
@@ -677,6 +698,7 @@ mod tests {
             state_snapshot: Some(&snap_detached),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar.connection_text(), "detached");
     }
@@ -690,6 +712,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Insert,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar_insert.mode_text(), "INSERT");
 
@@ -700,6 +723,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar_normal.mode_text(), "NORMAL");
 
@@ -710,6 +734,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Visual,
             usage: None,
+            trimming: None,
         };
         assert_eq!(bar_visual.mode_text(), "VISUAL");
     }
@@ -874,6 +899,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: Some(&u_full),
+            trimming: None,
         };
         let line_140 = bar_140.to_line(140);
         let rendered_140: String = line_140.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -913,6 +939,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
         let bar_zero = StatusBar {
             session_id: "ses_1",
@@ -921,6 +948,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: Some(&u_zero_used),
+            trimming: None,
         };
         assert_eq!(bar_none.to_line(140), bar_zero.to_line(140));
     }
@@ -948,6 +976,7 @@ mod tests {
             state_snapshot: None,
             mode: EditorMode::Normal,
             usage: Some(&u_full),
+            trimming: None,
         };
 
         let line = bar.to_line(80);
@@ -974,6 +1003,7 @@ mod tests {
             state_snapshot: Some(&snapshot),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
 
         // Wide terminal: full list
@@ -1006,6 +1036,7 @@ mod tests {
             state_snapshot: Some(&snapshot),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
 
         // Wide terminal: shows model bare id
@@ -1038,6 +1069,7 @@ mod tests {
             state_snapshot: Some(&snapshot),
             mode: EditorMode::Normal,
             usage: None,
+            trimming: None,
         };
 
         // Wide terminal: both shown

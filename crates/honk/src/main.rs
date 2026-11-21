@@ -598,6 +598,10 @@ async fn main() -> anyhow::Result<()> {
 
             let pigeon = chat_pigeon_settings(&args);
             let tag = chat_tag_settings(&args);
+            let trim_backend = honk::tui::app::TrimBackend::Honkd {
+                url: args.url.clone(),
+                secret: secret.clone(),
+            };
             let mut opts = honk::chat::driver::DriverOpts::new(args.url, secret, target);
             opts.max_turns = args.max_turns;
             opts.pigeon = pigeon;
@@ -605,7 +609,8 @@ async fn main() -> anyhow::Result<()> {
             opts.no_swarm = args.no_swarm;
             opts.model = args.model.map(|m| m.trim().to_string());
             let (handle, ui_rx) = honk::chat::driver::start(opts).await?;
-            let app = honk::tui::App::new(session_id, handle.cmd_tx());
+            let mut app = honk::tui::App::new(session_id, handle.cmd_tx());
+            app.trim_backend = trim_backend;
             honk::tui::app::run_app(app, ui_rx, handle).await?;
         }
         Commands::Pigeon(args) => {

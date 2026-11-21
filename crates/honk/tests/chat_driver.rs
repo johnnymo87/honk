@@ -4396,3 +4396,39 @@ async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
     let _ = handle.send(UiCommand::Shutdown);
     let _ = server_task.await;
 }
+
+/// `/quote`'s trim call (honk-9qf.31.4) through a real honkd: the answer and model come back,
+/// and a honkd error comes back as an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quote_trim_call_through_honkd() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.script_prompt(vec!["{\"keep\":[]}".into()]);
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let (text, model) = honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into())
+        .await
+        .expect("trim answer");
+    assert_eq!(text, "{\"keep\":[]}");
+    assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+    let sys = fake
+        .inbound()
+        .into_iter()
+        .find(|f| f["method"] == "_goose/unstable/session/system-prompt/set")
+        .expect("system prompt set");
+    assert_eq!(sys["params"]["text"], honk::tui::trim::SYSTEM);
+
+    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "  ".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("prompt is empty"), "{err}");
+}

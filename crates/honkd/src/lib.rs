@@ -4,6 +4,7 @@ pub mod hub;
 pub mod log;
 pub mod mcp;
 pub mod models;
+pub mod oneshot;
 pub mod rpc;
 pub mod session;
 pub mod state;

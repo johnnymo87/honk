@@ -422,6 +422,9 @@ pub struct Viewer {
     pub is_honk_aware: bool,
     pub attached_sessions: HashSet<String>,
     pub tx: ViewerTx,
+    /// In-flight `_honk/oneshot` calls by client `oneshotId`. Dropping a sender (the viewer
+    /// disconnecting) cancels its call.
+    pub oneshots: HashMap<String, tokio::sync::oneshot::Sender<()>>,
 }
 
 async fn dispatch_session_msg<F>(
@@ -572,6 +575,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
         is_honk_aware: false,
         attached_sessions: HashSet::new(),
         tx: viewer_tx,
+        oneshots: HashMap::new(),
     };
 
     while let Some(msg_res) = ws_receiver.next().await {
@@ -1309,6 +1313,59 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     .await
                     {
                         break;
+                    }
+                    continue;
+                } else if method == Some("_honk/oneshot") {
+                    let req = match crate::oneshot::OneshotReq::from_params(&params) {
+                        Ok(r) => r,
+                        Err(msg) => {
+                            let err_resp = crate::rpc::error(id, -32602, msg, None);
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                    viewer.oneshots.retain(|_, tx| !tx.is_closed());
+                    if let Some(key) = params.get("oneshotId").and_then(Value::as_str) {
+                        viewer.oneshots.insert(key.to_string(), cancel_tx);
+                    } else {
+                        // Not cancellable by id; still cancelled when the viewer goes away.
+                        viewer.oneshots.insert(format!("_anon_{id}"), cancel_tx);
+                    }
+                    let hub = hub.clone();
+                    let tx = viewer.tx.clone();
+                    tokio::spawn(async move {
+                        let resp = match hub.oneshot(req, cancel_rx).await {
+                            Ok(a) => crate::rpc::response(
+                                id,
+                                json!({ "text": a.text, "model": a.model }),
+                            ),
+                            Err(crate::oneshot::OneshotError::Cancelled) => {
+                                crate::rpc::error(id, -32800, "cancelled", None)
+                            }
+                            Err(crate::oneshot::OneshotError::Failed(msg)) => {
+                                crate::rpc::error(id, -32603, msg, None)
+                            }
+                        };
+                        let _ = tx.send_frame(Message::Text(resp.to_string().into()));
+                    });
+                    continue;
+                } else if method == Some("_honk/oneshot/cancel") {
+                    let key = params.get("oneshotId").and_then(Value::as_str);
+                    let found = key
+                        .and_then(|k| viewer.oneshots.remove(k))
+                        .map(|tx| tx.send(()).is_ok())
+                        .unwrap_or(false);
+                    if !id.is_null() {
+                        let resp = crate::rpc::response(id, json!({ "cancelled": found }));
+                        if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                            break;
+                        }
                     }
                     continue;
                 } else if method == Some("_honk/model/list") {
