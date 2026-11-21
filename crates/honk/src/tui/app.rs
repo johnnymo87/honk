@@ -1469,12 +1469,12 @@ mod tests {
         assert_eq!(app.pending_prefix, None);
         assert!(app.transcript.tools_expanded);
 
-        // 'z' then 't' toggles thoughts
-        assert!(!app.transcript.thoughts_expanded);
+        // 'z' then 't' toggles thoughts (expanded by default)
+        assert!(app.transcript.thoughts_expanded);
         app.handle_key(key(KeyCode::Char('z')));
         app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.pending_prefix, None);
-        assert!(app.transcript.thoughts_expanded);
+        assert!(!app.transcript.thoughts_expanded);
 
         // 'z' then 'j' toggles json
         assert!(!app.transcript.json_expanded);
