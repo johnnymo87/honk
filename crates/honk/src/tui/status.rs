@@ -312,24 +312,22 @@ impl<'a> StatusBar<'a> {
             vec![None]
         };
 
+        // The indicator shrinks before the model, mcp or usage drop, so those
+        // stay put as tool titles and elapsed time change.
         let mut candidate_tuples = Vec::new();
-        for act in &activity_candidates {
-            for model in &model_candidates {
-                for mcp in &mcp_candidates {
-                    if model_text.is_some() && model.is_none() && mcp.is_some() {
-                        continue;
+        for model in &model_candidates {
+            for mcp in &mcp_candidates {
+                if model_text.is_some() && model.is_none() && mcp.is_some() {
+                    continue;
+                }
+                for usage in usage_candidates
+                    .iter()
+                    .filter(|u| u.is_some())
+                    .chain([&None])
+                {
+                    for act in &activity_candidates {
+                        candidate_tuples.push((*act, model.clone(), mcp.clone(), usage.clone()));
                     }
-                    for usage in &usage_candidates {
-                        if usage.is_some() {
-                            candidate_tuples.push((
-                                *act,
-                                model.clone(),
-                                mcp.clone(),
-                                usage.clone(),
-                            ));
-                        }
-                    }
-                    candidate_tuples.push((*act, model.clone(), mcp.clone(), None));
                 }
             }
         }
