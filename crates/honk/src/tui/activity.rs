@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
+use crate::chat::driver::ConnectionState;
 use crate::chat::driver::StateSnapshot;
-use crate::chat::types::Ownership;
+use crate::chat::types::{Ownership, RunState};
 use crate::tui::transcript::{BlockKind, Transcript};
 
 /// Braille spinner, as opencode's transcript spinner.
@@ -62,9 +63,14 @@ impl Phase {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Cut `s` (first line only) to at most `max` display columns, ending in `…`.
+pub fn truncate(s: &str, max: usize) -> String {
+    cut_to_width(s.lines().next().unwrap_or("").trim(), max)
+}
+
+/// Cut `s` to at most `max` display columns, ending in `…` when cut.
+pub fn cut_to_width(s: &str, max: usize) -> String {
     use unicode_width::UnicodeWidthChar;
-    let s = s.lines().next().unwrap_or("").trim();
     if unicode_width::UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
@@ -72,7 +78,7 @@ fn truncate(s: &str, max: usize) -> String {
     let mut w = 0;
     for c in s.chars() {
         let cw = c.width().unwrap_or(0);
-        if w + cw > max - 1 {
+        if w + cw > max.saturating_sub(1) {
             break;
         }
         out.push(c);
@@ -136,10 +142,12 @@ pub fn format_elapsed(d: Duration) -> String {
     }
 }
 
-/// When the current busy stretch began.
+/// When the current turn began.
 #[derive(Clone, Debug, Default)]
 pub struct Clock {
     started: Option<Instant>,
+    /// The run the clock is timing, once one is seen.
+    run_id: Option<String>,
     /// The stretch was first seen during a replay, i.e. we attached mid-turn,
     /// so `started` is attach time and the transcript may know better.
     joined_mid_turn: bool,
@@ -147,14 +155,30 @@ pub struct Clock {
 
 impl Clock {
     /// Feed every new snapshot.
+    ///
+    /// A queued prompt is sent in the same step that ends the previous turn, so
+    /// the session can stay busy across turns; the clock restarts when the run
+    /// it was timing ends (`Idle`) or another run starts. `Unknown` (disconnect,
+    /// reset) keeps it, so a reconnect mid-turn keeps counting.
     pub fn observe(&mut self, snapshot: &StateSnapshot, now: Instant) {
-        if is_busy(snapshot) {
-            if self.started.is_none() {
-                self.started = Some(now);
-                self.joined_mid_turn = snapshot.replaying;
-            }
-        } else {
+        if !is_busy(snapshot) {
             *self = Self::default();
+            return;
+        }
+        let turn_over = match (&self.run_id, &snapshot.run_state) {
+            (Some(prev), RunState::Running(cur)) => prev != cur,
+            (Some(_), RunState::Idle) => true,
+            _ => false,
+        };
+        if turn_over || self.started.is_none() {
+            *self = Self {
+                started: Some(now),
+                run_id: None,
+                joined_mid_turn: snapshot.replaying,
+            };
+        }
+        if let RunState::Running(cur) = &snapshot.run_state {
+            self.run_id = Some(cur.clone());
         }
     }
 
@@ -198,12 +222,17 @@ pub fn glyph(animate: bool, elapsed: Duration) -> &'static str {
 }
 
 /// The rendered indicator: `⠹ thinking 12s`, plus `· other client` for a turn
-/// another client started.
+/// another client started. `short` drops the suffix and cuts the label, for
+/// narrow terminals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Indicator {
     pub text: String,
+    pub short: String,
     pub color: Color,
 }
+
+/// Longest label in the short form.
+const SHORT_LABEL_MAX: usize = 12;
 
 pub fn indicator(
     snapshot: Option<&StateSnapshot>,
@@ -214,20 +243,23 @@ pub fn indicator(
     now_unix: i64,
 ) -> Option<Indicator> {
     let phase = phase(snapshot, transcript)?;
-    let foreign = snapshot.is_some_and(|s| s.ownership == Ownership::Foreign);
-    let elapsed = clock.elapsed(now, transcript, now_unix);
+    let s = snapshot?;
+    // Attached mid-turn, ownership stays Unknown until the next run starts.
+    let foreign = s.ownership == Ownership::Foreign
+        || (s.ownership == Ownership::Unknown && s.run_state.is_running() && !s.prompt_in_flight);
+    // Don't spin while the connection is down: nothing is arriving.
+    let animate = animate && s.connection == ConnectionState::Live;
+    let elapsed = format_elapsed(clock.elapsed(now, transcript, now_unix));
     let local = clock
         .started
         .map(|s| now.saturating_duration_since(s))
         .unwrap_or_default();
-    let mut text = format!("{} {}", glyph(animate, local), phase.label());
-    if foreign {
-        text.push_str(" · other client");
-    }
-    text.push(' ');
-    text.push_str(&format_elapsed(elapsed));
+    let glyph = glyph(animate, local);
+    let label = phase.label();
+    let suffix = if foreign { " · other client" } else { "" };
     Some(Indicator {
-        text,
+        text: format!("{glyph} {label}{suffix} {elapsed}"),
+        short: format!("{glyph} {} {elapsed}", truncate(&label, SHORT_LABEL_MAX)),
         color: phase.color(foreign),
     })
 }
@@ -240,8 +272,6 @@ pub fn animation_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::driver::ConnectionState;
-    use crate::chat::types::RunState;
     use serde_json::json;
 
     fn snap(run: bool, ownership: Ownership) -> StateSnapshot {
@@ -409,5 +439,70 @@ mod tests {
         assert_eq!(i.color, Color::Yellow);
 
         assert_eq!(indicator(None, &t, &c, true, now, 0), None);
+    }
+
+    #[test]
+    fn clock_restarts_for_a_queued_turn() {
+        let t = Transcript::new();
+        let t0 = Instant::now();
+        let mut c = Clock::default();
+        c.observe(&snap(true, Ownership::Own), t0);
+        // The run ends and the queued prompt goes out in the same step.
+        let mut next = snap(false, Ownership::Unknown);
+        next.prompt_in_flight = true;
+        c.observe(&next, t0 + Duration::from_secs(300));
+        assert_eq!(
+            c.elapsed(t0 + Duration::from_secs(303), &t, 0),
+            Duration::from_secs(3)
+        );
+        // Its run starting keeps that clock.
+        let mut started = snap(true, Ownership::Own);
+        started.run_state = RunState::Running("r2".into());
+        c.observe(&started, t0 + Duration::from_secs(304));
+        assert_eq!(
+            c.elapsed(t0 + Duration::from_secs(310), &t, 0),
+            Duration::from_secs(10)
+        );
+        // A different run straight after restarts it.
+        let mut other = started.clone();
+        other.run_state = RunState::Running("r3".into());
+        c.observe(&other, t0 + Duration::from_secs(320));
+        assert_eq!(
+            c.elapsed(t0 + Duration::from_secs(321), &t, 0),
+            Duration::from_secs(1)
+        );
+        // A disconnect (Unknown) mid-turn keeps counting.
+        let mut lost = other.clone();
+        lost.run_state = RunState::Unknown;
+        lost.prompt_in_flight = true;
+        c.observe(&lost, t0 + Duration::from_secs(330));
+        assert_eq!(
+            c.elapsed(t0 + Duration::from_secs(331), &t, 0),
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn mid_turn_attach_is_other_client_and_down_connection_stops_spinning() {
+        let t = Transcript::new();
+        let t0 = Instant::now();
+        let s = snap(true, Ownership::Unknown);
+        let mut c = Clock::default();
+        c.observe(&s, t0);
+        let i = indicator(Some(&s), &t, &c, true, t0, 0).unwrap();
+        assert_eq!(i.text, "⠋ working · other client 0s");
+        assert_eq!(i.short, "⠋ working 0s");
+
+        let mut down = snap(true, Ownership::Own);
+        down.connection = ConnectionState::Reconnecting { attempt: 1 };
+        let i = indicator(Some(&down), &t, &c, true, t0, 0).unwrap();
+        assert!(i.text.starts_with(STATIC_GLYPH), "{}", i.text);
+    }
+
+    #[test]
+    fn cut_to_width_respects_wide_chars() {
+        assert_eq!(cut_to_width("ab — cd", 4), "ab …");
+        assert_eq!(cut_to_width("🦆🦆🦆", 5), "🦆🦆…");
+        assert_eq!(cut_to_width("short", 10), "short");
     }
 }
