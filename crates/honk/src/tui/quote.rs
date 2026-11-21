@@ -1,19 +1,44 @@
-//! `/quote N`: the coordinator's last N replies, quoted for the composer.
+//! `/quote [N]`: the coordinator's replies, quoted for the composer.
 //!
 //! A turn is a user block plus every block after it up to the next user block. Its reply is
 //! the text of its assistant blocks (thoughts, tools and notices are left out). Turns with no
 //! reply text do not count, so silent wake runs are skipped. The user block only labels the
 //! turn: stall-watch wakes, swarm messages and Jonathan's own prompts are never quoted.
+//!
+//! `/quote N` takes the last N such turns. Bare `/quote` takes every such turn from
+//! Jonathan's own last prompt (`Trigger::You`) onward, the reply to that prompt included.
+//! A `/compact` is not his prompt: stall-watch sends them too, and nothing tells the two apart.
 //! See docs/plans/2026-11-19-quote-replies.md.
 
 use crate::tui::transcript::{Block, BlockKind};
 pub use honk_wire::{Trigger, classify};
 
-/// The quoted replies and how many turns they cover.
+/// Which turns to quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// The last N turns with reply text.
+    Last(usize),
+    /// Every turn with reply text from your last prompt on, at most this many (the newest).
+    SinceYou(usize),
+}
+
+/// Why nothing was quoted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Empty {
+    /// No turn has reply text (or N was 0).
+    NoReplies,
+    /// `SinceYou`, but the transcript has no prompt of yours.
+    NeverSpoke,
+    /// `SinceYou`, but no turn from your last prompt on has reply text yet.
+    NothingSince,
+}
+
+/// The quoted replies, how many turns they cover, and how many matched before the cap.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Quoted {
     pub text: String,
     pub count: usize,
+    pub total: usize,
 }
 
 struct Turn {
@@ -23,18 +48,15 @@ struct Turn {
     created: Option<i64>,
 }
 
-/// Builds the quote of the last `n` turns that have reply text, oldest first.
+/// Builds the quote of the turns `pick` selects, oldest first.
 /// `running`: a run is active, so the last turn's reply may still be streaming.
 /// `fmt_time` formats unix seconds for the header (injected so tests don't depend on the TZ).
 pub fn build(
     blocks: &[Block],
-    n: usize,
+    pick: Pick,
     running: bool,
     fmt_time: impl Fn(i64) -> Option<String>,
-) -> Option<Quoted> {
-    if n == 0 {
-        return None;
-    }
+) -> Result<Quoted, Empty> {
     let mut turns: Vec<Turn> = Vec::new();
     for b in blocks {
         match b.kind {
@@ -66,17 +88,29 @@ pub fn build(
         }
     }
     let last_idx = turns.len().checked_sub(1);
-    let mut picked: Vec<(usize, &Turn)> = turns
+    let (start, n, empty) = match pick {
+        Pick::Last(n) => (0, n, Empty::NoReplies),
+        Pick::SinceYou(cap) => {
+            let Some(start) = turns
+                .iter()
+                .rposition(|t| t.trigger == Trigger::You && !t.is_compact)
+            else {
+                return Err(Empty::NeverSpoke);
+            };
+            (start, cap, Empty::NothingSince)
+        }
+    };
+    let eligible: Vec<(usize, &Turn)> = turns
         .iter()
         .enumerate()
-        .rev()
+        .skip(start)
         .filter(|(_, t)| !t.reply.is_empty() && !t.is_compact)
-        .take(n)
         .collect();
+    let total = eligible.len();
+    let picked = &eligible[total.saturating_sub(n)..];
     if picked.is_empty() {
-        return None;
+        return Err(empty);
     }
-    picked.reverse();
 
     let mut out = String::new();
     for (i, (idx, turn)) in picked.iter().enumerate() {
@@ -103,9 +137,10 @@ pub fn build(
             }
         }
     }
-    Some(Quoted {
+    Ok(Quoted {
         text: out,
         count: picked.len(),
+        total,
     })
 }
 
@@ -178,7 +213,7 @@ mod tests {
             user("[sw wake run=r reason=mail] mail"),
             ast("line 1\n\nline 3", 40),
         ];
-        let q = build(&blocks, 2, false, fmt).unwrap();
+        let q = build(&blocks, Pick::Last(2), false, fmt).unwrap();
         assert_eq!(q.count, 2);
         assert_eq!(
             q.text,
@@ -194,7 +229,7 @@ mod tests {
             block(BlockKind::Tool, "tool", None),
             ast("part two", 6),
         ];
-        let q = build(&blocks, 3, false, fmt).unwrap();
+        let q = build(&blocks, Pick::Last(3), false, fmt).unwrap();
         assert_eq!(q.count, 1);
         assert_eq!(q.text, "# T5 (you)\n> part one\n>\n> part two");
     }
@@ -202,7 +237,7 @@ mod tests {
     #[test]
     fn missing_created_omits_time_and_start_turn_is_labelled() {
         let blocks = vec![block(BlockKind::Assistant, "hello", None)];
-        let q = build(&blocks, 1, false, fmt).unwrap();
+        let q = build(&blocks, Pick::Last(1), false, fmt).unwrap();
         assert_eq!(q.text, "# (start)\n> hello");
     }
 
@@ -216,7 +251,7 @@ mod tests {
             user("next"),
             ast("partial", 3),
         ];
-        let q = build(&blocks, 5, true, fmt).unwrap();
+        let q = build(&blocks, Pick::Last(5), true, fmt).unwrap();
         assert_eq!(q.count, 2);
         assert_eq!(
             q.text,
@@ -227,15 +262,103 @@ mod tests {
     #[test]
     fn running_does_not_mark_an_earlier_turn() {
         let blocks = vec![user("hi"), ast("done", 1), user("next")];
-        let q = build(&blocks, 1, true, fmt).unwrap();
+        let q = build(&blocks, Pick::Last(1), true, fmt).unwrap();
         assert_eq!(q.text, "# T1 (you)\n> done");
     }
 
     #[test]
     fn nothing_to_quote() {
-        assert_eq!(build(&[], 3, false, fmt), None);
-        assert_eq!(build(&[user("x"), user("y")], 3, false, fmt), None);
-        assert_eq!(build(&[user("x"), ast("y", 1)], 0, false, fmt), None);
+        assert_eq!(build(&[], Pick::Last(3), false, fmt), Err(Empty::NoReplies));
+        assert_eq!(
+            build(&[user("x"), user("y")], Pick::Last(3), false, fmt),
+            Err(Empty::NoReplies)
+        );
+        assert_eq!(
+            build(&[user("x"), ast("y", 1)], Pick::Last(0), false, fmt),
+            Err(Empty::NoReplies)
+        );
+    }
+
+    #[test]
+    fn since_you_quotes_from_your_last_prompt_including_its_reply() {
+        let blocks = vec![
+            user("old prompt"),
+            ast("old reply", 1),
+            user("latest prompt"),
+            ast("reply to you", 2),
+            user("[sw wake run=r reason=mail] mail"),
+            ast("wake reply", 3),
+            user("<swarm_message v=\"1\" from=\"ses_w\">\nresult"),
+            user("You are goose session x, resume"),
+            ast("goose reply", 4),
+        ];
+        let q = since(&blocks, 50, false).unwrap();
+        assert_eq!(q.count, 3);
+        assert_eq!(q.total, 3);
+        assert_eq!(
+            q.text,
+            "# T2 (you)\n> reply to you\n\n# T3 (wake: mail)\n> wake reply\n\n# T4 (goose)\n> goose reply"
+        );
+    }
+
+    #[test]
+    fn since_you_caps_to_the_newest_and_reports_total() {
+        let blocks = vec![
+            user("me"),
+            ast("a", 1),
+            user("[sw wake run=r reason=x] x"),
+            ast("b", 2),
+            user("[sw wake run=r reason=x] x"),
+            ast("c", 3),
+        ];
+        let q = since(&blocks, 2, false).unwrap();
+        assert_eq!((q.count, q.total), (2, 3));
+        assert_eq!(q.text, "# T2 (wake: x)\n> b\n\n# T3 (wake: x)\n> c");
+    }
+
+    #[test]
+    fn since_you_compact_is_not_your_prompt() {
+        let blocks = vec![
+            user("me"),
+            ast("a", 1),
+            user("[sw wake run=r reason=x] x"),
+            ast("w", 2),
+            user("/compact"),
+            ast("Compaction complete", 2),
+            user("[sw wake run=r reason=x] x"),
+            ast("b", 3),
+        ];
+        let q = since(&blocks, 50, false).unwrap();
+        assert_eq!(
+            q.text,
+            "# T1 (you)\n> a\n\n# T2 (wake: x)\n> w\n\n# T3 (wake: x)\n> b"
+        );
+    }
+
+    #[test]
+    fn since_you_edge_cases() {
+        let wake_only = vec![user("[sw wake run=r reason=x] x"), ast("a", 1)];
+        assert_eq!(since(&wake_only, 50, false), Err(Empty::NeverSpoke));
+        assert_eq!(since(&[ast("hello", 1)], 50, false), Err(Empty::NeverSpoke));
+        let waiting = vec![user("me"), ast("a", 1), user("again")];
+        assert_eq!(since(&waiting, 50, true), Err(Empty::NothingSince));
+        let silent = vec![
+            user("me"),
+            user("[sw wake run=r reason=x] x"),
+            block(BlockKind::Tool, "t", None),
+        ];
+        assert_eq!(since(&silent, 50, false), Err(Empty::NothingSince));
+    }
+
+    #[test]
+    fn since_you_marks_the_running_turn() {
+        let blocks = vec![user("me"), ast("partial", 1)];
+        let q = since(&blocks, 50, true).unwrap();
+        assert_eq!(q.text, "# T1 (you, in progress)\n> partial");
+    }
+
+    fn since(blocks: &[Block], cap: usize, running: bool) -> Result<Quoted, Empty> {
+        build(blocks, Pick::SinceYou(cap), running, fmt)
     }
 
     #[test]

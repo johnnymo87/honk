@@ -22,6 +22,9 @@ use crate::tui::transcript::{Transcript, Viewport};
 /// Most replies `/quote` loads; the composer re-renders its whole content every frame.
 const MAX_QUOTE: usize = 50;
 
+/// Replies bare `/quote` loads when the transcript has no prompt of yours to count from.
+const QUOTE_FALLBACK: usize = 3;
+
 /// Transcript rows kept visible above a maximized composer.
 const MAXIMIZED_TRANSCRIPT_ROWS: u16 = 3;
 
@@ -517,20 +520,21 @@ impl App {
         self.history_stash.clear();
     }
 
-    /// `/quote [N]` / `:quote [N]`: loads the last N coordinator replies, quoted, into the
-    /// composer (see `tui::quote`). `keep_draft` keeps the current composer text below them.
+    /// `/quote [N]` / `:quote [N]`: loads coordinator replies, quoted, into the composer (see
+    /// `tui::quote`): the last N, or with no N every reply since your own last prompt.
+    /// `keep_draft` keeps the current composer text below them.
     pub fn quote(&mut self, arg: &str, keep_draft: bool) {
-        let n = if arg.is_empty() {
-            3
+        let pick = if arg.is_empty() {
+            quote::Pick::SinceYou(MAX_QUOTE)
         } else {
             match arg.parse::<usize>() {
                 Ok(n) if n > MAX_QUOTE => {
                     self.transcript.apply_notice(Notice::info(format!(
                         "/quote is capped at {MAX_QUOTE} replies"
                     )));
-                    MAX_QUOTE
+                    quote::Pick::Last(MAX_QUOTE)
                 }
-                Ok(n) if n >= 1 => n,
+                Ok(n) if n >= 1 => quote::Pick::Last(n),
                 _ => {
                     self.transcript.apply_notice(Notice::warning(
                         "invalid /quote argument: must be a positive integer",
@@ -542,15 +546,54 @@ impl App {
         // The core's run state, not the transcript's: the transcript's `active_run` is not
         // carried across a replay swap, so right after attaching it can read idle mid-run.
         let running = !self.is_idle();
-        let Some(q) = quote::build(&self.transcript.blocks, n, running, quote::local_time) else {
-            self.transcript
-                .apply_notice(Notice::warning("no replies to quote"));
-            return;
+        let blocks = &self.transcript.blocks;
+        let q = match quote::build(blocks, pick, running, quote::local_time) {
+            Ok(q) => {
+                match pick {
+                    quote::Pick::Last(n) if q.count < n => {
+                        self.transcript.apply_notice(Notice::info(format!(
+                            "only {} replies to quote",
+                            q.count
+                        )));
+                    }
+                    quote::Pick::SinceYou(_) if q.total > q.count => {
+                        self.transcript.apply_notice(Notice::info(format!(
+                            "{} replies since your last prompt; quoting the last {}",
+                            q.total, q.count
+                        )));
+                    }
+                    _ => {}
+                }
+                q
+            }
+            Err(quote::Empty::NeverSpoke) => {
+                let fallback = quote::Pick::Last(QUOTE_FALLBACK);
+                let Ok(q) = quote::build(blocks, fallback, running, quote::local_time) else {
+                    self.transcript
+                        .apply_notice(Notice::warning("no replies to quote"));
+                    return;
+                };
+                self.transcript.apply_notice(Notice::info(format!(
+                    "no prompt of yours in this session; quoting the last {} replies",
+                    q.count
+                )));
+                q
+            }
+            Err(quote::Empty::NothingSince) => {
+                let msg = if running {
+                    "no replies since your last prompt yet"
+                } else {
+                    "no replies since your last prompt"
+                };
+                self.transcript.apply_notice(Notice::warning(msg));
+                return;
+            }
+            Err(quote::Empty::NoReplies) => {
+                self.transcript
+                    .apply_notice(Notice::warning("no replies to quote"));
+                return;
+            }
         };
-        if q.count < n {
-            self.transcript
-                .apply_notice(Notice::info(format!("only {} replies to quote", q.count)));
-        }
         let draft = if keep_draft {
             self.get_composer_text()
         } else {
@@ -2273,6 +2316,118 @@ mod tests {
         let last = app.transcript.blocks.last().unwrap();
         assert_eq!(last.kind, BlockKind::Notice);
         assert!(last.text.contains("no replies to quote"));
+    }
+
+    fn last_notice(app: &App) -> String {
+        let last = app.transcript.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::Notice);
+        last.text.clone()
+    }
+
+    #[test]
+    fn test_bare_quote_takes_everything_since_your_last_prompt() {
+        let (mut app, mut cmd_rx) = quote_app();
+        type_str(&mut app, "/quote");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(cmd_rx.try_recv().is_err());
+        let text = app.get_composer_text();
+        assert!(text.contains("(you)\n> reply one\n\n# "), "{text}");
+        assert!(text.ends_with("(wake: mail)\n> reply two"), "{text}");
+
+        for f in [
+            update("user_message_chunk", "u4", "thanks", 400),
+            update("agent_message_chunk", "a4", "reply four", 401),
+        ] {
+            app.transcript.apply_frame(&f);
+        }
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        let text = app.get_composer_text();
+        assert!(text.ends_with("(you)\n> reply four"), "{text}");
+        assert!(
+            !text.contains("reply one") && !text.contains("reply two"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_bare_quote_with_nothing_since_your_prompt_warns() {
+        let (mut app, _cmd_rx) = quote_app();
+        app.transcript
+            .apply_frame(&update("user_message_chunk", "u4", "thanks", 400));
+        app.execute_app_command("quote");
+        assert!(app.is_composer_empty());
+        assert!(!app.composer_maximized);
+        assert!(last_notice(&app).contains("no replies since your last prompt"));
+    }
+
+    #[test]
+    fn test_bare_quote_when_you_never_spoke_falls_back_to_last_three() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        for i in 0..4 {
+            let t = 100 * (i + 1);
+            for f in [
+                update(
+                    "user_message_chunk",
+                    &format!("u{i}"),
+                    "[sw wake run=r reason=mail] Woken",
+                    t,
+                ),
+                update(
+                    "agent_message_chunk",
+                    &format!("a{i}"),
+                    &format!("wake reply {i}"),
+                    t + 1,
+                ),
+            ] {
+                app.transcript.apply_frame(&f);
+            }
+        }
+        app.execute_app_command("quote");
+        let text = app.get_composer_text();
+        assert!(!text.contains("wake reply 0"), "{text}");
+        assert!(
+            text.contains("wake reply 1") && text.ends_with("> wake reply 3"),
+            "{text}"
+        );
+        assert!(
+            last_notice(&app).contains("no prompt of yours in this session; quoting the last 3")
+        );
+    }
+
+    #[test]
+    fn test_bare_quote_caps_a_long_backlog() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        app.transcript
+            .apply_frame(&update("user_message_chunk", "me", "hello", 1));
+        for i in 0..(MAX_QUOTE + 2) {
+            let t = 100 * (i as i64 + 1);
+            for f in [
+                update(
+                    "user_message_chunk",
+                    &format!("u{i}"),
+                    "[sw wake run=r reason=mail] Woken",
+                    t,
+                ),
+                update(
+                    "agent_message_chunk",
+                    &format!("a{i}"),
+                    &format!("r{i}."),
+                    t + 1,
+                ),
+            ] {
+                app.transcript.apply_frame(&f);
+            }
+        }
+        app.execute_app_command("quote");
+        let text = app.get_composer_text();
+        assert_eq!(text.matches("\n> r").count(), MAX_QUOTE, "{text}");
+        assert!(!text.contains("> r1.") && text.contains("> r2.") && text.ends_with("> r51."));
+        assert!(
+            last_notice(&app).contains("52 replies since your last prompt; quoting the last 50")
+        );
     }
 
     #[test]
