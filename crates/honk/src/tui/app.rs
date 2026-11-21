@@ -728,6 +728,7 @@ impl App {
         if !trim {
             self.drop_trim("trim cancelled for the untrimmed quote");
         }
+        let asked = pick;
         let Some((q, pick, note)) = self.pick_quote(pick) else {
             return;
         };
@@ -746,7 +747,7 @@ impl App {
         }
         if q.text.len() <= quote_trim::MIN_BYTES {
             let mut msg = format!("{note}quoted {what} in full: too short for trimming to help");
-            if matches!(pick, quote::Pick::SinceYou(_)) {
+            if matches!(asked, quote::Pick::SinceYou(_)) {
                 msg.push_str(
                     "; if you already replied, /quote N trims the last N replies and \
                      /quote prev counts from your previous prompt",
@@ -3126,9 +3127,11 @@ mod tests {
         app.set_composer_text("");
         app.execute_app_command("quote 4");
         let t = app.trim.as_ref().expect("trimming");
+        assert!(!t.prompt.contains("status?"), "{}", t.prompt);
         assert!(
-            !t.prompt.contains("<<<"),
-            "no prompt of yours to show: {}",
+            t.prompt
+                .contains("prompt that R4 answers (context only, not selectable):\n<<<\nok\n>>>"),
+            "{}",
             t.prompt
         );
         assert!(

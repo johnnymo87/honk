@@ -11,7 +11,7 @@ use serde_json::Value;
 /// Below this many bytes of quote, trimming would not save reading; quote it all at once.
 pub const MIN_BYTES: usize = 4000;
 
-pub const SYSTEM: &str = r#"You pick, from a coordinator agent's recent replies to Jonathan, the passages he needs to read: anything he must answer or decide, questions put to him, blockers, results he asked for, risks, and anything else he would want to see. Leave out routine progress narration, restated context, acknowledgements, and what he already knows from his own prompt.
+pub const SYSTEM: &str = r#"You pick, from a coordinator agent's recent replies to Jonathan, the passages he needs to read: anything he must answer or decide, questions put to him, blockers, results he asked for, risks, and anything else he would want to see. Leave out routine progress narration, restated context, acknowledgements, and what he already knows or has already answered in his own prompts (shown as context between the replies).
 
 You never write prose. Answer with one JSON object and nothing else:
 {"keep":[{"reply":1,"all":true,"tag":"done"},{"reply":2,"lines":[[3,7],[12,12]],"tag":"ask"}]}
@@ -35,10 +35,18 @@ pub fn sendable(replies: &[Reply]) -> Vec<&Reply> {
     replies.iter().filter(|r| !r.in_progress).collect()
 }
 
-/// The user message: your prompt for context, then each reply with numbered lines.
+/// The user message: your prompt the span starts from, then each reply with numbered lines,
+/// each reply to a prompt of yours preceded by that prompt (context the model must not pick).
 pub fn prompt(replies: &[&Reply], your_prompt: Option<&str>) -> String {
+    fn nonempty(p: Option<&str>) -> Option<&str> {
+        p.map(str::trim).filter(|p| !p.is_empty())
+    }
     let mut out = String::new();
-    if let Some(p) = your_prompt.map(str::trim).filter(|p| !p.is_empty()) {
+    // Shown with the first reply below when that is the reply to it.
+    let first_has_it = replies
+        .first()
+        .is_some_and(|r| nonempty(r.your_prompt.as_deref()) == nonempty(your_prompt));
+    if let Some(p) = nonempty(your_prompt).filter(|_| !first_has_it) {
         out.push_str(
             "Jonathan's prompt these replies follow (context only, not selectable):\n<<<\n",
         );
@@ -48,6 +56,12 @@ pub fn prompt(replies: &[&Reply], your_prompt: Option<&str>) -> String {
         out.push_str("The replies:\n");
     }
     for (i, r) in replies.iter().enumerate() {
+        if let Some(p) = nonempty(r.your_prompt.as_deref()) {
+            out.push_str(&format!(
+                "\nJonathan's prompt that R{} answers (context only, not selectable):\n<<<\n{p}\n>>>\n",
+                i + 1
+            ));
+        }
         let label = r.header.trim_start_matches('#').trim();
         out.push_str(&format!("\nR{} {label}\n", i + 1));
         for (j, line) in r.text.lines().enumerate() {
@@ -271,11 +285,38 @@ pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prompt_shows_your_prompts_between_the_replies_once() {
+        let mut a = reply("T1 (you)", "a");
+        a.your_prompt = Some("first?".into());
+        let w = reply("T2 (wake: x)", "w");
+        let mut b = reply("T3 (you)", "b");
+        b.your_prompt = Some("second?".into());
+        let rs = [a, w, b];
+        let sent: Vec<&Reply> = rs.iter().collect();
+        let p = prompt(&sent, Some("first?"));
+        assert_eq!(p.matches("first?").count(), 1, "{p}");
+        assert!(p.starts_with("The replies:\n"), "{p}");
+        assert!(
+            p.contains(
+                "prompt that R1 answers (context only, not selectable):\n<<<\nfirst?\n>>>\n\nR1 T1"
+            ),
+            "{p}"
+        );
+        assert!(
+            p.contains(
+                "prompt that R3 answers (context only, not selectable):\n<<<\nsecond?\n>>>\n\nR3 T3"
+            ),
+            "{p}"
+        );
+    }
+
     fn reply(header: &str, text: &str) -> Reply {
         Reply {
             header: format!("# {header}"),
             text: text.to_string(),
             in_progress: false,
+            your_prompt: None,
         }
     }
 

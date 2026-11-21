@@ -69,6 +69,8 @@ pub struct Reply {
     pub text: String,
     /// The run is still writing it.
     pub in_progress: bool,
+    /// Your prompt, when this is the reply to one (context for the trim, never quoted).
+    pub your_prompt: Option<String>,
 }
 
 /// `text` as quote lines: `> line`, and a bare `>` for a blank line.
@@ -189,6 +191,8 @@ pub fn build(
                 header,
                 text: turn.reply.join("\n\n"),
                 in_progress,
+                your_prompt: (turn.trigger == Trigger::You && !turn.is_compact)
+                    .then(|| turn.prompt.clone()),
             }
         })
         .collect();

@@ -373,7 +373,8 @@ impl Hub {
 
 /// Gives goose session `sid` the session-tags tag of goose session `from`. Best effort: an
 /// untagged session (an `auto:` tag) or a failing binary leaves `sid` to session-tags' own
-/// `auto:goose/honk-oneshot`.
+/// `auto:goose/honk-oneshot`. A one-time copy: a later retag of `from` does not follow, and a
+/// session swept after a honkd crash is archived untagged.
 async fn tag_like(bin: std::path::PathBuf, from: String, sid: String) {
     let run = |args: Vec<String>| {
         let bin = bin.clone();
@@ -408,12 +409,17 @@ async fn tag_like(bin: std::path::PathBuf, from: String, sid: String) {
     }
 }
 
-/// The tag in `session-tags which` output (`tag<TAB>source<TAB>root<TAB>kind`), unless auto.
+/// The tag in `session-tags which` output (`tag<TAB>source<TAB>root<TAB>kind`), when it is
+/// one to inherit: kind `session` (an `auto` kind, or an older three-column session-tags, is
+/// not), the rule honk's own launch inheritance follows (`crates/honk/src/octags.rs`).
 fn which_tag(out: &str) -> Option<String> {
-    let mut cols = out.lines().next()?.split('\t');
-    let tag = cols.next()?.trim();
-    let source = cols.next().unwrap_or("").trim();
-    (!tag.is_empty() && !tag.starts_with("auto:") && source != "auto").then(|| tag.to_string())
+    let cols: Vec<&str> = out.lines().next()?.split('\t').map(str::trim).collect();
+    match cols.as_slice() {
+        [tag, _, _, "session", ..] if !tag.is_empty() && !tag.starts_with("auto:") => {
+            Some(tag.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn agent_text<'a>(frame: &'a Value, sid: &str) -> Option<&'a str> {
@@ -441,6 +447,11 @@ mod tests {
         );
         assert_eq!(which_tag("auto:goose/x\tauto\tgoose:1\tsession\n"), None);
         assert_eq!(which_tag(""), None);
+        assert_eq!(
+            which_tag("prog\tmanual\tgoose:1\n"),
+            None,
+            "old 3-column output"
+        );
     }
 
     #[test]
