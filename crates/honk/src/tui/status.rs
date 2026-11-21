@@ -235,7 +235,7 @@ impl<'a> StatusBar<'a> {
 
             if let Some(secs) = self.trimming {
                 spans.push(Span::styled(
-                    format!("  [trimming {secs}s, Ctrl-C cancels]"),
+                    format!("  [trimming {secs}s]"),
                     Style::default().bg(Color::DarkGray).fg(Color::Cyan),
                 ));
             }
@@ -303,7 +303,11 @@ impl<'a> StatusBar<'a> {
             .unwrap_or(0);
         let conn_text = self.connection_text();
         let conn_w = unicode_width::UnicodeWidthStr::width(conn_text.as_str()) + 2;
-        let base_non_title_left = badge_w + spacer_w + queued_w + conn_w;
+        let trimming_w = self
+            .trimming
+            .map(|secs| format!("  [trimming {secs}s]").len())
+            .unwrap_or(0);
+        let base_non_title_left = badge_w + spacer_w + queued_w + trimming_w + conn_w;
 
         let usage_candidates: Vec<Option<String>> = if let Some(u) = self.usage {
             let levels = [UsageLevel::Full, UsageLevel::NoCost, UsageLevel::TokensOnly];
@@ -484,6 +488,27 @@ mod tests {
             assert_eq!(shorten_home(&home), "~");
         }
         assert_eq!(shorten_home("/var/log"), "/var/log");
+    }
+
+    #[test]
+    fn test_trimming_shows_and_fits() {
+        let bar = StatusBar {
+            session_id: "ses",
+            session_title: Some("a fairly long session title for the trim"),
+            cwd: Some("/home/dev/projects/honk"),
+            state_snapshot: None,
+            mode: EditorMode::Normal,
+            usage: None,
+            trimming: Some(7),
+        };
+        for width in [60u16, 120] {
+            // At 60 columns the title gives way.
+            let line = bar.to_line_with(width, None);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains("[trimming 7s]"), "{text}");
+            assert!(text.contains("live"), "{text}");
+            assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= width as usize);
+        }
     }
 
     #[test]
