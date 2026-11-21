@@ -1,5 +1,5 @@
 //! Registering a goose session with a pigeon daemon so it gets a pigeon chat channel
-//! (a Slack channel; a Telegram topic on a machine still on Telegram).
+//! (a Slack channel).
 //!
 //! pigeon learns about a goose session only when it launches one itself or when
 //! something calls its `POST /goose/sessions`. Registering is not enough to make
