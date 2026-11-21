@@ -1,5 +1,6 @@
 use crate::chat::driver::{ConnectionState, StateSnapshot};
 use crate::chat::types::Ownership;
+use crate::tui::activity::Indicator;
 use edtui::EditorMode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -168,6 +169,11 @@ impl<'a> StatusBar<'a> {
     }
 
     pub fn to_line(&self, width: u16) -> Line<'static> {
+        self.to_line_with(width, None)
+    }
+
+    /// The status line, with `activity` in place of the static run state.
+    pub fn to_line_with(&self, width: u16, activity: Option<&Indicator>) -> Line<'static> {
         let base_style = Style::default().bg(Color::DarkGray).fg(Color::White);
 
         let title_style = Style::default()
@@ -199,14 +205,21 @@ impl<'a> StatusBar<'a> {
             let display_title = self.title_and_cwd(max_title_w);
             spans.push(Span::styled(display_title, title_style));
 
-            // Run state
-            let run_state = self.run_state_text();
-            let run_style = Style::default().bg(Color::DarkGray).fg(match run_state {
-                "running" => Color::Green,
-                "running (other client)" => Color::Yellow,
-                "waiting" => Color::Cyan,
-                _ => Color::DarkGray,
-            });
+            // Run state, or the activity indicator while busy
+            let (run_state, run_color) = match activity {
+                Some(a) => (a.text.as_str(), a.color),
+                None => {
+                    let text = self.run_state_text();
+                    let color = match text {
+                        "running" => Color::Green,
+                        "running (other client)" => Color::Yellow,
+                        "waiting" => Color::Cyan,
+                        _ => Color::DarkGray,
+                    };
+                    (text, color)
+                }
+            };
+            let run_style = Style::default().bg(Color::DarkGray).fg(run_color);
             spans.push(Span::styled(format!("  [{}]", run_state), run_style));
 
             // Queued
@@ -265,7 +278,9 @@ impl<'a> StatusBar<'a> {
 
         let badge_w = unicode_width::UnicodeWidthStr::width(self.mode_text()) + 2;
         let spacer_w = 1;
-        let run_state_w = unicode_width::UnicodeWidthStr::width(self.run_state_text()) + 4;
+        let run_state_w = unicode_width::UnicodeWidthStr::width(
+            activity.map_or(self.run_state_text(), |a| a.text.as_str()),
+        ) + 4;
         let queued_w = self
             .queued_text()
             .map(|q| unicode_width::UnicodeWidthStr::width(q.as_str()) + 4)
@@ -357,14 +372,20 @@ impl<'a> StatusBar<'a> {
     }
 }
 
-impl<'a> Widget for StatusBar<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl<'a> StatusBar<'a> {
+    pub fn render_with(&self, area: Rect, buf: &mut Buffer, activity: Option<&Indicator>) {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let line = self.to_line(area.width);
+        let line = self.to_line_with(area.width, activity);
         buf.set_style(area, Style::default().bg(Color::DarkGray));
         buf.set_line(area.x, area.y, &line, area.width);
+    }
+}
+
+impl<'a> Widget for StatusBar<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_with(area, buf, None);
     }
 }
 
@@ -390,6 +411,8 @@ mod tests {
             model: None,
             known_models: Vec::new(),
             models_listed: false,
+            compacting: false,
+            awaiting_permission: false,
         }
     }
 

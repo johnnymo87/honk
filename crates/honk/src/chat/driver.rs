@@ -162,6 +162,10 @@ pub struct StateSnapshot {
     pub model: Option<String>,
     pub known_models: Vec<String>,
     pub models_listed: bool,
+    /// A local `/compact` is in flight or running.
+    pub compacting: bool,
+    /// Another client's turn is waiting on a permission answer from us.
+    pub awaiting_permission: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -319,6 +323,8 @@ fn maybe_emit_state(
         model: core.model().map(str::to_string),
         known_models: core.known_model_ids().to_vec(),
         models_listed: core.models_listed(),
+        compacting: core.is_compacting(),
+        awaiting_permission: !core.pending_permissions().is_empty(),
     };
     if last_state.as_ref() != Some(&current) {
         *last_state = Some(current.clone());
@@ -555,6 +561,8 @@ async fn run_driver(
         model: None,
         known_models: Vec::new(),
         models_listed: false,
+        compacting: false,
+        awaiting_permission: false,
     });
     let _ = ui_tx.send(UiEvent::State(last_state.clone().unwrap()));
 

@@ -168,6 +168,11 @@ impl ChatCore {
         self.prompt_sent.is_some()
     }
 
+    /// A local `/compact` turn is in flight or running.
+    pub fn is_compacting(&self) -> bool {
+        self.prompt_sent.as_ref().is_some_and(|p| p.is_command) || self.run_is_command
+    }
+
     pub fn queued_len(&self) -> usize {
         self.local_queue.len() + self.held_steers.len() + self.detached_buffered_lines.len()
     }
