@@ -55,6 +55,12 @@ pub struct Args {
     pub models_file: Option<PathBuf>,
     #[arg(long = "mcp-no-confirm", value_delimiter = ',')]
     pub mcp_no_confirm: Vec<String>,
+    /// `SERVER=TOOL,TOOL,...`: when honkd enables SERVER in a goose session, goose
+    /// exposes only these tools from it (goose's per-extension `available_tools`
+    /// allowlist; any other tool is absent from the tool list and cannot be called).
+    /// Repeatable, one server per flag. A server with no entry gets every tool.
+    #[arg(long = "mcp-allow-tools", value_name = "SERVER=TOOL,...")]
+    pub mcp_allow_tools: Vec<String>,
     #[arg(long, help = "Allow agents to self-grant MCP servers via POST /mcp/*")]
     pub mcp_self_grant: bool,
     #[arg(
@@ -81,6 +87,40 @@ pub struct Args {
 }
 
 impl Args {
+    /// Parses `--mcp-allow-tools` into server name -> sorted, deduplicated tools.
+    ///
+    /// Fails on a malformed value, a duplicate server, or an empty tool list: goose
+    /// reads an empty `available_tools` as "every tool", so an empty list must
+    /// never be passed through as if it restricted anything.
+    pub fn mcp_allow_tools_map(
+        &self,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+        let mut map = std::collections::BTreeMap::new();
+        for raw in &self.mcp_allow_tools {
+            let Some((server, tools)) = raw.split_once('=') else {
+                anyhow::bail!("--mcp-allow-tools '{raw}': expected SERVER=TOOL,TOOL,...");
+            };
+            let server = server.trim();
+            if server.is_empty() {
+                anyhow::bail!("--mcp-allow-tools '{raw}': server name is empty");
+            }
+            let mut list = Vec::new();
+            for tool in tools.split(',') {
+                let tool = tool.trim();
+                if tool.is_empty() {
+                    anyhow::bail!("--mcp-allow-tools '{raw}': empty tool name");
+                }
+                list.push(tool.to_string());
+            }
+            list.sort();
+            list.dedup();
+            if map.insert(server.to_string(), list).is_some() {
+                anyhow::bail!("--mcp-allow-tools: server '{server}' is given more than once");
+            }
+        }
+        Ok(map)
+    }
+
     pub fn resolve_state_dir(&self) -> PathBuf {
         if let Some(dir) = &self.state_dir {
             return dir.clone();
@@ -244,5 +284,64 @@ mod tests {
             args.swarm_pigeon_token_file,
             Some(PathBuf::from("/tmp/pigeon-token"))
         );
+    }
+    fn allow_tools_args(values: &[&str]) -> Args {
+        let mut argv = vec!["honkd", "--upstream-secret-file", "/tmp/secret"];
+        for v in values {
+            argv.push("--mcp-allow-tools");
+            argv.push(v);
+        }
+        Args::try_parse_from(argv).expect("parse args")
+    }
+
+    #[test]
+    fn default_mcp_allow_tools_is_empty() {
+        let args = allow_tools_args(&[]);
+        assert!(args.mcp_allow_tools_map().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parsed_mcp_allow_tools_sorted_and_deduped() {
+        let args = allow_tools_args(&[
+            "slack-ro=users_search,channels_list,users_search",
+            "figma=get_file",
+        ]);
+        let map = args.mcp_allow_tools_map().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["slack-ro"], vec!["channels_list", "users_search"]);
+        assert_eq!(map["figma"], vec!["get_file"]);
+    }
+
+    #[test]
+    fn parsed_mcp_allow_tools_trims_blanks() {
+        let args = allow_tools_args(&[" slack-ro = channels_list , users_search "]);
+        let map = args.mcp_allow_tools_map().unwrap();
+        assert_eq!(map["slack-ro"], vec!["channels_list", "users_search"]);
+    }
+
+    #[test]
+    fn mcp_allow_tools_rejects_malformed_values() {
+        // An empty list would reach goose as "no allowlist" (every tool), so it
+        // must be an error rather than a silently permissive entry.
+        for bad in [
+            "slack-ro",
+            "slack-ro=",
+            "slack-ro= , ",
+            "=channels_list",
+            "slack-ro=a,,b",
+        ] {
+            let args = allow_tools_args(&[bad]);
+            assert!(
+                args.mcp_allow_tools_map().is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_allow_tools_rejects_duplicate_server() {
+        let args = allow_tools_args(&["slack-ro=a", "slack-ro=b"]);
+        let err = args.mcp_allow_tools_map().unwrap_err().to_string();
+        assert!(err.contains("slack-ro"), "{err}");
     }
 }

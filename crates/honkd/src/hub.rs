@@ -252,9 +252,28 @@ impl Hub {
             } else {
                 None
             };
-            let mut policy = crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone());
+            let mut policy = crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone())
+                .with_available_tools(args.mcp_allow_tools_map()?);
             if has_swarm {
                 policy.no_confirm.insert("swarm".to_string());
+            }
+            if let Some(path) = &args.mcp_catalog
+                && !policy.available_tools.is_empty()
+            {
+                match crate::mcp::catalog::Catalog::load(path) {
+                    Ok(catalog) => {
+                        for name in policy.allowlisted_servers_missing_from(&catalog) {
+                            tracing::warn!(
+                                "--mcp-allow-tools names '{name}', which is not in {}; it restricts nothing",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "cannot read {} to check --mcp-allow-tools names: {e:#}",
+                        path.display()
+                    ),
+                }
             }
             Some(crate::mcp::McpConfig {
                 catalog_path: args.mcp_catalog.clone(),

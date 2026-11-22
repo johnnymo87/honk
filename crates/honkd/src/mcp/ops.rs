@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 
 use crate::mcp::catalog::{Catalog, CatalogEntry, EntrySource, Transport, marker};
@@ -40,13 +40,34 @@ pub trait GooseRequester: Send + Sync {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     pub no_confirm: BTreeSet<String>,
+    /// Server name -> the only tools goose may expose from it (sorted, deduped,
+    /// never empty). Sent as goose's `available_tools`; see `--mcp-allow-tools`.
+    #[serde(default)]
+    pub available_tools: BTreeMap<String, Vec<String>>,
 }
 
 impl Policy {
     pub fn new(no_confirm: impl IntoIterator<Item = String>) -> Self {
         Self {
             no_confirm: no_confirm.into_iter().collect(),
+            available_tools: BTreeMap::new(),
         }
+    }
+
+    pub fn with_available_tools(mut self, available_tools: BTreeMap<String, Vec<String>>) -> Self {
+        self.available_tools = available_tools;
+        self
+    }
+
+    /// Allowlisted server names that `catalog` does not have. Such an entry
+    /// restricts nothing (a typo like `slack_ro` leaves `slack-ro` with every
+    /// tool), so honkd warns about it at startup.
+    pub fn allowlisted_servers_missing_from(&self, catalog: &Catalog) -> Vec<String> {
+        self.available_tools
+            .keys()
+            .filter(|name| catalog.get(name).is_none())
+            .cloned()
+            .collect()
     }
 }
 
@@ -209,6 +230,9 @@ fn confirm_refusal_hint(name: &str, catalog: &Catalog, is_agent: bool) -> String
 struct GooseExtensionInfo {
     key: String,
     description: Option<String>,
+    /// The extension's stored `available_tools`, sorted; `None` when goose
+    /// reports none (every tool is exposed).
+    available_tools: Option<Vec<String>>,
 }
 
 async fn fetch_goose_extensions(
@@ -247,9 +271,25 @@ async fn fetch_goose_extensions(
             .or_else(|| ext_val.get("description").and_then(|d| d.as_str()))
             .map(|s| s.to_string());
 
+        let available_tools = ext_val
+            .get("extension")
+            .and_then(|e| e.get("available_tools"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                let mut tools: Vec<String> = arr
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect();
+                tools.sort();
+                tools.dedup();
+                tools
+            })
+            .filter(|tools| !tools.is_empty());
+
         list.push(GooseExtensionInfo {
             key,
             description: desc,
+            available_tools,
         });
     }
     Ok(list)
@@ -453,10 +493,20 @@ pub async fn enable_with_reason(
     let mut results = Vec::new();
     for name in &unique_names {
         let expected_marker = marker(name);
+        let wanted_tools = policy.available_tools.get(name);
         let existing = goose_exts.iter().find(|e| &e.key == name);
+        let mut stale_allowlist = false;
 
         if let Some(ext) = existing {
-            if ext.description.as_deref() == Some(&expected_marker) {
+            if ext.description.as_deref() == Some(&expected_marker)
+                && wanted_tools.is_some()
+                && ext.available_tools.as_ref() != wanted_tools
+            {
+                // On, but enabled before (or under a different) tool allowlist:
+                // it may expose tools the policy now withholds. Fall through and
+                // re-add it below rather than reporting "already on".
+                stale_allowlist = true;
+            } else if ext.description.as_deref() == Some(&expected_marker) {
                 // Already on
                 results.push(NameResult {
                     name: name.clone(),
@@ -500,6 +550,34 @@ pub async fn enable_with_reason(
             continue;
         }
 
+        // Drop the copy with the stale allowlist; the add below replaces it.
+        if stale_allowlist {
+            let remove_res = req
+                .request(
+                    "_goose/unstable/session/extensions/remove",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "extensionKey": name,
+                    }),
+                )
+                .await;
+            if let Err(e) = remove_res {
+                results.push(NameResult {
+                    name: name.clone(),
+                    ok: false,
+                    error: Some(format!(
+                        "failed to apply the tool allowlist to '{name}': {}",
+                        e.message
+                    )),
+                    note: None,
+                    replaced: None,
+                    changed: false,
+                });
+                continue;
+            }
+            goose_exts.retain(|e| &e.key != name);
+        }
+
         // Check if sibling is currently enabled WITH marker
         let mut replaced = None;
         if let Some(sibling) = find_sibling(name, catalog) {
@@ -540,7 +618,10 @@ pub async fn enable_with_reason(
         }
 
         // Add extension
-        let ext_json = spec.to_add_extension_json();
+        let mut ext_json = spec.to_add_extension_json();
+        if let Some(tools) = wanted_tools {
+            ext_json["available_tools"] = serde_json::json!(tools);
+        }
         let add_res = req
             .request(
                 "_goose/unstable/session/extensions/add",
@@ -557,18 +638,19 @@ pub async fn enable_with_reason(
                 goose_exts.push(GooseExtensionInfo {
                     key: name.clone(),
                     description: Some(expected_marker),
+                    available_tools: wanted_tools.cloned(),
                 });
                 results.push(NameResult {
                     name: name.clone(),
                     ok: true,
                     error: None,
-                    note: None,
+                    note: stale_allowlist.then(|| "tool allowlist updated".to_string()),
                     replaced,
                     changed: true,
                 });
             }
             Err(e) => {
-                let changed = replaced.is_some();
+                let changed = replaced.is_some() || stale_allowlist;
                 let redacted_error = crate::mcp::redact::redact_mcp_error(&e.message, spec);
                 results.push(NameResult {
                     name: name.clone(),
@@ -988,6 +1070,184 @@ mod tests {
         assert!(other_keys.contains(&"developer"));
         assert!(other_keys.contains(&"figma"));
         assert!(!other_keys.contains(&"slack"));
+    }
+
+    fn allowlist_policy() -> Policy {
+        sample_policy().with_available_tools(std::collections::BTreeMap::from([(
+            "slack-ro".to_string(),
+            vec!["channels_list".to_string(), "users_search".to_string()],
+        )]))
+    }
+
+    fn added_extensions(req: &FakeRequester) -> Vec<Value> {
+        add_calls(req)
+            .into_iter()
+            .map(|p| p["extension"].clone())
+            .collect()
+    }
+
+    fn honk_slack_ro(available_tools: Option<Vec<&str>>) -> Value {
+        let mut ext = serde_json::json!({
+            "type": "mcp",
+            "description": "honk-mcp:slack-ro",
+            "server": { "name": "slack-ro" }
+        });
+        if let Some(tools) = available_tools {
+            ext["available_tools"] = serde_json::json!(tools);
+        }
+        serde_json::json!({ "extensionKey": "slack-ro", "extension": ext })
+    }
+
+    #[test]
+    fn test_allowlisted_servers_missing_from_catalog() {
+        let cat = sample_catalog();
+        let policy = sample_policy().with_available_tools(std::collections::BTreeMap::from([
+            ("slack-ro".to_string(), vec!["channels_list".to_string()]),
+            ("slack_ro".to_string(), vec!["channels_list".to_string()]),
+        ]));
+        assert_eq!(
+            policy.allowlisted_servers_missing_from(&cat),
+            vec!["slack_ro"]
+        );
+        assert!(
+            allowlist_policy()
+                .allowlisted_servers_missing_from(&cat)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enable_sends_configured_tool_allowlist() {
+        let cat = sample_catalog();
+        let req = FakeRequester::new(vec![]);
+        let res = enable(
+            &req,
+            &cat,
+            &allowlist_policy(),
+            "ses_1",
+            &["slack-ro".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok);
+        let adds = added_extensions(&req);
+        assert_eq!(adds.len(), 1);
+        assert_eq!(
+            adds[0]["available_tools"],
+            serde_json::json!(["channels_list", "users_search"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enable_without_allowlist_sends_no_available_tools() {
+        let cat = sample_catalog();
+        let req = FakeRequester::new(vec![]);
+        enable(
+            &req,
+            &cat,
+            &allowlist_policy(),
+            "ses_1",
+            &["figma".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        let adds = added_extensions(&req);
+        assert_eq!(adds.len(), 1);
+        assert!(adds[0].get("available_tools").is_none(), "{}", adds[0]);
+    }
+
+    #[tokio::test]
+    async fn test_enable_already_on_with_matching_allowlist_is_noop() {
+        let cat = sample_catalog();
+        // Stored order differs from the policy's; it is still the same set.
+        let req = FakeRequester::new(vec![honk_slack_ro(Some(vec![
+            "users_search",
+            "channels_list",
+        ]))]);
+        let res = enable(
+            &req,
+            &cat,
+            &allowlist_policy(),
+            "ses_1",
+            &["slack-ro".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(res.results[0].ok);
+        assert_eq!(res.results[0].note.as_deref(), Some("already on"));
+        assert!(!res.results[0].changed);
+        assert!(added_extensions(&req).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enable_already_on_without_allowlist_is_readded_with_it() {
+        // A session that enabled slack-ro before the allowlist existed holds every
+        // tool; enabling it again must narrow it, not report "already on".
+        for stale in [
+            None,
+            Some(vec!["channels_list", "users_search", "conversations_join"]),
+        ] {
+            let cat = sample_catalog();
+            let req = FakeRequester::new(vec![honk_slack_ro(stale.clone())]);
+            let res = enable(
+                &req,
+                &cat,
+                &allowlist_policy(),
+                "ses_1",
+                &["slack-ro".to_string()],
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(res.results[0].ok, "{stale:?}: {:?}", res.results[0]);
+            assert!(res.results[0].changed, "{stale:?}");
+            assert_eq!(
+                res.results[0].note.as_deref(),
+                Some("tool allowlist updated")
+            );
+            let calls = req.calls();
+            let remove_idx = calls
+                .iter()
+                .position(|(m, p)| {
+                    m == "_goose/unstable/session/extensions/remove"
+                        && p["extensionKey"] == "slack-ro"
+                })
+                .expect("stale slack-ro removed");
+            let add_idx = calls
+                .iter()
+                .position(|(m, _)| m == "_goose/unstable/session/extensions/add")
+                .expect("slack-ro re-added");
+            assert!(remove_idx < add_idx);
+            assert_eq!(
+                added_extensions(&req)[0]["available_tools"],
+                serde_json::json!(["channels_list", "users_search"])
+            );
+            assert!(res.enabled.contains(&"slack-ro".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enable_stale_allowlist_readd_failure_reports_error() {
+        let cat = sample_catalog();
+        let req = FakeRequester::new(vec![honk_slack_ro(None)]);
+        req.set_fail_method(Some("_goose/unstable/session/extensions/add".to_string()));
+        let res = enable(
+            &req,
+            &cat,
+            &allowlist_policy(),
+            "ses_1",
+            &["slack-ro".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(!res.results[0].ok);
+        // The unrestricted copy was removed, so the session did change.
+        assert!(res.results[0].changed);
+        assert!(!res.enabled.contains(&"slack-ro".to_string()));
     }
 
     #[tokio::test]
