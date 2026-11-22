@@ -257,6 +257,24 @@ impl Hub {
             if has_swarm {
                 policy.no_confirm.insert("swarm".to_string());
             }
+            if let Some(path) = &args.mcp_catalog
+                && !policy.available_tools.is_empty()
+            {
+                match crate::mcp::catalog::Catalog::load(path) {
+                    Ok(catalog) => {
+                        for name in policy.allowlisted_servers_missing_from(&catalog) {
+                            tracing::warn!(
+                                "--mcp-allow-tools names '{name}', which is not in {}; it restricts nothing",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "cannot read {} to check --mcp-allow-tools names: {e:#}",
+                        path.display()
+                    ),
+                }
+            }
             Some(crate::mcp::McpConfig {
                 catalog_path: args.mcp_catalog.clone(),
                 policy,

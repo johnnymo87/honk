@@ -58,6 +58,17 @@ impl Policy {
         self.available_tools = available_tools;
         self
     }
+
+    /// Allowlisted server names that `catalog` does not have. Such an entry
+    /// restricts nothing (a typo like `slack_ro` leaves `slack-ro` with every
+    /// tool), so honkd warns about it at startup.
+    pub fn allowlisted_servers_missing_from(&self, catalog: &Catalog) -> Vec<String> {
+        self.available_tools
+            .keys()
+            .filter(|name| catalog.get(name).is_none())
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,6 +1096,24 @@ mod tests {
             ext["available_tools"] = serde_json::json!(tools);
         }
         serde_json::json!({ "extensionKey": "slack-ro", "extension": ext })
+    }
+
+    #[test]
+    fn test_allowlisted_servers_missing_from_catalog() {
+        let cat = sample_catalog();
+        let policy = sample_policy().with_available_tools(std::collections::BTreeMap::from([
+            ("slack-ro".to_string(), vec!["channels_list".to_string()]),
+            ("slack_ro".to_string(), vec!["channels_list".to_string()]),
+        ]));
+        assert_eq!(
+            policy.allowlisted_servers_missing_from(&cat),
+            vec!["slack_ro"]
+        );
+        assert!(
+            allowlist_policy()
+                .allowlisted_servers_missing_from(&cat)
+                .is_empty()
+        );
     }
 
     #[tokio::test]
