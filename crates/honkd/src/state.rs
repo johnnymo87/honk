@@ -45,7 +45,7 @@ pub struct Revert {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TurnErrorRecord {
-    /// goose's `_meta.goose.turnError.kind`, or honkd's `rpc` / `interrupted`.
+    /// goose's `error.data.kind` / `_meta.goose.turnError.kind`, or honkd's `rpc` / `interrupted`.
     pub kind: String,
     pub message: String,
     pub at_unix: u64,

@@ -315,10 +315,19 @@ impl Hub {
                             return Err(OneshotError::Cancelled);
                         }
                         if let Some(err) = frame.get("error") {
-                            let msg = err
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("error");
+                            let msg = if err.pointer("/data/reason").and_then(Value::as_str)
+                                == Some("turn_failed")
+                            {
+                                err.pointer("/data/message")
+                                    .and_then(Value::as_str)
+                                    .filter(|m| !m.is_empty())
+                                    .or_else(|| err.get("message").and_then(Value::as_str))
+                                    .unwrap_or("error")
+                            } else {
+                                err.get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("error")
+                            };
                             return Err(OneshotError::Failed(format!("model: {msg}")));
                         }
                         let stop = frame

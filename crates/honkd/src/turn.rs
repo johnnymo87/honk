@@ -550,6 +550,25 @@ pub fn turn_outcome(
             {
                 return None;
             }
+            if let Some(data) = err.get("data")
+                && data.get("reason").and_then(Value::as_str) == Some("turn_failed")
+            {
+                let kind = data
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or("rpc");
+                let message = data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| err.get("message").and_then(Value::as_str))
+                    .unwrap_or("");
+                return Some(TurnOutcome::Failed {
+                    kind: capped(kind.to_string()),
+                    message: capped(message.to_string()),
+                });
+            }
             let message = err.get("message").and_then(Value::as_str).unwrap_or("");
             let message = match err.get("data").and_then(Value::as_str) {
                 Some(data) if !message.is_empty() => format!("{message}: {data}"),
@@ -1796,6 +1815,55 @@ mod tests {
         let busy = Reply::Error(busy_error("run_1"));
         assert_eq!(turn_outcome(&busy, None, None), None);
         assert_eq!(turn_outcome(&busy, None, Some(0)), None);
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_reply_is_recorded() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "provider",
+                "message": "overloaded"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("provider", "overloaded")
+        );
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_stock_goose_without_kind_falls_back_to_rpc() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Turn failed",
+            "data": {
+                "reason": "turn_failed"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("rpc", "Turn failed")
+        );
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_prefers_data_message() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "network",
+                "message": "connection reset"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("network", "connection reset")
+        );
     }
 
     #[test]

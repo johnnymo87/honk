@@ -133,6 +133,52 @@ async fn json_rpc_error_reply_is_listed_as_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn turn_failed_error_reply_is_listed_with_its_kind_and_message() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": {
+            "reason": "turn_failed",
+            "kind": "provider",
+            "message": "overloaded"
+        }
+    })));
+    let reply = prompt(&mut v, &sid, "fails").await;
+    assert!(reply.get("error").is_some(), "{reply}");
+
+    let error = listed_error(&mut v, &sid).await;
+    assert_eq!(error["kind"], "provider");
+    assert_eq!(error["message"], "overloaded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_failed_error_reply_stock_goose_is_listed_as_rpc() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Turn failed",
+        "data": {
+            "reason": "turn_failed"
+        }
+    })));
+    let reply = prompt(&mut v, &sid, "fails").await;
+    assert!(reply.get("error").is_some(), "{reply}");
+
+    let error = listed_error(&mut v, &sid).await;
+    assert_eq!(error["kind"], "rpc");
+    assert_eq!(error["message"], "Turn failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_run_clears_the_error_before_it_ends() {
     let fake = FakeGoose::start().await;
     let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
