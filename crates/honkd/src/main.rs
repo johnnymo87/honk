@@ -35,6 +35,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Err(e) = args.mcp_allow_tools_map() {
+        eprintln!("honkd: {e:#}");
+        std::process::exit(1);
+    }
+
     // 3. StateStore::open (it takes the lock and checks the upstream URL)
     let state_dir = args.resolve_state_dir();
     let state_store =

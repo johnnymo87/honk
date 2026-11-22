@@ -252,7 +252,8 @@ impl Hub {
             } else {
                 None
             };
-            let mut policy = crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone());
+            let mut policy = crate::mcp::ops::Policy::new(args.mcp_no_confirm.clone())
+                .with_available_tools(args.mcp_allow_tools_map()?);
             if has_swarm {
                 policy.no_confirm.insert("swarm".to_string());
             }
