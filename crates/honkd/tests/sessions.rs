@@ -295,29 +295,25 @@ async fn session_list_running_clears_on_cancel() {
         .await;
     assert_eq!(r0["result"]["stopReason"], "end_turn");
 
-    // Connect fresh viewer so its incoming frame buffer is empty
-    let mut v2 = Viewer::connect_pigeon(&h).await;
-
-    let p_id = v2
+    let p_id = v
         .request(
             "session/prompt",
             prompt_params(&sid, "test cancel gated", None),
         )
         .await;
 
-    // Wait until run is active
-    v2.wait_for(|f| {
-        f.pointer("/params/update/sessionUpdate")
-            .and_then(Value::as_str)
-            == Some("session_info_update")
-            && f.pointer("/params/update/_meta/goose/activeRunId")
-                .and_then(Value::as_str)
-                .is_some()
-    })
-    .await;
+    // Wait until the gated prompt reaches the model: goose's run is active.
+    let wait_start = std::time::Instant::now();
+    while g.model().turn_requests().len() < 2 {
+        assert!(
+            wait_start.elapsed() < std::time::Duration::from_secs(10),
+            "goose never reached prompt 1"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // While run is active: session/list must report running: true
-    let list_res_active = v2.call("session/list", json!({})).await;
+    let list_res_active = v.call("session/list", json!({})).await;
     let entry_active = list_res_active["result"]["sessions"]
         .as_array()
         .unwrap()
@@ -327,15 +323,14 @@ async fn session_list_running_clears_on_cancel() {
     assert_eq!(entry_active["_meta"]["honk"]["running"], true);
 
     // Cancel while turn is active
-    v2.call("session/cancel", json!({ "sessionId": &sid }))
-        .await;
+    v.call("session/cancel", json!({ "sessionId": &sid })).await;
     g.model().open("gate_cancel_running");
 
-    let p_resp = v2.response(&p_id).await;
+    let p_resp = v.response(&p_id).await;
     assert_eq!(p_resp["result"]["stopReason"], "cancelled");
 
     // After cancel: session/list must report running: false
-    let list_res_after = v2.call("session/list", json!({})).await;
+    let list_res_after = v.call("session/list", json!({})).await;
     let entry_after = list_res_after["result"]["sessions"]
         .as_array()
         .unwrap()
