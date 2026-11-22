@@ -54,8 +54,11 @@ pub fn batches(replies: &[&Reply], budget: usize) -> Vec<std::ops::Range<usize>>
     out
 }
 
+/// Most bytes of your later prompts shown to one part (nearest first).
+const LATER_PROMPT_BYTES: usize = 20_000;
+
 /// One prompt per batch. A later batch is shown your newest prompt before it as the prompt
-/// it follows, and told it is a part of a longer span.
+/// it follows; with several, each is told it is a part, and shown your prompts after it.
 pub fn batch_prompts(
     replies: &[&Reply],
     your_prompt: Option<&str>,
@@ -71,11 +74,30 @@ pub fn batch_prompts(
                 .rev()
                 .find_map(|r| r.your_prompt.as_deref())
                 .or(your_prompt);
-            let first = replies[b.start].your_prompt.as_deref().or(before);
-            let body = prompt(&replies[b.clone()], first);
+            let body = prompt(&replies[b.clone()], before);
             if n == 1 {
                 body
             } else {
+                // So a part can drop what a later prompt of his answered.
+                let mut later = String::new();
+                for p in replies[b.end..]
+                    .iter()
+                    .filter_map(|r| r.your_prompt.as_deref().map(str::trim))
+                    .filter(|p| !p.is_empty())
+                {
+                    if later.len() + p.len() > LATER_PROMPT_BYTES {
+                        break;
+                    }
+                    later.push_str(&format!("<<<\n{p}\n>>>\n"));
+                }
+                let body = if later.is_empty() {
+                    body
+                } else {
+                    format!(
+                        "{body}\nJonathan's prompts after these replies, oldest first (context \
+                         only, not selectable; what they answer he already knows):\n{later}"
+                    )
+                };
                 format!(
                     "(Part {} of {n} of a longer span; the other parts are judged separately, \
                      so judge these replies on their own. R numbers restart in each part.)\n\n{body}",
@@ -451,6 +473,28 @@ mod tests {
         let all = 0..3;
         let one = batch_prompts(&sent, Some("first?"), std::slice::from_ref(&all));
         assert_eq!(one, vec![prompt(&sent, Some("first?"))]);
+        assert!(!ps[1].contains("prompts after these"), "{}", ps[1]);
+        let mut x = reply("T4 (you)", "x");
+        x.your_prompt = Some("later answer".into());
+        let rs2 = [rs[0].clone(), rs[1].clone(), x];
+        let sent2: Vec<&Reply> = rs2.iter().collect();
+        let ps = batch_prompts(&sent2, Some("first?"), &[0..2, 2..3]);
+        assert!(
+            ps[0].ends_with("prompts after these replies, oldest first (context only, not selectable; what they answer he already knows):\n<<<\nlater answer\n>>>\n"),
+            "{}",
+            ps[0]
+        );
+        // Your previous prompt stays as context when the first reply answers a later one.
+        let mut y = reply("T5 (you)", "y");
+        y.your_prompt = Some("last".into());
+        let only = [y];
+        let s3: Vec<&Reply> = only.iter().collect();
+        let all = 0..1;
+        let p = &batch_prompts(&s3, Some("prev"), std::slice::from_ref(&all))[0];
+        assert!(
+            p.contains("<<<\nprev\n>>>") && p.contains("<<<\nlast\n>>>"),
+            "{p}"
+        );
     }
 
     #[test]

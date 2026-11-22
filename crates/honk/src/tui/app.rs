@@ -2955,6 +2955,31 @@ mod tests {
         assert!(app.trim.is_some());
     }
 
+    #[test]
+    fn test_a_fully_answered_multi_call_trim_is_cached() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        app.trim_batch_bytes = 1000;
+        app.execute_app_command("quote");
+        let seq = app.trim.as_ref().unwrap().seq;
+        for part in 0..3 {
+            app.on_trim_done(TrimDone {
+                seq,
+                part,
+                result: Ok((r#"{"keep":[{"reply":1,"lines":[[1,1]]}]}"#.into(), None)),
+            });
+        }
+        let text = app.get_composer_text();
+        assert!(
+            text.contains("> head0") && text.contains("> head2"),
+            "{text}"
+        );
+        assert!(text.starts_with("# honk: trimmed"), "{text}");
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        assert!(app.trim.is_none(), "cached");
+        assert_eq!(app.get_composer_text(), text);
+    }
+
     /// Your prompt, then three long wake replies (well over `trim::MIN_BYTES`).
     fn long_app(backend: TrimBackend) -> (App, mpsc::UnboundedReceiver<UiCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
