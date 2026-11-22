@@ -486,9 +486,14 @@ async fn test_undo_redo_viewer_routing() {
         .call("_honk/undo", serde_json::json!({ "sessionId": sid }))
         .await;
     assert_eq!(r3["error"]["code"], -32002);
-    // Stub goose does not advertise truncateFromMessage by default -> capability refusal
-    assert_eq!(
-        r3["error"]["message"],
-        "goose does not support undo (needs patched goose with truncateFromMessage)"
+    // StubGoose runs the real HONK_GOOSE_BIN, so the answer depends on that binary: a goose
+    // without truncateFromMessage gets the capability refusal; the patched goose
+    // (johnnymo87/goose patch 21, since patched-1.54.0.15) has it and answers
+    // "nothing to undo" for this empty conversation. Either proves the routing this test is about.
+    let msg = r3["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg == "goose does not support undo (needs patched goose with truncateFromMessage)"
+            || msg == "nothing to undo",
+        "unexpected undo refusal: {msg:?}"
     );
 }
