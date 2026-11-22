@@ -4454,7 +4454,7 @@ async fn trim_real_log() {
     }
     let q = quote::build(
         &t.blocks,
-        quote::Pick::SinceYou(50),
+        quote::Pick::SinceYou,
         false,
         quote::local_time,
     )

@@ -22,9 +22,6 @@ use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
 use crate::tui::trim as quote_trim;
 
-/// Most replies `/quote` loads; the composer re-renders its whole content every frame.
-const MAX_QUOTE: usize = 50;
-
 /// Replies bare `/quote` loads when the transcript has no prompt of yours to count from.
 const QUOTE_FALLBACK: usize = 3;
 
@@ -107,8 +104,11 @@ pub struct App {
     trim_seq: u64,
     trim_tx: mpsc::UnboundedSender<TrimDone>,
     trim_rx: Option<mpsc::UnboundedReceiver<TrimDone>>,
-    /// The last answer, by a hash of its prompt: re-running `/quote` on the same replies is free.
-    trim_cache: Option<(u64, String, Option<String>)>,
+    /// The last answers (one per call), by a hash of their prompts: re-running `/quote` on the
+    /// same replies is free.
+    trim_cache: Option<(u64, Vec<quote_trim::Answer>)>,
+    /// Bytes of replies per model call (`trim::BATCH_BYTES`; smaller in tests).
+    trim_batch_bytes: usize,
     /// Last elapsed second drawn in the status bar, so the tick only redraws when it changes.
     trim_drawn_secs: Option<u64>,
 }
@@ -134,15 +134,23 @@ pub struct PendingTrim {
     /// The untrimmed form of the same pick (`/quote full 5`), for notices.
     pub full: String,
     pub key: u64,
-    pub prompt: String,
-    abort: Option<tokio::task::AbortHandle>,
+    /// One prompt per model call, and the replies (indexes into the sendable ones) each covers.
+    pub prompts: Vec<String>,
+    pub batches: Vec<std::ops::Range<usize>>,
+    /// Each call's answer, as it arrives.
+    answers: Vec<Option<TrimResult>>,
+    aborts: Vec<tokio::task::AbortHandle>,
 }
+
+type TrimResult = Result<quote_trim::Answer, String>;
 
 /// A finished model call: the answer text and the model, or why it failed.
 #[derive(Debug)]
 pub struct TrimDone {
     pub seq: u64,
-    pub result: Result<(String, Option<String>), String>,
+    /// Which of the trim's calls (index into `PendingTrim::prompts`).
+    pub part: usize,
+    pub result: TrimResult,
 }
 
 /// How long honk waits for honkd's answer (honkd's own limit is 90 s).
@@ -216,8 +224,8 @@ fn quoted_what(q: &quote::Quoted, pick: quote::Pick) -> String {
 fn full_form(pick: quote::Pick) -> String {
     match pick {
         quote::Pick::Last(n) => format!("/quote full {n}"),
-        quote::Pick::SinceYou(_) => "/quote full".to_string(),
-        quote::Pick::SincePrev(_) => "/quote full prev".to_string(),
+        quote::Pick::SinceYou => "/quote full".to_string(),
+        quote::Pick::SincePrev => "/quote full prev".to_string(),
     }
 }
 
@@ -272,6 +280,7 @@ impl App {
             trim_tx,
             trim_rx: Some(trim_rx),
             trim_cache: None,
+            trim_batch_bytes: quote_trim::BATCH_BYTES,
             trim_drawn_secs: None,
         }
     }
@@ -706,9 +715,9 @@ impl App {
     }
 
     /// `/quote [full|all] [N|prev]` / `:quote ...`: loads coordinator replies, quoted, into the
-    /// composer (see `tui::quote`). `N`: the last N. `all`: every reply since your own last
-    /// prompt. Bare: the same replies, trimmed by the default model to what you need to see
-    /// (see `tui::trim`), when they are long enough for that to help.
+    /// composer (see `tui::quote`): since your last prompt, the last N, or since your previous
+    /// prompt, with no cap. Without `full`, trimmed by the default model to what you need to
+    /// see (see `tui::trim`; a long span takes several calls), when long enough to help.
     /// `keep_draft` keeps the current composer text below them.
     pub fn quote(&mut self, arg: &str, keep_draft: bool) {
         let Some((pick, trim)) = self.parse_quote_arg(arg) else {
@@ -747,7 +756,7 @@ impl App {
         }
         if q.text.len() <= quote_trim::MIN_BYTES {
             let mut msg = format!("{note}quoted {what} in full: too short for trimming to help");
-            if matches!(asked, quote::Pick::SinceYou(_)) {
+            if matches!(asked, quote::Pick::SinceYou) {
                 msg.push_str(
                     "; if you already replied, /quote N trims the last N replies and \
                      /quote prev counts from your previous prompt",
@@ -763,19 +772,22 @@ impl App {
             self.load_quote(&q.text, &draft);
             return;
         }
-        let prompt = quote_trim::prompt(&sent, q.your_prompt.as_deref());
-        let key = hash_of(&prompt);
-        if let Some((k, answer, model)) = self.trim_cache.clone()
+        let batches = quote_trim::batches(&sent, self.trim_batch_bytes);
+        let prompts = quote_trim::batch_prompts(&sent, q.your_prompt.as_deref(), &batches);
+        let key = hash_of(&prompts.join("\u{0}"));
+        if let Some((k, answers)) = self.trim_cache.clone()
             && k == key
         {
             if !note.is_empty() {
                 self.transcript
                     .apply_notice(Notice::info(note.trim_end_matches("; ")));
             }
-            self.finish_trim(q, &full, Ok((answer, model)));
+            let answers = answers.into_iter().map(Ok).collect::<Vec<_>>();
+            self.finish_trim(q, &full, &batches, &answers);
             return;
         }
-        let abort = match &self.trim_backend {
+        let seq = self.trim_seq + 1;
+        let aborts = match &self.trim_backend {
             TrimBackend::None => {
                 self.transcript.apply_notice(Notice::warning(format!(
                     "{note}no model to trim with; quoted {what}, untrimmed"
@@ -784,33 +796,47 @@ impl App {
                 return;
             }
             TrimBackend::Honkd { url, secret } => {
-                let (url, secret, p) = (url.clone(), secret.clone(), prompt.clone());
-                let from = Some(self.session_id.clone());
-                let tx = self.trim_tx.clone();
-                let seq = self.trim_seq + 1;
-                Some(
-                    tokio::spawn(async move {
-                        let result = run_trim(url, secret, p, from).await;
-                        let _ = tx.send(TrimDone { seq, result });
+                let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(quote_trim::PARALLEL));
+                prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(part, p)| {
+                        let (url, secret, p) = (url.clone(), secret.clone(), p.clone());
+                        let from = Some(self.session_id.clone());
+                        let (tx, gate) = (self.trim_tx.clone(), gate.clone());
+                        tokio::spawn(async move {
+                            let result = match gate.acquire_owned().await {
+                                Ok(_permit) => run_trim(url, secret, p, from).await,
+                                Err(_) => Err("cancelled".to_string()),
+                            };
+                            let _ = tx.send(TrimDone { seq, part, result });
+                        })
+                        .abort_handle()
                     })
-                    .abort_handle(),
-                )
+                    .collect()
             }
             #[cfg(test)]
-            TrimBackend::Record => None,
+            TrimBackend::Record => Vec::new(),
         };
-        self.trim_seq += 1;
+        self.trim_seq = seq;
+        let calls = match prompts.len() {
+            1 => String::new(),
+            n => format!(" in {n} model calls"),
+        };
         self.transcript.apply_notice(Notice::info(format!(
-            "{note}trimming {what} to what needs you; Ctrl-C cancels, {full} skips the model",
+            "{note}trimming {what} to what needs you{calls}; Ctrl-C cancels, {full} skips the \
+             model",
         )));
         self.trim = Some(PendingTrim {
-            seq: self.trim_seq,
+            seq,
             started: std::time::Instant::now(),
             quoted: q,
             full,
             key,
-            prompt,
-            abort,
+            answers: vec![None; prompts.len()],
+            prompts,
+            batches,
+            aborts,
         });
         self.trim_drawn_secs = None;
     }
@@ -830,16 +856,10 @@ impl App {
             _ => return None,
         };
         let pick = match words.as_slice() {
-            [] => quote::Pick::SinceYou(MAX_QUOTE),
-            ["prev"] => quote::Pick::SincePrev(MAX_QUOTE),
+            [] => quote::Pick::SinceYou,
+            ["prev"] => quote::Pick::SincePrev,
             [n] => match n.parse::<usize>().ok()? {
                 0 => return None,
-                n if n > MAX_QUOTE => {
-                    self.transcript.apply_notice(Notice::info(format!(
-                        "/quote is capped at {MAX_QUOTE} replies"
-                    )));
-                    quote::Pick::Last(MAX_QUOTE)
-                }
                 n => quote::Pick::Last(n),
             },
             _ => return None,
@@ -860,8 +880,8 @@ impl App {
         let build = |p| quote::build(blocks, p, running, quote::local_time);
         let (result, pick, note) = match build(pick) {
             Err(quote::Empty::OnePrompt) => (
-                build(quote::Pick::SinceYou(MAX_QUOTE)),
-                quote::Pick::SinceYou(MAX_QUOTE),
+                build(quote::Pick::SinceYou),
+                quote::Pick::SinceYou,
                 Some("only one prompt of yours in this session, so counting from it".to_string()),
             ),
             Err(quote::Empty::NeverSpoke) => {
@@ -882,14 +902,6 @@ impl App {
                 let note = note.or_else(|| match pick {
                     quote::Pick::Last(n) if q.count < n => {
                         Some(format!("only {} replies to quote", q.count))
-                    }
-                    quote::Pick::SinceYou(_) | quote::Pick::SincePrev(_) if q.total > q.count => {
-                        Some(format!(
-                            "{} replies {}; quoting the last {}",
-                            q.total,
-                            pick.describe(),
-                            q.count
-                        ))
                     }
                     _ => None,
                 });
@@ -939,45 +951,71 @@ impl App {
     /// Stops a pending trim, if any, saying why.
     fn drop_trim(&mut self, why: &str) {
         if let Some(t) = self.trim.take() {
-            if let Some(a) = t.abort {
+            for a in t.aborts {
                 a.abort();
             }
             self.transcript.apply_notice(Notice::info(why));
         }
     }
 
-    /// The model call finished: quote what it kept, or everything if it failed.
+    /// One model call finished; once all have, quote what they kept (a failed call's replies
+    /// in full, every reply if all failed).
     pub fn on_trim_done(&mut self, done: TrimDone) {
-        if self.trim.as_ref().is_none_or(|t| t.seq != done.seq) {
+        let Some(t) = self.trim.as_mut().filter(|t| t.seq == done.seq) else {
+            return;
+        };
+        let Some(slot) = t.answers.get_mut(done.part) else {
+            return;
+        };
+        *slot = Some(done.result);
+        if t.answers.iter().any(Option::is_none) {
             return;
         }
         let t = self.trim.take().expect("checked");
-        if let Ok((answer, model)) = &done.result
-            && quote_trim::parse(answer, &quote_trim::sendable(&t.quoted.replies)).is_ok()
-        {
-            self.trim_cache = Some((t.key, answer.clone(), model.clone()));
+        let answers: Vec<TrimResult> = t.answers.into_iter().map(Option::unwrap).collect();
+        let sent = quote_trim::sendable(&t.quoted.replies);
+        let all_good = t.batches.iter().zip(&answers).all(|(b, a)| {
+            a.as_ref()
+                .is_ok_and(|(text, _)| quote_trim::parse(text, &sent[b.clone()]).is_ok())
+        });
+        if all_good {
+            let ok = answers.iter().cloned().map(Result::unwrap).collect();
+            self.trim_cache = Some((t.key, ok));
         }
-        self.finish_trim(t.quoted, &t.full, done.result);
+        self.finish_trim(t.quoted, &t.full, &t.batches, &answers);
     }
 
-    /// `full`: the untrimmed form of the same pick, for notices.
+    /// `full`: the untrimmed form of the same pick, for notices. `answers`: one per batch.
     fn finish_trim(
         &mut self,
         q: quote::Quoted,
         full: &str,
-        result: Result<(String, Option<String>), String>,
+        batches: &[std::ops::Range<usize>],
+        answers: &[TrimResult],
     ) {
         let sent = quote_trim::sendable(&q.replies);
-        let kept = result
-            .and_then(|(answer, model)| quote_trim::parse(&answer, &sent).map(|k| (k, model)));
+        let kept = quote_trim::merge(&sent, batches, answers);
         let text = match kept {
-            Ok((kept, _)) if kept.is_empty() && !q.replies.iter().any(|r| r.in_progress) => {
+            Ok(m) if m.kept.is_empty() && !q.replies.iter().any(|r| r.in_progress) => {
                 self.transcript.apply_notice(Notice::info(format!(
                     "the model found nothing that needs you; {full} quotes them all"
                 )));
                 return;
             }
-            Ok((kept, model)) => quote_trim::render(&q.replies, &kept, model.as_deref()),
+            Ok(quote_trim::Merged {
+                kept,
+                model,
+                failed,
+            }) => {
+                if let Some(why) = failed.first() {
+                    self.transcript.apply_notice(Notice::warning(format!(
+                        "{} of {} trim calls failed ({why}); their replies are quoted in full",
+                        failed.len(),
+                        batches.len()
+                    )));
+                }
+                quote_trim::render(&q.replies, &kept, model.as_deref())
+            }
             Err(why) => {
                 self.transcript.apply_notice(Notice::warning(format!(
                     "trim failed ({why}); quoted them all, untrimmed"
@@ -2821,12 +2859,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_quote_caps_a_long_backlog() {
+    fn test_quote_has_no_cap() {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_q", cmd_tx);
         app.transcript
             .apply_frame(&update("user_message_chunk", "me", "hello", 1));
-        for i in 0..(MAX_QUOTE + 2) {
+        for i in 0..120 {
             let t = 100 * (i as i64 + 1);
             for f in [
                 update(
@@ -2847,11 +2885,74 @@ mod tests {
         }
         app.execute_app_command("quote all");
         let text = app.get_composer_text();
-        assert_eq!(text.matches("\n> r").count(), MAX_QUOTE, "{text}");
-        assert!(!text.contains("> r1.") && text.contains("> r2.") && text.ends_with("> r51."));
+        assert_eq!(text.matches("\n> r").count(), 120, "{text}");
+        assert!(text.contains("> r0.") && text.ends_with("> r119."));
+        assert!(!last_notice(&app).contains("capped") && !last_notice(&app).contains("last 50"));
+        app.set_composer_text("");
+        app.execute_app_command("quote full 100");
+        assert_eq!(app.get_composer_text().matches("\n> r").count(), 100);
         assert!(
-            last_notice(&app).contains("52 replies since your last prompt; quoting the last 50")
+            last_notice(&app).contains("the last 100 replies"),
+            "{}",
+            last_notice(&app)
         );
+    }
+
+    #[test]
+    fn test_a_long_span_trims_in_several_calls_and_merges_in_order() {
+        let (mut app, _rx) = long_app(TrimBackend::Record);
+        // Each long_app reply is about 1.7 KB: one per call.
+        app.trim_batch_bytes = 1000;
+        app.execute_app_command("quote");
+        let t = app.trim.as_ref().expect("trimming");
+        assert_eq!(t.prompts.len(), 3);
+        assert!(t.prompts[1].starts_with("(Part 2 of 3"), "{}", t.prompts[1]);
+        assert!(
+            t.prompts[1].contains("<<<\nstatus?\n>>>"),
+            "{}",
+            t.prompts[1]
+        );
+        assert!(t.prompts[2].contains("R1 ") && t.prompts[2].contains("L44: QUESTION2?"));
+        assert!(!t.prompts[2].contains("R2 "));
+        assert!(
+            last_notice(&app).contains("in 3 model calls"),
+            "{}",
+            last_notice(&app)
+        );
+        let seq = t.seq;
+        let done = |part, result: TrimResult| TrimDone { seq, part, result };
+        let keep_q = |n: usize| {
+            Ok((
+                format!(r#"{{"keep":[{{"reply":1,"lines":[[{n},{n}]],"tag":"ask"}}]}}"#),
+                Some("m".to_string()),
+            ))
+        };
+        // Out of order; nothing renders until every call is in.
+        app.on_trim_done(done(2, keep_q(44)));
+        app.on_trim_done(done(0, keep_q(1)));
+        assert!(app.trim.is_some() && app.is_composer_empty());
+        app.on_trim_done(done(1, Err("no answer within 100s".into())));
+        assert!(app.trim.is_none());
+        let text = app.get_composer_text();
+        let (h0, f1, q2) = (
+            text.find("> head0").unwrap(),
+            text.find("> filler line 1").unwrap(),
+            text.find("> QUESTION2?").unwrap(),
+        );
+        assert!(h0 < f1 && f1 < q2, "{text}");
+        assert!(
+            text.contains("> QUESTION1?") && !text.contains("QUESTION0"),
+            "{text}"
+        );
+        assert!(
+            last_notice(&app).contains("1 of 3 trim calls failed (no answer within 100s)"),
+            "{}",
+            last_notice(&app)
+        );
+        // A partly failed trim is not cached: the next /quote asks again.
+        app.set_composer_text("");
+        app.execute_app_command("quote");
+        assert!(app.trim.is_some());
     }
 
     /// Your prompt, then three long wake replies (well over `trim::MIN_BYTES`).
@@ -2887,6 +2988,7 @@ mod tests {
         let seq = app.trim.as_ref().expect("a trim is pending").seq;
         app.on_trim_done(TrimDone {
             seq,
+            part: 0,
             result: result
                 .map(|(a, m)| (a.to_string(), m.map(str::to_string)))
                 .map_err(str::to_string),
@@ -2900,8 +3002,12 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
         let t = app.trim.as_ref().expect("trimming");
-        assert!(t.prompt.contains("<<<\nstatus?\n>>>"), "{}", t.prompt);
-        assert!(t.prompt.contains("R3 ") && t.prompt.contains("L44: QUESTION2?"));
+        assert!(
+            t.prompts[0].contains("<<<\nstatus?\n>>>"),
+            "{}",
+            t.prompts[0]
+        );
+        assert!(t.prompts[0].contains("R3 ") && t.prompts[0].contains("L44: QUESTION2?"));
         assert!(last_notice(&app).contains("trimming 3 replies"));
         assert!(app.is_composer_empty());
 
@@ -2975,6 +3081,7 @@ mod tests {
         // A late answer for the cancelled trim is ignored.
         app.on_trim_done(TrimDone {
             seq,
+            part: 0,
             result: Ok((r#"{"keep":[{"reply":1,"all":true}]}"#.into(), None)),
         });
         assert!(app.is_composer_empty());
@@ -3127,22 +3234,22 @@ mod tests {
         app.set_composer_text("");
         app.execute_app_command("quote 4");
         let t = app.trim.as_ref().expect("trimming");
-        assert!(!t.prompt.contains("status?"), "{}", t.prompt);
+        assert!(!t.prompts[0].contains("status?"), "{}", t.prompts[0]);
         assert!(
-            t.prompt
+            t.prompts[0]
                 .contains("prompt that R4 answers (context only, not selectable):\n<<<\nok\n>>>"),
             "{}",
-            t.prompt
+            t.prompts[0]
         );
         assert!(
-            t.prompt.contains("R4 ") && t.prompt.contains("L1: noted"),
+            t.prompts[0].contains("R4 ") && t.prompts[0].contains("L1: noted"),
             "{}",
-            t.prompt
+            t.prompts[0]
         );
         assert!(
-            !t.prompt.contains("R5 ") && !t.prompt.contains("since then"),
+            !t.prompts[0].contains("R5 ") && !t.prompts[0].contains("since then"),
             "{}",
-            t.prompt
+            t.prompts[0]
         );
         let n = last_notice(&app);
         assert!(
@@ -3168,11 +3275,15 @@ mod tests {
             .apply_frame(&update("agent_message_chunk", "a9", "noted", 901));
         app.execute_app_command("quote prev");
         let t = app.trim.as_ref().expect("trimming");
-        assert!(t.prompt.contains("<<<\nstatus?\n>>>"), "{}", t.prompt);
         assert!(
-            t.prompt.contains("R4 ") && t.prompt.contains("L1: noted"),
+            t.prompts[0].contains("<<<\nstatus?\n>>>"),
             "{}",
-            t.prompt
+            t.prompts[0]
+        );
+        assert!(
+            t.prompts[0].contains("R4 ") && t.prompts[0].contains("L1: noted"),
+            "{}",
+            t.prompts[0]
         );
         let n = last_notice(&app);
         assert!(
