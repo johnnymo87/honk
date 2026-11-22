@@ -292,3 +292,48 @@ async fn oneshot_turn_error_is_an_error_not_an_answer() {
     assert_eq!(res["error"]["message"], "model: overloaded", "{res}");
     wait_until("state clean", || state(&h)["oneshot_sessions"] == json!([])).await;
 }
+
+/// goose v1.60.2+ reports turn failure as a JSON-RPC error with `data.reason == "turn_failed"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn oneshot_turn_failed_error_is_an_error_not_an_answer() {
+    let fake = FakeGoose::start().await;
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": { "reason": "turn_failed", "kind": "provider", "message": "overloaded" }
+    })));
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let res = v
+        .call("_honk/oneshot", json!({ "system": "", "prompt": "P" }))
+        .await;
+    assert_eq!(res["error"]["message"], "model: overloaded", "{res}");
+    wait_until("state clean", || state(&h)["oneshot_sessions"] == json!([])).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oneshot_turn_failed_error_stock_goose_uses_error_message() {
+    let fake = FakeGoose::start().await;
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": { "reason": "turn_failed" }
+    })));
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let mut v = Viewer::connect(&h).await;
+    let res = v
+        .call("_honk/oneshot", json!({ "system": "", "prompt": "P" }))
+        .await;
+    assert_eq!(res["error"]["message"], "model: Internal error", "{res}");
+    wait_until("state clean", || state(&h)["oneshot_sessions"] == json!([])).await;
+}

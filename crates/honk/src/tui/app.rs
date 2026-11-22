@@ -103,7 +103,7 @@ pub struct App {
     pub trim: Option<PendingTrim>,
     trim_seq: u64,
     trim_tx: mpsc::UnboundedSender<TrimDone>,
-    trim_rx: Option<mpsc::UnboundedReceiver<TrimDone>>,
+    pub trim_rx: Option<mpsc::UnboundedReceiver<TrimDone>>,
     /// The last answers (one per call), by a hash of their prompts: re-running `/quote` on the
     /// same replies is free.
     trim_cache: Option<(u64, Vec<quote_trim::Answer>)>,

@@ -167,6 +167,7 @@ struct FakeGooseInner {
     respond_status: Mutex<Option<StatusCode>>,
     prompt_status: Mutex<Option<StatusCode>>,
     prompt_error_reply: Mutex<Option<Value>>,
+    prompt_end_error: Mutex<Option<Value>>,
     prompt_result_meta: Mutex<Option<Value>>,
     session_new_status: Mutex<Option<StatusCode>>,
     session_new_error_reply: Mutex<Option<Value>>,
@@ -234,6 +235,7 @@ impl FakeGoose {
             respond_status: Mutex::new(None),
             prompt_status: Mutex::new(None),
             prompt_error_reply: Mutex::new(None),
+            prompt_end_error: Mutex::new(None),
             prompt_result_meta: Mutex::new(None),
             session_new_status: Mutex::new(None),
             session_new_error_reply: Mutex::new(None),
@@ -460,6 +462,24 @@ impl FakeGoose {
 
     pub fn set_prompt_error_reply(&self, err: Option<Value>) {
         *self.state.prompt_error_reply.lock().unwrap() = err;
+    }
+
+    /// Error reply to emit at the end of `session/prompt` (after chunks or custom frames),
+    /// in place of `result`.
+    pub fn set_prompt_end_error(&self, err: Option<Value>) {
+        *self.state.prompt_end_error.lock().unwrap() = err;
+    }
+
+    /// Configures the fake goose to emit the v1.60.2+ turn_failed failure sequence
+    /// (activeRunId Some, chunks, activeRunId null, then the error reply).
+    pub fn set_prompt_turn_failed(&self, kind: Option<&str>, message: Option<&str>) {
+        self.set_prompt_end_error(Some(turn_failed_error(kind, message)));
+    }
+
+    /// JSON-RPC error reply for goose v1.60.2+ turn failure:
+    /// `{"code": -32603, "message": message, "data": {"reason": "turn_failed", "kind": kind, "message": message}}`.
+    pub fn turn_failed_error(kind: Option<&str>, message: Option<&str>) -> Value {
+        turn_failed_error(kind, message)
     }
 
     /// `_meta` for the result of every later `session/prompt` (e.g.
@@ -1495,16 +1515,22 @@ async fn handle_post(
                         } else {
                             "end_turn"
                         };
-                        emit_session_frame(
-                            &state_clone,
-                            &conn_id_clone,
-                            &sid_clone,
+                        let resp = if let Some(err) =
+                            state_clone.prompt_end_error.lock().unwrap().clone()
+                        {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": err
+                            })
+                        } else {
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": prompt_result(&state_clone, stop_reason)
-                            }),
-                        );
+                            })
+                        };
+                        emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, resp);
                     }
                     return;
                 }
@@ -1610,16 +1636,21 @@ async fn handle_post(
                     } else {
                         "end_turn"
                     };
-                    emit_session_frame(
-                        &state_clone,
-                        &conn_id_clone,
-                        &sid_clone,
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": prompt_result(&state_clone, stop_reason)
-                        }),
-                    );
+                    let resp =
+                        if let Some(err) = state_clone.prompt_end_error.lock().unwrap().clone() {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": err
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": prompt_result(&state_clone, stop_reason)
+                            })
+                        };
+                    emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, resp);
                 }
 
                 state_clone
@@ -1947,4 +1978,21 @@ async fn handle_delete(
 
     state.deleted_connections.lock().unwrap().push(conn_id);
     StatusCode::ACCEPTED.into_response()
+}
+
+/// JSON-RPC error reply for goose v1.60.2+ turn failure:
+/// `{"code": -32603, "message": message, "data": {"reason": "turn_failed", "kind": kind, "message": message}}`.
+pub fn turn_failed_error(kind: Option<&str>, message: Option<&str>) -> Value {
+    let mut data = json!({ "reason": "turn_failed" });
+    if let Some(k) = kind {
+        data["kind"] = json!(k);
+    }
+    if let Some(m) = message {
+        data["message"] = json!(m);
+    }
+    json!({
+        "code": -32603,
+        "message": message.unwrap_or("turn failed"),
+        "data": data,
+    })
 }

@@ -2369,6 +2369,108 @@ fn test_prompt_error_with_non_empty_queue() {
 }
 
 #[test]
+fn test_turn_failed_error_shows_notice_with_no_returned_text_extended_shape() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("run something".into()));
+    assert_eq!(core.prompt_sent().unwrap().text, "run something");
+
+    let err_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "provider",
+                "message": "overloaded"
+            }
+        }
+    })));
+
+    let notice_eff = err_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("notice effect emitted");
+
+    assert_eq!(notice_eff.kind, NoticeKind::Error);
+    assert_eq!(notice_eff.returned_text, None);
+    assert!(notice_eff.text.contains("turn failed"));
+    assert!(notice_eff.text.contains("provider"));
+    assert!(notice_eff.text.contains("overloaded"));
+    assert!(!notice_eff.text.contains("your message did not run"));
+}
+
+#[test]
+fn test_turn_failed_error_shows_notice_stock_shape() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("run something".into()));
+    assert_eq!(core.prompt_sent().unwrap().text, "run something");
+
+    let err_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32603,
+            "message": "Turn failed in agent",
+            "data": {
+                "reason": "turn_failed"
+            }
+        }
+    })));
+
+    let notice_eff = err_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("notice effect emitted");
+
+    assert_eq!(notice_eff.kind, NoticeKind::Error);
+    assert_eq!(notice_eff.returned_text, None);
+    assert_eq!(notice_eff.text, "turn failed: Turn failed in agent");
+}
+
+#[test]
+fn test_turn_failed_error_code_32000_auth() {
+    let (mut core, _) = new_test_core();
+    core.handle(Input::Line("run something".into()));
+
+    let err_effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32000,
+            "message": "Unauthorized model access",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "refusal",
+                "message": "Model key expired"
+            }
+        }
+    })));
+
+    let notice_eff = err_effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) => Some(n),
+            _ => None,
+        })
+        .expect("notice effect emitted");
+
+    assert_eq!(notice_eff.kind, NoticeKind::Error);
+    assert_eq!(notice_eff.returned_text, None);
+    assert!(notice_eff.text.contains("turn failed"));
+    assert!(notice_eff.text.contains("refusal"));
+    assert!(notice_eff.text.contains("Model key expired"));
+    assert!(!notice_eff.text.contains("your message did not run"));
+}
+
+#[test]
 fn test_replayed_active_run_id_and_request_permission_do_not_trigger_live_behaviour() {
     let now = Instant::now();
     let opts = ChatOpts {

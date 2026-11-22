@@ -277,7 +277,9 @@ impl TurnCore {
         };
         self.cancel_pending = false;
         let is_busy = crate::rpc::busy_run_id(frame).is_some();
-        if !inf.announced && !is_busy && frame.get("error").is_none() {
+        let is_turn_failed =
+            frame.pointer("/error/data/reason").and_then(Value::as_str) == Some("turn_failed");
+        if !inf.announced && !is_busy && (frame.get("error").is_none() || is_turn_failed) {
             self.client_prompts += 1;
         }
         if let Some(run) = crate::rpc::busy_run_id(frame) {
@@ -549,6 +551,25 @@ pub fn turn_outcome(
             if crate::rpc::busy_run_id(err).is_some() || (turn.is_none() && prompt_index.is_none())
             {
                 return None;
+            }
+            if let Some(data) = err.get("data")
+                && data.get("reason").and_then(Value::as_str) == Some("turn_failed")
+            {
+                let kind = data
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or("rpc");
+                let message = data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| err.get("message").and_then(Value::as_str))
+                    .unwrap_or("");
+                return Some(TurnOutcome::Failed {
+                    kind: capped(kind.to_string()),
+                    message: capped(message.to_string()),
+                });
             }
             let message = err.get("message").and_then(Value::as_str).unwrap_or("");
             let message = match err.get("data").and_then(Value::as_str) {
@@ -1796,6 +1817,102 @@ mod tests {
         let busy = Reply::Error(busy_error("run_1"));
         assert_eq!(turn_outcome(&busy, None, None), None);
         assert_eq!(turn_outcome(&busy, None, Some(0)), None);
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_reply_is_recorded() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "provider",
+                "message": "overloaded"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("provider", "overloaded")
+        );
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_stock_goose_without_kind_falls_back_to_rpc() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Turn failed",
+            "data": {
+                "reason": "turn_failed"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("rpc", "Turn failed")
+        );
+    }
+
+    #[test]
+    fn turn_outcome_turn_failed_error_prefers_data_message() {
+        let err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+                "reason": "turn_failed",
+                "kind": "network",
+                "message": "connection reset"
+            }
+        }));
+        assert_eq!(
+            turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
+            failed("network", "connection reset")
+        );
+    }
+
+    #[test]
+    fn test_unannounced_turn_failed_reply_increments_client_prompts() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let p_actions = core.on_prompt(owner.clone(), json!({"prompt": "first"}), &mut ids);
+        let Action::SendPrompt { upstream_id, .. } = &p_actions[0] else {
+            panic!("expected SendPrompt");
+        };
+        assert_eq!(core.client_prompts, 0);
+
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": { "reason": "turn_failed" }
+            }
+        });
+        core.on_prompt_reply(upstream_id, &reply_frame, &mut ids);
+        assert_eq!(core.client_prompts, 1);
+    }
+
+    #[test]
+    fn test_unannounced_generic_rpc_error_does_not_increment_client_prompts() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let p_actions = core.on_prompt(owner.clone(), json!({"prompt": "first"}), &mut ids);
+        let Action::SendPrompt { upstream_id, .. } = &p_actions[0] else {
+            panic!("expected SendPrompt");
+        };
+        assert_eq!(core.client_prompts, 0);
+
+        let generic_err = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32600,
+                "message": "Invalid request"
+            }
+        });
+        core.on_prompt_reply(upstream_id, &generic_err, &mut ids);
+        assert_eq!(core.client_prompts, 0);
     }
 
     #[test]

@@ -4,7 +4,9 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use super::parse::{busy_run_id, is_busy_error, is_lost_track, is_no_active_run, is_run_mismatch};
+use super::parse::{
+    busy_run_id, is_busy_error, is_lost_track, is_no_active_run, is_run_mismatch, is_turn_failed,
+};
 use super::types::{
     ChatOpts, Effect, IdAlloc, InflightSteer, Input, Notice, Ownership, PendingPermission,
     PromptSent, RunState,
@@ -667,6 +669,24 @@ impl ChatCore {
                         ),
                         prompt.text.clone(),
                     )));
+                } else if is_turn_failed(err) {
+                    self.run_state = RunState::Idle;
+                    self.run_ownership = Ownership::Unknown;
+                    let kind = err
+                        .pointer("/data/kind")
+                        .and_then(Value::as_str)
+                        .filter(|k| !k.is_empty());
+                    let msg = err
+                        .pointer("/data/message")
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.is_empty())
+                        .or_else(|| err.get("message").and_then(Value::as_str))
+                        .unwrap_or("unknown error");
+                    let text = match kind {
+                        Some(k) => format!("turn failed ({k}): {msg}"),
+                        None => format!("turn failed: {msg}"),
+                    };
+                    effects.push(Effect::Notice(Notice::error(text)));
                 } else {
                     let msg = err
                         .get("message")

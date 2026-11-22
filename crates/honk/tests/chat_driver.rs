@@ -4434,6 +4434,323 @@ async fn test_quote_trim_call_through_honkd() {
     assert!(err.contains("prompt is empty"), "{err}");
 }
 
+/// `/quote`'s trim call with goose v1.60.2+ turn failure (honk reads data.message).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quote_trim_call_through_honkd_with_turn_failed_error() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": {
+            "reason": "turn_failed",
+            "kind": "provider",
+            "message": "overloaded"
+        }
+    })));
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "model: overloaded", "{err}");
+}
+
+/// When `/quote`'s trim fails with the new goose v1.60.2+ turn_failed error shape,
+/// the app must fall back to the untrimmed quote with a warning notice rather than hanging.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quote_trim_failure_falls_back_to_untrimmed_quote_without_hanging() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.set_prompt_error_reply(Some(json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": {
+            "reason": "turn_failed",
+            "kind": "provider",
+            "message": "overloaded"
+        }
+    })));
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = honk::tui::app::App::new("ses_trim_fail", cmd_tx);
+    app.trim_backend = honk::tui::app::TrimBackend::Honkd {
+        url: h.ws_url().to_string(),
+        secret: h.secret().to_string(),
+    };
+    // Add prompt and long wake replies so quote triggers a trim
+    app.transcript.apply_frame(&json!({
+        "method": "session/update",
+        "params": {
+            "sessionId": "ses_trim_fail",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "messageId": "u1",
+                "content": { "type": "text", "text": "status?" }
+            }
+        }
+    }));
+    for i in 0..3 {
+        let body = format!(
+            "head{i}\n\n{}\nQUESTION{i}?",
+            format!("filler line {i} with plenty of words\n").repeat(40)
+        );
+        app.transcript.apply_frame(&json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_trim_fail",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": format!("u_wake_{i}"),
+                    "content": { "type": "text", "text": "[sw wake run=r reason=mail] Woken" }
+                }
+            }
+        }));
+        app.transcript.apply_frame(&json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_trim_fail",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": format!("a_wake_{i}"),
+                    "content": { "type": "text", "text": body }
+                }
+            }
+        }));
+    }
+
+    let mut trim_rx = app.trim_rx.take().expect("trim_rx exists");
+    app.execute_app_command("quote");
+    assert!(app.trim.is_some(), "trim should be initiated");
+
+    // Wait for the background oneshot trim to return with timeout (must not hang!)
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), trim_rx.recv())
+        .await
+        .expect("must not hang waiting for trim")
+        .expect("trim_rx produced a result");
+
+    app.on_trim_done(done);
+    assert!(app.trim.is_none(), "trim should be finished");
+
+    let last_notice = app
+        .transcript
+        .blocks
+        .iter()
+        .rev()
+        .find(|b| b.kind == honk::tui::transcript::BlockKind::Notice)
+        .expect("a notice was posted");
+    assert!(
+        last_notice.text.contains("trim failed (model: overloaded)")
+            && last_notice.text.contains("untrimmed"),
+        "notice should warn about trim failure with data.message: {}",
+        last_notice.text
+    );
+    let composer_text = app.get_composer_text();
+    assert!(
+        composer_text.contains("QUESTION0?") && composer_text.contains("filler line 2"),
+        "composer should contain untrimmed quote: {composer_text}"
+    );
+    assert!(!composer_text.contains("# honk: trimmed"));
+}
+
+/// Goose v1.60 failure sequence (activeRunId Some, chunks, activeRunId null, error reply)
+/// in honk chat: streams the partial assistant text, receives the turn_failed error reply,
+/// emits an error notice with no returned text, and returns to Idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_chat_turn_failed_real_sequence_shows_notice_no_returned_text() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.script_prompt(vec!["partial stream ".into(), "before failure".into()]);
+    fake.set_prompt_turn_failed(Some("provider"), Some("overloaded"));
+
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let opts = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut attached_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !attached_seen {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && matches!(evt, UiEvent::Attached { .. })
+        {
+            attached_seen = true;
+        }
+    }
+    assert!(attached_seen);
+
+    handle
+        .send(UiCommand::Line("run something".into()))
+        .expect("send line");
+
+    let mut assistant_text = String::new();
+    let mut notice_received = None;
+    let mut became_idle = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !(became_idle && notice_received.is_some()) {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Transcript(f) => {
+                    if let Some(text) = f
+                        .pointer("/params/update/content/text")
+                        .and_then(Value::as_str)
+                    {
+                        assistant_text.push_str(text);
+                    }
+                }
+                UiEvent::Notice(n) => {
+                    notice_received = Some(n);
+                }
+                UiEvent::State(s) if s.run_state == RunState::Idle => {
+                    became_idle = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        assistant_text.contains("partial stream"),
+        "streamed chunks received: {assistant_text}"
+    );
+    let notice = notice_received.expect("notice was received");
+    assert_eq!(notice.kind, honk::chat::NoticeKind::Error);
+    assert_eq!(
+        notice.returned_text, None,
+        "turn_failed must NOT return text to composer"
+    );
+    assert!(
+        notice.text.contains("turn failed (provider): overloaded"),
+        "{notice:?}"
+    );
+    assert!(!notice.text.contains("your message did not run"));
+    assert!(became_idle, "session returned to idle state");
+
+    let _ = handle.send(UiCommand::Shutdown);
+}
+
+/// Stock goose turn_failed failure sequence (activeRunId Some, chunks, activeRunId null, error reply without kind/data.message)
+/// in honk chat: emits "turn failed: {error.message}" with no returned text.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_chat_turn_failed_stock_shape_shows_notice_no_returned_text() {
+    let fake = honk_testgoose::FakeGoose::start().await;
+    let Some(honkd_bin) = find_honkd_bin() else {
+        eprintln!("skipping test: honkd binary not found");
+        return;
+    };
+    fake.script_prompt(vec!["chunk".into()]);
+    fake.set_prompt_end_error(Some(json!({
+        "code": -32603,
+        "message": "upstream failed",
+        "data": { "reason": "turn_failed" }
+    })));
+
+    let h = HonkdHarness::spawn_with_extra(
+        &honkd_bin,
+        &fake.url(),
+        fake.secret_file(),
+        None,
+        &["--allow-unpatched-upstream"],
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().expect("create tmp cwd");
+    let opts = DriverOpts::new(
+        h.ws_url(),
+        h.secret(),
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+
+    let (handle, mut rx) = start(opts).await.expect("start driver");
+
+    let mut attached_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !attached_seen {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && matches!(evt, UiEvent::Attached { .. })
+        {
+            attached_seen = true;
+        }
+    }
+    assert!(attached_seen);
+
+    handle
+        .send(UiCommand::Line("run something".into()))
+        .expect("send line");
+
+    let mut notice_received = None;
+    let mut became_idle = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !(became_idle && notice_received.is_some()) {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::Notice(n) => {
+                    notice_received = Some(n);
+                }
+                UiEvent::State(s) if s.run_state == RunState::Idle => {
+                    became_idle = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let notice = notice_received.expect("notice was received");
+    assert_eq!(notice.kind, honk::chat::NoticeKind::Error);
+    assert_eq!(
+        notice.returned_text, None,
+        "turn_failed must NOT return text to composer"
+    );
+    assert_eq!(notice.text, "turn failed: upstream failed");
+    assert!(became_idle, "session returned to idle state");
+
+    let _ = handle.send(UiCommand::Shutdown);
+}
+
 /// Manual check of `/quote`'s trim on a real session log against a live honkd, through the
 /// same batching and merge as honk chat (several calls for a long span):
 /// `HONK_TRIM_LOG=~/.local/state/honk/sessions/<sid>.jsonl HONK_TRIM_URL=ws://127.0.0.1:4280
