@@ -724,6 +724,7 @@ async fn gone_session_resolves_inflight_to_done_upstream_gone() {
     // Induce gap on resume, and 404 on steer probe POST
     fake.gap_on_next_resume(&sid);
     fake.set_steer_status(Some(StatusCode::NOT_FOUND));
+    fake.set_drop_prompt_reply(true);
 
     let pid = v
         .request(
@@ -1105,15 +1106,21 @@ async fn cancel_on_unannounced_inflight_ends_with_reply_and_done_ledger() {
         .await;
 
     // Wait for prompt to be in-flight in honkd
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Verify it is in-flight in ledger
-    let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
-    let state: Value = serde_json::from_str(&state_content).unwrap();
-    assert_eq!(
-        state["ledger"]["crid-unannounced-cancel"]["state"],
-        "in_flight"
-    );
+    let state_file = h.state_dir.path().join("state.json");
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(state_content) = std::fs::read_to_string(&state_file)
+            && let Ok(state) = serde_json::from_str::<Value>(&state_content)
+            && state["ledger"]["crid-unannounced-cancel"]["state"] == "in_flight"
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed out waiting for prompt to be in_flight in ledger"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Client cancels the unannounced inflight prompt
     v.call("session/cancel", json!({ "sessionId": &sid })).await;

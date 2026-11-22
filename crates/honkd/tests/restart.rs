@@ -135,7 +135,7 @@ async fn ring_gap_mid_run_appends_then_rebuilds_once_at_turn_end() {
     // Tell fake to return Gap on next resume
     fake.gap_on_next_resume(&sid);
 
-    fake.script_prompt(vec!["chunk1".into(), "chunk2".into()]);
+    fake.script_prompt((0..50).map(|i| format!("chunk{i}")).collect());
     let p_id = v
         .request("session/prompt", prompt_params(&sid, "go", None))
         .await;
@@ -604,7 +604,7 @@ async fn delivered_but_reply_lost_synthesizes_end_turn_after_grace_no_hang() {
 
     // Tell FakeGoose to drop the reply frame on replay and report a Gap so reply is lost
     fake.gap_on_next_resume(&sid);
-    fake.lose_next(&sid, |f| f.get("result").is_some());
+    fake.set_drop_prompt_reply(true);
 
     // Set export with Turn 1 completed in SQLite, but FakeGoose will not send reply on new connection
     fake.set_export_data(

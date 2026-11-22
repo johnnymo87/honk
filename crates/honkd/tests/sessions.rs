@@ -232,16 +232,23 @@ async fn session_list_reports_running_during_inflight_window() {
         )
         .await;
 
-    // Immediately query session/list during the in-flight window (before run announcement)
-    let list_res_inflight = v.call("session/list", json!({})).await;
-    let entry_inflight = list_res_inflight["result"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["sessionId"] == sid)
-        .unwrap();
-    assert_eq!(
-        entry_inflight["_meta"]["honk"]["running"], true,
+    // Query session/list during the in-flight window (before run announcement)
+    let start = std::time::Instant::now();
+    let mut was_running = false;
+    while start.elapsed() < std::time::Duration::from_millis(400) {
+        let list_res_inflight = v.call("session/list", json!({})).await;
+        if let Some(entry_inflight) = list_res_inflight["result"]["sessions"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|s| s["sessionId"] == sid))
+            && entry_inflight["_meta"]["honk"]["running"] == true
+        {
+            was_running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        was_running,
         "session must report running: true while prompt is in-flight before run announcement"
     );
 
@@ -264,14 +271,29 @@ async fn session_list_running_clears_on_cancel() {
     let Some(g) = StubGoose::start_or_skip().await else {
         return;
     };
-    g.model().push([Turn::Gate(
-        "gate_cancel_running".into(),
-        Box::new(Turn::Text(vec!["done".into()])),
-    )]);
+    // goose's ACP session/list only returns sessions that have persisted messages.
+    // A completed first turn makes the session listed, so this test observes
+    // honkd's `_meta.honk.running` annotation.
+    g.model().push([
+        Turn::Text(vec!["ok".into()]),
+        Turn::Gate(
+            "gate_cancel_running".into(),
+            Box::new(Turn::Text(vec!["done".into()])),
+        ),
+    ]);
 
     let h = Honkd::spawn(&g.url(), g.secret_file(), &[]).await;
     let mut v = Viewer::connect(&h).await;
     let sid = new_session(&mut v, g.cwd().to_str().unwrap()).await;
+    v.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+    )
+    .await;
+    let r0 = v
+        .call("session/prompt", prompt_params(&sid, "zeroth", Some("z")))
+        .await;
+    assert_eq!(r0["result"]["stopReason"], "end_turn");
 
     let p_id = v
         .request(
@@ -280,16 +302,15 @@ async fn session_list_running_clears_on_cancel() {
         )
         .await;
 
-    // Wait until run is active
-    v.wait_for(|f| {
-        f.pointer("/params/update/sessionUpdate")
-            .and_then(Value::as_str)
-            == Some("session_info_update")
-            && f.pointer("/params/update/_meta/goose/activeRunId")
-                .and_then(Value::as_str)
-                .is_some()
-    })
-    .await;
+    // Wait until the gated prompt reaches the model: goose's run is active.
+    let wait_start = std::time::Instant::now();
+    while g.model().turn_requests().len() < 2 {
+        assert!(
+            wait_start.elapsed() < std::time::Duration::from_secs(10),
+            "goose never reached prompt 1"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // While run is active: session/list must report running: true
     let list_res_active = v.call("session/list", json!({})).await;
