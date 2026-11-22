@@ -39,6 +39,7 @@ struct AppState {
     turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     seen_tool_names: Arc<Mutex<HashSet<String>>>,
+    tool_call_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct StubModel {
@@ -51,6 +52,7 @@ pub struct StubModel {
     pub(crate) turn_requests: Arc<Mutex<Vec<serde_json::Value>>>,
     pub(crate) classification_log: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     pub(crate) seen_tool_names: Arc<Mutex<HashSet<String>>>,
+    pub(crate) tool_call_counter: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -69,6 +71,7 @@ impl StubModel {
         let turn_requests = Arc::new(Mutex::new(Vec::new()));
         let classification_log = Arc::new(Mutex::new(Vec::new()));
         let seen_tool_names = Arc::new(Mutex::new(HashSet::new()));
+        let tool_call_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
         let state = AppState {
             turns: turns.clone(),
@@ -79,6 +82,7 @@ impl StubModel {
             turn_requests: turn_requests.clone(),
             classification_log: classification_log.clone(),
             seen_tool_names: seen_tool_names.clone(),
+            tool_call_counter: tool_call_counter.clone(),
         };
 
         let app = Router::new()
@@ -106,6 +110,7 @@ impl StubModel {
             turn_requests,
             classification_log,
             seen_tool_names,
+            tool_call_counter,
             shutdown_tx: Some(shutdown_tx),
         }
     }
@@ -153,6 +158,11 @@ impl StubModel {
             .collect();
         names.sort();
         names
+    }
+
+    pub fn tool_call_counter(&self) -> u64 {
+        self.tool_call_counter
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -352,40 +362,48 @@ async fn build_json_response(turn: Turn, state: AppState) -> (StatusCode, Json<s
                 })),
             )
         }
-        Turn::ToolCall { tool, arguments } => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": "chatcmpl-stub",
-                "object": "chat.completion",
-                "created": 1770000000,
-                "model": "stub-model",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": serde_json::Value::Null,
-                            "tool_calls": [
-                                {
-                                    "id": "call_stub_001",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool,
-                                        "arguments": arguments.to_string()
+        Turn::ToolCall { tool, arguments } => {
+            let call_id = format!(
+                "call_stub_{:03}",
+                state
+                    .tool_call_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "chatcmpl-stub",
+                    "object": "chat.completion",
+                    "created": 1770000000,
+                    "model": "stub-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Null,
+                                "tool_calls": [
+                                    {
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool,
+                                            "arguments": arguments.to_string()
+                                        }
                                     }
-                                }
-                            ]
-                        },
-                        "finish_reason": "tool_calls"
+                                ]
+                            },
+                            "finish_reason": "tool_calls"
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 10,
+                        "total_tokens": 20
                     }
-                ],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 10,
-                    "total_tokens": 20
-                }
-            })),
-        ),
+                })),
+            )
+        }
         Turn::TextThenGate {
             before,
             gate,
@@ -530,6 +548,12 @@ fn build_sse_response(turn: Turn, state: AppState) -> Response {
                 }
             }
             Turn::ToolCall { tool, arguments } => {
+                let call_id = format!(
+                    "call_stub_{:03}",
+                    state
+                        .tool_call_counter
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                );
                 let mut frames: Vec<String> = Vec::new();
                 frames.push(format!(
                     "data: {}\n\n",
@@ -547,7 +571,7 @@ fn build_sse_response(turn: Turn, state: AppState) -> Response {
                                     "tool_calls": [
                                         {
                                             "index": 0,
-                                            "id": "call_stub_001",
+                                            "id": call_id,
                                             "type": "function",
                                             "function": {
                                                 "name": tool,
@@ -745,4 +769,67 @@ fn build_sse_response(turn: Turn, state: AppState) -> Response {
         axum::body::Body::from_stream(stream),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stub_model_mints_unique_tool_call_ids() {
+        let model = StubModel::start().await;
+        model.push([
+            Turn::ToolCall {
+                tool: "tool_a".into(),
+                arguments: serde_json::json!({}),
+            },
+            Turn::ToolCall {
+                tool: "tool_b".into(),
+                arguments: serde_json::json!({}),
+            },
+        ]);
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/v1/chat/completions", model.base_url());
+
+        // First call
+        let res1: serde_json::Value = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "tool_a"}}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id1 = res1["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap();
+
+        // Second call
+        let res2: serde_json::Value = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "again"}],
+                "tools": [{"type": "function", "function": {"name": "tool_b"}}],
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id2 = res2["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(id1, "call_stub_001");
+        assert_eq!(id2, "call_stub_002");
+        assert_ne!(id1, id2);
+    }
 }
