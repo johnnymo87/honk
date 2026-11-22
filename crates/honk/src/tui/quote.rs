@@ -19,10 +19,10 @@ pub use honk_wire::{Trigger, classify};
 pub enum Pick {
     /// The last N turns with reply text.
     Last(usize),
-    /// Every turn with reply text from your last prompt on, at most this many (the newest).
-    SinceYou(usize),
+    /// Every turn with reply text from your last prompt on.
+    SinceYou,
     /// `SinceYou`, but counted from your previous prompt (the one before your last).
-    SincePrev(usize),
+    SincePrev,
 }
 
 impl Pick {
@@ -31,8 +31,8 @@ impl Pick {
         match self {
             Pick::Last(1) => "the last reply".into(),
             Pick::Last(n) => format!("the last {n} replies"),
-            Pick::SinceYou(_) => "since your last prompt".into(),
-            Pick::SincePrev(_) => "since your previous prompt".into(),
+            Pick::SinceYou => "since your last prompt".into(),
+            Pick::SincePrev => "since your previous prompt".into(),
         }
     }
 }
@@ -50,12 +50,11 @@ pub enum Empty {
     OnePrompt,
 }
 
-/// The quoted replies, how many turns they cover, and how many matched before the cap.
+/// The quoted replies and how many turns they cover.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Quoted {
     pub text: String,
     pub count: usize,
-    pub total: usize,
     /// The picked replies, oldest first, unquoted (for `/quote`'s model trim, `tui::trim`).
     pub replies: Vec<Reply>,
     /// `SinceYou`: the text of the prompt counted from.
@@ -143,8 +142,8 @@ pub fn build(
     let mut your_prompt = None;
     let (start, n, empty) = match pick {
         Pick::Last(n) => (0, n, Empty::NoReplies),
-        Pick::SinceYou(cap) | Pick::SincePrev(cap) => {
-            let back = usize::from(matches!(pick, Pick::SincePrev(_)));
+        Pick::SinceYou | Pick::SincePrev => {
+            let back = usize::from(matches!(pick, Pick::SincePrev));
             let yours: Vec<usize> = turns
                 .iter()
                 .enumerate()
@@ -158,7 +157,7 @@ pub fn build(
                 return Err(Empty::OnePrompt);
             };
             your_prompt = Some(turns[start].prompt.clone());
-            (start, cap, Empty::NothingSince)
+            (start, usize::MAX, Empty::NothingSince)
         }
     };
     let eligible: Vec<(usize, &Turn)> = turns
@@ -167,8 +166,7 @@ pub fn build(
         .skip(start)
         .filter(|(_, t)| !t.reply.is_empty() && !t.is_compact)
         .collect();
-    let total = eligible.len();
-    let picked = &eligible[total.saturating_sub(n)..];
+    let picked = &eligible[eligible.len().saturating_sub(n)..];
     if picked.is_empty() {
         return Err(empty);
     }
@@ -204,7 +202,6 @@ pub fn build(
     Ok(Quoted {
         text,
         count: picked.len(),
-        total,
         replies,
         your_prompt,
     })
@@ -358,9 +355,8 @@ mod tests {
             user("You are goose session x, resume"),
             ast("goose reply", 4),
         ];
-        let q = since(&blocks, 50, false).unwrap();
+        let q = since(&blocks, false).unwrap();
         assert_eq!(q.count, 3);
-        assert_eq!(q.total, 3);
         assert_eq!(
             q.text,
             "# T2 (you)\n> reply to you\n\n# T3 (wake: mail)\n> wake reply\n\n# T4 (goose)\n> goose reply"
@@ -368,18 +364,21 @@ mod tests {
     }
 
     #[test]
-    fn since_you_caps_to_the_newest_and_reports_total() {
-        let blocks = vec![
-            user("me"),
-            ast("a", 1),
-            user("[sw wake run=r reason=x] x"),
-            ast("b", 2),
-            user("[sw wake run=r reason=x] x"),
-            ast("c", 3),
-        ];
-        let q = since(&blocks, 2, false).unwrap();
-        assert_eq!((q.count, q.total), (2, 3));
-        assert_eq!(q.text, "# T2 (wake: x)\n> b\n\n# T3 (wake: x)\n> c");
+    fn since_you_has_no_cap() {
+        let mut blocks = vec![user("me")];
+        for i in 0..120 {
+            blocks.push(user("[sw wake run=r reason=x] x"));
+            blocks.push(ast(&format!("r{i}"), i));
+        }
+        let q = since(&blocks, false).unwrap();
+        assert_eq!(q.count, 120);
+        assert!(
+            q.text.contains("> r0\n") && q.text.ends_with("> r119"),
+            "{}",
+            q.text
+        );
+        let q = build(&blocks, Pick::Last(500), false, fmt).unwrap();
+        assert_eq!(q.count, 120);
     }
 
     #[test]
@@ -394,7 +393,7 @@ mod tests {
             user("[sw wake run=r reason=x] x"),
             ast("b", 3),
         ];
-        let q = since(&blocks, 50, false).unwrap();
+        let q = since(&blocks, false).unwrap();
         assert_eq!(
             q.text,
             "# T1 (you)\n> a\n\n# T2 (wake: x)\n> w\n\n# T3 (wake: x)\n> b"
@@ -404,22 +403,22 @@ mod tests {
     #[test]
     fn since_you_edge_cases() {
         let wake_only = vec![user("[sw wake run=r reason=x] x"), ast("a", 1)];
-        assert_eq!(since(&wake_only, 50, false), Err(Empty::NeverSpoke));
-        assert_eq!(since(&[ast("hello", 1)], 50, false), Err(Empty::NeverSpoke));
+        assert_eq!(since(&wake_only, false), Err(Empty::NeverSpoke));
+        assert_eq!(since(&[ast("hello", 1)], false), Err(Empty::NeverSpoke));
         let waiting = vec![user("me"), ast("a", 1), user("again")];
-        assert_eq!(since(&waiting, 50, true), Err(Empty::NothingSince));
+        assert_eq!(since(&waiting, true), Err(Empty::NothingSince));
         let silent = vec![
             user("me"),
             user("[sw wake run=r reason=x] x"),
             block(BlockKind::Tool, "t", None),
         ];
-        assert_eq!(since(&silent, 50, false), Err(Empty::NothingSince));
+        assert_eq!(since(&silent, false), Err(Empty::NothingSince));
     }
 
     #[test]
     fn since_you_marks_the_running_turn() {
         let blocks = vec![user("me"), ast("partial", 1)];
-        let q = since(&blocks, 50, true).unwrap();
+        let q = since(&blocks, true).unwrap();
         assert_eq!(q.text, "# T1 (you, in progress)\n> partial");
     }
 
@@ -435,7 +434,7 @@ mod tests {
             user("second"),
             ast("b", 4),
         ];
-        let q = build(&blocks, Pick::SincePrev(50), false, fmt).unwrap();
+        let q = build(&blocks, Pick::SincePrev, false, fmt).unwrap();
         assert_eq!(
             q.text,
             "# T1 (you)\n> a\n\n# T2 (wake: x)\n> w\n\n# T4 (you)\n> b"
@@ -443,17 +442,17 @@ mod tests {
         assert_eq!(q.your_prompt.as_deref(), Some("first"));
         let one = vec![user("only"), ast("a", 1)];
         assert_eq!(
-            build(&one, Pick::SincePrev(50), false, fmt),
+            build(&one, Pick::SincePrev, false, fmt),
             Err(Empty::OnePrompt)
         );
         assert_eq!(
-            build(&[ast("a", 1)], Pick::SincePrev(50), false, fmt),
+            build(&[ast("a", 1)], Pick::SincePrev, false, fmt),
             Err(Empty::NeverSpoke)
         );
     }
 
-    fn since(blocks: &[Block], cap: usize, running: bool) -> Result<Quoted, Empty> {
-        build(blocks, Pick::SinceYou(cap), running, fmt)
+    fn since(blocks: &[Block], running: bool) -> Result<Quoted, Empty> {
+        build(blocks, Pick::SinceYou, running, fmt)
     }
 
     #[test]

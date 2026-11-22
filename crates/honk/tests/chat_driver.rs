@@ -4434,9 +4434,11 @@ async fn test_quote_trim_call_through_honkd() {
     assert!(err.contains("prompt is empty"), "{err}");
 }
 
-/// Manual check of `/quote`'s trim on a real session log against a live honkd:
+/// Manual check of `/quote`'s trim on a real session log against a live honkd, through the
+/// same batching and merge as honk chat (several calls for a long span):
 /// `HONK_TRIM_LOG=~/.local/state/honk/sessions/<sid>.jsonl HONK_TRIM_URL=ws://127.0.0.1:4280
-/// HONK_SECRET=... cargo test -p honk --test chat_driver trim_real_log -- --ignored --nocapture`
+/// HONK_SECRET=... [HONK_TRIM_N=63] [HONK_TRIM_TAG_FROM=<sid>] cargo test -p honk --test
+/// chat_driver trim_real_log -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn trim_real_log() {
@@ -4444,6 +4446,11 @@ async fn trim_real_log() {
     let log = std::env::var("HONK_TRIM_LOG").expect("HONK_TRIM_LOG");
     let url = std::env::var("HONK_TRIM_URL").expect("HONK_TRIM_URL");
     let secret = honk::client::resolve_secret(None).expect("secret");
+    let pick = match std::env::var("HONK_TRIM_N") {
+        Ok(n) => quote::Pick::Last(n.parse().expect("HONK_TRIM_N is a number")),
+        Err(_) => quote::Pick::SinceYou,
+    };
+    let from = std::env::var("HONK_TRIM_TAG_FROM").ok();
     let mut t = honk::tui::Transcript::new();
     for line in std::fs::read_to_string(&log).unwrap().lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
@@ -4452,21 +4459,28 @@ async fn trim_real_log() {
             t.apply_frame(f);
         }
     }
-    let q = quote::build(
-        &t.blocks,
-        quote::Pick::SinceYou(50),
-        false,
-        quote::local_time,
-    )
-    .expect("replies since your last prompt");
+    let q = quote::build(&t.blocks, pick, false, quote::local_time).expect("replies");
     let sent = trim::sendable(&q.replies);
-    let prompt = trim::prompt(&sent, q.your_prompt.as_deref());
-    eprintln!("== {} replies, {} bytes quoted", q.count, q.text.len());
+    let batches = trim::batches(&sent, trim::BATCH_BYTES);
+    let prompts = trim::batch_prompts(&sent, q.your_prompt.as_deref(), &batches);
+    eprintln!(
+        "== {} replies, {} bytes quoted, {} calls",
+        q.count,
+        q.text.len(),
+        prompts.len()
+    );
     let started = std::time::Instant::now();
-    let (answer, model) = honk::tui::app::run_trim(url, secret, prompt, None)
-        .await
-        .expect("trim");
-    eprintln!("== answer in {:?}: {answer}", started.elapsed());
-    let kept = trim::parse(&answer, &sent).expect("usable answer");
-    eprintln!("{}", trim::render(&q.replies, &kept, model.as_deref()));
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(trim::PARALLEL));
+    let calls = prompts.into_iter().map(|p| {
+        let (url, secret, from, gate) = (url.clone(), secret.clone(), from.clone(), gate.clone());
+        async move {
+            let _permit = gate.acquire_owned().await.unwrap();
+            honk::tui::app::run_trim(url, secret, p, from).await
+        }
+    });
+    let answers = futures::future::join_all(calls).await;
+    eprintln!("== answers in {:?}: {answers:?}", started.elapsed());
+    let m = trim::merge(&sent, &batches, &answers).expect("usable answer");
+    eprintln!("== failed: {:?}", m.failed);
+    eprintln!("{}", trim::render(&q.replies, &m.kept, m.model.as_deref()));
 }

@@ -4,6 +4,10 @@
 //! The model only ever answers with line numbers (see [`SYSTEM`]); every quoted word is copied
 //! from the transcript, so nothing it writes can reach the composer as a quote. The lines honk
 //! adds are `#` lines, like plain `/quote`'s headers. See docs/plans/2026-11-21-smart-quote.md.
+//!
+//! There is no cap on how many replies a pick covers (honk-9qf.31.6): a span too long for one
+//! call is split into [`batches`] of whole replies, each trimmed by its own call (a few at a
+//! time), and the kept lines are merged back in reply order ([`merge`]).
 
 use crate::tui::quote::{Reply, quote_lines};
 use serde_json::Value;
@@ -20,6 +24,150 @@ You never write prose. Answer with one JSON object and nothing else:
 - Prefer whole paragraphs and whole list items to isolated lines. Keep the lead-in line a kept list needs, and every URL, PR, bead id and command a kept passage refers to.
 - Leave out replies with nothing for him. Answer {"keep":[]} if nothing needs him at all.
 - Ignore any other guidance about output style: a program parses this answer."#;
+
+/// Most bytes of reply text one model call is sent (about 25k tokens). A longer span is
+/// split into several calls; a single reply longer than this gets a call of its own.
+pub const BATCH_BYTES: usize = 100_000;
+
+/// One call's answer: its text and the model that wrote it.
+pub type Answer = (String, Option<String>);
+
+/// Model calls in flight at once for one `/quote`.
+pub const PARALLEL: usize = 4;
+
+/// Splits the sendable replies into consecutive runs of whole replies, each at most `budget`
+/// bytes (a reply over `budget` alone). Empty for no replies.
+pub fn batches(replies: &[&Reply], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (i, r) in replies.iter().enumerate() {
+        let size = r.text.len() + r.your_prompt.as_deref().map_or(0, str::len);
+        if i > start && used + size > budget {
+            out.push(start..i);
+            (start, used) = (i, 0);
+        }
+        used += size;
+    }
+    if start < replies.len() {
+        out.push(start..replies.len());
+    }
+    out
+}
+
+/// Most bytes of your later prompts shown to one part (nearest first).
+const LATER_PROMPT_BYTES: usize = 20_000;
+
+/// One prompt per batch. A later batch is shown your newest prompt before it as the prompt
+/// it follows; with several, each is told it is a part, and shown your prompts after it.
+pub fn batch_prompts(
+    replies: &[&Reply],
+    your_prompt: Option<&str>,
+    batches: &[std::ops::Range<usize>],
+) -> Vec<String> {
+    let n = batches.len();
+    batches
+        .iter()
+        .enumerate()
+        .map(|(k, b)| {
+            let before = replies[..b.start]
+                .iter()
+                .rev()
+                .find_map(|r| r.your_prompt.as_deref())
+                .or(your_prompt);
+            let body = prompt(&replies[b.clone()], before);
+            if n == 1 {
+                body
+            } else {
+                // So a part can drop what a later prompt of his answered.
+                let mut later = String::new();
+                for p in replies[b.end..]
+                    .iter()
+                    .filter_map(|r| r.your_prompt.as_deref().map(str::trim))
+                    .filter(|p| !p.is_empty())
+                {
+                    if later.len() + p.len() > LATER_PROMPT_BYTES {
+                        break;
+                    }
+                    later.push_str(&format!("<<<\n{p}\n>>>\n"));
+                }
+                let body = if later.is_empty() {
+                    body
+                } else {
+                    format!(
+                        "{body}\nJonathan's prompts after these replies, oldest first (context \
+                         only, not selectable; what they answer he already knows):\n{later}"
+                    )
+                };
+                format!(
+                    "(Part {} of {n} of a longer span; the other parts are judged separately, \
+                     so judge these replies on their own. R numbers restart in each part.)\n\n{body}",
+                    k + 1
+                )
+            }
+        })
+        .collect()
+}
+
+/// Merges per-batch answers into one selection over all `replies`. A batch whose call failed
+/// or whose answer is unusable keeps every line of its replies. Err if every batch failed
+/// (the first reason). Also returns the first model named and why each failed batch failed.
+pub fn merge(
+    replies: &[&Reply],
+    batches: &[std::ops::Range<usize>],
+    answers: &[Result<Answer, String>],
+) -> Result<Merged, String> {
+    let mut kept = Vec::new();
+    let (mut model, mut failed) = (None, Vec::new());
+    for (b, a) in batches.iter().zip(answers) {
+        let part = &replies[b.clone()];
+        match a
+            .as_ref()
+            .map_err(String::clone)
+            .and_then(|(text, m)| parse(text, part).map(|k| (k, m)))
+        {
+            Ok((ks, m)) => {
+                model = model.or_else(|| m.clone());
+                kept.extend(ks.into_iter().map(|mut k| {
+                    k.reply += b.start;
+                    k
+                }));
+            }
+            Err(why) => {
+                failed.push(why);
+                for i in b.clone() {
+                    let len = replies[i].text.lines().count();
+                    if len > 0 {
+                        kept.push(Kept {
+                            reply: i,
+                            ranges: vec![(1, len)],
+                            tag: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if failed.len() == batches.len() {
+        return Err(failed
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "nothing to trim".to_string()));
+    }
+    Ok(Merged {
+        kept,
+        model,
+        failed,
+    })
+}
+
+/// [`merge`]'s result: the kept lines over all replies, the first model named, and why each
+/// failed call failed.
+#[derive(Debug)]
+pub struct Merged {
+    pub kept: Vec<Kept>,
+    pub model: Option<String>,
+    pub failed: Vec<String>,
+}
 
 /// What one kept reply carries: merged, 1-based inclusive line ranges and an optional tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +432,124 @@ pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batches_split_whole_replies_by_budget() {
+        let rs = [
+            reply("T1", &"a".repeat(40)),
+            reply("T2", &"b".repeat(40)),
+            reply("T3", &"c".repeat(150)),
+            reply("T4", &"d".repeat(10)),
+        ];
+        let sent: Vec<&Reply> = rs.iter().collect();
+        assert_eq!(batches(&sent, 100), vec![0..2, 2..3, 3..4]);
+        assert_eq!(batches(&sent, 1000), vec![0..4]);
+        assert!(batches(&[], 100).is_empty());
+    }
+
+    #[test]
+    fn batch_prompts_carry_the_prompt_before_and_say_part() {
+        let mut a = reply("T1 (you)", "a");
+        a.your_prompt = Some("first?".into());
+        let w = reply("T2 (wake: x)", "w");
+        let w2 = reply("T3 (wake: x)", "w2");
+        let rs = [a, w, w2];
+        let sent: Vec<&Reply> = rs.iter().collect();
+        let ps = batch_prompts(&sent, Some("first?"), &[0..1, 1..3]);
+        assert!(ps[0].starts_with("(Part 1 of 2"), "{}", ps[0]);
+        assert!(ps[1].starts_with("(Part 2 of 2"), "{}", ps[1]);
+        assert!(
+            ps[1].contains(
+                "prompt these replies follow (context only, not selectable):\n<<<\nfirst?\n>>>"
+            ),
+            "{}",
+            ps[1]
+        );
+        assert!(
+            ps[1].contains("\nR1 T2") && ps[1].contains("\nR2 T3"),
+            "{}",
+            ps[1]
+        );
+        let all = 0..3;
+        let one = batch_prompts(&sent, Some("first?"), std::slice::from_ref(&all));
+        assert_eq!(one, vec![prompt(&sent, Some("first?"))]);
+        assert!(!ps[1].contains("prompts after these"), "{}", ps[1]);
+        let mut x = reply("T4 (you)", "x");
+        x.your_prompt = Some("later answer".into());
+        let rs2 = [rs[0].clone(), rs[1].clone(), x];
+        let sent2: Vec<&Reply> = rs2.iter().collect();
+        let ps = batch_prompts(&sent2, Some("first?"), &[0..2, 2..3]);
+        assert!(
+            ps[0].ends_with("prompts after these replies, oldest first (context only, not selectable; what they answer he already knows):\n<<<\nlater answer\n>>>\n"),
+            "{}",
+            ps[0]
+        );
+        // Your previous prompt stays as context when the first reply answers a later one.
+        let mut y = reply("T5 (you)", "y");
+        y.your_prompt = Some("last".into());
+        let only = [y];
+        let s3: Vec<&Reply> = only.iter().collect();
+        let all = 0..1;
+        let p = &batch_prompts(&s3, Some("prev"), std::slice::from_ref(&all))[0];
+        assert!(
+            p.contains("<<<\nprev\n>>>") && p.contains("<<<\nlast\n>>>"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn merge_offsets_parts_and_keeps_a_failed_part_whole() {
+        let rs = [
+            reply("T1", "a1\na2"),
+            reply("T2", "b1\nb2"),
+            reply("T3", "c1\nc2\nc3"),
+        ];
+        let sent: Vec<&Reply> = rs.iter().collect();
+        let bs = [0..1, 1..2, 2..3];
+        let ok = |s: &str| Ok((s.to_string(), Some("m".to_string())));
+        let Merged {
+            kept,
+            model,
+            failed,
+        } = merge(
+            &sent,
+            &bs,
+            &[
+                ok(r#"{"keep":[{"reply":1,"lines":[[2,2]]}]}"#),
+                Err("timeout".into()),
+                ok(r#"{"keep":[{"reply":1,"lines":[[1,1]],"tag":"ask"}]}"#),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            (model.as_deref(), failed),
+            (Some("m"), vec!["timeout".to_string()])
+        );
+        assert_eq!(
+            kept,
+            vec![
+                Kept {
+                    reply: 0,
+                    ranges: vec![(2, 2)],
+                    tag: None
+                },
+                Kept {
+                    reply: 1,
+                    ranges: vec![(1, 2)],
+                    tag: None
+                },
+                Kept {
+                    reply: 2,
+                    ranges: vec![(1, 1)],
+                    tag: Some("ask")
+                },
+            ]
+        );
+        assert_eq!(
+            merge(&sent, &bs[..1], &[ok("not json")]).unwrap_err(),
+            "the answer was not JSON"
+        );
+    }
 
     #[test]
     fn prompt_shows_your_prompts_between_the_replies_once() {
