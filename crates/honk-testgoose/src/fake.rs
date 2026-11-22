@@ -44,14 +44,14 @@ impl StreamState {
         let seq = self.next_seq;
         self.next_seq += 1;
 
-        if let Some(sender) = &self.sender {
-            if is_lost {
-                if patched {
-                    self.ring.push_back((seq, frame));
-                }
-                return;
+        if is_lost {
+            if patched {
+                self.ring.push_back((seq, frame));
             }
+            return;
+        }
 
+        if let Some(sender) = &self.sender {
             let sse_str = if patched {
                 format!("id: {seq}\ndata: {frame}\n\n")
             } else {

@@ -463,6 +463,7 @@ async fn steer_probe_post_failure_404_transitions_to_gone() {
     // Induce gap on resume, and 404 on steer probe POST
     fake.gap_on_next_resume(&sid);
     fake.set_steer_status(Some(StatusCode::NOT_FOUND));
+    fake.set_drop_prompt_reply(true);
 
     let pid = v
         .request(
