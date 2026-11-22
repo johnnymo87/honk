@@ -470,9 +470,10 @@ impl FakeGoose {
         *self.state.prompt_end_error.lock().unwrap() = err;
     }
 
-    /// Configures the fake goose to return a v1.60.2+ turn_failed JSON-RPC error reply on `session/prompt`.
+    /// Configures the fake goose to emit the v1.60.2+ turn_failed failure sequence
+    /// (activeRunId Some, chunks, activeRunId null, then the error reply).
     pub fn set_prompt_turn_failed(&self, kind: Option<&str>, message: Option<&str>) {
-        self.set_prompt_error_reply(Some(turn_failed_error(kind, message)));
+        self.set_prompt_end_error(Some(turn_failed_error(kind, message)));
     }
 
     /// JSON-RPC error reply for goose v1.60.2+ turn failure:

@@ -79,3 +79,7 @@ pub fn is_lost_track(val: &Value) -> bool {
             .is_some_and(check)
         || val.as_str().is_some_and(check)
 }
+
+pub fn is_turn_failed(val: &Value) -> bool {
+    val.pointer("/data/reason").and_then(Value::as_str) == Some("turn_failed")
+}

@@ -277,7 +277,9 @@ impl TurnCore {
         };
         self.cancel_pending = false;
         let is_busy = crate::rpc::busy_run_id(frame).is_some();
-        if !inf.announced && !is_busy && frame.get("error").is_none() {
+        let is_turn_failed =
+            frame.pointer("/error/data/reason").and_then(Value::as_str) == Some("turn_failed");
+        if !inf.announced && !is_busy && (frame.get("error").is_none() || is_turn_failed) {
             self.client_prompts += 1;
         }
         if let Some(run) = crate::rpc::busy_run_id(frame) {
@@ -1864,6 +1866,53 @@ mod tests {
             turn_outcome(&err, Some(&turn_meta(None)), Some(0)),
             failed("network", "connection reset")
         );
+    }
+
+    #[test]
+    fn test_unannounced_turn_failed_reply_increments_client_prompts() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let p_actions = core.on_prompt(owner.clone(), json!({"prompt": "first"}), &mut ids);
+        let Action::SendPrompt { upstream_id, .. } = &p_actions[0] else {
+            panic!("expected SendPrompt");
+        };
+        assert_eq!(core.client_prompts, 0);
+
+        let reply_frame = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": { "reason": "turn_failed" }
+            }
+        });
+        core.on_prompt_reply(upstream_id, &reply_frame, &mut ids);
+        assert_eq!(core.client_prompts, 1);
+    }
+
+    #[test]
+    fn test_unannounced_generic_rpc_error_does_not_increment_client_prompts() {
+        let mut ids = UpstreamIds::new(1);
+        let mut core = TurnCore::default();
+        let owner = make_owner(Some(1), 10, Some("req_1"));
+        let p_actions = core.on_prompt(owner.clone(), json!({"prompt": "first"}), &mut ids);
+        let Action::SendPrompt { upstream_id, .. } = &p_actions[0] else {
+            panic!("expected SendPrompt");
+        };
+        assert_eq!(core.client_prompts, 0);
+
+        let generic_err = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": {
+                "code": -32600,
+                "message": "Invalid request"
+            }
+        });
+        core.on_prompt_reply(upstream_id, &generic_err, &mut ids);
+        assert_eq!(core.client_prompts, 0);
     }
 
     #[test]

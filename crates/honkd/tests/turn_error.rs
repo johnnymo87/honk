@@ -179,6 +179,76 @@ async fn turn_failed_error_reply_stock_goose_is_listed_as_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn turn_failed_real_sequence_streams_chunks_and_is_listed_as_error() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    // Real goose 1.60 failure sequence: activeRunId Some, chunks, activeRunId null, then error reply
+    fake.script_prompt(vec!["partial stream ".into(), "before failure".into()]);
+    fake.set_prompt_turn_failed(Some("provider"), Some("rate limit exceeded"));
+
+    let id = v
+        .request("session/prompt", prompt_params(&sid, "fails", None))
+        .await;
+
+    // During the turn, activeRunId was announced
+    v.wait_for(|f| {
+        f.pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .is_some()
+    })
+    .await;
+
+    let reply = v.response(&id).await;
+    assert!(reply.get("error").is_some(), "{reply}");
+
+    let error = listed_error(&mut v, &sid).await;
+    assert_eq!(error["kind"], "provider");
+    assert_eq!(error["message"], "rate limit exceeded");
+
+    // Clean turn clears it
+    fake.set_prompt_end_error(None);
+    fake.script_prompt(vec!["all good".into()]);
+    let clean_reply = prompt(&mut v, &sid, "works").await;
+    assert_eq!(clean_reply["result"]["stopReason"], "end_turn");
+    assert_eq!(listed_error(&mut v, &sid).await, Value::Null);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_failed_stock_goose_real_sequence_is_listed_as_rpc() {
+    let fake = FakeGoose::start().await;
+    let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
+    let mut v = Viewer::connect_pigeon(&h).await;
+    let sid = new_session(&mut v, "/tmp").await;
+
+    fake.script_prompt(vec!["streaming...".into()]);
+    fake.set_prompt_end_error(Some(json!({
+        "code": -32603,
+        "message": "Stock turn failed",
+        "data": { "reason": "turn_failed" }
+    })));
+
+    let id = v
+        .request("session/prompt", prompt_params(&sid, "fails", None))
+        .await;
+    v.wait_for(|f| {
+        f.pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .is_some()
+    })
+    .await;
+
+    let reply = v.response(&id).await;
+    assert!(reply.get("error").is_some(), "{reply}");
+
+    let error = listed_error(&mut v, &sid).await;
+    assert_eq!(error["kind"], "rpc");
+    assert_eq!(error["message"], "Stock turn failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_run_clears_the_error_before_it_ends() {
     let fake = FakeGoose::start().await;
     let h = Honkd::spawn(&fake.url(), fake.secret_file(), UNPATCHED).await;
