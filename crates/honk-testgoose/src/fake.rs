@@ -1714,8 +1714,14 @@ async fn handle_post(
                 return StatusCode::ACCEPTED.into_response();
             }
 
-            let config_id = frame.pointer("/params/configId").and_then(Value::as_str).map(String::from);
-            let value = frame.pointer("/params/value").and_then(Value::as_str).map(String::from);
+            let config_id = frame
+                .pointer("/params/configId")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let value = frame
+                .pointer("/params/value")
+                .and_then(Value::as_str)
+                .map(String::from);
 
             let delay_opt = *state.set_config_option_delay.lock().unwrap();
             let state_clone = state.clone();
@@ -1732,7 +1738,10 @@ async fn handle_post(
                             if opt.get("id").and_then(Value::as_str) == Some(cid)
                                 && let Some(obj) = opt.as_object_mut()
                             {
-                                obj.insert("currentValue".to_string(), Value::String(val.to_string()));
+                                obj.insert(
+                                    "currentValue".to_string(),
+                                    Value::String(val.to_string()),
+                                );
                             }
                         }
                     }

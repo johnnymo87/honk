@@ -231,32 +231,38 @@ mod tests {
 
     #[test]
     fn rejects_zero_on_load_model_timeouts() {
-        assert!(Args::try_parse_from([
-            "honkd",
-            "--upstream-secret-file",
-            "/tmp/secret",
-            "--on-load-model-timeout-secs",
-            "0",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from([
+                "honkd",
+                "--upstream-secret-file",
+                "/tmp/secret",
+                "--on-load-model-timeout-secs",
+                "0",
+            ])
+            .is_err()
+        );
 
-        assert!(Args::try_parse_from([
-            "honkd",
-            "--upstream-secret-file",
-            "/tmp/secret",
-            "--on-load-model-applied-timeout-secs",
-            "0",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from([
+                "honkd",
+                "--upstream-secret-file",
+                "/tmp/secret",
+                "--on-load-model-applied-timeout-secs",
+                "0",
+            ])
+            .is_err()
+        );
 
-        assert!(Args::try_parse_from([
-            "honkd",
-            "--upstream-secret-file",
-            "/tmp/secret",
-            "--on-load-model-rpc-timeout-secs",
-            "0",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from([
+                "honkd",
+                "--upstream-secret-file",
+                "/tmp/secret",
+                "--on-load-model-rpc-timeout-secs",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

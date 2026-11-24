@@ -71,7 +71,11 @@ fi
     // Check hook log
     let log_content = std::fs::read_to_string(&log_path).expect("read log");
     let lines: Vec<&str> = log_content.lines().collect();
-    assert_eq!(lines.len(), 2, "expected decide and applied in log: {log_content}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected decide and applied in log: {log_content}"
+    );
     assert_eq!(
         lines[0],
         format!("decide --session {sid} --current claude-opus-5-5")
@@ -130,7 +134,9 @@ fi
     let mut v = Viewer::connect(&h).await;
 
     // 1. Empty stdout
-    let load_empty = v.call("session/load", json!({ "sessionId": sid_empty })).await;
+    let load_empty = v
+        .call("session/load", json!({ "sessionId": sid_empty }))
+        .await;
     let opts_empty = load_empty["result"]["configOptions"]
         .as_array()
         .expect("configOptions array");
@@ -140,7 +146,9 @@ fi
     );
 
     // 2. Same model
-    let load_same = v.call("session/load", json!({ "sessionId": sid_same })).await;
+    let load_same = v
+        .call("session/load", json!({ "sessionId": sid_same }))
+        .await;
     let opts_same = load_same["result"]["configOptions"]
         .as_array()
         .expect("configOptions array");
@@ -151,7 +159,11 @@ fi
 
     let log_content = std::fs::read_to_string(&log_path).expect("read log");
     let lines: Vec<&str> = log_content.lines().collect();
-    assert_eq!(lines.len(), 2, "only 2 decide calls expected: {log_content}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "only 2 decide calls expected: {log_content}"
+    );
     assert!(
         lines.iter().all(|l| l.starts_with("decide")),
         "no applied calls should occur: {log_content}"
@@ -201,7 +213,9 @@ fi
     let mut v = Viewer::connect(&h).await;
 
     // Subcase A: Non-zero exit
-    let load_fail = v.call("session/load", json!({ "sessionId": sid_fail })).await;
+    let load_fail = v
+        .call("session/load", json!({ "sessionId": sid_fail }))
+        .await;
     let opts_fail = load_fail["result"]["configOptions"]
         .as_array()
         .expect("configOptions array");
@@ -212,7 +226,9 @@ fi
 
     // Subcase B: Timeout
     let t0 = Instant::now();
-    let load_timeout = v.call("session/load", json!({ "sessionId": sid_timeout })).await;
+    let load_timeout = v
+        .call("session/load", json!({ "sessionId": sid_timeout }))
+        .await;
     let elapsed = t0.elapsed();
     assert!(
         elapsed < Duration::from_secs(4),
