@@ -500,3 +500,68 @@ fi
         "applied --session {sid} --from claude-opus-5-5 --to gemini-3.8-flash --ts-ms "
     )));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_on_load_model_upstream_timeout_late_update_captured_in_drain() {
+    let fake = FakeGoose::start().await;
+    let sid = "session-upstream-timeout-late-update";
+    fake.insert_session(sid, "/tmp");
+    // Delay set_config_option for 1200ms, while honkd RPC timeout is 1s
+    fake.set_config_option_delay(Some(Duration::from_millis(1200)));
+
+    let td = tempfile::tempdir().unwrap();
+    let log_path = td.path().join("hook.log");
+    let hook_body = format!(
+        r#"#!/bin/sh
+echo "$@" >> "{}"
+if [ "$1" = "decide" ]; then
+    echo "gemini-3.8-flash"
+elif [ "$1" = "applied" ]; then
+    sleep 0.6
+fi
+"#,
+        log_path.display()
+    );
+    let hook_path = create_hook_script(td.path(), &hook_body);
+
+    let h = Honkd::spawn(
+        &fake.url(),
+        fake.secret_file(),
+        &[
+            "--allow-unpatched-upstream",
+            "--on-load-model-cmd",
+            hook_path.to_str().unwrap(),
+            "--on-load-model-rpc-timeout-secs",
+            "1",
+            "--on-load-model-applied-timeout-secs",
+            "2",
+        ],
+    )
+    .await;
+
+    let mut v = Viewer::connect(&h).await;
+    let load_reply = v.call("session/load", json!({ "sessionId": sid })).await;
+
+    // Although set_config_option RPC call timed out, goose's late config_option_update
+    // arrived during the applied hook's 600ms sleep and was captured in the drain loop:
+    let opts = load_reply["result"]["configOptions"]
+        .as_array()
+        .expect("configOptions array");
+    assert_eq!(
+        opts.iter().find(|o| o["id"] == "model").unwrap()["currentValue"],
+        "gemini-3.8-flash",
+        "load_reply must capture target model from drained config_option_update"
+    );
+
+    let log_content = std::fs::read_to_string(&log_path).expect("read log");
+    let lines: Vec<&str> = log_content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "both decide and applied must be called: {log_content}"
+    );
+    assert!(lines[0].starts_with("decide "));
+    assert!(lines[1].starts_with(&format!(
+        "applied --session {sid} --from claude-opus-5-5 --to gemini-3.8-flash --ts-ms "
+    )));
+}

@@ -4,20 +4,86 @@ use std::time::Duration;
 
 use honk_upstream::Upstream;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+
+pub const MAX_HOOK_OUTPUT_BYTES: u64 = 8 * 1024;
+
+pub struct HookOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Reads up to `limit` bytes from `reader`, then drains any remaining bytes to `tokio::io::sink()`.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut take = (&mut reader).take(limit);
+    take.read_to_end(&mut buf).await?;
+    tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+    Ok(buf)
+}
+
+/// Waits for `child` while boundedly reading `stdout` and `stderr` (up to `limit` bytes each).
+///
+/// Taking `stdout` and `stderr` before `wait()` still drops `child` when this future
+/// is cancelled (e.g. by `tokio::time::timeout`), triggering `kill_on_drop(true)`.
+pub async fn wait_bounded(
+    mut child: tokio::process::Child,
+    limit: u64,
+) -> std::io::Result<HookOutput> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_fut = async {
+        if let Some(stdout) = stdout {
+            read_bounded(stdout, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let stderr_fut = async {
+        if let Some(stderr) = stderr {
+            read_bounded(stderr, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (stdout_res, stderr_res, status_res) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+    let stdout = stdout_res?;
+    let stderr = stderr_res?;
+    let status = status_res?;
+    Ok(HookOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// Finds an entry in `reply["configOptions"]` (array) where `id == "model"`
 /// and returns `currentValue` as `&str`.
 pub fn extract_current_model(reply: &Value) -> Option<&str> {
-    let opts = reply
-        .as_array()
-        .or_else(|| reply.get("configOptions").and_then(Value::as_array))
-        .or_else(|| reply.pointer("/result/configOptions").and_then(Value::as_array))?;
+    let opts = reply.get("configOptions").and_then(Value::as_array)?;
     for opt in opts {
         if opt.get("id").and_then(Value::as_str) == Some("model") {
             return opt.get("currentValue").and_then(Value::as_str);
         }
     }
     None
+}
+
+/// Applies `configOptions` into a reply object (e.g. `LoadSessionResponse`).
+pub fn apply_config_options(reply: &mut Value, opts: Value) {
+    let obj = match reply.as_object_mut() {
+        Some(o) => o,
+        None => {
+            *reply = serde_json::json!({});
+            reply.as_object_mut().expect("object")
+        }
+    };
+    obj.insert("configOptions".to_string(), opts);
 }
 
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
@@ -72,7 +138,12 @@ pub async fn maybe_switch_model_on_load(
         }
     };
 
-    let output = match tokio::time::timeout(decide_timeout, child.wait_with_output()).await {
+    let output = match tokio::time::timeout(
+        decide_timeout,
+        wait_bounded(child, MAX_HOOK_OUTPUT_BYTES),
+    )
+    .await
+    {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             tracing::warn!(
@@ -143,14 +214,7 @@ pub async fn maybe_switch_model_on_load(
                 let result = frame.get("result").unwrap_or(&frame);
                 if extract_current_model(result) == Some(target.as_str()) {
                     if let Some(opts) = result.get("configOptions") {
-                        let obj = match load_reply.as_object_mut() {
-                            Some(o) => o,
-                            None => {
-                                *load_reply = serde_json::json!({});
-                                load_reply.as_object_mut().expect("object")
-                            }
-                        };
-                        obj.insert("configOptions".to_string(), opts.clone());
+                        apply_config_options(load_reply, opts.clone());
                     }
                     tracing::info!(
                         %sid,
@@ -206,7 +270,12 @@ pub async fn maybe_switch_model_on_load(
 
         match applied_cmd.spawn() {
             Ok(child) => {
-                match tokio::time::timeout(applied_timeout, child.wait_with_output()).await {
+                match tokio::time::timeout(
+                    applied_timeout,
+                    wait_bounded(child, MAX_HOOK_OUTPUT_BYTES),
+                )
+                .await
+                {
                     Ok(Ok(out)) => {
                         if !out.status.success() {
                             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -264,23 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_current_model_from_result() {
-        let val = json!({
+    fn test_extract_current_model_agrees_on_shape() {
+        // Only inspects val.get("configOptions").and_then(Value::as_array)
+        let bare_array = json!([
+            { "id": "model", "currentValue": "gemini-1.5-pro" }
+        ]);
+        assert_eq!(extract_current_model(&bare_array), None);
+
+        let wrapped = json!({
             "result": {
                 "configOptions": [
                     { "id": "model", "currentValue": "claude-3-5-sonnet" }
                 ]
             }
         });
-        assert_eq!(extract_current_model(&val), Some("claude-3-5-sonnet"));
-    }
-
-    #[test]
-    fn test_extract_current_model_from_array() {
-        let val = json!([
-            { "id": "model", "currentValue": "gemini-1.5-pro" }
-        ]);
-        assert_eq!(extract_current_model(&val), Some("gemini-1.5-pro"));
+        assert_eq!(extract_current_model(&wrapped), None);
     }
 
     #[test]
@@ -294,6 +361,43 @@ mod tests {
 
         let empty = json!({});
         assert_eq!(extract_current_model(&empty), None);
+    }
+
+    #[test]
+    fn test_apply_config_options() {
+        let mut reply = json!({
+            "someOtherField": 123
+        });
+        let opts = json!([
+            { "id": "model", "currentValue": "gpt-4o" }
+        ]);
+        apply_config_options(&mut reply, opts.clone());
+        assert_eq!(reply["configOptions"], opts);
+        assert_eq!(reply["someOtherField"], 123);
+
+        let mut non_object = json!(null);
+        apply_config_options(&mut non_object, opts.clone());
+        assert_eq!(non_object["configOptions"], opts);
+    }
+
+    #[tokio::test]
+    async fn test_wait_bounded_large_output() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let child = cmd.spawn().expect("spawn sh");
+        let output = wait_bounded(child, MAX_HOOK_OUTPUT_BYTES)
+            .await
+            .expect("wait bounded");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_HOOK_OUTPUT_BYTES as usize);
+        assert_eq!(output.stderr.len(), MAX_HOOK_OUTPUT_BYTES as usize);
     }
 
     #[test]

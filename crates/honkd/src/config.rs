@@ -51,11 +51,26 @@ pub struct Args {
         help = "Optional command invoked when an unheld session is activated to decide whether to switch its model"
     )]
     pub on_load_model_cmd: Option<PathBuf>,
-    #[arg(long, default_value_t = 3, hide = true)]
+    #[arg(
+        long,
+        default_value_t = 3,
+        hide = true,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub on_load_model_timeout_secs: u64,
-    #[arg(long, default_value_t = 2, hide = true)]
+    #[arg(
+        long,
+        default_value_t = 2,
+        hide = true,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub on_load_model_applied_timeout_secs: u64,
-    #[arg(long, default_value_t = 10, hide = true)]
+    #[arg(
+        long,
+        default_value_t = 10,
+        hide = true,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub on_load_model_rpc_timeout_secs: u64,
     #[arg(long)]
     pub mcp_catalog: Option<PathBuf>,
@@ -212,6 +227,36 @@ mod tests {
         assert_eq!(args.on_load_model_timeout_secs, 5);
         assert_eq!(args.on_load_model_applied_timeout_secs, 4);
         assert_eq!(args.on_load_model_rpc_timeout_secs, 15);
+    }
+
+    #[test]
+    fn rejects_zero_on_load_model_timeouts() {
+        assert!(Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--on-load-model-timeout-secs",
+            "0",
+        ])
+        .is_err());
+
+        assert!(Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--on-load-model-applied-timeout-secs",
+            "0",
+        ])
+        .is_err());
+
+        assert!(Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--on-load-model-rpc-timeout-secs",
+            "0",
+        ])
+        .is_err());
     }
 
     #[test]

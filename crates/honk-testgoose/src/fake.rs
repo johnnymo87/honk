@@ -1739,6 +1739,19 @@ async fn handle_post(
                     opts.clone()
                 };
 
+                // Respond with { configOptions } or custom result
+                let custom_result = state_clone.set_config_option_result.lock().unwrap().clone();
+                let result_val = custom_result.unwrap_or_else(|| {
+                    json!({
+                        "configOptions": updated_options,
+                    })
+                });
+
+                let notification_options = result_val
+                    .get("configOptions")
+                    .cloned()
+                    .unwrap_or_else(|| json!(updated_options));
+
                 // Emit session/update notification first
                 let update_frame = json!({
                     "jsonrpc": "2.0",
@@ -1747,19 +1760,11 @@ async fn handle_post(
                         "sessionId": sid_clone,
                         "update": {
                             "sessionUpdate": "config_option_update",
-                            "configOptions": updated_options,
+                            "configOptions": notification_options,
                         }
                     }
                 });
                 emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, update_frame);
-
-                // Respond with { configOptions } or custom result
-                let custom_result = state_clone.set_config_option_result.lock().unwrap().clone();
-                let result_val = custom_result.unwrap_or_else(|| {
-                    json!({
-                        "configOptions": updated_options,
-                    })
-                });
 
                 let mut conns = state_clone.connections.lock().unwrap();
                 if let Some(conn) = conns.get_mut(&conn_id_clone)

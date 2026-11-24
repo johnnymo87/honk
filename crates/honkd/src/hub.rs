@@ -1735,13 +1735,23 @@ impl Hub {
                     && key == &honk_upstream::StreamKey::Session(sid_str.clone())
                     && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                 {
-                    if frame.get("method").and_then(Value::as_str) == Some("session/update")
-                        && frame
+                    if frame.get("method").and_then(Value::as_str) == Some("session/update") {
+                        if frame
                             .pointer("/params/update")
                             .and_then(honk_wire::usage)
                             .is_some()
-                    {
-                        carried_usage = Some(frame.clone());
+                        {
+                            carried_usage = Some(frame.clone());
+                        }
+                        if let Some(opts) = frame
+                            .pointer("/params/update/configOptions")
+                            .and_then(Value::as_array)
+                        {
+                            crate::load_model_hook::apply_config_options(
+                                &mut load_reply,
+                                Value::Array(opts.clone()),
+                            );
+                        }
                     }
                     continue;
                 }
