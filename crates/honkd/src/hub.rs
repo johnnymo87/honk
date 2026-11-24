@@ -35,6 +35,44 @@ pub struct SessionHandle {
 type ActivatingReceiver =
     tokio::sync::watch::Receiver<Option<Result<SessionHandle, ActivationError>>>;
 
+/// At most this many session exports are fetched, parsed and turned into a log generation
+/// at once. An export of a large session costs ~15x its transcript in transient memory
+/// (the JSON text, its `Value` tree, the update frames); after a goose restart every held
+/// session rebuilt at once and OOM-killed honkd (honk-9qf.37).
+pub const MAX_CONCURRENT_EXPORTS: usize = 2;
+
+/// How long an export waits for a permit before going ahead without one. The bound is a
+/// memory guard, not a lock: a wait this long means permits are stuck (an export permit
+/// can sit in a session actor's queue inside `SessionMsg::Rebuilt`), and proceeding beats
+/// stalling that session forever.
+pub const EXPORT_PERMIT_WAIT: Duration = Duration::from_secs(30);
+
+/// A parsed session export. Holds one of the hub's export permits until dropped, so keep it
+/// (or its permit, via [`Export::into_permit`]) alive until the rebuild built from it is done.
+pub struct Export {
+    value: Value,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Export {
+    /// Drop the parsed export but keep the permit (the frames built from it are still alive).
+    pub fn into_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permit
+    }
+
+    /// Take the parsed export and release the permit now.
+    pub fn into_value(self) -> Value {
+        self.value
+    }
+}
+
+impl std::ops::Deref for Export {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+
 pub struct Hub {
     pub args: Arc<Args>,
     pub state: Arc<Mutex<StateStore>>,
@@ -49,6 +87,7 @@ pub struct Hub {
     pub control_connected_notify: Arc<tokio::sync::Notify>,
     pub control_reconnecting: Arc<std::sync::atomic::AtomicBool>,
     pub reactivation_slot: Arc<Mutex<tokio::time::Instant>>,
+    pub export_permits: Arc<tokio::sync::Semaphore>,
     pub upstream_ids: Arc<Mutex<UpstreamIds>>,
     pub pending_control: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
@@ -299,6 +338,7 @@ impl Hub {
             control_connected_notify,
             control_reconnecting,
             reactivation_slot,
+            export_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXPORTS)),
             upstream_ids: Arc::new(Mutex::new(UpstreamIds::new(boot))),
             pending_control,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1056,7 +1096,23 @@ impl Hub {
         call_result
     }
 
-    pub async fn export(&self, sid: &str) -> anyhow::Result<Value> {
+    pub async fn export(&self, sid: &str) -> anyhow::Result<Export> {
+        let permit = match tokio::time::timeout(
+            EXPORT_PERMIT_WAIT,
+            self.export_permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(_)) => None, // never closed
+            Err(_) => {
+                tracing::warn!(
+                    "Session {sid}: waited {}s for an export permit; exporting without one",
+                    EXPORT_PERMIT_WAIT.as_secs()
+                );
+                None
+            }
+        };
         let export_res = self
             .session_call(
                 sid,
@@ -1076,7 +1132,10 @@ impl Hub {
             .context("export missing data string")?;
         let session_val: Value =
             serde_json::from_str(data_str).context("failed to parse export data JSON")?;
-        Ok(session_val)
+        Ok(Export {
+            value: session_val,
+            permit,
+        })
     }
 
     pub async fn recover_sidecar_text(&self, info: &crate::state::SidecarRecoveryInfo) {

@@ -1006,6 +1006,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "fs4",
  "futures",
@@ -1013,6 +1014,7 @@ dependencies = [
  "honk-testgoose",
  "honk-upstream",
  "honk-wire",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

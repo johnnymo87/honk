@@ -6,8 +6,18 @@ use honkd::state::StateStore;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Before the runtime starts any thread: every thread that allocates may otherwise get
+    // its own malloc arena (honk-9qf.37).
+    honkd::malloc::tune();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let args = Args::parse();
 
     // 1. Initialize JSON tracing. No request URIs or headers are ever logged.
@@ -257,6 +267,7 @@ async fn main() {
     let _ = std::io::stdout().flush();
 
     let app = downstream::router(hub, downstream_secret);
+    honkd::malloc::spawn_trim_task();
 
     // 8. SIGTERM/SIGINT: stop accepting and exit, with no upstream calls
     let server = axum::serve(listener, app);
