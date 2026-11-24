@@ -45,6 +45,18 @@ pub struct Args {
     pub turn_hook_token_file: Option<PathBuf>,
     #[arg(long, default_value_t = 1200, hide = true)]
     pub turn_hook_retry_secs: u64,
+    /// Optional command invoked when an unheld session is activated to decide whether to switch its model
+    #[arg(
+        long,
+        help = "Optional command invoked when an unheld session is activated to decide whether to switch its model"
+    )]
+    pub on_load_model_cmd: Option<PathBuf>,
+    #[arg(long, default_value_t = 3, hide = true)]
+    pub on_load_model_timeout_secs: u64,
+    #[arg(long, default_value_t = 2, hide = true)]
+    pub on_load_model_applied_timeout_secs: u64,
+    #[arg(long, default_value_t = 10, hide = true)]
+    pub on_load_model_rpc_timeout_secs: u64,
     #[arg(long)]
     pub mcp_catalog: Option<PathBuf>,
     /// Path to JSON file defining configured models per provider
@@ -165,6 +177,41 @@ mod tests {
         assert_eq!(args.turn_hook_url, None);
         assert_eq!(args.turn_hook_token_file, None);
         assert_eq!(args.turn_hook_retry_secs, 1200);
+    }
+
+    #[test]
+    fn default_on_load_model_flags() {
+        let args = Args::try_parse_from(["honkd", "--upstream-secret-file", "/tmp/secret"])
+            .expect("parse args");
+        assert_eq!(args.on_load_model_cmd, None);
+        assert_eq!(args.on_load_model_timeout_secs, 3);
+        assert_eq!(args.on_load_model_applied_timeout_secs, 2);
+        assert_eq!(args.on_load_model_rpc_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parsed_on_load_model_flags() {
+        let args = Args::try_parse_from([
+            "honkd",
+            "--upstream-secret-file",
+            "/tmp/secret",
+            "--on-load-model-cmd",
+            "/usr/local/bin/model-policy",
+            "--on-load-model-timeout-secs",
+            "5",
+            "--on-load-model-applied-timeout-secs",
+            "4",
+            "--on-load-model-rpc-timeout-secs",
+            "15",
+        ])
+        .expect("parse args");
+        assert_eq!(
+            args.on_load_model_cmd,
+            Some(PathBuf::from("/usr/local/bin/model-policy"))
+        );
+        assert_eq!(args.on_load_model_timeout_secs, 5);
+        assert_eq!(args.on_load_model_applied_timeout_secs, 4);
+        assert_eq!(args.on_load_model_rpc_timeout_secs, 15);
     }
 
     #[test]

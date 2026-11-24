@@ -182,6 +182,9 @@ struct FakeGooseInner {
     extension_add_delay: Mutex<Option<Duration>>,
     truncate_error: Mutex<Option<Value>>,
     truncate_found: Mutex<Option<bool>>,
+    set_config_option_error: Mutex<Option<Value>>,
+    set_config_option_delay: Mutex<Option<Duration>>,
+    set_config_option_result: Mutex<Option<Value>>,
 }
 
 pub struct FakeGoose {
@@ -250,6 +253,9 @@ impl FakeGoose {
             extension_add_delay: Mutex::new(None),
             truncate_error: Mutex::new(None),
             truncate_found: Mutex::new(None),
+            set_config_option_error: Mutex::new(None),
+            set_config_option_delay: Mutex::new(None),
+            set_config_option_result: Mutex::new(None),
         });
 
         let app = Router::new()
@@ -577,6 +583,18 @@ impl FakeGoose {
             .lock()
             .unwrap()
             .insert(sid.to_string(), options);
+    }
+
+    pub fn set_config_option_error(&self, err: Option<Value>) {
+        *self.state.set_config_option_error.lock().unwrap() = err;
+    }
+
+    pub fn set_config_option_delay(&self, delay: Option<Duration>) {
+        *self.state.set_config_option_delay.lock().unwrap() = delay;
+    }
+
+    pub fn set_config_option_result(&self, result: Option<Value>) {
+        *self.state.set_config_option_result.lock().unwrap() = result;
     }
 
     pub fn script_truncate_error(&self, error: Value) {
@@ -1676,58 +1694,99 @@ async fn handle_post(
                 .or_else(|| frame.pointer("/params/sessionId").and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string();
-            let config_id = frame.pointer("/params/configId").and_then(Value::as_str);
-            let value = frame.pointer("/params/value").and_then(Value::as_str);
 
-            let updated_options = {
-                let mut all_opts = state.session_config_options.lock().unwrap();
-                let opts = all_opts
-                    .entry(sid.clone())
-                    .or_insert_with(default_config_options);
-                if let (Some(cid), Some(val)) = (config_id, value) {
-                    for opt in opts.iter_mut() {
-                        if opt.get("id").and_then(Value::as_str) == Some(cid)
-                            && let Some(obj) = opt.as_object_mut()
-                        {
-                            obj.insert("currentValue".to_string(), Value::String(val.to_string()));
+            if let Some(err) = state.set_config_option_error.lock().unwrap().clone() {
+                let mut conns = state.connections.lock().unwrap();
+                if let Some(conn) = conns.get_mut(&conn_id)
+                    && let Some(id) = req_id
+                {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": err,
+                    });
+                    let stream = conn
+                        .sessions
+                        .entry(sid.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
+                }
+                return StatusCode::ACCEPTED.into_response();
+            }
+
+            let config_id = frame.pointer("/params/configId").and_then(Value::as_str).map(String::from);
+            let value = frame.pointer("/params/value").and_then(Value::as_str).map(String::from);
+
+            let delay_opt = *state.set_config_option_delay.lock().unwrap();
+            let state_clone = state.clone();
+            let conn_id_clone = conn_id.clone();
+            let sid_clone = sid.clone();
+            let respond = move || {
+                let updated_options = {
+                    let mut all_opts = state_clone.session_config_options.lock().unwrap();
+                    let opts = all_opts
+                        .entry(sid_clone.clone())
+                        .or_insert_with(default_config_options);
+                    if let (Some(cid), Some(val)) = (&config_id, &value) {
+                        for opt in opts.iter_mut() {
+                            if opt.get("id").and_then(Value::as_str) == Some(cid)
+                                && let Some(obj) = opt.as_object_mut()
+                            {
+                                obj.insert("currentValue".to_string(), Value::String(val.to_string()));
+                            }
                         }
                     }
-                }
-                opts.clone()
-            };
+                    opts.clone()
+                };
 
-            // Emit session/update notification first
-            let update_frame = json!({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": sid,
-                    "update": {
-                        "sessionUpdate": "config_option_update",
-                        "configOptions": updated_options,
-                    }
-                }
-            });
-            emit_session_frame(&state, &conn_id, &sid, update_frame);
-
-            // Respond with { configOptions }
-            let mut conns = state.connections.lock().unwrap();
-            if let Some(conn) = conns.get_mut(&conn_id)
-                && let Some(id) = req_id
-            {
-                let resp = json!({
+                // Emit session/update notification first
+                let update_frame = json!({
                     "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "configOptions": updated_options,
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": sid_clone,
+                        "update": {
+                            "sessionUpdate": "config_option_update",
+                            "configOptions": updated_options,
+                        }
                     }
                 });
-                let stream = conn
-                    .sessions
-                    .entry(sid.clone())
-                    .or_insert_with(StreamState::new);
-                stream.push_frame(resp, patched, false);
+                emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, update_frame);
+
+                // Respond with { configOptions } or custom result
+                let custom_result = state_clone.set_config_option_result.lock().unwrap().clone();
+                let result_val = custom_result.unwrap_or_else(|| {
+                    json!({
+                        "configOptions": updated_options,
+                    })
+                });
+
+                let mut conns = state_clone.connections.lock().unwrap();
+                if let Some(conn) = conns.get_mut(&conn_id_clone)
+                    && let Some(id) = req_id
+                {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result_val,
+                    });
+                    let stream = conn
+                        .sessions
+                        .entry(sid_clone.clone())
+                        .or_insert_with(StreamState::new);
+                    stream.push_frame(resp, patched, false);
+                }
+            };
+
+            if let Some(delay) = delay_opt {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    respond();
+                });
+            } else {
+                respond();
             }
+
             StatusCode::ACCEPTED.into_response()
         }
         Some(
