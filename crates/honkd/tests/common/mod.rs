@@ -88,6 +88,10 @@ impl Honkd {
         format!("ws://{}/acp", self.addr)
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     pub fn kill9(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

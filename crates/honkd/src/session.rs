@@ -302,6 +302,8 @@ pub enum SessionMsg {
     Rebuilt {
         token: u64,
         frames: Vec<Value>,
+        /// The export permit, held until the new log generation is built (honk-9qf.37).
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
         keys: std::collections::HashSet<honk_wire::BlockKey>,
         export_used: Option<u64>,
         resume_from: Option<u64>,
@@ -1047,7 +1049,7 @@ impl Session {
             }
         });
         let stamped_opt = match self.log.append(vec![(None, synth_frame)]) {
-            Ok(entries) => entries.last().map(|e| e.frame.clone()),
+            Ok(mut frames) => frames.pop(),
             Err(_) => None,
         };
         if let Some(frame) = stamped_opt {
@@ -1498,10 +1500,12 @@ impl Session {
                             keys.insert(k);
                         }
                     }
+                    let permit = export_val.into_permit();
                     let _ = self_tx
                         .send(SessionMsg::Rebuilt {
                             token,
                             frames,
+                            permit,
                             keys,
                             export_used,
                             resume_from,
@@ -1531,7 +1535,7 @@ impl Session {
         resume_from: Option<u64>,
         client_prompts: usize,
     ) {
-        let carried_usage = crate::log::last_usage_frame(self.log.entries()).cloned();
+        let carried_usage = crate::log::last_usage_frame(self.log.entries());
         let buffered = std::mem::take(&mut self.rebuilding_buffered_frames);
         let (new_log, _next_epoch) = match create_new_generation_from_export(
             &self.sid,
@@ -1789,8 +1793,15 @@ impl Session {
     }
 
     fn send_to_viewer(&mut self, viewer_id: ViewerId, frame: Value) -> bool {
+        self.send_msg_to_viewer(
+            viewer_id,
+            axum::extract::ws::Message::Text(frame.to_string().into()),
+        )
+    }
+
+    fn send_msg_to_viewer(&mut self, viewer_id: ViewerId, msg: axum::extract::ws::Message) -> bool {
         if let Some((tx, _)) = self.viewers.get(&viewer_id) {
-            if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
+            if !tx.send_frame(msg) {
                 self.viewers.remove(&viewer_id);
                 return false;
             }
@@ -2233,7 +2244,7 @@ impl Session {
                     self.fan_out_legacy(&legacy_frame);
                 } else {
                     let stamped = match self.log.append(vec![(id_opt, frame)]) {
-                        Ok(entries) => entries.last().map(|e| e.frame.clone()),
+                        Ok(mut frames) => frames.pop(),
                         Err(e) => {
                             tracing::error!("failed to append frame to session log: {e:#}");
                             None
@@ -2631,7 +2642,7 @@ impl Session {
 
                     // Record first -> fan out stamped entry
                     let stamped = match self.log.append(vec![(None, synth_frame.clone())]) {
-                        Ok(entries) => entries.last().map(|e| e.frame.clone()),
+                        Ok(mut frames) => frames.pop(),
                         Err(_) => None,
                     };
                     if let Some(frame) = stamped {
@@ -2925,8 +2936,8 @@ impl Session {
                 reply,
             } => {
                 let (reset, entries) = match self.log.resume(after.as_ref()) {
-                    crate::log::Resume::Reset(e) => (true, e.to_vec()),
-                    crate::log::Resume::Delta(e) => (false, e.to_vec()),
+                    crate::log::Resume::Reset(e) => (true, e),
+                    crate::log::Resume::Delta(e) => (false, e),
                 };
                 let head = self.log.head();
 
@@ -2945,10 +2956,9 @@ impl Session {
                     ));
                 }
 
+                msgs.reserve(entries.len() + 3 + self.pending_server_requests.len());
                 for entry in entries {
-                    msgs.push(axum::extract::ws::Message::Text(
-                        entry.frame.to_string().into(),
-                    ));
+                    msgs.push(axum::extract::ws::Message::Text(entry.raw().clone()));
                 }
 
                 let mut load_res = self.init_result.clone();
@@ -3663,6 +3673,7 @@ impl Session {
             SessionMsg::Rebuilt {
                 token,
                 frames,
+                permit,
                 keys,
                 export_used,
                 resume_from,
@@ -3681,6 +3692,7 @@ impl Session {
                 }
                 self.on_rebuilt(frames, keys, export_used, resume_from, client_prompts)
                     .await;
+                drop(permit);
             }
             SessionMsg::ReplyText {
                 owners,
@@ -3777,7 +3789,8 @@ impl Session {
                 let up_id = upstream_id.clone();
                 self.ambiguous_export_in_flight = true;
                 tokio::spawn(async move {
-                    let res = hub.export(&sid).await;
+                    // Release the export permit before queueing the result on the actor.
+                    let res = hub.export(&sid).await.map(crate::hub::Export::into_value);
                     let _ = self_tx
                         .send(SessionMsg::AmbiguousExportResult {
                             token,
@@ -4481,24 +4494,29 @@ impl Session {
     }
 
     fn fan_out_stamped(&mut self, stamped_frame: &Value, honk_aware_only: bool) {
+        // Serialize once per variant; every viewer's queue then shares the same bytes.
+        let mut stamped_msg = None;
+        let mut legacy_msg = None;
         let mut to_send = Vec::new();
-        let mut legacy_frame = None;
 
         for (vid, (_, is_honk_aware)) in &self.viewers {
             if *is_honk_aware {
-                to_send.push((*vid, stamped_frame.clone()));
+                let msg = stamped_msg.get_or_insert_with(|| {
+                    axum::extract::ws::Message::Text(stamped_frame.to_string().into())
+                });
+                to_send.push((*vid, msg.clone()));
             } else if !honk_aware_only {
-                let frame = legacy_frame.get_or_insert_with(|| {
+                let msg = legacy_msg.get_or_insert_with(|| {
                     let mut f = stamped_frame.clone();
                     crate::rpc::strip_honk_meta(&mut f);
-                    f
+                    axum::extract::ws::Message::Text(f.to_string().into())
                 });
-                to_send.push((*vid, frame.clone()));
+                to_send.push((*vid, msg.clone()));
             }
         }
 
-        for (vid, frame) in to_send {
-            self.send_to_viewer(vid, frame);
+        for (vid, msg) in to_send {
+            self.send_msg_to_viewer(vid, msg);
         }
     }
 
@@ -4527,9 +4545,7 @@ impl Session {
             reset_frame.to_string().into(),
         ));
         for entry in self.log.entries() {
-            msgs.push(axum::extract::ws::Message::Text(
-                entry.frame.to_string().into(),
-            ));
+            msgs.push(axum::extract::ws::Message::Text(entry.raw().clone()));
         }
         msgs.push(axum::extract::ws::Message::Text(
             replay_done_frame.to_string().into(),
@@ -4717,7 +4733,7 @@ impl Session {
             .log
             .entries()
             .iter()
-            .position(|e| is_user_message_chunk_with_id(&e.frame, &target));
+            .position(|e| is_user_message_chunk_with_id(&e.frame(), &target));
         let Some(cut_idx) = cut_idx else {
             let err = crate::rpc::error(
                 id,
@@ -4731,14 +4747,14 @@ impl Session {
 
         let kept_entries = &self.log.entries()[..cut_idx];
         let tail_entries = &self.log.entries()[cut_idx..];
-        let tail_frames: Vec<Value> = tail_entries.iter().map(|e| e.frame.clone()).collect();
+        let tail_frames: Vec<Value> = tail_entries.iter().map(|e| e.frame()).collect();
         let kept_frames: Vec<(Option<u64>, Value)> = kept_entries
             .iter()
-            .map(|e| (e.upstream_id, e.frame.clone()))
+            .map(|e| (e.upstream_id, e.frame()))
             .collect();
-        let turns = tail_entries
+        let turns = tail_frames
             .iter()
-            .filter_map(|e| user_message_chunk_id(&e.frame))
+            .filter_map(user_message_chunk_id)
             .collect::<HashSet<_>>()
             .len();
 
@@ -4952,7 +4968,7 @@ impl Session {
             .log
             .entries()
             .iter()
-            .map(|e| (e.upstream_id, e.frame.clone()))
+            .map(|e| (e.upstream_id, e.frame()))
             .collect();
         for f in frames_to_restore {
             combined_frames.push((None, f.clone()));
@@ -5251,7 +5267,7 @@ mod tests {
         assert_eq!(entries[0].upstream_id, None);
         assert_eq!(
             entries[0]
-                .frame
+                .frame()
                 .pointer("/params/update/content/text")
                 .and_then(Value::as_str),
             Some("export text")
@@ -5261,7 +5277,7 @@ mod tests {
         assert_eq!(entries[1].upstream_id, None);
         assert_eq!(
             entries[1]
-                .frame
+                .frame()
                 .pointer("/params/update/used")
                 .and_then(Value::as_u64),
             Some(100)
@@ -5274,7 +5290,7 @@ mod tests {
         assert_eq!(entries[3].upstream_id, Some(11));
         assert_eq!(
             entries[3]
-                .frame
+                .frame()
                 .pointer("/params/update/used")
                 .and_then(Value::as_u64),
             Some(300)
@@ -5333,7 +5349,8 @@ mod tests {
 
         let entries1 = log1.entries();
         assert_eq!(entries1.len(), 2);
-        let u1 = entries1[1].frame.pointer("/params/update").unwrap();
+        let u1_frame = entries1[1].frame();
+        let u1 = u1_frame.pointer("/params/update").unwrap();
         assert_eq!(u1.get("used").and_then(Value::as_u64), Some(175));
         assert_eq!(u1.get("size").and_then(Value::as_u64), Some(200));
         assert_eq!(
@@ -5448,6 +5465,9 @@ mod tests {
             control_connected_notify: Arc::new(tokio::sync::Notify::new()),
             control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::hub::MAX_CONCURRENT_EXPORTS,
+            )),
             upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
             pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -5690,6 +5710,9 @@ mod tests {
             control_connected_notify: Arc::new(tokio::sync::Notify::new()),
             control_reconnecting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reactivation_slot: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
+            export_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::hub::MAX_CONCURRENT_EXPORTS,
+            )),
             upstream_ids: Arc::new(tokio::sync::Mutex::new(crate::rpc::UpstreamIds::new(1))),
             pending_control: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -6687,7 +6710,8 @@ mod tests {
 
         let entries = session.log.entries();
         assert_eq!(entries.len(), 1);
-        let update = entries[0].frame.pointer("/params/update").unwrap();
+        let update_frame = entries[0].frame();
+        let update = update_frame.pointer("/params/update").unwrap();
         assert_eq!(
             update.get("sessionUpdate").and_then(Value::as_str),
             Some("user_message_chunk")
@@ -6712,7 +6736,8 @@ mod tests {
 
         let entries = session.log.entries();
         assert_eq!(entries.len(), 2);
-        let update2 = entries[1].frame.pointer("/params/update").unwrap();
+        let update2_frame = entries[1].frame();
+        let update2 = update2_frame.pointer("/params/update").unwrap();
         assert_eq!(
             update2.get("messageId").and_then(Value::as_str),
             Some("synth_req_42")
@@ -6792,7 +6817,7 @@ mod tests {
         assert_eq!(session.log.entries().len(), 1);
         assert_eq!(
             session.log.entries()[0]
-                .frame
+                .frame()
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str),
             Some("msg_other_9999")
@@ -7396,7 +7421,7 @@ mod tests {
         assert_eq!(session.log.entries().len(), 2);
         assert_eq!(
             session.log.entries()[0]
-                .frame
+                .frame()
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str),
             Some(h1_id)
@@ -7571,7 +7596,7 @@ mod tests {
         assert_eq!(session.log.entries().len(), 2);
         assert_eq!(
             session.log.entries()[0]
-                .frame
+                .frame()
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str),
             Some(h1_id)
@@ -8066,7 +8091,7 @@ mod tests {
         assert_eq!(new_log.entries().len(), 2);
         assert_eq!(
             new_log.entries()[0]
-                .frame
+                .frame()
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str),
             Some(h1_id)
@@ -8207,7 +8232,7 @@ mod tests {
         assert_eq!(new_log.entries().len(), 3);
         assert_eq!(
             new_log.entries()[2]
-                .frame
+                .frame()
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str),
             Some("asst_live")

@@ -39,6 +39,7 @@ async fn activation_extension_set_against_wider_config() -> anyhow::Result<()> {
     // Start StubGoose with config.yaml enabling both developer AND todo
     let config = StubGooseConfig {
         extra_extensions: vec!["todo".to_string()],
+        ..Default::default()
     };
     let Some(goose) = StubGoose::start_with_config_or_skip(config).await else {
         eprintln!("skipping activation test: HONK_GOOSE_BIN unset or not found");

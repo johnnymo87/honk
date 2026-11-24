@@ -2,6 +2,7 @@ pub mod config;
 pub mod downstream;
 pub mod hub;
 pub mod log;
+pub mod malloc;
 pub mod mcp;
 pub mod models;
 pub mod oneshot;

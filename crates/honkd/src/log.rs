@@ -1,14 +1,41 @@
 use anyhow::Result;
+use axum::extract::ws::Utf8Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// One logged frame. The frame is held as its serialized JSON text, not a `serde_json::Value`:
+/// a `Value` tree costs ~7x its JSON size, and an actor holds every entry of its session's
+/// log for as long as it lives (honk-9qf.37). The text is refcounted, so replaying it to a
+/// viewer shares the bytes instead of copying them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub seq: u64,
     pub upstream_id: Option<u64>,
-    pub frame: Value,
+    raw: Utf8Bytes,
+}
+
+impl Entry {
+    pub fn new(seq: u64, upstream_id: Option<u64>, frame: &Value) -> Self {
+        Self {
+            seq,
+            upstream_id,
+            raw: Utf8Bytes::from(frame.to_string()),
+        }
+    }
+
+    /// The frame's JSON text, exactly as logged (stamped with `_meta.honk`).
+    pub fn raw(&self) -> &Utf8Bytes {
+        &self.raw
+    }
+
+    /// Parse the frame. Allocates a full `Value` tree; use for rare inspection only.
+    pub fn frame(&self) -> Value {
+        // `raw` only ever comes from serializing a Value or from a line `open` parsed.
+        serde_json::from_str(self.raw.as_str()).unwrap_or(Value::Null)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -37,15 +64,37 @@ struct BorrowedLogLine<'a> {
     seq: Option<u64>,
     id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    frame: Option<&'a Value>,
+    frame: Option<&'a RawValue>,
 }
 
 #[derive(Deserialize)]
-struct OwnedLogLine {
+struct RawLogLine<'a> {
     seq: Option<u64>,
     id: Option<u64>,
-    #[serde(default)]
-    frame: Option<Value>,
+    #[serde(default, borrow)]
+    frame: Option<&'a RawValue>,
+}
+
+/// Serialize one stamped frame: its log line (appended to `buf`) and its entry.
+fn encode_line(
+    buf: &mut String,
+    seq: u64,
+    upstream_id: Option<u64>,
+    frame: &Value,
+) -> Result<Entry> {
+    let raw = serde_json::value::to_raw_value(frame)?;
+    let line = BorrowedLogLine {
+        seq: Some(seq),
+        id: upstream_id,
+        frame: Some(&raw),
+    };
+    buf.push_str(&serde_json::to_string(&line)?);
+    buf.push('\n');
+    Ok(Entry {
+        seq,
+        upstream_id,
+        raw: Utf8Bytes::from(String::from(Box::<str>::from(raw))),
+    })
 }
 
 fn stamp_frame(frame: &mut Value, epoch: u64, seq: u64) {
@@ -146,18 +195,7 @@ impl SessionLog {
             if let Some(id) = upstream_id {
                 last_upstream_id = Some(last_upstream_id.map_or(id, |prev| prev.max(id)));
             }
-            let line = BorrowedLogLine {
-                seq: Some(seq),
-                id: upstream_id,
-                frame: Some(&frame),
-            };
-            buf.push_str(&serde_json::to_string(&line)?);
-            buf.push('\n');
-            entries.push(Entry {
-                seq,
-                upstream_id,
-                frame,
-            });
+            entries.push(encode_line(&mut buf, seq, upstream_id, &frame)?);
         }
 
         tmp_file.write_all(buf.as_bytes())?;
@@ -199,6 +237,8 @@ impl SessionLog {
 
         let mut data = Vec::with_capacity(file_len);
         file.read_to_end(&mut data)?;
+        // One shared buffer: every entry's text is a refcounted slice of it.
+        let data = bytes::Bytes::from(data);
 
         if data.is_empty() {
             anyhow::bail!("log file {} is empty", path.display());
@@ -230,16 +270,18 @@ impl SessionLog {
             let line_bytes = &data[line_start..line_end];
             let more_bytes_follow = line_end + 1 < data.len();
 
-            match serde_json::from_slice::<OwnedLogLine>(line_bytes) {
+            match serde_json::from_slice::<RawLogLine>(line_bytes) {
                 Ok(line) => {
                     if let Some(id) = line.id {
                         last_upstream_id = Some(last_upstream_id.map_or(id, |prev| prev.max(id)));
                     }
                     if let (Some(seq), Some(frame)) = (line.seq, line.frame) {
+                        let raw = Utf8Bytes::try_from(data.slice_ref(frame.get().as_bytes()))
+                            .map_err(|e| anyhow::anyhow!("log frame is not UTF-8: {e}"))?;
                         entries.push(Entry {
                             seq,
                             upstream_id: line.id,
-                            frame,
+                            raw,
                         });
                     }
                     valid_file_len = line_end + 1;
@@ -278,12 +320,13 @@ impl SessionLog {
         })
     }
 
-    /// Stamp params._meta.honk = {epoch, seq} and append as ONE write. Returns the stamped entries.
-    pub fn append(&mut self, frames: Vec<(Option<u64>, Value)>) -> Result<&[Entry]> {
+    /// Stamp params._meta.honk = {epoch, seq} and append as ONE write. Returns the stamped frames.
+    pub fn append(&mut self, frames: Vec<(Option<u64>, Value)>) -> Result<Vec<Value>> {
         if frames.is_empty() {
-            return Ok(&[]);
+            return Ok(Vec::new());
         }
-        let start_idx = self.entries.len();
+        let mut stamped = Vec::with_capacity(frames.len());
+        let mut new_entries = Vec::with_capacity(frames.len());
         let mut seq = self.head().seq;
         let mut buf = String::new();
 
@@ -299,22 +342,13 @@ impl SessionLog {
                 self.last_processed_id =
                     Some(self.last_processed_id.map_or(id, |prev| prev.max(id)));
             }
-            let line = BorrowedLogLine {
-                seq: Some(seq),
-                id: upstream_id,
-                frame: Some(&frame),
-            };
-            buf.push_str(&serde_json::to_string(&line)?);
-            buf.push('\n');
-            self.entries.push(Entry {
-                seq,
-                upstream_id,
-                frame,
-            });
+            new_entries.push(encode_line(&mut buf, seq, upstream_id, &frame)?);
+            stamped.push(frame);
         }
 
         self.file.write_all(buf.as_bytes())?;
-        Ok(&self.entries[start_idx..])
+        self.entries.extend(new_entries);
+        Ok(stamped)
     }
 
     /// Id-only line: a session-stream frame that was processed but not logged.
@@ -490,14 +524,18 @@ pub fn delete_redo_sidecar(log_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn last_usage_frame(entries: &[Entry]) -> Option<&Value> {
+pub fn last_usage_frame(entries: &[Entry]) -> Option<Value> {
     entries.iter().rev().find_map(|entry| {
-        if entry.frame.get("method").and_then(Value::as_str) != Some("session/update") {
+        // A usage frame carries this literal; skip parsing the (many, large) frames without it.
+        if !entry.raw.as_str().contains("\"usage_update\"") {
             return None;
         }
-        let update = entry.frame.pointer("/params/update")?;
-        honk_wire::usage(update)?;
-        Some(&entry.frame)
+        let frame = entry.frame();
+        if frame.get("method").and_then(Value::as_str) != Some("session/update") {
+            return None;
+        }
+        honk_wire::usage(frame.pointer("/params/update")?)?;
+        Some(frame)
     })
 }
 
@@ -540,31 +578,11 @@ mod tests {
     #[test]
     fn test_last_usage_frame() {
         let entries = vec![
-            Entry {
-                seq: 1,
-                upstream_id: Some(1),
-                frame: chunk("m1", "hello"),
-            },
-            Entry {
-                seq: 2,
-                upstream_id: Some(2),
-                frame: usage_frame(100, 200),
-            },
-            Entry {
-                seq: 3,
-                upstream_id: Some(3),
-                frame: chunk("m2", "world"),
-            },
-            Entry {
-                seq: 4,
-                upstream_id: Some(4),
-                frame: usage_frame(150, 200),
-            },
-            Entry {
-                seq: 5,
-                upstream_id: Some(5),
-                frame: chunk("m3", "!"),
-            },
+            Entry::new(1, Some(1), &chunk("m1", "hello")),
+            Entry::new(2, Some(2), &usage_frame(100, 200)),
+            Entry::new(3, Some(3), &chunk("m2", "world")),
+            Entry::new(4, Some(4), &usage_frame(150, 200)),
+            Entry::new(5, Some(5), &chunk("m3", "!")),
         ];
 
         let found = last_usage_frame(&entries);
@@ -578,19 +596,15 @@ mod tests {
         let empty: Vec<Entry> = vec![];
         assert_eq!(last_usage_frame(&empty), None);
 
-        let chunks_only = vec![Entry {
-            seq: 1,
-            upstream_id: Some(1),
-            frame: chunk("m1", "hello"),
-        }];
+        let chunks_only = vec![Entry::new(1, Some(1), &chunk("m1", "hello"))];
         assert_eq!(last_usage_frame(&chunks_only), None);
 
         // Frame with method != "session/update" must be ignored
         let mut entries_with_custom = entries.clone();
-        entries_with_custom.push(Entry {
-            seq: 6,
-            upstream_id: Some(6),
-            frame: crate::rpc::notification(
+        entries_with_custom.push(Entry::new(
+            6,
+            Some(6),
+            &crate::rpc::notification(
                 "_goose/unstable/session/update",
                 json!({
                     "sessionId": "s",
@@ -601,7 +615,7 @@ mod tests {
                     }
                 }),
             ),
-        });
+        ));
         let found_custom = last_usage_frame(&entries_with_custom);
         assert_eq!(
             found_custom
@@ -612,10 +626,10 @@ mod tests {
             "custom method must be ignored, returning previous session/update frame"
         );
 
-        let custom_only = vec![Entry {
-            seq: 1,
-            upstream_id: Some(1),
-            frame: crate::rpc::notification(
+        let custom_only = vec![Entry::new(
+            1,
+            Some(1),
+            &crate::rpc::notification(
                 "_goose/unstable/session/update",
                 json!({
                     "sessionId": "s",
@@ -626,8 +640,37 @@ mod tests {
                     }
                 }),
             ),
-        }];
+        )];
         assert_eq!(last_usage_frame(&custom_only), None);
+    }
+
+    #[test]
+    fn entries_hold_the_logged_json_text_across_append_and_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.jsonl");
+        let mut log = SessionLog::create(&p, 2, None, vec![(None, chunk("m", "a"))]).unwrap();
+        let stamped = log.append(vec![(Some(7), chunk("m", "b"))]).unwrap();
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(log.entries()[1].frame(), stamped[0]);
+        assert_eq!(log.entries()[1].raw().as_str(), stamped[0].to_string());
+
+        let before: Vec<String> = log.entries().iter().map(|e| e.raw().to_string()).collect();
+        drop(log);
+        let reopened = SessionLog::open(&p).unwrap();
+        let after: Vec<String> = reopened
+            .entries()
+            .iter()
+            .map(|e| e.raw().to_string())
+            .collect();
+        assert_eq!(before, after, "reopen must yield the same frame text");
+        assert_eq!(
+            reopened.entries()[0]
+                .frame()
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str),
+            Some("a")
+        );
+        assert_eq!(reopened.entries()[1].upstream_id, Some(7));
     }
 
     #[test]
@@ -736,7 +779,7 @@ mod tests {
         let p = d.path().join("s.jsonl");
         let mut log = SessionLog::create(&p, 4, None, vec![(None, chunk("m", "init"))]).unwrap();
         assert_eq!(
-            honk_wire::frame_cursor(&log.entries[0].frame),
+            honk_wire::frame_cursor(&log.entries[0].frame()),
             Some(honk_wire::Cursor { epoch: 4, seq: 1 })
         );
 
@@ -744,7 +787,7 @@ mod tests {
             .append(vec![(Some(10), chunk("m", "appended"))])
             .unwrap();
         assert_eq!(
-            honk_wire::frame_cursor(&entries[0].frame),
+            honk_wire::frame_cursor(&entries[0]),
             Some(honk_wire::Cursor { epoch: 4, seq: 2 })
         );
     }

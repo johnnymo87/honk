@@ -8,6 +8,9 @@ use tempfile::TempDir;
 #[derive(Debug, Clone, Default)]
 pub struct StubGooseConfig {
     pub extra_extensions: Vec<String>,
+    /// Top-level config.yaml lines appended after `extensions:` (e.g.
+    /// `GOOSE_AUTO_COMPACT_THRESHOLD: 0.0`).
+    pub extra_config_yaml: String,
 }
 
 pub struct StubGoose {
@@ -99,6 +102,7 @@ impl StubGoose {
 "#
             ));
         }
+        config_yaml.push_str(&config.extra_config_yaml);
         std::fs::write(config_dir.join("config.yaml"), config_yaml).expect("write config.yaml");
 
         let mut rand_bytes = [0u8; 16];
