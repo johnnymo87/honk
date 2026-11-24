@@ -1468,3 +1468,47 @@ async fn gap_rebuild_carries_usage_update_to_new_epoch() {
     assert_eq!(cost.amount, 0.08);
     assert_eq!(cost.currency, "USD");
 }
+
+/// honk-9qf.38: honkd restarts while goose has also restarted, so every held session's
+/// reattach gets a 404 and its actor retires itself at boot. A retired session must load
+/// afterwards (lazy re-activation), not fail with "Session actor terminated" because a
+/// dead handle was left in the hub.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_retired_at_boot_by_upstream_404_still_load() {
+    let mut fake = FakeGoose::start().await;
+    fake.advertise_patched(true);
+    let mut h = Honkd::spawn(&fake.url(), fake.secret_file(), &[]).await;
+    let mut v = Viewer::connect(&h).await;
+    let mut sids = Vec::new();
+    for _ in 0..6 {
+        let sid = new_session(&mut v, ".").await;
+        v.call(
+            "session/load",
+            json!({"sessionId": &sid, "cwd": ".", "mcpServers": []}),
+        )
+        .await;
+        sids.push(sid);
+    }
+    drop(v);
+    h.kill9();
+    fake.restart().await; // old connections now answer 404
+    // Slow the boot loop so early actors retire before it finishes, as large logs did.
+    h.restart_with_env(&[("HONKD_TEST_BOOT_SPAWN_DELAY_MS", "300")])
+        .await;
+    // Let every actor's reattach fail and retire.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut w = Viewer::connect(&h).await;
+    for sid in &sids {
+        let r = w
+            .call(
+                "session/load",
+                json!({"sessionId": sid, "cwd": ".", "mcpServers": []}),
+            )
+            .await;
+        assert!(
+            r.get("error").is_none(),
+            "session {sid} must load after retiring at boot: {r}"
+        );
+    }
+}

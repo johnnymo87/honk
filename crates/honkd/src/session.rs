@@ -1793,8 +1793,15 @@ impl Session {
     }
 
     fn send_to_viewer(&mut self, viewer_id: ViewerId, frame: Value) -> bool {
+        self.send_msg_to_viewer(
+            viewer_id,
+            axum::extract::ws::Message::Text(frame.to_string().into()),
+        )
+    }
+
+    fn send_msg_to_viewer(&mut self, viewer_id: ViewerId, msg: axum::extract::ws::Message) -> bool {
         if let Some((tx, _)) = self.viewers.get(&viewer_id) {
-            if !tx.send_frame(axum::extract::ws::Message::Text(frame.to_string().into())) {
+            if !tx.send_frame(msg) {
                 self.viewers.remove(&viewer_id);
                 return false;
             }
@@ -4487,24 +4494,29 @@ impl Session {
     }
 
     fn fan_out_stamped(&mut self, stamped_frame: &Value, honk_aware_only: bool) {
+        // Serialize once per variant; every viewer's queue then shares the same bytes.
+        let mut stamped_msg = None;
+        let mut legacy_msg = None;
         let mut to_send = Vec::new();
-        let mut legacy_frame = None;
 
         for (vid, (_, is_honk_aware)) in &self.viewers {
             if *is_honk_aware {
-                to_send.push((*vid, stamped_frame.clone()));
+                let msg = stamped_msg.get_or_insert_with(|| {
+                    axum::extract::ws::Message::Text(stamped_frame.to_string().into())
+                });
+                to_send.push((*vid, msg.clone()));
             } else if !honk_aware_only {
-                let frame = legacy_frame.get_or_insert_with(|| {
+                let msg = legacy_msg.get_or_insert_with(|| {
                     let mut f = stamped_frame.clone();
                     crate::rpc::strip_honk_meta(&mut f);
-                    f
+                    axum::extract::ws::Message::Text(f.to_string().into())
                 });
-                to_send.push((*vid, frame.clone()));
+                to_send.push((*vid, msg.clone()));
             }
         }
 
-        for (vid, frame) in to_send {
-            self.send_to_viewer(vid, frame);
+        for (vid, msg) in to_send {
+            self.send_msg_to_viewer(vid, msg);
         }
     }
 

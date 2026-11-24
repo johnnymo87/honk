@@ -35,8 +35,7 @@ pub struct SessionHandle {
 type ActivatingReceiver =
     tokio::sync::watch::Receiver<Option<Result<SessionHandle, ActivationError>>>;
 
-/// At most this many session exports are fetched, parsed and turned into a log generation
-/// at once. An export of a large session costs ~15x its transcript in transient memory
+/// At most this many session exports are parsed and turned into a log generation at once. An export of a large session costs ~15x its transcript in transient memory
 /// (the JSON text, its `Value` tree, the update frames); after a goose restart every held
 /// session rebuilt at once and OOM-killed honkd (honk-9qf.37).
 pub const MAX_CONCURRENT_EXPORTS: usize = 2;
@@ -419,8 +418,6 @@ impl Hub {
                 .collect()
         };
 
-        let mut session_handles = HashMap::new();
-
         for (sid, held) in held_sessions {
             let log_path = hub.state_dir.join("sessions").join(format!("{sid}.jsonl"));
             let (session_log, needs_rebuild) = if log_path.exists() {
@@ -522,9 +519,10 @@ impl Hub {
                 queued_mcp_launches: std::collections::VecDeque::new(),
             };
 
-            tokio::spawn(session.run());
-
-            session_handles.insert(
+            // Register the handle BEFORE the actor runs: an actor whose reattach gets a 404
+            // retires itself by removing its sid from hub.sessions, and a handle inserted
+            // after that would be a dead one that fails every load (honk-9qf.38).
+            hub.sessions.write().await.insert(
                 sid.clone(),
                 SessionHandle {
                     sid: sid.clone(),
@@ -532,9 +530,17 @@ impl Hub {
                     tx: session_tx,
                 },
             );
-        }
+            tokio::spawn(session.run());
 
-        *hub.sessions.write().await = session_handles;
+            // Test hook: a slow boot loop (large logs) lets early actors retire before it ends.
+            #[cfg(debug_assertions)]
+            if let Ok(ms) = std::env::var("HONKD_TEST_BOOT_SPAWN_DELAY_MS")
+                .unwrap_or_default()
+                .parse::<u64>()
+            {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
 
         for info in resolved_sidecar {
             hub.recover_sidecar_text(&info).await;
@@ -1097,22 +1103,6 @@ impl Hub {
     }
 
     pub async fn export(&self, sid: &str) -> anyhow::Result<Export> {
-        let permit = match tokio::time::timeout(
-            EXPORT_PERMIT_WAIT,
-            self.export_permits.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => Some(p),
-            Ok(Err(_)) => None, // never closed
-            Err(_) => {
-                tracing::warn!(
-                    "Session {sid}: waited {}s for an export permit; exporting without one",
-                    EXPORT_PERMIT_WAIT.as_secs()
-                );
-                None
-            }
-        };
         let export_res = self
             .session_call(
                 sid,
@@ -1130,6 +1120,24 @@ impl Hub {
             .get("data")
             .and_then(Value::as_str)
             .context("export missing data string")?;
+        // Take the permit only now: the memory is spent from here on (the parsed tree, the
+        // frames and the log generation built from it), not while goose is answering.
+        let permit = match tokio::time::timeout(
+            EXPORT_PERMIT_WAIT,
+            self.export_permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(_)) => None, // never closed
+            Err(_) => {
+                tracing::warn!(
+                    "Session {sid}: waited {}s for an export permit; exporting without one",
+                    EXPORT_PERMIT_WAIT.as_secs()
+                );
+                None
+            }
+        };
         let session_val: Value =
             serde_json::from_str(data_str).context("failed to parse export data JSON")?;
         Ok(Export {
@@ -1475,13 +1483,32 @@ impl Hub {
         notify.notify_waiters();
     }
 
+    /// The held handle for `sid`, if its actor is still running. A handle whose actor has
+    /// exited is stale (nothing should leave one, but one did: honk-9qf.38); drop it so the
+    /// caller activates a fresh actor instead of failing every request.
+    async fn live_handle(&self, sid: &str) -> Option<SessionHandle> {
+        let h = self.sessions.read().await.get(sid).cloned()?;
+        if !h.tx.is_closed() {
+            return Some(h);
+        }
+        let mut sessions = self.sessions.write().await;
+        if sessions
+            .get(sid)
+            .is_some_and(|cur| cur.tx.same_channel(&h.tx))
+        {
+            tracing::warn!("Session {sid}: dropping a stale handle to an exited actor");
+            sessions.remove(sid);
+        }
+        None
+    }
+
     pub async fn get_or_activate_session(
         &self,
         sid: &str,
     ) -> Result<SessionHandle, ActivationError> {
         loop {
             // 1. If held, return handle
-            if let Some(h) = self.sessions.read().await.get(sid).cloned() {
+            if let Some(h) = self.live_handle(sid).await {
                 return Ok(h);
             }
 
@@ -1501,7 +1528,7 @@ impl Hub {
         // 3. Coalesce concurrent activations
         let mut rx = {
             let mut activating = self.activating.lock().await;
-            if let Some(h) = self.sessions.read().await.get(sid).cloned() {
+            if let Some(h) = self.live_handle(sid).await {
                 return Ok(h);
             }
 
