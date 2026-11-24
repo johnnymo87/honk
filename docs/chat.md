@@ -177,10 +177,10 @@ Commands can be executed either from the `:` command line or by typing them dire
 | `/undo` | `:undo` | Hide the last turn across all views and fill an empty composer with the undone prompt text (files not restored; `/redo` restores until next prompt). |
 | `/redo` | `:redo` | Restore the last undone turn (until the next prompt arrives from anyone). |
 | `/mcp` | `:mcp` | List catalog MCP servers, or configure per-session servers (`/mcp list`, `/mcp enable <names>`, `/mcp disable <names>`). |
-| `/quote` | `:quote` | Load the replies since your own last prompt (as `/quote full` picks them) into the composer, trimmed by goose's default model to what you need to answer or see. The model only returns line numbers; honk copies those lines from the transcript, so every `> ` line is the agent's own words. Lines honk adds are `#` lines: a first line saying which model trimmed and how many lines it kept, each kept reply's header with a tag (`ask`, `blocker`, `done`, `fyi`), and `# …` between passages it cut apart. A reply still streaming is appended untrimmed. Replies under 4000 bytes in all are quoted in full without the model; when that happens for bare `/quote`, the notice points at `/quote N` and `/quote prev`, for when you already replied before reading. While the model runs (seconds to a minute) the status bar shows `[trimming Ns]`; Ctrl-C on an empty composer cancels the trim (not the agent's run), and sending a prompt or an untrimmed `/quote` cancels it too. Anything you type meanwhile stays below the quote when it arrives, and Ctrl-C with text in the composer keeps its usual meaning. If the call fails or the answer is unusable, it quotes all the picked replies, with a warning; if the model keeps nothing, it says so and leaves the composer alone. A span over about 100 KB of reply text is split into several calls of whole replies (about 100 KB each, four at a time), each told it sees a part, and the kept lines are merged in reply order; the notice says how many calls. If some calls fail, their replies are quoted in full, with a warning naming how many failed. The same replies again reuse the last answer, when every call succeeded. Limits that remain: each call has honkd's 90 s budget, so a very long span can take a few minutes (the status bar counts seconds, not calls); a single reply is never split, so one too long for the model is quoted whole after its call fails; spend grows with the span; and a reply still streaming is quoted as it was when you ran `/quote`. A very large untrimmed quote also makes the composer slower to redraw (about 30 ms per frame at 1 MB). The call runs through honkd's `_honk/oneshot`, on a throwaway hidden goose session with no tools, archived afterwards and tagged with the quoted session's session-tags tag, so its spend counts under the same program. |
+| `/quote` | `:quote` | Load the replies since your own last prompt (as `/quote full` picks them) into the composer, trimmed by goose's default model to what you need to answer or see. The model only returns line numbers; honk copies those lines from the transcript, so every `> ` line is the agent's own words. Lines honk adds are `#` lines: a first line saying which model trimmed and how many lines it kept, each kept reply's header with a tag (`ask`, `blocker`, `done`, `fyi`), and `# …` between passages it cut apart. A reply still streaming is appended untrimmed. Replies under 4000 bytes in all are quoted in full without the model; when that happens for bare `/quote`, the notice points at `/quote N` and `/quote prev`, for when you already replied before reading. While the model runs (seconds to a minute) the status bar shows `[trimming Ns]`; Ctrl-C on an empty composer cancels the trim (not the agent's run), and sending a prompt or an untrimmed `/quote` cancels it too. Anything you type meanwhile stays below the quote when it arrives, and Ctrl-C with text in the composer keeps its usual meaning. If the call fails or the answer is unusable, it quotes all the picked replies, with a warning; if the model keeps nothing, it says so and leaves the composer alone. A span over about 100 KB of reply text is split into several calls of whole replies (about 100 KB each, four at a time), each told it sees a part, and the kept lines are merged in reply order; the notice says how many calls. If some calls fail, their replies are quoted in full, with a warning naming how many failed. The same replies again reuse the last answer, when every call succeeded. Limits that remain: each call has honkd's 90 s budget, so a very long span can take a few minutes (the status bar counts seconds, not calls); a single reply is never split, so one too long for the model is quoted whole after its call fails; spend grows with the span; and a reply still streaming is quoted as it was when you ran `/quote`. A very large untrimmed quote also makes the composer slower to redraw (about 30 ms per frame at 1 MB). honkd does the pick and the trim (`_honk/quote`, below; pigeon's Slack `/quote` makes the same call), each model call through `_honk/oneshot`, on a throwaway hidden goose session with no tools, archived afterwards and tagged so its spend counts under the right program: a stall-watch coordinator's program (its tag comes from the coordinator's working directory, since coordinators themselves are tagged `stall-watcher-runs`), otherwise the quoted session's own tag. |
 | `/quote N` | `:quote N` | `/quote`'s trim over the last N replies instead, for when you already replied and bare `/quote` finds little. Any N works; asking for more replies than the session has quotes them all, saying how many. |
 | `/quote prev` | `:quote prev` | `/quote`'s trim over every reply since your previous prompt (the one before your last), the replies to both prompts included. With only one prompt of yours in the transcript it counts from that one, saying so. |
-| `/quote full` | `:quote full` | Any of the forms above untrimmed, with no model call: `/quote full` (since your last prompt), `/quote full N`, `/quote full prev`. `/quote all` is the same as `/quote full`. "Since your last prompt" starts with the reply to it: wakes, swarm messages, scheduled messages, prompts goose wrote and `/compact` (stall-watch sends those too) don't count as yours; a plain-text prompt another agent wrote, such as a launch prompt, does, since nothing marks it. There is no cap on how many replies any form picks: honk chat replays the whole session history when it attaches, so every reply goose kept is there to quote. If you haven't spoken in the loaded transcript it falls back to the last 3 (the trimmed forms too), and if nothing has replied since your prompt it warns instead. |
+| `/quote full` | `:quote full` | Any of the forms above untrimmed, with no model call: `/quote full` (since your last prompt), `/quote full N`, `/quote full prev`. `/quote all` is the same as `/quote full`. "Since your last prompt" starts with the reply to it: wakes, swarm messages, scheduled messages, prompts goose wrote and `/compact` (stall-watch sends those too) don't count as yours; a plain-text prompt another agent wrote, such as a launch prompt, does, since nothing marks it. There is no cap on how many replies any form picks: honkd reads the session's whole log, so every reply goose kept is there to quote. If you haven't spoken in the loaded transcript it falls back to the last 3 (the trimmed forms too), and if nothing has replied since your prompt it warns instead. |
 | Quote format | | Every form loads replies into the composer, oldest first, each quoted with `> ` under a `# MM-DD HH:MM (trigger)` header, and maximizes the composer in normal mode. A turn counts only if the agent wrote reply text in it; thoughts, tool calls and the message that started the turn (a stall-watch wake, a swarm message, or your own prompt) are left out, and `/compact` turns are skipped. The trigger is `you`, `wake: <reason>`, `swarm: <sender>`, `scheduled`, `goose` (a prompt goose wrote itself), or `start`; `in progress` marks a reply still streaming. `/quote` replaces the composer; `:quote` keeps your draft below the quotes. No `/quote` form is sent upstream. |
 | `/yank` | `:yank` | Copy the text of the latest assistant message to the system clipboard via ANSI OSC 52 (refused if >100 KB base64). |
 | — | `:dump` | Write entire transcript to a temporary markdown file (`honk-dump-*.md`) and open in `$PAGER` or `$EDITOR` (defaults to `less -R`). |
@@ -296,7 +296,7 @@ When creating a new session with `honk chat --new`:
 ### `_honk/oneshot`
 
 One model call outside any session's conversation, used by `/quote`'s trim. Request
-`{system, prompt, effort?, timeoutMs?, oneshotId?, tagFrom?}`; reply `{text, model}`, or error `-32800`
+`{system, prompt, effort?, timeoutMs?, oneshotId?, tagFrom?, tag?}`; reply `{text, model}`, or error `-32800`
 when cancelled. honkd opens a side connection to goose, creates a hidden session with no
 extensions in an empty directory under its state dir, replaces goose's base system prompt with
 `system` (goose still appends its hints), sets `thinking_effort` if given, prompts, collects the
@@ -304,10 +304,43 @@ agent's text, and archives the session (`_goose/unstable/session/archive`; `sess
 also delete its usage records, which session-tags counts spend from). With `--session-tags-bin`
 and `tagFrom` (a goose session id), honkd copies that session's tag onto the new one
 (`session-tags which goose:<tagFrom>`, then `set <tag> goose:<new>`); an `auto:` tag is not
-copied. No model is set, so goose's configured default runs it.
+copied. An explicit `tag` is set instead of `tagFrom`'s. No model is set, so goose's configured default runs it.
 `timeoutMs` defaults to 90 s and is capped at 300 s. `_honk/oneshot/cancel {oneshotId}` cancels
 a call made on the same connection, and so does closing the connection. A session left behind by
 a honkd that died mid-call is archived at the next start.
+
+### `_honk/quote`
+
+`/quote`'s pick and trim, shared by honk chat and pigeon's Slack `/quote` (honk-9qf.31.7).
+Request `{sessionId, pick: {kind: "since"} | {kind: "prev"} | {kind: "last", n}, full?, tag?,
+quoteId?}`. honkd reads the session's log (`<state>/sessions/<sid>.jsonl`) line by line, without
+loading an idle session into goose, rebuilds the turns as honk chat's transcript would, picks
+the replies with the fallbacks above (only one prompt of yours: count from it; none: the last
+3), and unless `full`, trims them with one `_honk/oneshot` call per batch of about 100 KB,
+four at a time. A reply still streaming (the session is running) is marked in progress and
+never sent to the model. The last 16 fully good trim answers are remembered, so the same
+replies again cost nothing. `tag` names the session-tags tag the model calls are charged to;
+without it, a stall-watch coordinator's program (read from the working directory of a session honkd holds; a coordinator honkd has let go of is charged to its own tag), else the quoted session's tag. `never_spoke` and `one_prompt` are not returned today, since honkd falls back instead (counting from your only prompt, or the last 3 replies); a session with nothing to quote is `no_replies`. Use a fresh `quoteId` per request: a second request with the same id on the same connection cancels the first.
+
+Reply:
+
+```jsonc
+{ "summary": "# honk: trimmed by claude-opus-5-5, kept 12 of 80 lines from 3 of 5 replies",
+                                       // null when untrimmed
+  "replies": [{ "header": "# 11-24 13:05 (wake: mail) · ask",   // as the composer shows it
+                "passages": [["line", "", "line"], ["line"]],    // verbatim, unquoted
+                "inProgress": false }],
+  "notices": ["trimmed 5 replies since your last prompt to what needs you"],
+  "warnings": [],                      // e.g. trim failed, quoted them all, untrimmed
+  "empty": null,                       // or no_replies | never_spoke | nothing_since
+                                       //    | one_prompt | nothing_kept (reason in notices)
+  "model": "claude-opus-5-5" }
+```
+
+honk chat's composer text is the summary, then each reply's header and its passages as `> `
+lines with `# …` between passages, blocks separated by a blank line. An unknown session or bad
+params is error -32602; `_honk/quote/cancel {quoteId}` (or closing the connection) cancels it
+with -32800, and each model call still archives its session.
 
 ---
 

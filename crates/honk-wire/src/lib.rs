@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 pub mod export;
 pub mod prompt_kind;
+pub mod quote;
 
 pub use prompt_kind::{Trigger, classify, is_human_prompt};
 

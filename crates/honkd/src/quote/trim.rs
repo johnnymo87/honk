@@ -1,5 +1,6 @@
-//! `/quote`'s model trim (honk-9qf.31.4, .5): the default model picks which lines of the
-//! picked replies (since your last prompt, the last N, or since your previous prompt) you need to see, and honk quotes those lines from the source.
+//! `/quote`'s model trim (honk-9qf.31.4, .5; in honkd since .7): the default model picks which
+//! lines of the picked replies (since your last prompt, the last N, or since your previous
+//! prompt) you need to see, and honkd quotes those lines from the source.
 //!
 //! The model only ever answers with line numbers (see [`SYSTEM`]); every quoted word is copied
 //! from the transcript, so nothing it writes can reach the composer as a quote. The lines honk
@@ -9,7 +10,8 @@
 //! call is split into [`batches`] of whole replies, each trimmed by its own call (a few at a
 //! time), and the kept lines are merged back in reply order ([`merge`]).
 
-use crate::tui::quote::{Reply, quote_lines};
+use super::pick::Reply;
+use honk_wire::quote::QuotedReply;
 use serde_json::Value;
 
 /// Below this many bytes of quote, trimming would not save reading; quote it all at once.
@@ -372,17 +374,17 @@ fn non_blank(lines: &[&str]) -> usize {
     lines.iter().filter(|l| !l.trim().is_empty()).count()
 }
 
-/// The composer text: a `#` summary line, then each kept reply's passages, quoted, with a
-/// `# …` line between passages that are not adjacent. A reply still being written follows,
-/// untrimmed. `model`: which model trimmed, for the summary line.
-pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
+/// The trimmed quote: a `#` summary line, then each kept reply with its passages (the
+/// composer puts a `# …` line between two). A reply still being written follows, untrimmed.
+/// `model`: which model trimmed, for the summary line.
+pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> (String, Vec<QuotedReply>) {
     let sent = sendable(replies);
     let total_lines: usize = sent
         .iter()
         .map(|r| non_blank(&r.text.lines().collect::<Vec<_>>()))
         .sum();
     let mut kept_lines = 0;
-    let mut blocks = Vec::new();
+    let mut out = Vec::new();
     for k in kept {
         let r = sent[k.reply];
         let lines: Vec<&str> = r.text.lines().collect();
@@ -397,7 +399,7 @@ pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
             }
             if !slice.is_empty() {
                 kept_lines += non_blank(slice);
-                passages.push(quote_lines(slice.iter().copied()));
+                passages.push(slice.iter().map(|l| l.to_string()).collect());
             }
         }
         if passages.is_empty() {
@@ -407,26 +409,26 @@ pub fn render(replies: &[Reply], kept: &[Kept], model: Option<&str>) -> String {
         if let Some(t) = k.tag {
             header.push_str(&format!(" · {t}"));
         }
-        blocks.push(format!("{header}\n{}", passages.join("\n# …\n")));
+        out.push(QuotedReply {
+            header,
+            passages,
+            in_progress: false,
+        });
     }
     let by = model.map(|m| format!(" by {m}")).unwrap_or_default();
-    let mut out = format!(
+    let summary = format!(
         "# honk: trimmed{by}, kept {kept_lines} of {total_lines} lines from {} of {} replies",
-        blocks.len(),
+        out.len(),
         sent.len()
     );
-    for b in blocks {
-        out.push_str("\n\n");
-        out.push_str(&b);
-    }
     for r in replies.iter().filter(|r| r.in_progress) {
-        out.push_str(&format!(
-            "\n\n{} · untrimmed\n{}",
-            r.header,
-            quote_lines(r.text.lines())
-        ));
+        out.push(QuotedReply {
+            header: format!("{} · untrimmed", r.header),
+            passages: vec![r.text.lines().map(str::to_string).collect()],
+            in_progress: true,
+        });
     }
-    out
+    (summary, out)
 }
 
 #[cfg(test)]
@@ -577,6 +579,15 @@ mod tests {
         );
     }
 
+    fn text((summary, replies): (String, Vec<QuotedReply>)) -> String {
+        honk_wire::quote::QuoteReply {
+            summary: Some(summary),
+            replies,
+            ..Default::default()
+        }
+        .composer_text()
+    }
+
     fn reply(header: &str, text: &str) -> Reply {
         Reply {
             header: format!("# {header}"),
@@ -675,7 +686,7 @@ mod tests {
             tag: Some("ask"),
         }];
         assert_eq!(
-            render(&rs, &kept, Some("claude-opus-5-5")),
+            text(render(&rs, &kept, Some("claude-opus-5-5"))),
             "# honk: trimmed by claude-opus-5-5, kept 2 of 5 lines from 1 of 2 replies\n\n\
              # T1 (wake: x) · ask\n> keep one\n# …\n> keep two\n\n\
              # T3 (wake: z, in progress) · untrimmed\n> partial"
@@ -690,7 +701,7 @@ mod tests {
             ranges: vec![(1, 3)],
             tag: None,
         }];
-        let out = render(&rs, &kept, None);
+        let out = text(render(&rs, &kept, None));
         assert!(out.ends_with("# T1 (you)\n> a\n>\n> b"), "{out}");
         assert!(
             out.starts_with("# honk: trimmed, kept 2 of 2 lines"),

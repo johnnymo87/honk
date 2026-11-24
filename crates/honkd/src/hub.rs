@@ -97,6 +97,10 @@ pub struct Hub {
     pub in_flight_creations: Arc<std::sync::atomic::AtomicUsize>,
     pub next_actor_id: Arc<std::sync::atomic::AtomicU64>,
     pub mcp: Option<crate::mcp::McpConfig>,
+    /// `_honk/quote`: log reads at once, the last trim answers, and bytes per model call.
+    pub quote_reads: Arc<tokio::sync::Semaphore>,
+    pub quote_cache: Arc<std::sync::Mutex<crate::quote::AnswerCache>>,
+    pub quote_batch_bytes: usize,
 }
 
 pub fn validate_swarm_args(args: &Args) -> anyhow::Result<()> {
@@ -348,6 +352,11 @@ impl Hub {
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             mcp,
+            quote_reads: Arc::new(tokio::sync::Semaphore::new(
+                crate::quote::MAX_CONCURRENT_READS,
+            )),
+            quote_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+            quote_batch_bytes: crate::quote::trim::BATCH_BYTES,
         });
 
         *hub.self_weak.write().unwrap() = Some(Arc::downgrade(&hub));

@@ -425,6 +425,8 @@ pub struct Viewer {
     /// In-flight `_honk/oneshot` calls by client `oneshotId`. Dropping a sender (the viewer
     /// disconnecting) cancels its call.
     pub oneshots: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// In-flight `_honk/quote` calls by client `quoteId`, cancelled the same way.
+    pub quotes: HashMap<String, tokio::sync::oneshot::Sender<()>>,
 }
 
 async fn dispatch_session_msg<F>(
@@ -576,6 +578,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
         attached_sessions: HashSet::new(),
         tx: viewer_tx,
         oneshots: HashMap::new(),
+        quotes: HashMap::new(),
     };
 
     while let Some(msg_res) = ws_receiver.next().await {
@@ -1359,6 +1362,60 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                     let key = params.get("oneshotId").and_then(Value::as_str);
                     let found = key
                         .and_then(|k| viewer.oneshots.remove(k))
+                        .map(|tx| tx.send(()).is_ok())
+                        .unwrap_or(false);
+                    if !id.is_null() {
+                        let resp = crate::rpc::response(id, json!({ "cancelled": found }));
+                        if !viewer.tx.send_frame(Message::Text(resp.to_string().into())) {
+                            break;
+                        }
+                    }
+                    continue;
+                } else if method == Some(honk_wire::quote::METHOD) {
+                    let req = match serde_json::from_value::<honk_wire::quote::QuoteReq>(
+                        params.clone(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let err_resp = crate::rpc::error(
+                                id,
+                                -32602,
+                                format!("invalid _honk/quote params: {e}"),
+                                None,
+                            );
+                            if !viewer
+                                .tx
+                                .send_frame(Message::Text(err_resp.to_string().into()))
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                    viewer.quotes.retain(|_, tx| !tx.is_closed());
+                    let key = req
+                        .quote_id
+                        .clone()
+                        .unwrap_or_else(|| format!("_anon_{id}"));
+                    viewer.quotes.insert(key, cancel_tx);
+                    let hub = hub.clone();
+                    let tx = viewer.tx.clone();
+                    tokio::spawn(async move {
+                        let resp = match hub.quote(req, cancel_rx).await {
+                            Ok(reply) => crate::rpc::response(
+                                id,
+                                serde_json::to_value(reply).unwrap_or(Value::Null),
+                            ),
+                            Err(e) => crate::rpc::error(id, e.code(), e.message(), None),
+                        };
+                        let _ = tx.send_frame(Message::Text(resp.to_string().into()));
+                    });
+                    continue;
+                } else if method == Some(honk_wire::quote::CANCEL) {
+                    let key = params.get("quoteId").and_then(Value::as_str);
+                    let found = key
+                        .and_then(|k| viewer.quotes.remove(k))
                         .map(|tx| tx.send(()).is_ok())
                         .unwrap_or(false);
                     if !id.is_null() {
