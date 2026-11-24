@@ -5478,6 +5478,9 @@ mod tests {
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             mcp: None,
+            quote_reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            quote_cache: Default::default(),
+            quote_batch_bytes: crate::quote::trim::BATCH_BYTES,
         });
 
         // Seeded from log::last_usage_frame
@@ -5723,6 +5726,9 @@ mod tests {
             in_flight_creations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_actor_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             mcp: None,
+            quote_reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            quote_cache: Default::default(),
+            quote_batch_bytes: crate::quote::trim::BATCH_BYTES,
         });
 
         let session = Session {

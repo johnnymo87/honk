@@ -17,13 +17,9 @@ use crate::tui::activity;
 use crate::tui::composer;
 use crate::tui::keys::{Action, configure_key_handler, resolve};
 use crate::tui::model_picker::{ModelPicker, PickerOutcome};
-use crate::tui::quote;
 use crate::tui::status::StatusBar;
 use crate::tui::transcript::{Transcript, Viewport};
-use crate::tui::trim as quote_trim;
-
-/// Replies bare `/quote` loads when the transcript has no prompt of yours to count from.
-const QUOTE_FALLBACK: usize = 3;
+use honk_wire::quote::{Empty, Pick, QuoteReply, QuoteReq};
 
 /// Transcript rows kept visible above a maximized composer.
 const MAXIMIZED_TRANSCRIPT_ROWS: u16 = 3;
@@ -97,94 +93,68 @@ pub struct App {
     pub animate: bool,
     /// The activity indicator text as last drawn, to redraw only when it changes.
     drawn_activity: Option<String>,
-    /// Where `/quote`'s model trim runs (see `tui::trim`).
+    /// Where `/quote` runs: honkd's `_honk/quote`, which picks and trims.
     pub trim_backend: TrimBackend,
-    /// The trim in flight, if any.
+    /// The `/quote` in flight, if any.
     pub trim: Option<PendingTrim>,
     trim_seq: u64,
     trim_tx: mpsc::UnboundedSender<TrimDone>,
     pub trim_rx: Option<mpsc::UnboundedReceiver<TrimDone>>,
-    /// The last answers (one per call), by a hash of their prompts: re-running `/quote` on the
-    /// same replies is free.
-    trim_cache: Option<(u64, Vec<quote_trim::Answer>)>,
-    /// Bytes of replies per model call (`trim::BATCH_BYTES`; smaller in tests).
-    trim_batch_bytes: usize,
     /// Last elapsed second drawn in the status bar, so the tick only redraws when it changes.
     trim_drawn_secs: Option<u64>,
 }
 
-/// Where `/quote`'s model call goes.
+/// Where `/quote` goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TrimBackend {
-    /// No model call: the trimmed forms quote everything, as `/quote full` does.
+    /// Nowhere: `/quote` says so.
     #[default]
     None,
-    /// honkd's `_honk/oneshot`, on a connection of its own.
+    /// honkd's `_honk/quote`, on a connection of its own.
     Honkd { url: String, secret: String },
-    /// Tests: record the prompt instead of calling anything.
+    /// Tests: record the request; the test answers it with `on_trim_done`.
     #[cfg(test)]
     Record,
 }
 
-/// A trim in flight: what it was asked about, and how to stop it.
+/// A `/quote` in flight: what it asked, and how to stop it.
 pub struct PendingTrim {
     pub seq: u64,
     pub started: std::time::Instant,
-    pub quoted: quote::Quoted,
+    pub req: QuoteReq,
     /// The untrimmed form of the same pick (`/quote full 5`), for notices.
     pub full: String,
-    pub key: u64,
-    /// One prompt per model call, and the replies (indexes into the sendable ones) each covers.
-    pub prompts: Vec<String>,
-    pub batches: Vec<std::ops::Range<usize>>,
-    /// Each call's answer, as it arrives.
-    answers: Vec<Option<TrimResult>>,
-    aborts: Vec<tokio::task::AbortHandle>,
+    /// The composer text when it was asked: if it is still that when the answer comes, the
+    /// quote goes above it with the cursor at the top, as an immediate quote would.
+    draft: String,
+    abort: Option<tokio::task::AbortHandle>,
 }
 
-type TrimResult = Result<quote_trim::Answer, String>;
-
-/// A finished model call: the answer text and the model, or why it failed.
+/// honkd's answer to a `/quote`, or why there is none.
 #[derive(Debug)]
 pub struct TrimDone {
     pub seq: u64,
-    /// Which of the trim's calls (index into `PendingTrim::prompts`).
-    pub part: usize,
-    pub result: TrimResult,
+    pub result: Result<QuoteReply, String>,
 }
 
-/// How long honk waits for honkd's answer (honkd's own limit is 90 s).
-const TRIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(100);
+/// How long honk waits for honkd's answer. A long span takes several model calls (90 s
+/// each, four at a time), so this is generous; Ctrl-C cancels sooner.
+const QUOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Asks honkd's `_honk/oneshot` to trim; the answer text and the model that wrote it.
-/// `tag_from`: the session being quoted; honkd tags the model call's session like it, so the
-/// call's spend lands under the same program in session-tags.
-pub async fn run_trim(
-    url: String,
-    secret: String,
-    prompt: String,
-    tag_from: Option<String>,
-) -> Result<(String, Option<String>), String> {
+/// Asks honkd's `_honk/quote` for a quote. Closing the connection (aborting this) cancels it.
+pub async fn run_quote(url: String, secret: String, req: QuoteReq) -> Result<QuoteReply, String> {
     let call = async {
         let mut client = crate::client::Client::connect(&url, &secret)
             .await
             .map_err(|e| format!("{e:#}"))?;
+        let params = serde_json::to_value(&req).map_err(|e| e.to_string())?;
         let res = client
-            .call(
-                "_honk/oneshot",
-                serde_json::json!({
-                    "system": quote_trim::SYSTEM,
-                    "prompt": prompt,
-                    "effort": "low",
-                    "timeoutMs": 90_000,
-                    "tagFrom": tag_from,
-                }),
-            )
+            .call(honk_wire::quote::METHOD, params)
             .await
             .map_err(|e| format!("{e:#}"))?;
         if let Some(err) = res.get("error") {
             if err.get("code").and_then(Value::as_i64) == Some(-32601) {
-                return Err("honkd is too old for /quote's trim".to_string());
+                return Err("honkd is too old for /quote; restart it".to_string());
             }
             let msg = err
                 .get("message")
@@ -192,48 +162,21 @@ pub async fn run_trim(
                 .unwrap_or("error");
             return Err(msg.to_string());
         }
-        let text = res
-            .pointer("/result/text")
-            .and_then(Value::as_str)
-            .ok_or("honkd's answer had no text")?
-            .to_string();
-        let model = res
-            .pointer("/result/model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        Ok((text, model))
+        serde_json::from_value(res.get("result").cloned().unwrap_or(Value::Null))
+            .map_err(|e| format!("honkd's answer was malformed: {e}"))
     };
-    match tokio::time::timeout(TRIM_TIMEOUT, call).await {
+    match tokio::time::timeout(QUOTE_TIMEOUT, call).await {
         Ok(r) => r,
-        Err(_) => Err(format!("no answer within {}s", TRIM_TIMEOUT.as_secs())),
+        Err(_) => Err(format!("no answer within {}s", QUOTE_TIMEOUT.as_secs())),
     }
 }
 
-/// What a quote loaded, for notices: "3 replies since your last prompt", "the last 5 replies".
-fn quoted_what(q: &quote::Quoted, pick: quote::Pick) -> String {
+/// What a trimmed `/quote` is about, for the notice while it runs.
+fn asked_what(pick: Pick) -> String {
     match pick {
-        quote::Pick::Last(_) => quote::Pick::Last(q.count).describe(),
-        _ => {
-            let noun = if q.count == 1 { "reply" } else { "replies" };
-            format!("{} {noun} {}", q.count, pick.describe())
-        }
+        Pick::Last { .. } => pick.describe(),
+        _ => format!("the replies {}", pick.describe()),
     }
-}
-
-/// The untrimmed command for the same replies.
-fn full_form(pick: quote::Pick) -> String {
-    match pick {
-        quote::Pick::Last(n) => format!("/quote full {n}"),
-        quote::Pick::SinceYou => "/quote full".to_string(),
-        quote::Pick::SincePrev => "/quote full prev".to_string(),
-    }
-}
-
-fn hash_of(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
 }
 
 impl App {
@@ -279,8 +222,6 @@ impl App {
             trim_seq: 0,
             trim_tx,
             trim_rx: Some(trim_rx),
-            trim_cache: None,
-            trim_batch_bytes: quote_trim::BATCH_BYTES,
             trim_drawn_secs: None,
         }
     }
@@ -715,10 +656,10 @@ impl App {
     }
 
     /// `/quote [full|all] [N|prev]` / `:quote ...`: loads coordinator replies, quoted, into the
-    /// composer (see `tui::quote`): since your last prompt, the last N, or since your previous
-    /// prompt, with no cap. Without `full`, trimmed by the default model to what you need to
-    /// see (see `tui::trim`; a long span takes several calls), when long enough to help.
-    /// `keep_draft` keeps the current composer text below them.
+    /// composer: since your last prompt, the last N, or since your previous prompt, with no
+    /// cap. Without `full`, trimmed by the default model to what you need to see. honkd does
+    /// both (`_honk/quote`, the same call pigeon's Slack `/quote` makes); honk asks and loads
+    /// the answer. `keep_draft` keeps the current composer text below the quote.
     pub fn quote(&mut self, arg: &str, keep_draft: bool) {
         let Some((pick, trim)) = self.parse_quote_arg(arg) else {
             self.transcript.apply_notice(Notice::warning(format!(
@@ -737,112 +678,62 @@ impl App {
         if !trim {
             self.drop_trim("trim cancelled for the untrimmed quote");
         }
-        let asked = pick;
-        let Some((q, pick, note)) = self.pick_quote(pick) else {
-            return;
+        let seq = self.trim_seq + 1;
+        let req = QuoteReq {
+            session_id: self.session_id.clone(),
+            pick,
+            full: !trim,
+            // honkd charges a coordinator's quote to its program, and anything else to the
+            // quoted session's own tag.
+            tag: None,
+            quote_id: Some(format!("honk-chat-{seq}")),
         };
+        let abort = match &self.trim_backend {
+            TrimBackend::None => {
+                self.transcript
+                    .apply_notice(Notice::warning("/quote needs honkd, and honk has none"));
+                return;
+            }
+            TrimBackend::Honkd { url, secret } => {
+                let (url, secret, r) = (url.clone(), secret.clone(), req.clone());
+                let tx = self.trim_tx.clone();
+                Some(
+                    tokio::spawn(async move {
+                        let result = run_quote(url, secret, r).await;
+                        let _ = tx.send(TrimDone { seq, result });
+                    })
+                    .abort_handle(),
+                )
+            }
+            #[cfg(test)]
+            TrimBackend::Record => None,
+        };
+        self.trim_seq = seq;
+        let full = pick.full_form();
+        if trim {
+            self.transcript.apply_notice(Notice::info(format!(
+                "trimming {} to what needs you; Ctrl-C cancels, {full} skips the model",
+                asked_what(pick)
+            )));
+        }
         let draft = if keep_draft {
             self.get_composer_text()
         } else {
             String::new()
         };
-        let what = quoted_what(&q, pick);
-        let note = note.map(|n| format!("{n}; ")).unwrap_or_default();
-        if !trim {
-            self.transcript
-                .apply_notice(Notice::info(format!("{note}quoted {what}, untrimmed")));
-            self.load_quote(&q.text, &draft);
-            return;
-        }
-        if q.text.len() <= quote_trim::MIN_BYTES {
-            let mut msg = format!("{note}quoted {what} in full: too short for trimming to help");
-            if matches!(asked, quote::Pick::SinceYou) {
-                msg.push_str(
-                    "; if you already replied, /quote N trims the last N replies and \
-                     /quote prev counts from your previous prompt",
-                );
-            }
-            self.transcript.apply_notice(Notice::info(msg));
-            self.load_quote(&q.text, &draft);
-            return;
-        }
-        let full = full_form(pick);
-        let sent = quote_trim::sendable(&q.replies);
-        if sent.is_empty() {
-            self.load_quote(&q.text, &draft);
-            return;
-        }
-        let batches = quote_trim::batches(&sent, self.trim_batch_bytes);
-        let prompts = quote_trim::batch_prompts(&sent, q.your_prompt.as_deref(), &batches);
-        let key = hash_of(&prompts.join("\u{0}"));
-        if let Some((k, answers)) = self.trim_cache.clone()
-            && k == key
-        {
-            if !note.is_empty() {
-                self.transcript
-                    .apply_notice(Notice::info(note.trim_end_matches("; ")));
-            }
-            let answers = answers.into_iter().map(Ok).collect::<Vec<_>>();
-            self.finish_trim(q, &full, &batches, &answers);
-            return;
-        }
-        let seq = self.trim_seq + 1;
-        let aborts = match &self.trim_backend {
-            TrimBackend::None => {
-                self.transcript.apply_notice(Notice::warning(format!(
-                    "{note}no model to trim with; quoted {what}, untrimmed"
-                )));
-                self.load_quote(&q.text, &draft);
-                return;
-            }
-            TrimBackend::Honkd { url, secret } => {
-                let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(quote_trim::PARALLEL));
-                prompts
-                    .iter()
-                    .enumerate()
-                    .map(|(part, p)| {
-                        let (url, secret, p) = (url.clone(), secret.clone(), p.clone());
-                        let from = Some(self.session_id.clone());
-                        let (tx, gate) = (self.trim_tx.clone(), gate.clone());
-                        tokio::spawn(async move {
-                            let result = match gate.acquire_owned().await {
-                                Ok(_permit) => run_trim(url, secret, p, from).await,
-                                Err(_) => Err("cancelled".to_string()),
-                            };
-                            let _ = tx.send(TrimDone { seq, part, result });
-                        })
-                        .abort_handle()
-                    })
-                    .collect()
-            }
-            #[cfg(test)]
-            TrimBackend::Record => Vec::new(),
-        };
-        self.trim_seq = seq;
-        let calls = match prompts.len() {
-            1 => String::new(),
-            n => format!(" in {n} model calls"),
-        };
-        self.transcript.apply_notice(Notice::info(format!(
-            "{note}trimming {what} to what needs you{calls}; Ctrl-C cancels, {full} skips the \
-             model",
-        )));
         self.trim = Some(PendingTrim {
             seq,
             started: std::time::Instant::now(),
-            quoted: q,
+            req,
             full,
-            key,
-            answers: vec![None; prompts.len()],
-            prompts,
-            batches,
-            aborts,
+            draft,
+            abort,
         });
         self.trim_drawn_secs = None;
     }
 
     /// `[full|all] [N|prev]` as (which replies, whether to trim them); None if malformed.
-    fn parse_quote_arg(&mut self, arg: &str) -> Option<(quote::Pick, bool)> {
+    fn parse_quote_arg(&mut self, arg: &str) -> Option<(Pick, bool)> {
         // `full` (or `all`) may come before or after the rest: `/quote all 20`, `/quote 20 all`.
         let all: Vec<&str> = arg.split_whitespace().collect();
         let words: Vec<&str> = all
@@ -856,71 +747,15 @@ impl App {
             _ => return None,
         };
         let pick = match words.as_slice() {
-            [] => quote::Pick::SinceYou,
-            ["prev"] => quote::Pick::SincePrev,
+            [] => Pick::Since,
+            ["prev"] => Pick::Prev,
             [n] => match n.parse::<usize>().ok()? {
                 0 => return None,
-                n => quote::Pick::Last(n),
+                n => Pick::Last { n },
             },
             _ => return None,
         };
         Some((pick, trim))
-    }
-
-    /// The replies `pick` selects, the pick actually used (a fallback may replace it), and a
-    /// note on how they were picked; None, after a warning, if there are none.
-    fn pick_quote(
-        &mut self,
-        pick: quote::Pick,
-    ) -> Option<(quote::Quoted, quote::Pick, Option<String>)> {
-        // The core's run state, not the transcript's: the transcript's `active_run` is not
-        // carried across a replay swap, so right after attaching it can read idle mid-run.
-        let running = !self.is_idle();
-        let blocks = &self.transcript.blocks;
-        let build = |p| quote::build(blocks, p, running, quote::local_time);
-        let (result, pick, note) = match build(pick) {
-            Err(quote::Empty::OnePrompt) => (
-                build(quote::Pick::SinceYou),
-                quote::Pick::SinceYou,
-                Some("only one prompt of yours in this session, so counting from it".to_string()),
-            ),
-            Err(quote::Empty::NeverSpoke) => {
-                let fallback = quote::Pick::Last(QUOTE_FALLBACK);
-                let r = build(fallback);
-                let note = r.as_ref().ok().map(|q| {
-                    format!(
-                        "no prompt of yours in this session, so the last {}",
-                        q.count
-                    )
-                });
-                (r.map_err(|_| quote::Empty::NoReplies), fallback, note)
-            }
-            r => (r, pick, None),
-        };
-        match result {
-            Ok(q) => {
-                let note = note.or_else(|| match pick {
-                    quote::Pick::Last(n) if q.count < n => {
-                        Some(format!("only {} replies to quote", q.count))
-                    }
-                    _ => None,
-                });
-                Some((q, pick, note))
-            }
-            Err(quote::Empty::NothingSince) => {
-                let yet = if running { " yet" } else { "" };
-                self.transcript.apply_notice(Notice::warning(format!(
-                    "no replies {}{yet}; /quote N quotes the last N replies",
-                    pick.describe()
-                )));
-                None
-            }
-            Err(_) => {
-                self.transcript
-                    .apply_notice(Notice::warning("no replies to quote"));
-                None
-            }
-        }
     }
 
     /// Puts `text` in the composer ahead of `draft`, maximized, in normal mode at the top.
@@ -938,8 +773,8 @@ impl App {
         self.reset_history_recall();
     }
 
-    /// Ctrl-C while trimming: stop the model call (honkd cancels it when the connection
-    /// closes) and quote nothing.
+    /// Ctrl-C while trimming: stop the quote (honkd cancels its model calls when the
+    /// connection closes) and quote nothing.
     pub fn cancel_trim(&mut self) {
         if let Some(full) = self.trim.as_ref().map(|t| t.full.clone()) {
             self.drop_trim(&format!(
@@ -948,85 +783,50 @@ impl App {
         }
     }
 
-    /// Stops a pending trim, if any, saying why.
+    /// Stops a pending quote, if any, saying why.
     fn drop_trim(&mut self, why: &str) {
         if let Some(t) = self.trim.take() {
-            for a in t.aborts {
+            if let Some(a) = t.abort {
                 a.abort();
             }
             self.transcript.apply_notice(Notice::info(why));
         }
     }
 
-    /// One model call finished; once all have, quote what they kept (a failed call's replies
-    /// in full, every reply if all failed).
+    /// honkd answered: show its notices and load the quote, if any. Text typed while it ran
+    /// stays below, where it was, and so does the cursor.
     pub fn on_trim_done(&mut self, done: TrimDone) {
-        let Some(t) = self.trim.as_mut().filter(|t| t.seq == done.seq) else {
-            return;
-        };
-        let Some(slot) = t.answers.get_mut(done.part) else {
-            return;
-        };
-        *slot = Some(done.result);
-        if t.answers.iter().any(Option::is_none) {
+        if self.trim.as_ref().is_none_or(|t| t.seq != done.seq) {
             return;
         }
         let t = self.trim.take().expect("checked");
-        let answers: Vec<TrimResult> = t.answers.into_iter().map(Option::unwrap).collect();
-        let sent = quote_trim::sendable(&t.quoted.replies);
-        let all_good = t.batches.iter().zip(&answers).all(|(b, a)| {
-            a.as_ref()
-                .is_ok_and(|(text, _)| quote_trim::parse(text, &sent[b.clone()]).is_ok())
-        });
-        if all_good {
-            let ok = answers.iter().cloned().map(Result::unwrap).collect();
-            self.trim_cache = Some((t.key, ok));
-        }
-        self.finish_trim(t.quoted, &t.full, &t.batches, &answers);
-    }
-
-    /// `full`: the untrimmed form of the same pick, for notices. `answers`: one per batch.
-    fn finish_trim(
-        &mut self,
-        q: quote::Quoted,
-        full: &str,
-        batches: &[std::ops::Range<usize>],
-        answers: &[TrimResult],
-    ) {
-        let sent = quote_trim::sendable(&q.replies);
-        let kept = quote_trim::merge(&sent, batches, answers);
-        let text = match kept {
-            Ok(m) if m.kept.is_empty() && !q.replies.iter().any(|r| r.in_progress) => {
-                self.transcript.apply_notice(Notice::info(format!(
-                    "the model found nothing that needs you; {full} quotes them all"
-                )));
+        let reply = match done.result {
+            Ok(r) => r,
+            Err(why) => {
+                self.transcript
+                    .apply_notice(Notice::warning(format!("/quote failed: {why}")));
                 return;
             }
-            Ok(quote_trim::Merged {
-                kept,
-                model,
-                failed,
-            }) => {
-                if let Some(why) = failed.first() {
-                    self.transcript.apply_notice(Notice::warning(format!(
-                        "{} of {} trim calls failed ({why}); their replies are quoted in full",
-                        failed.len(),
-                        batches.len()
-                    )));
-                }
-                quote_trim::render(&q.replies, &kept, model.as_deref())
-            }
-            Err(why) => {
-                self.transcript.apply_notice(Notice::warning(format!(
-                    "trim failed ({why}); quoted them all, untrimmed"
-                )));
-                q.text.clone()
-            }
         };
-        // Text typed while the model ran stays below, where it was, and so does the cursor.
+        // Nothing to quote is a warning, as it always was; the model keeping nothing is not.
+        let nothing = reply.empty.is_some_and(|e| e != Empty::NothingKept);
+        for n in &reply.notices {
+            self.transcript.apply_notice(if nothing {
+                Notice::warning(n.clone())
+            } else {
+                Notice::info(n.clone())
+            });
+        }
+        for w in &reply.warnings {
+            self.transcript.apply_notice(Notice::warning(w.clone()));
+        }
+        let text = reply.composer_text();
+        if text.is_empty() {
+            return;
+        }
         let draft = self.get_composer_text();
-        if draft.trim().is_empty() {
-            self.load_quote(&text, "");
+        if draft.trim().is_empty() || draft == t.draft {
+            self.load_quote(&text, &draft);
         } else {
             let rows = text.lines().count() + 1;
             let cursor = self.composer.cursor;
@@ -1608,6 +1408,7 @@ mod tests {
         );
         assert!(unseen_warnings(&mut rx).is_empty());
     }
+    use crate::chat::types::NoticeKind;
     use crate::chat::types::{Ownership, RunState};
     use crate::tui::BlockKind;
     use crossterm::event::{KeyEventKind, KeyEventState};
@@ -2705,81 +2506,11 @@ mod tests {
         assert!(app.model_picker.is_some());
     }
 
-    fn update(kind: &str, id: &str, text: &str, created: i64) -> Value {
-        json!({"jsonrpc": "2.0", "method": "session/update", "params": {
-            "sessionId": "ses_q",
-            "update": {"sessionUpdate": kind, "messageId": id,
-                "content": {"type": "text", "text": text},
-                "_meta": {"goose": {"created": created, "messageId": id}}}}})
-    }
-
     fn quote_app() -> (App, mpsc::UnboundedReceiver<UiCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_q", cmd_tx);
-        for f in [
-            update("user_message_chunk", "u1", "what's up?", 100),
-            update("agent_message_chunk", "a1", "reply one", 101),
-            update(
-                "user_message_chunk",
-                "u2",
-                "[sw wake run=r reason=mail] Woken",
-                200,
-            ),
-            update("agent_thought_chunk", "t2", "hmm", 201),
-            update("agent_message_chunk", "a2", "reply two", 202),
-            update(
-                "user_message_chunk",
-                "u3",
-                "<swarm_message v=\"1\" from=\"ses_w\">\nx",
-                300,
-            ),
-        ] {
-            app.transcript.apply_frame(&f);
-        }
+        app.trim_backend = TrimBackend::Record;
         (app, cmd_rx)
-    }
-
-    #[test]
-    fn test_slash_quote_fills_maximized_normal_composer_and_sends_nothing() {
-        let (mut app, mut cmd_rx) = quote_app();
-        type_str(&mut app, "/quote 2");
-        app.handle_key(key(KeyCode::Enter));
-
-        assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
-        let text = app.get_composer_text();
-        assert!(text.starts_with("# "), "{text}");
-        assert!(text.contains("(you)\n> reply one\n\n# "), "{text}");
-        assert!(text.ends_with("(wake: mail)\n> reply two"), "{text}");
-        assert!(!text.contains("Woken") && !text.contains("hmm") && !text.contains("what's up"));
-        assert_eq!(app.composer.mode, EditorMode::Normal);
-        assert_eq!(app.composer.cursor, edtui::Index2::new(0, 0));
-        assert!(app.composer_maximized);
-        assert!(app.history.is_empty());
-    }
-
-    #[test]
-    fn test_colon_quote_keeps_draft_below() {
-        let (mut app, mut cmd_rx) = quote_app();
-        app.set_composer_text("my draft");
-        app.execute_app_command("quote 1");
-        assert!(cmd_rx.try_recv().is_err());
-        let text = app.get_composer_text();
-        assert!(text.ends_with("> reply two\n\nmy draft"), "{text}");
-        assert!(!text.contains("reply one"));
-    }
-
-    #[test]
-    fn test_quote_with_nothing_to_quote_warns() {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let mut app = App::new("ses_q", cmd_tx);
-        type_str(&mut app, "/quote");
-        app.handle_key(key(KeyCode::Enter));
-        assert!(cmd_rx.try_recv().is_err());
-        assert!(app.is_composer_empty());
-        assert!(!app.composer_maximized);
-        let last = app.transcript.blocks.last().unwrap();
-        assert_eq!(last.kind, BlockKind::Notice);
-        assert!(last.text.contains("no replies to quote"));
     }
 
     fn last_notice(app: &App) -> String {
@@ -2788,326 +2519,212 @@ mod tests {
         last.text.clone()
     }
 
-    #[test]
-    fn test_bare_quote_takes_everything_since_your_last_prompt() {
-        let (mut app, mut cmd_rx) = quote_app();
-        type_str(&mut app, "/quote");
-        app.handle_key(key(KeyCode::Enter));
-        assert!(cmd_rx.try_recv().is_err());
-        let text = app.get_composer_text();
-        assert!(text.contains("(you)\n> reply one\n\n# "), "{text}");
-        assert!(text.ends_with("(wake: mail)\n> reply two"), "{text}");
+    fn last_notice_kind(app: &App) -> NoticeKind {
+        let last = app.transcript.blocks.last().unwrap();
+        last.notice.as_ref().expect("a notice").kind
+    }
 
-        for f in [
-            update("user_message_chunk", "u4", "thanks", 400),
-            update("agent_message_chunk", "a4", "reply four", 401),
-        ] {
-            app.transcript.apply_frame(&f);
+    fn quoted(header: &str, lines: &[&str]) -> honk_wire::quote::QuotedReply {
+        honk_wire::quote::QuotedReply {
+            header: header.into(),
+            passages: vec![lines.iter().map(|l| l.to_string()).collect()],
+            in_progress: false,
         }
-        app.set_composer_text("");
-        app.execute_app_command("quote");
-        let text = app.get_composer_text();
-        assert!(text.ends_with("(you)\n> reply four"), "{text}");
-        assert!(
-            !text.contains("reply one") && !text.contains("reply two"),
-            "{text}"
-        );
     }
 
-    #[test]
-    fn test_bare_quote_with_nothing_since_your_prompt_warns() {
-        let (mut app, _cmd_rx) = quote_app();
-        app.transcript
-            .apply_frame(&update("user_message_chunk", "u4", "thanks", 400));
-        app.execute_app_command("quote");
-        assert!(app.is_composer_empty());
-        assert!(!app.composer_maximized);
-        assert!(last_notice(&app).contains("no replies since your last prompt"));
-    }
-
-    #[test]
-    fn test_bare_quote_when_you_never_spoke_falls_back_to_last_three() {
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let mut app = App::new("ses_q", cmd_tx);
-        for i in 0..4 {
-            let t = 100 * (i + 1);
-            for f in [
-                update(
-                    "user_message_chunk",
-                    &format!("u{i}"),
-                    "[sw wake run=r reason=mail] Woken",
-                    t,
-                ),
-                update(
-                    "agent_message_chunk",
-                    &format!("a{i}"),
-                    &format!("wake reply {i}"),
-                    t + 1,
-                ),
-            ] {
-                app.transcript.apply_frame(&f);
-            }
+    /// An untrimmed answer: two replies.
+    fn full_reply() -> QuoteReply {
+        QuoteReply {
+            replies: vec![
+                quoted("# 11-19 10:01 (you)", &["reply one"]),
+                quoted("# 11-19 10:02 (wake: mail)", &["reply two", "", "more"]),
+            ],
+            notices: vec!["quoted 2 replies since your last prompt, untrimmed".into()],
+            ..Default::default()
         }
-        app.execute_app_command("quote");
-        let text = app.get_composer_text();
-        assert!(!text.contains("wake reply 0"), "{text}");
-        assert!(
-            text.contains("wake reply 1") && text.ends_with("> wake reply 3"),
-            "{text}"
-        );
-        assert!(last_notice(&app).contains("no prompt of yours in this session, so the last 3"));
     }
+    const FULL_TEXT: &str =
+        "# 11-19 10:01 (you)\n> reply one\n\n# 11-19 10:02 (wake: mail)\n> reply two\n>\n> more";
 
-    #[test]
-    fn test_quote_has_no_cap() {
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let mut app = App::new("ses_q", cmd_tx);
-        app.transcript
-            .apply_frame(&update("user_message_chunk", "me", "hello", 1));
-        for i in 0..120 {
-            let t = 100 * (i as i64 + 1);
-            for f in [
-                update(
-                    "user_message_chunk",
-                    &format!("u{i}"),
-                    "[sw wake run=r reason=mail] Woken",
-                    t,
-                ),
-                update(
-                    "agent_message_chunk",
-                    &format!("a{i}"),
-                    &format!("r{i}."),
-                    t + 1,
-                ),
-            ] {
-                app.transcript.apply_frame(&f);
-            }
-        }
-        app.execute_app_command("quote all");
-        let text = app.get_composer_text();
-        assert_eq!(text.matches("\n> r").count(), 120, "{text}");
-        assert!(text.contains("> r0.") && text.ends_with("> r119."));
-        assert!(!last_notice(&app).contains("capped") && !last_notice(&app).contains("last 50"));
-        app.set_composer_text("");
-        app.execute_app_command("quote full 100");
-        assert_eq!(app.get_composer_text().matches("\n> r").count(), 100);
-        assert!(
-            last_notice(&app).contains("the last 100 replies"),
-            "{}",
-            last_notice(&app)
-        );
-    }
-
-    #[test]
-    fn test_a_long_span_trims_in_several_calls_and_merges_in_order() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        // Each long_app reply is about 1.7 KB: one per call.
-        app.trim_batch_bytes = 1000;
-        app.execute_app_command("quote");
-        let t = app.trim.as_ref().expect("trimming");
-        assert_eq!(t.prompts.len(), 3);
-        assert!(t.prompts[1].starts_with("(Part 2 of 3"), "{}", t.prompts[1]);
-        assert!(
-            t.prompts[1].contains("<<<\nstatus?\n>>>"),
-            "{}",
-            t.prompts[1]
-        );
-        assert!(t.prompts[2].contains("R1 ") && t.prompts[2].contains("L44: QUESTION2?"));
-        assert!(!t.prompts[2].contains("R2 "));
-        assert!(
-            last_notice(&app).contains("in 3 model calls"),
-            "{}",
-            last_notice(&app)
-        );
-        let seq = t.seq;
-        let done = |part, result: TrimResult| TrimDone { seq, part, result };
-        let keep_q = |n: usize| {
-            Ok((
-                format!(r#"{{"keep":[{{"reply":1,"lines":[[{n},{n}]],"tag":"ask"}}]}}"#),
-                Some("m".to_string()),
-            ))
-        };
-        // Out of order; nothing renders until every call is in.
-        app.on_trim_done(done(2, keep_q(44)));
-        app.on_trim_done(done(0, keep_q(1)));
-        assert!(app.trim.is_some() && app.is_composer_empty());
-        app.on_trim_done(done(1, Err("no answer within 100s".into())));
-        assert!(app.trim.is_none());
-        let text = app.get_composer_text();
-        let (h0, f1, q2) = (
-            text.find("> head0").unwrap(),
-            text.find("> filler line 1").unwrap(),
-            text.find("> QUESTION2?").unwrap(),
-        );
-        assert!(h0 < f1 && f1 < q2, "{text}");
-        assert!(
-            text.contains("> QUESTION1?") && !text.contains("QUESTION0"),
-            "{text}"
-        );
-        assert!(
-            last_notice(&app).contains("1 of 3 trim calls failed (no answer within 100s)"),
-            "{}",
-            last_notice(&app)
-        );
-        // A partly failed trim is not cached: the next /quote asks again.
-        app.set_composer_text("");
-        app.execute_app_command("quote");
-        assert!(app.trim.is_some());
-    }
-
-    #[test]
-    fn test_a_fully_answered_multi_call_trim_is_cached() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        app.trim_batch_bytes = 1000;
-        app.execute_app_command("quote");
-        let seq = app.trim.as_ref().unwrap().seq;
-        for part in 0..3 {
-            app.on_trim_done(TrimDone {
-                seq,
-                part,
-                result: Ok((r#"{"keep":[{"reply":1,"lines":[[1,1]]}]}"#.into(), None)),
-            });
-        }
-        let text = app.get_composer_text();
-        assert!(
-            text.contains("> head0") && text.contains("> head2"),
-            "{text}"
-        );
-        assert!(text.starts_with("# honk: trimmed"), "{text}");
-        app.set_composer_text("");
-        app.execute_app_command("quote");
-        assert!(app.trim.is_none(), "cached");
-        assert_eq!(app.get_composer_text(), text);
-    }
-
-    /// Your prompt, then three long wake replies (well over `trim::MIN_BYTES`).
-    fn long_app(backend: TrimBackend) -> (App, mpsc::UnboundedReceiver<UiCommand>) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let mut app = App::new("ses_q", cmd_tx);
-        app.trim_backend = backend;
-        app.transcript
-            .apply_frame(&update("user_message_chunk", "me", "status?", 1));
-        for i in 0..3 {
-            let t = 100 * (i + 1);
-            let body = format!(
-                "head{i}\n\n{}\nQUESTION{i}?",
-                format!("filler line {i} with plenty of words\n").repeat(40)
-            );
-            app.transcript.apply_frame(&update(
-                "user_message_chunk",
-                &format!("u{i}"),
-                "[sw wake run=r reason=mail] Woken",
-                t,
-            ));
-            app.transcript.apply_frame(&update(
-                "agent_message_chunk",
-                &format!("a{i}"),
-                &body,
-                t + 1,
-            ));
-        }
-        (app, cmd_rx)
-    }
-
-    fn answer(app: &mut App, result: Result<(&str, Option<&str>), &str>) {
-        let seq = app.trim.as_ref().expect("a trim is pending").seq;
+    fn answer(app: &mut App, result: Result<QuoteReply, &str>) {
+        let seq = app.trim.as_ref().expect("a quote is pending").seq;
         app.on_trim_done(TrimDone {
             seq,
-            part: 0,
-            result: result
-                .map(|(a, m)| (a.to_string(), m.map(str::to_string)))
-                .map_err(str::to_string),
+            result: result.map_err(str::to_string),
         });
     }
 
     #[test]
-    fn test_bare_quote_trims_long_replies_and_quotes_only_kept_lines() {
-        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
-        type_str(&mut app, "/quote");
+    fn test_slash_quote_asks_honkd_and_fills_maximized_normal_composer() {
+        let (mut app, mut cmd_rx) = quote_app();
+        type_str(&mut app, "/quote 2");
         app.handle_key(key(KeyCode::Enter));
         assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
-        let t = app.trim.as_ref().expect("trimming");
+        let t = app.trim.as_ref().expect("asked");
+        assert_eq!(t.req.session_id, "ses_q");
+        assert_eq!((t.req.pick, t.req.full), (Pick::Last { n: 2 }, false));
+        assert_eq!(t.req.tag, None, "honkd picks the program");
+        assert!(t.req.quote_id.is_some());
         assert!(
-            t.prompts[0].contains("<<<\nstatus?\n>>>"),
-            "{}",
-            t.prompts[0]
-        );
-        assert!(t.prompts[0].contains("R3 ") && t.prompts[0].contains("L44: QUESTION2?"));
-        assert!(last_notice(&app).contains("trimming 3 replies"));
-        assert!(app.is_composer_empty());
-
-        answer(
-            &mut app,
-            Ok((
-                r#"{"keep":[{"reply":1,"lines":[[1,1]],"tag":"fyi"},{"reply":3,"lines":[[44,44]],"tag":"ask"}]}"#,
-                Some("claude-opus-5-5"),
-            )),
-        );
-        assert!(app.trim.is_none());
-        let text = app.get_composer_text();
-        assert!(
-            text.starts_with(
-                "# honk: trimmed by claude-opus-5-5, kept 2 of 126 lines from 2 of 3 replies"
+            last_notice(&app).starts_with(
+                "trimming the last 2 replies to what needs you; Ctrl-C cancels, /quote full 2 skips the model"
             ),
-            "{text}"
+            "{}",
+            last_notice(&app)
         );
-        assert!(text.contains("(wake: mail) · fyi\n> head0\n\n# "), "{text}");
-        assert!(text.ends_with("(wake: mail) · ask\n> QUESTION2?"), "{text}");
-        assert!(!text.contains("filler") && !text.contains("QUESTION0"));
+        assert!(app.is_composer_empty());
+        answer(&mut app, Ok(full_reply()));
+        assert!(app.trim.is_none());
+        assert_eq!(app.get_composer_text(), FULL_TEXT);
         assert_eq!(app.composer.mode, EditorMode::Normal);
         assert_eq!(app.composer.cursor, edtui::Index2::new(0, 0));
         assert!(app.composer_maximized);
-
-        // The same replies again: the cached answer, no model call.
-        app.set_composer_text("");
-        app.execute_app_command("quote");
-        assert!(app.trim.is_none());
-        assert!(
-            app.get_composer_text()
-                .starts_with("# honk: trimmed by claude-opus-5-5")
-        );
+        assert!(app.history.is_empty());
+        assert!(last_notice(&app).contains("untrimmed"));
+        assert_eq!(last_notice_kind(&app), NoticeKind::Info);
     }
 
     #[test]
-    fn test_trim_failure_or_bad_answer_quotes_everything() {
-        for result in [Err("model: overloaded"), Ok(("Sure! Read R1.", None))] {
-            let (mut app, _rx) = long_app(TrimBackend::Record);
-            app.execute_app_command("quote");
-            answer(&mut app, result);
-            let text = app.get_composer_text();
-            assert!(text.contains("QUESTION0?") && text.contains("filler line 2"));
-            assert!(!text.contains("# honk: trimmed"));
-            assert!(
-                last_notice(&app).contains("trim failed"),
-                "{}",
-                last_notice(&app)
+    fn test_quote_forms_map_to_requests() {
+        for (arg, pick, full) in [
+            ("quote", Pick::Since, false),
+            ("quote prev", Pick::Prev, false),
+            ("quote 7", Pick::Last { n: 7 }, false),
+            ("quote full", Pick::Since, true),
+            ("quote all", Pick::Since, true),
+            ("quote full 2", Pick::Last { n: 2 }, true),
+            ("quote all 2", Pick::Last { n: 2 }, true),
+            ("quote 2 all", Pick::Last { n: 2 }, true),
+            ("quote full prev", Pick::Prev, true),
+        ] {
+            let (mut app, _rx) = quote_app();
+            app.execute_app_command(arg);
+            let t = app.trim.as_ref().expect(arg);
+            assert_eq!((t.req.pick, t.req.full), (pick, full), "{arg}");
+            let notice = app.transcript.blocks.last().map(|b| b.text.clone());
+            assert_eq!(
+                notice.is_some_and(|n| n.starts_with("trimming ")),
+                !full,
+                "{arg}"
             );
         }
     }
 
     #[test]
-    fn test_trim_keeping_nothing_says_so_and_leaves_the_composer() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
+    fn test_colon_quote_keeps_draft_below() {
+        let (mut app, mut cmd_rx) = quote_app();
+        app.set_composer_text("my draft");
+        app.execute_app_command("quote full 1");
+        assert!(cmd_rx.try_recv().is_err());
+        answer(&mut app, Ok(full_reply()));
+        assert_eq!(app.get_composer_text(), format!("{FULL_TEXT}\n\nmy draft"));
+        assert_eq!(app.composer.cursor, edtui::Index2::new(0, 0));
+        assert_eq!(app.composer.mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn test_quote_with_nothing_to_quote_warns() {
+        for (empty, msg) in [
+            (Empty::NoReplies, "no replies to quote"),
+            (
+                Empty::NothingSince,
+                "no replies since your last prompt; /quote N quotes the last N replies",
+            ),
+        ] {
+            let (mut app, _rx) = quote_app();
+            app.execute_app_command("quote");
+            answer(
+                &mut app,
+                Ok(QuoteReply {
+                    empty: Some(empty),
+                    notices: vec![msg.into()],
+                    ..Default::default()
+                }),
+            );
+            assert!(app.is_composer_empty());
+            assert!(!app.composer_maximized);
+            assert_eq!(last_notice(&app), msg);
+            assert_eq!(last_notice_kind(&app), NoticeKind::Warning);
+        }
+    }
+
+    #[test]
+    fn test_trimmed_answer_loads_summary_and_passages_with_warnings() {
+        let (mut app, _rx) = quote_app();
         app.execute_app_command("quote");
-        answer(&mut app, Ok((r#"{"keep":[]}"#, None)));
+        let mut r = QuoteReply {
+            summary: Some("# honk: trimmed by m, kept 2 of 9 lines from 1 of 2 replies".into()),
+            replies: vec![quoted("# T1 (wake: mail) · ask", &["a"])],
+            notices: vec!["trimmed 2 replies since your last prompt to what needs you".into()],
+            warnings: vec!["1 of 2 trim calls failed (x); their replies are quoted in full".into()],
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        r.replies[0].passages.push(vec!["b".into()]);
+        answer(&mut app, Ok(r));
+        assert_eq!(
+            app.get_composer_text(),
+            "# honk: trimmed by m, kept 2 of 9 lines from 1 of 2 replies\n\n\
+             # T1 (wake: mail) · ask\n> a\n# …\n> b"
+        );
+        assert!(last_notice(&app).contains("1 of 2 trim calls failed"));
+        assert_eq!(last_notice_kind(&app), NoticeKind::Warning);
+    }
+
+    #[test]
+    fn test_trim_keeping_nothing_says_so_and_leaves_the_composer() {
+        let (mut app, _rx) = quote_app();
+        app.execute_app_command("quote");
+        answer(
+            &mut app,
+            Ok(QuoteReply {
+                empty: Some(Empty::NothingKept),
+                notices: vec![
+                    "trimmed 3 replies".into(),
+                    "the model found nothing that needs you; /quote full quotes them all".into(),
+                ],
+                ..Default::default()
+            }),
+        );
         assert!(app.is_composer_empty());
         assert!(last_notice(&app).contains("nothing that needs you"));
+        assert_eq!(last_notice_kind(&app), NoticeKind::Info);
+    }
+
+    #[test]
+    fn test_honkd_failure_warns() {
+        let (mut app, _rx) = quote_app();
+        app.execute_app_command("quote");
+        answer(
+            &mut app,
+            Err("unknown session ses_q: honkd has no log for it"),
+        );
+        assert!(app.is_composer_empty());
+        assert_eq!(
+            last_notice(&app),
+            "/quote failed: unknown session ses_q: honkd has no log for it"
+        );
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_q", cmd_tx);
+        app.execute_app_command("quote");
+        assert!(app.trim.is_none());
+        assert!(last_notice(&app).contains("needs honkd"));
     }
 
     #[test]
     fn test_ctrl_c_cancels_the_trim_without_interrupting_the_run() {
-        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        let (mut app, mut cmd_rx) = quote_app();
         app.execute_app_command("quote");
         let seq = app.trim.as_ref().unwrap().seq;
         app.handle_key(ctrl('c'));
         assert!(app.trim.is_none());
         assert!(cmd_rx.try_recv().is_err(), "no Interrupt");
         assert!(last_notice(&app).contains("trim cancelled"));
-        // A late answer for the cancelled trim is ignored.
+        assert!(last_notice(&app).contains("/quote full quotes the same replies"));
+        // A late answer for the cancelled quote is ignored.
         app.on_trim_done(TrimDone {
             seq,
-            part: 0,
-            result: Ok((r#"{"keep":[{"reply":1,"all":true}]}"#.into(), None)),
+            result: Ok(full_reply()),
         });
         assert!(app.is_composer_empty());
         // The next Ctrl-C is an ordinary interrupt again.
@@ -3117,23 +2734,20 @@ mod tests {
 
     #[test]
     fn test_text_typed_while_trimming_stays_below_with_its_cursor() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
+        let (mut app, _rx) = quote_app();
         app.execute_app_command("quote");
         type_str(&mut app, "typing");
         assert_eq!(app.composer.mode, EditorMode::Insert);
-        answer(
-            &mut app,
-            Ok((r#"{"keep":[{"reply":2,"lines":[[1,1]]}]}"#, None)),
-        );
+        answer(&mut app, Ok(full_reply()));
         let text = app.get_composer_text();
-        assert!(text.ends_with("> head1\n\ntyping"), "{text}");
+        assert_eq!(text, format!("{FULL_TEXT}\n\ntyping"));
         assert_eq!(app.composer.mode, EditorMode::Insert, "mode left alone");
-        assert_eq!(app.composer.cursor, edtui::Index2::new(5, 6));
+        assert_eq!(app.composer.cursor, edtui::Index2::new(8, 6));
     }
 
     #[test]
     fn test_ctrl_c_with_a_draft_while_trimming_keeps_its_usual_meaning() {
-        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        let (mut app, mut cmd_rx) = quote_app();
         app.execute_app_command("quote");
         type_str(&mut app, "draft");
         app.handle_key(ctrl('c'));
@@ -3148,7 +2762,7 @@ mod tests {
 
     #[test]
     fn test_sending_a_prompt_or_an_untrimmed_quote_cancels_the_trim() {
-        let (mut app, mut cmd_rx) = long_app(TrimBackend::Record);
+        let (mut app, mut cmd_rx) = quote_app();
         app.execute_app_command("quote");
         type_str(&mut app, "go ahead");
         app.handle_key(key(KeyCode::Enter));
@@ -3159,179 +2773,28 @@ mod tests {
         );
         assert!(last_notice(&app).contains("you sent a prompt"));
 
-        let (mut app, _rx) = long_app(TrimBackend::Record);
+        let (mut app, _rx) = quote_app();
         app.execute_app_command("quote");
+        let first = app.trim.as_ref().unwrap().seq;
         app.execute_app_command("quote full 1");
-        assert!(app.trim.is_none());
-        assert!(app.get_composer_text().contains("QUESTION2?"));
-        assert!(!app.get_composer_text().contains("QUESTION0?"));
-    }
-
-    #[test]
-    fn test_unusable_answers_are_not_cached() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        app.execute_app_command("quote");
-        answer(&mut app, Ok(("Ran into this error", None)));
-        app.set_composer_text("");
-        app.execute_app_command("quote");
-        assert!(app.trim.is_some(), "asks the model again");
+        let t = app.trim.as_ref().expect("the untrimmed quote");
+        assert!(t.seq != first && t.req.full);
+        assert!(
+            app.transcript
+                .blocks
+                .iter()
+                .any(|b| b.text.contains("trim cancelled for the untrimmed quote"))
+        );
     }
 
     #[test]
     fn test_second_bare_quote_while_trimming_warns() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
+        let (mut app, _rx) = quote_app();
         app.execute_app_command("quote");
         let seq = app.trim.as_ref().unwrap().seq;
         app.execute_app_command("quote");
         assert_eq!(app.trim.as_ref().unwrap().seq, seq);
         assert!(last_notice(&app).contains("already trimming"));
-    }
-
-    #[test]
-    fn test_bare_quote_skips_the_model_when_short_or_unavailable() {
-        let (mut app, _rx) = quote_app();
-        app.trim_backend = TrimBackend::Record;
-        app.execute_app_command("quote");
-        assert!(app.trim.is_none());
-        assert!(app.get_composer_text().contains("> reply one"));
-        assert!(last_notice(&app).contains("in full: too short"));
-
-        let (mut app, _rx) = long_app(TrimBackend::None);
-        app.execute_app_command("quote");
-        assert!(app.trim.is_none());
-        assert!(app.get_composer_text().contains("filler line 2"));
-        assert!(last_notice(&app).contains("no model to trim with"));
-    }
-
-    #[test]
-    fn test_quote_full_and_its_alias_all_never_trim() {
-        for arg in [
-            "quote full",
-            "quote all",
-            "quote full 2",
-            "quote all 2",
-            "quote full prev",
-        ] {
-            let (mut app, _rx) = long_app(TrimBackend::Record);
-            app.transcript
-                .apply_frame(&update("user_message_chunk", "me2", "later", 900));
-            app.transcript
-                .apply_frame(&update("agent_message_chunk", "a9", "late reply", 901));
-            app.execute_app_command(arg);
-            assert!(app.trim.is_none(), "{arg}");
-            let text = app.get_composer_text();
-            assert!(text.ends_with("> late reply"), "{arg}: {text}");
-            let reaches_back = !matches!(arg, "quote full" | "quote all");
-            assert_eq!(
-                text.contains("filler line 2"),
-                reaches_back,
-                "{arg}: {text}"
-            );
-            assert!(
-                last_notice(&app).contains("untrimmed"),
-                "{arg}: {}",
-                last_notice(&app)
-            );
-        }
-    }
-
-    #[test]
-    fn test_quote_n_trims_the_last_n_replies() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        // You already replied: bare /quote finds only the short answer to that.
-        app.transcript
-            .apply_frame(&update("user_message_chunk", "me2", "ok", 900));
-        app.transcript
-            .apply_frame(&update("agent_message_chunk", "a9", "noted", 901));
-        app.execute_app_command("quote");
-        assert!(app.trim.is_none());
-        let text = app.get_composer_text();
-        assert!(
-            text.ends_with("(you)\n> noted") && !text.contains("filler"),
-            "{text}"
-        );
-        let hint = last_notice(&app);
-        assert!(
-            hint.contains("/quote N") && hint.contains("/quote prev"),
-            "{hint}"
-        );
-
-        app.set_composer_text("");
-        app.execute_app_command("quote 4");
-        let t = app.trim.as_ref().expect("trimming");
-        assert!(!t.prompts[0].contains("status?"), "{}", t.prompts[0]);
-        assert!(
-            t.prompts[0]
-                .contains("prompt that R4 answers (context only, not selectable):\n<<<\nok\n>>>"),
-            "{}",
-            t.prompts[0]
-        );
-        assert!(
-            t.prompts[0].contains("R4 ") && t.prompts[0].contains("L1: noted"),
-            "{}",
-            t.prompts[0]
-        );
-        assert!(
-            !t.prompts[0].contains("R5 ") && !t.prompts[0].contains("since then"),
-            "{}",
-            t.prompts[0]
-        );
-        let n = last_notice(&app);
-        assert!(
-            n.contains("trimming the last 4 replies") && n.contains("/quote full 4"),
-            "{n}"
-        );
-        answer(
-            &mut app,
-            Ok((
-                r#"{"keep":[{"reply":3,"lines":[[44,44]],"tag":"ask"}]}"#,
-                None,
-            )),
-        );
-        assert!(app.get_composer_text().ends_with("· ask\n> QUESTION2?"));
-    }
-
-    #[test]
-    fn test_quote_prev_trims_since_your_previous_prompt() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        app.transcript
-            .apply_frame(&update("user_message_chunk", "me2", "ok", 900));
-        app.transcript
-            .apply_frame(&update("agent_message_chunk", "a9", "noted", 901));
-        app.execute_app_command("quote prev");
-        let t = app.trim.as_ref().expect("trimming");
-        assert!(
-            t.prompts[0].contains("<<<\nstatus?\n>>>"),
-            "{}",
-            t.prompts[0]
-        );
-        assert!(
-            t.prompts[0].contains("R4 ") && t.prompts[0].contains("L1: noted"),
-            "{}",
-            t.prompts[0]
-        );
-        let n = last_notice(&app);
-        assert!(
-            n.contains("since your previous prompt") && n.contains("/quote full prev"),
-            "{n}"
-        );
-        answer(&mut app, Err("boom"));
-        let n = last_notice(&app);
-        assert!(n.contains("trim failed") && n.contains("untrimmed"), "{n}");
-        assert!(app.get_composer_text().contains("filler line 0"));
-    }
-
-    #[test]
-    fn test_quote_prev_with_one_prompt_counts_from_it() {
-        let (mut app, _rx) = long_app(TrimBackend::Record);
-        app.execute_app_command("quote prev");
-        assert!(app.trim.is_some());
-        let n = last_notice(&app);
-        assert!(
-            n.contains("only one prompt of yours")
-                && n.contains("trimming 3 replies since your last prompt"),
-            "{n}"
-        );
     }
 
     #[test]
@@ -3432,16 +2895,11 @@ mod tests {
             compacting: false,
             awaiting_permission: false,
         });
-        // Running: the quote's last turn is marked in progress.
-        app.transcript
-            .apply_frame(&update("agent_message_chunk", "a3", "partial", 301));
-        app.set_composer_text("");
-        app.execute_app_command("quote 1");
-        assert!(
-            app.get_composer_text().contains(", in progress)"),
-            "{}",
-            app.get_composer_text()
-        );
+        app.execute_app_command("quote full 1");
+        let mut r = full_reply();
+        r.replies[1].header = "# 11-19 10:02 (wake: mail, in progress)".into();
+        answer(&mut app, Ok(r));
+        assert!(app.composer_maximized);
         assert!(!app.is_idle());
         app.handle_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.is_composer_empty());

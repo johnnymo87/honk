@@ -4397,16 +4397,50 @@ async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
     let _ = server_task.await;
 }
 
-/// `/quote`'s trim call (honk-9qf.31.4) through a real honkd: the answer and model come back,
-/// and a honkd error comes back as an error.
+/// Writes a honkd session log: your prompt, then three long wake replies (well over the
+/// size `/quote` trims at).
+fn write_quote_log(state_dir: &Path, sid: &str) {
+    let dir = state_dir.join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let chunk = |kind: &str, id: &str, text: &str| {
+        json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": sid,
+            "update": { "sessionUpdate": kind, "messageId": id,
+                "content": { "type": "text", "text": text } } } })
+    };
+    let mut frames = vec![chunk("user_message_chunk", "u1", "status?")];
+    for i in 0..3 {
+        let body = format!(
+            "head{i}\n\n{}\nQUESTION{i}?",
+            format!("filler line {i} with plenty of words\n").repeat(40)
+        );
+        frames.push(chunk(
+            "user_message_chunk",
+            &format!("w{i}"),
+            "[sw wake run=r reason=mail] Woken",
+        ));
+        frames.push(chunk("agent_message_chunk", &format!("a{i}"), &body));
+    }
+    let mut out = json!({ "epoch": 1, "resume_from": null }).to_string();
+    for (i, f) in frames.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&json!({ "seq": i + 1, "id": null, "frame": f }).to_string());
+    }
+    out.push('\n');
+    std::fs::write(dir.join(format!("{sid}.jsonl")), out).unwrap();
+}
+
+/// honk chat's `/quote` through a real honkd's `_honk/quote` (honk-9qf.31.7): honkd reads the
+/// log, trims with the model, and the app loads only the kept lines.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_quote_trim_call_through_honkd() {
+async fn test_quote_through_honkd() {
     let fake = honk_testgoose::FakeGoose::start().await;
     let Some(honkd_bin) = find_honkd_bin() else {
         eprintln!("skipping test: honkd binary not found");
         return;
     };
-    fake.script_prompt(vec!["{\"keep\":[]}".into()]);
+    fake.script_prompt(vec![
+        r#"{"keep":[{"reply":3,"lines":[[44,44]],"tag":"ask"}]}"#.into(),
+    ]);
     let h = HonkdHarness::spawn_with_extra(
         &honkd_bin,
         &fake.url(),
@@ -4415,58 +4449,60 @@ async fn test_quote_trim_call_through_honkd() {
         &["--allow-unpatched-upstream"],
     )
     .await;
-    let (text, model) =
-        honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into(), None)
-            .await
-            .expect("trim answer");
-    assert_eq!(text, "{\"keep\":[]}");
-    assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+    write_quote_log(h.state_dir.path(), "20261124_1");
+
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = honk::tui::app::App::new("20261124_1", cmd_tx);
+    app.trim_backend = honk::tui::app::TrimBackend::Honkd {
+        url: h.ws_url().to_string(),
+        secret: h.secret().to_string(),
+    };
+    let mut trim_rx = app.trim_rx.take().expect("trim_rx exists");
+    app.execute_app_command("quote");
+    let done = tokio::time::timeout(std::time::Duration::from_secs(20), trim_rx.recv())
+        .await
+        .expect("must not hang")
+        .expect("an answer");
+    app.on_trim_done(done);
+    let text = app.get_composer_text();
+    assert!(
+        text.starts_with(
+            "# honk: trimmed by claude-opus-5-5, kept 1 of 126 lines from 1 of 3 replies\n\n# "
+        ),
+        "{text}"
+    );
+    assert!(text.ends_with("(wake: mail) · ask\n> QUESTION2?"), "{text}");
     let sys = fake
         .inbound()
         .into_iter()
         .find(|f| f["method"] == "_goose/unstable/session/system-prompt/set")
         .expect("system prompt set");
-    assert_eq!(sys["params"]["text"], honk::tui::trim::SYSTEM);
+    assert!(
+        sys["params"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("You pick, from a coordinator agent's recent replies")
+    );
 
-    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "  ".into(), None)
-        .await
-        .unwrap_err();
-    assert!(err.contains("prompt is empty"), "{err}");
-}
-
-/// `/quote`'s trim call with goose v1.60.2+ turn failure (honk reads data.message).
-#[tokio::test(flavor = "multi_thread")]
-async fn test_quote_trim_call_through_honkd_with_turn_failed_error() {
-    let fake = honk_testgoose::FakeGoose::start().await;
-    let Some(honkd_bin) = find_honkd_bin() else {
-        eprintln!("skipping test: honkd binary not found");
-        return;
-    };
-    fake.set_prompt_error_reply(Some(json!({
-        "code": -32603,
-        "message": "Internal error",
-        "data": {
-            "reason": "turn_failed",
-            "kind": "provider",
-            "message": "overloaded"
-        }
-    })));
-    let h = HonkdHarness::spawn_with_extra(
-        &honkd_bin,
-        &fake.url(),
-        fake.secret_file(),
-        None,
-        &["--allow-unpatched-upstream"],
+    // An unknown session is an error, said as a warning.
+    let err = honk::tui::app::run_quote(
+        h.ws_url(),
+        h.secret(),
+        honk_wire::quote::QuoteReq {
+            session_id: "20990101_1".into(),
+            pick: honk_wire::quote::Pick::Since,
+            full: false,
+            tag: None,
+            quote_id: None,
+        },
     )
-    .await;
-    let err = honk::tui::app::run_trim(h.ws_url(), h.secret(), "R1 x\nL1: y\n".into(), None)
-        .await
-        .unwrap_err();
-    assert_eq!(err, "model: overloaded", "{err}");
+    .await
+    .unwrap_err();
+    assert!(err.contains("unknown session"), "{err}");
 }
 
-/// When `/quote`'s trim fails with the new goose v1.60.2+ turn_failed error shape,
-/// the app must fall back to the untrimmed quote with a warning notice rather than hanging.
+/// When the trim fails with goose v1.60.2+'s turn_failed error shape, honkd quotes
+/// everything with a warning naming data.message, and the app loads it rather than hanging.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_quote_trim_failure_falls_back_to_untrimmed_quote_without_hanging() {
     let fake = honk_testgoose::FakeGoose::start().await;
@@ -4491,66 +4527,23 @@ async fn test_quote_trim_failure_falls_back_to_untrimmed_quote_without_hanging()
         &["--allow-unpatched-upstream"],
     )
     .await;
+    write_quote_log(h.state_dir.path(), "20261124_2");
 
     let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = honk::tui::app::App::new("ses_trim_fail", cmd_tx);
+    let mut app = honk::tui::app::App::new("20261124_2", cmd_tx);
     app.trim_backend = honk::tui::app::TrimBackend::Honkd {
         url: h.ws_url().to_string(),
         secret: h.secret().to_string(),
     };
-    // Add prompt and long wake replies so quote triggers a trim
-    app.transcript.apply_frame(&json!({
-        "method": "session/update",
-        "params": {
-            "sessionId": "ses_trim_fail",
-            "update": {
-                "sessionUpdate": "user_message_chunk",
-                "messageId": "u1",
-                "content": { "type": "text", "text": "status?" }
-            }
-        }
-    }));
-    for i in 0..3 {
-        let body = format!(
-            "head{i}\n\n{}\nQUESTION{i}?",
-            format!("filler line {i} with plenty of words\n").repeat(40)
-        );
-        app.transcript.apply_frame(&json!({
-            "method": "session/update",
-            "params": {
-                "sessionId": "ses_trim_fail",
-                "update": {
-                    "sessionUpdate": "user_message_chunk",
-                    "messageId": format!("u_wake_{i}"),
-                    "content": { "type": "text", "text": "[sw wake run=r reason=mail] Woken" }
-                }
-            }
-        }));
-        app.transcript.apply_frame(&json!({
-            "method": "session/update",
-            "params": {
-                "sessionId": "ses_trim_fail",
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "messageId": format!("a_wake_{i}"),
-                    "content": { "type": "text", "text": body }
-                }
-            }
-        }));
-    }
-
     let mut trim_rx = app.trim_rx.take().expect("trim_rx exists");
     app.execute_app_command("quote");
-    assert!(app.trim.is_some(), "trim should be initiated");
-
-    // Wait for the background oneshot trim to return with timeout (must not hang!)
-    let done = tokio::time::timeout(std::time::Duration::from_secs(10), trim_rx.recv())
+    assert!(app.trim.is_some(), "quote should be initiated");
+    let done = tokio::time::timeout(std::time::Duration::from_secs(20), trim_rx.recv())
         .await
-        .expect("must not hang waiting for trim")
+        .expect("must not hang waiting for the quote")
         .expect("trim_rx produced a result");
-
     app.on_trim_done(done);
-    assert!(app.trim.is_none(), "trim should be finished");
+    assert!(app.trim.is_none(), "quote should be finished");
 
     let last_notice = app
         .transcript
@@ -4751,53 +4744,36 @@ async fn test_chat_turn_failed_stock_shape_shows_notice_no_returned_text() {
     let _ = handle.send(UiCommand::Shutdown);
 }
 
-/// Manual check of `/quote`'s trim on a real session log against a live honkd, through the
-/// same batching and merge as honk chat (several calls for a long span):
-/// `HONK_TRIM_LOG=~/.local/state/honk/sessions/<sid>.jsonl HONK_TRIM_URL=ws://127.0.0.1:4280
-/// HONK_SECRET=... [HONK_TRIM_N=63] [HONK_TRIM_TAG_FROM=<sid>] cargo test -p honk --test
-/// chat_driver trim_real_log -- --ignored --nocapture`
+/// Manual check of `/quote` on a real session against a live honkd (`_honk/quote`, the same
+/// call honk chat and pigeon make; it runs model calls, so it spends):
+/// `HONK_QUOTE_SID=<sid> HONK_QUOTE_URL=ws://127.0.0.1:4280 HONK_SECRET=... [HONK_QUOTE_N=63]
+/// [HONK_QUOTE_TAG=<tag>] cargo test -p honk --test chat_driver quote_real_session -- --ignored
+/// --nocapture`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn trim_real_log() {
-    use honk::tui::{quote, trim};
-    let log = std::env::var("HONK_TRIM_LOG").expect("HONK_TRIM_LOG");
-    let url = std::env::var("HONK_TRIM_URL").expect("HONK_TRIM_URL");
+async fn quote_real_session() {
+    use honk_wire::quote::{Pick, QuoteReq};
+    let sid = std::env::var("HONK_QUOTE_SID").expect("HONK_QUOTE_SID");
+    let url = std::env::var("HONK_QUOTE_URL").expect("HONK_QUOTE_URL");
     let secret = honk::client::resolve_secret(None).expect("secret");
-    let pick = match std::env::var("HONK_TRIM_N") {
-        Ok(n) => quote::Pick::Last(n.parse().expect("HONK_TRIM_N is a number")),
-        Err(_) => quote::Pick::SinceYou,
+    let pick = match std::env::var("HONK_QUOTE_N") {
+        Ok(n) => Pick::Last {
+            n: n.parse().expect("HONK_QUOTE_N is a number"),
+        },
+        Err(_) => Pick::Since,
     };
-    let from = std::env::var("HONK_TRIM_TAG_FROM").ok();
-    let mut t = honk::tui::Transcript::new();
-    for line in std::fs::read_to_string(&log).unwrap().lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
-            && let Some(f) = v.get("frame")
-        {
-            t.apply_frame(f);
-        }
-    }
-    let q = quote::build(&t.blocks, pick, false, quote::local_time).expect("replies");
-    let sent = trim::sendable(&q.replies);
-    let batches = trim::batches(&sent, trim::BATCH_BYTES);
-    let prompts = trim::batch_prompts(&sent, q.your_prompt.as_deref(), &batches);
-    eprintln!(
-        "== {} replies, {} bytes quoted, {} calls",
-        q.count,
-        q.text.len(),
-        prompts.len()
-    );
+    let req = QuoteReq {
+        session_id: sid,
+        pick,
+        full: false,
+        tag: std::env::var("HONK_QUOTE_TAG").ok(),
+        quote_id: None,
+    };
     let started = std::time::Instant::now();
-    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(trim::PARALLEL));
-    let calls = prompts.into_iter().map(|p| {
-        let (url, secret, from, gate) = (url.clone(), secret.clone(), from.clone(), gate.clone());
-        async move {
-            let _permit = gate.acquire_owned().await.unwrap();
-            honk::tui::app::run_trim(url, secret, p, from).await
-        }
-    });
-    let answers = futures::future::join_all(calls).await;
-    eprintln!("== answers in {:?}: {answers:?}", started.elapsed());
-    let m = trim::merge(&sent, &batches, &answers).expect("usable answer");
-    eprintln!("== failed: {:?}", m.failed);
-    eprintln!("{}", trim::render(&q.replies, &m.kept, m.model.as_deref()));
+    let r = honk::tui::app::run_quote(url, secret, req)
+        .await
+        .expect("an answer");
+    eprintln!("== in {:?}", started.elapsed());
+    eprintln!("== notices: {:?}\n== warnings: {:?}", r.notices, r.warnings);
+    eprintln!("{}", r.composer_text());
 }

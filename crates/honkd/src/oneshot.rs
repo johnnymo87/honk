@@ -39,10 +39,12 @@ pub struct OneshotReq {
     pub timeout: Duration,
     /// The goose session this call serves: its session-tags tag goes on the oneshot session.
     pub tag_from: Option<String>,
+    /// A session-tags tag for the oneshot session; overrides `tag_from`'s.
+    pub tag: Option<String>,
 }
 
 impl OneshotReq {
-    /// Parses `_honk/oneshot` params: `{system, prompt, effort?, timeoutMs?, tagFrom?}`.
+    /// Parses `_honk/oneshot` params: `{system, prompt, effort?, timeoutMs?, tagFrom?, tag?}`.
     pub fn from_params(params: &Value) -> Result<Self, String> {
         let text = |key: &str| {
             params
@@ -72,6 +74,12 @@ impl OneshotReq {
             tag_from: params
                 .get("tagFrom")
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            tag: params
+                .get("tag")
+                .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
         })
@@ -219,12 +227,15 @@ impl Hub {
                 .map_err(|e| fail("state", e))?;
         }
         *sid_out = Some(sid.clone());
-        if let (Some(bin), Some(from)) = (&self.args.session_tags_bin, &req.tag_from) {
-            *tagging = Some(tokio::spawn(tag_like(
-                bin.clone(),
-                from.clone(),
-                sid.clone(),
-            )));
+        if let Some(bin) = &self.args.session_tags_bin {
+            let tag = match (&req.tag, &req.tag_from) {
+                (Some(tag), _) => Some(TagSource::Tag(tag.clone())),
+                (None, Some(from)) => Some(TagSource::Like(from.clone())),
+                (None, None) => None,
+            };
+            if let Some(tag) = tag {
+                *tagging = Some(tokio::spawn(tag_session(bin.clone(), tag, sid.clone())));
+            }
         }
 
         up.subscribe_with(
@@ -380,11 +391,19 @@ impl Hub {
     }
 }
 
-/// Gives goose session `sid` the session-tags tag of goose session `from`. Best effort: an
-/// untagged session (an `auto:` tag) or a failing binary leaves `sid` to session-tags' own
-/// `auto:goose/honk-oneshot`. A one-time copy: a later retag of `from` does not follow, and a
-/// session swept after a honkd crash is archived untagged.
-async fn tag_like(bin: std::path::PathBuf, from: String, sid: String) {
+/// Which session-tags tag a oneshot session gets.
+enum TagSource {
+    /// This one (`tag`).
+    Tag(String),
+    /// The one goose session `from` has (`tagFrom`).
+    Like(String),
+}
+
+/// Gives goose session `sid` a session-tags tag: `tag`, or the tag of goose session `from`.
+/// Best effort: an untagged `from` (an `auto:` tag) or a failing binary leaves `sid` to
+/// session-tags' own `auto:goose/honk-oneshot`. A one-time copy: a later retag of `from` does
+/// not follow, and a session swept after a honkd crash is archived untagged.
+async fn tag_session(bin: std::path::PathBuf, source: TagSource, sid: String) {
     let run = |args: Vec<String>| {
         let bin = bin.clone();
         async move {
@@ -406,12 +425,18 @@ async fn tag_like(bin: std::path::PathBuf, from: String, sid: String) {
             Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
         }
     };
-    let which = match run(vec!["which".into(), format!("goose:{from}")]).await {
-        Ok(out) => out,
-        Err(e) => return tracing::warn!(%sid, %from, "session-tags which failed: {e:#}"),
-    };
-    let Some(tag) = which_tag(&which) else {
-        return tracing::debug!(%sid, %from, "oneshot not tagged: {from} has no tag");
+    let tag = match source {
+        TagSource::Tag(tag) => tag,
+        TagSource::Like(from) => {
+            let which = match run(vec!["which".into(), format!("goose:{from}")]).await {
+                Ok(out) => out,
+                Err(e) => return tracing::warn!(%sid, %from, "session-tags which failed: {e:#}"),
+            };
+            let Some(tag) = which_tag(&which) else {
+                return tracing::debug!(%sid, %from, "oneshot not tagged: {from} has no tag");
+            };
+            tag
+        }
     };
     if let Err(e) = run(vec!["set".into(), tag.clone(), format!("goose:{sid}")]).await {
         tracing::warn!(%sid, %tag, "session-tags set failed: {e:#}");
@@ -479,6 +504,10 @@ mod tests {
         .unwrap();
         assert_eq!(r.timeout, DEFAULT_TIMEOUT);
         assert_eq!(r.tag_from.as_deref(), Some("20261111_19"));
+        assert_eq!(r.tag, None);
+        let r = OneshotReq::from_params(&json!({ "system": "", "prompt": "p", "tag": " honk " }))
+            .unwrap();
+        assert_eq!(r.tag.as_deref(), Some("honk"));
         assert!(OneshotReq::from_params(&json!({ "system": "s" })).is_err());
         assert!(OneshotReq::from_params(&json!({ "system": "s", "prompt": " " })).is_err());
     }

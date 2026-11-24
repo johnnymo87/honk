@@ -1,52 +1,30 @@
-//! `/quote [full] [N|prev]`: the coordinator's replies, quoted for the composer.
+//! Which replies `/quote` takes (moved from honk chat, `crates/honk/src/tui/quote.rs`).
 //!
 //! A turn is a user block plus every block after it up to the next user block. Its reply is
 //! the text of its assistant blocks (thoughts, tools and notices are left out). Turns with no
 //! reply text do not count, so silent wake runs are skipped. The user block only labels the
 //! turn: stall-watch wakes, swarm messages and Jonathan's own prompts are never quoted.
 //!
-//! `/quote N` takes the last N such turns. Bare `/quote` takes every such turn from
-//! Jonathan's own last prompt (`Trigger::You`) onward, the reply to that prompt included;
-//! `/quote prev` does the same from the prompt before that one.
+//! `Last(N)` takes the last N such turns. `Since` takes every such turn from Jonathan's own
+//! last prompt (`Trigger::You`) onward, the reply to that prompt included; `Prev` does the
+//! same from the prompt before that one.
 //! A `/compact` is not his prompt: stall-watch sends them too, and nothing tells the two apart.
 //! See docs/plans/2026-11-19-quote-replies.md.
 
-use crate::tui::transcript::{Block, BlockKind};
+use super::turns::{Block, Kind};
+pub use honk_wire::quote::{Pick, quote_lines};
 pub use honk_wire::{Trigger, classify};
-
-/// Which turns to quote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pick {
-    /// The last N turns with reply text.
-    Last(usize),
-    /// Every turn with reply text from your last prompt on.
-    SinceYou,
-    /// `SinceYou`, but counted from your previous prompt (the one before your last).
-    SincePrev,
-}
-
-impl Pick {
-    /// Which replies this picks, for notices: "since your last prompt", "the last 5".
-    pub fn describe(self) -> String {
-        match self {
-            Pick::Last(1) => "the last reply".into(),
-            Pick::Last(n) => format!("the last {n} replies"),
-            Pick::SinceYou => "since your last prompt".into(),
-            Pick::SincePrev => "since your previous prompt".into(),
-        }
-    }
-}
 
 /// Why nothing was quoted.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Empty {
     /// No turn has reply text (or N was 0).
     NoReplies,
-    /// `SinceYou`, but the transcript has no prompt of yours.
+    /// `Since`, but the transcript has no prompt of yours.
     NeverSpoke,
-    /// `SinceYou`, but no turn from your last prompt on has reply text yet.
+    /// `Since`, but no turn from your last prompt on has reply text yet.
     NothingSince,
-    /// `SincePrev`, but the transcript has only one prompt of yours.
+    /// `Prev`, but the transcript has only one prompt of yours.
     OnePrompt,
 }
 
@@ -55,9 +33,9 @@ pub enum Empty {
 pub struct Quoted {
     pub text: String,
     pub count: usize,
-    /// The picked replies, oldest first, unquoted (for `/quote`'s model trim, `tui::trim`).
+    /// The picked replies, oldest first, unquoted (for `/quote`'s model trim, `super::trim`).
     pub replies: Vec<Reply>,
-    /// `SinceYou`: the text of the prompt counted from.
+    /// `Since`: the text of the prompt counted from.
     pub your_prompt: Option<String>,
 }
 
@@ -70,23 +48,6 @@ pub struct Reply {
     pub in_progress: bool,
     /// Your prompt, when this is the reply to one (context for the trim, never quoted).
     pub your_prompt: Option<String>,
-}
-
-/// `text` as quote lines: `> line`, and a bare `>` for a blank line.
-pub fn quote_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
-    let mut out = String::new();
-    for (i, line) in lines.into_iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if line.is_empty() {
-            out.push('>');
-        } else {
-            out.push_str("> ");
-            out.push_str(line);
-        }
-    }
-    out
 }
 
 struct Turn {
@@ -109,14 +70,14 @@ pub fn build(
     let mut turns: Vec<Turn> = Vec::new();
     for b in blocks {
         match b.kind {
-            BlockKind::User => turns.push(Turn {
+            Kind::User => turns.push(Turn {
                 trigger: classify(&b.text),
                 is_compact: b.text.trim() == "/compact",
                 prompt: b.text.clone(),
                 reply: Vec::new(),
                 created: None,
             }),
-            BlockKind::Assistant => {
+            Kind::Assistant => {
                 if turns.is_empty() {
                     turns.push(Turn {
                         trigger: Trigger::Start,
@@ -135,15 +96,14 @@ pub fn build(
                     turn.reply.push(text.to_string());
                 }
             }
-            _ => {}
         }
     }
     let last_idx = turns.len().checked_sub(1);
     let mut your_prompt = None;
     let (start, n, empty) = match pick {
-        Pick::Last(n) => (0, n, Empty::NoReplies),
-        Pick::SinceYou | Pick::SincePrev => {
-            let back = usize::from(matches!(pick, Pick::SincePrev));
+        Pick::Last { n } => (0, n, Empty::NoReplies),
+        Pick::Since | Pick::Prev => {
+            let back = usize::from(matches!(pick, Pick::Prev));
             let yours: Vec<usize> = turns
                 .iter()
                 .enumerate()
@@ -210,7 +170,7 @@ pub fn build(
 /// `MM-DD HH:MM` in the host's local time zone.
 pub fn local_time(secs: i64) -> Option<String> {
     let t: libc::time_t = secs;
-    // SAFETY: localtime_r writes only into `tm`, which we own; honk never calls setenv.
+    // SAFETY: localtime_r writes only into `tm`, which we own; honkd never calls setenv.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::localtime_r(&t, &mut tm) };
     if r.is_null() {
@@ -228,36 +188,18 @@ pub fn local_time(secs: i64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use honk_wire::BlockKey;
-
-    fn block(kind: BlockKind, text: &str, created: Option<i64>) -> Block {
-        let key = match kind {
-            BlockKind::User => BlockKey::User(text.into()),
-            BlockKind::Assistant => BlockKey::Text(text.into()),
-            BlockKind::Thought => BlockKey::Thought(text.into()),
-            BlockKind::Tool => BlockKey::Tool(text.into()),
-            BlockKind::Notice => BlockKey::Notice(text.into()),
-        };
+    fn block(kind: Kind, text: &str, created: Option<i64>) -> Block {
         Block {
-            key,
             kind,
-            revision: 1,
             text: text.into(),
-            title: String::new(),
-            status: String::new(),
-            tool_kind: None,
-            input_text: String::new(),
-            output_text: String::new(),
-            notification_line: None,
-            notice: None,
             created,
         }
     }
     fn user(t: &str) -> Block {
-        block(BlockKind::User, t, None)
+        block(Kind::User, t, None)
     }
     fn ast(t: &str, c: i64) -> Block {
-        block(BlockKind::Assistant, t, Some(c))
+        block(Kind::Assistant, t, Some(c))
     }
     fn fmt(secs: i64) -> Option<String> {
         Some(format!("T{secs}"))
@@ -269,14 +211,12 @@ mod tests {
             user("first prompt"),
             ast("old reply", 10),
             user("[sw wake run=r reason=heartbeat] quiet"),
-            block(BlockKind::Thought, "thinking", Some(20)),
-            block(BlockKind::Tool, "tool", None),
             user("<swarm_message v=\"1\" from=\"ses_w\">\nresult"),
             ast("swarm reply", 30),
             user("[sw wake run=r reason=mail] mail"),
             ast("line 1\n\nline 3", 40),
         ];
-        let q = build(&blocks, Pick::Last(2), false, fmt).unwrap();
+        let q = build(&blocks, Pick::Last { n: 2 }, false, fmt).unwrap();
         assert_eq!(q.count, 2);
         assert_eq!(
             q.text,
@@ -286,21 +226,16 @@ mod tests {
 
     #[test]
     fn joins_multiple_text_blocks_in_a_turn_and_excludes_user_text() {
-        let blocks = vec![
-            user("please do x"),
-            ast("part one", 5),
-            block(BlockKind::Tool, "tool", None),
-            ast("part two", 6),
-        ];
-        let q = build(&blocks, Pick::Last(3), false, fmt).unwrap();
+        let blocks = vec![user("please do x"), ast("part one", 5), ast("part two", 6)];
+        let q = build(&blocks, Pick::Last { n: 3 }, false, fmt).unwrap();
         assert_eq!(q.count, 1);
         assert_eq!(q.text, "# T5 (you)\n> part one\n>\n> part two");
     }
 
     #[test]
     fn missing_created_omits_time_and_start_turn_is_labelled() {
-        let blocks = vec![block(BlockKind::Assistant, "hello", None)];
-        let q = build(&blocks, Pick::Last(1), false, fmt).unwrap();
+        let blocks = vec![block(Kind::Assistant, "hello", None)];
+        let q = build(&blocks, Pick::Last { n: 1 }, false, fmt).unwrap();
         assert_eq!(q.text, "# (start)\n> hello");
     }
 
@@ -314,7 +249,7 @@ mod tests {
             user("next"),
             ast("partial", 3),
         ];
-        let q = build(&blocks, Pick::Last(5), true, fmt).unwrap();
+        let q = build(&blocks, Pick::Last { n: 5 }, true, fmt).unwrap();
         assert_eq!(q.count, 2);
         assert_eq!(
             q.text,
@@ -325,19 +260,22 @@ mod tests {
     #[test]
     fn running_does_not_mark_an_earlier_turn() {
         let blocks = vec![user("hi"), ast("done", 1), user("next")];
-        let q = build(&blocks, Pick::Last(1), true, fmt).unwrap();
+        let q = build(&blocks, Pick::Last { n: 1 }, true, fmt).unwrap();
         assert_eq!(q.text, "# T1 (you)\n> done");
     }
 
     #[test]
     fn nothing_to_quote() {
-        assert_eq!(build(&[], Pick::Last(3), false, fmt), Err(Empty::NoReplies));
         assert_eq!(
-            build(&[user("x"), user("y")], Pick::Last(3), false, fmt),
+            build(&[], Pick::Last { n: 3 }, false, fmt),
             Err(Empty::NoReplies)
         );
         assert_eq!(
-            build(&[user("x"), ast("y", 1)], Pick::Last(0), false, fmt),
+            build(&[user("x"), user("y")], Pick::Last { n: 3 }, false, fmt),
+            Err(Empty::NoReplies)
+        );
+        assert_eq!(
+            build(&[user("x"), ast("y", 1)], Pick::Last { n: 0 }, false, fmt),
             Err(Empty::NoReplies)
         );
     }
@@ -377,7 +315,7 @@ mod tests {
             "{}",
             q.text
         );
-        let q = build(&blocks, Pick::Last(500), false, fmt).unwrap();
+        let q = build(&blocks, Pick::Last { n: 500 }, false, fmt).unwrap();
         assert_eq!(q.count, 120);
     }
 
@@ -407,11 +345,7 @@ mod tests {
         assert_eq!(since(&[ast("hello", 1)], false), Err(Empty::NeverSpoke));
         let waiting = vec![user("me"), ast("a", 1), user("again")];
         assert_eq!(since(&waiting, true), Err(Empty::NothingSince));
-        let silent = vec![
-            user("me"),
-            user("[sw wake run=r reason=x] x"),
-            block(BlockKind::Tool, "t", None),
-        ];
+        let silent = vec![user("me"), user("[sw wake run=r reason=x] x")];
         assert_eq!(since(&silent, false), Err(Empty::NothingSince));
     }
 
@@ -434,25 +368,22 @@ mod tests {
             user("second"),
             ast("b", 4),
         ];
-        let q = build(&blocks, Pick::SincePrev, false, fmt).unwrap();
+        let q = build(&blocks, Pick::Prev, false, fmt).unwrap();
         assert_eq!(
             q.text,
             "# T1 (you)\n> a\n\n# T2 (wake: x)\n> w\n\n# T4 (you)\n> b"
         );
         assert_eq!(q.your_prompt.as_deref(), Some("first"));
         let one = vec![user("only"), ast("a", 1)];
+        assert_eq!(build(&one, Pick::Prev, false, fmt), Err(Empty::OnePrompt));
         assert_eq!(
-            build(&one, Pick::SincePrev, false, fmt),
-            Err(Empty::OnePrompt)
-        );
-        assert_eq!(
-            build(&[ast("a", 1)], Pick::SincePrev, false, fmt),
+            build(&[ast("a", 1)], Pick::Prev, false, fmt),
             Err(Empty::NeverSpoke)
         );
     }
 
     fn since(blocks: &[Block], running: bool) -> Result<Quoted, Empty> {
-        build(blocks, Pick::SinceYou, running, fmt)
+        build(blocks, Pick::Since, running, fmt)
     }
 
     #[test]

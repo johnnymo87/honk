@@ -6,6 +6,7 @@ pub mod malloc;
 pub mod mcp;
 pub mod models;
 pub mod oneshot;
+pub mod quote;
 pub mod rpc;
 pub mod session;
 pub mod state;
