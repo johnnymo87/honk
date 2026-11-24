@@ -1,6 +1,7 @@
 pub mod config;
 pub mod downstream;
 pub mod hub;
+pub mod load_model_hook;
 pub mod log;
 pub mod malloc;
 pub mod mcp;

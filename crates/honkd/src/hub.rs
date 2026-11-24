@@ -1692,7 +1692,7 @@ impl Hub {
                 })?;
 
             // Step 4: session/load {sessionId, cwd: stored, mcpServers: []}; discard its replay frames (C1)
-            let load_reply = session_upstream
+            let mut load_reply = session_upstream
                 .call(
                     "session/load",
                     json!({
@@ -1709,6 +1709,19 @@ impl Hub {
                     message: format!("failed to call session/load: {e:#}"),
                 })?;
 
+            if let Some(cmd) = &hub.args.on_load_model_cmd {
+                crate::load_model_hook::maybe_switch_model_on_load(
+                    cmd,
+                    Duration::from_secs(hub.args.on_load_model_timeout_secs),
+                    Duration::from_secs(hub.args.on_load_model_rpc_timeout_secs),
+                    Duration::from_secs(hub.args.on_load_model_applied_timeout_secs),
+                    &sid_str,
+                    &mut session_upstream,
+                    &mut load_reply,
+                )
+                .await;
+            }
+
             let (up_handle, mut event_rx) = session_upstream.split();
 
             // C1: Drain frames arrived before load reply.
@@ -1722,13 +1735,23 @@ impl Hub {
                     && key == &honk_upstream::StreamKey::Session(sid_str.clone())
                     && crate::rpc::kind(frame) == crate::rpc::Kind::Notification
                 {
-                    if frame.get("method").and_then(Value::as_str) == Some("session/update")
-                        && frame
+                    if frame.get("method").and_then(Value::as_str) == Some("session/update") {
+                        if frame
                             .pointer("/params/update")
                             .and_then(honk_wire::usage)
                             .is_some()
-                    {
-                        carried_usage = Some(frame.clone());
+                        {
+                            carried_usage = Some(frame.clone());
+                        }
+                        if let Some(opts) = frame
+                            .pointer("/params/update/configOptions")
+                            .and_then(Value::as_array)
+                        {
+                            crate::load_model_hook::apply_config_options(
+                                &mut load_reply,
+                                Value::Array(opts.clone()),
+                            );
+                        }
                     }
                     continue;
                 }
