@@ -344,9 +344,17 @@ impl Hub {
                 "unknown session {sid}: honkd has no log for it"
             )));
         }
+        // Sampled on both sides of the read: a run that ends mid-read may have left its reply
+        // cut off on disk, so any doubt marks the last reply in progress (never trimmed).
+        let running_before = self.is_session_running(&sid);
         let blocks = {
-            let _permit = self.quote_reads.acquire().await;
-            let read = tokio::task::spawn_blocking(move || turns::read(&path));
+            let permit = self.quote_reads.clone().acquire_owned().await;
+            // The permit moves into the read, so a cancelled quote still holds it until the
+            // read is done and the bound on concurrent reads holds.
+            let read = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                turns::read(&path)
+            });
             tokio::select! {
                 r = read => r
                     .map_err(|e| QuoteError::Failed(format!("reading the log: {e}")))?
@@ -354,7 +362,7 @@ impl Hub {
                 _ = &mut cancel => return Err(QuoteError::Cancelled),
             }
         };
-        let running = self.is_session_running(&sid);
+        let running = running_before || self.is_session_running(&sid);
         let step = prepare(
             &blocks,
             req.pick,

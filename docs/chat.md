@@ -320,7 +320,7 @@ the replies with the fallbacks above (only one prompt of yours: count from it; n
 four at a time. A reply still streaming (the session is running) is marked in progress and
 never sent to the model. The last 16 fully good trim answers are remembered, so the same
 replies again cost nothing. `tag` names the session-tags tag the model calls are charged to;
-without it, a stall-watch coordinator's program, else the quoted session's tag.
+without it, a stall-watch coordinator's program (read from the working directory of a session honkd holds; a coordinator honkd has let go of is charged to its own tag), else the quoted session's tag. `never_spoke` and `one_prompt` are not returned today, since honkd falls back instead (counting from your only prompt, or the last 3 replies); a session with nothing to quote is `no_replies`. Use a fresh `quoteId` per request: a second request with the same id on the same connection cancels the first.
 
 Reply:
 
