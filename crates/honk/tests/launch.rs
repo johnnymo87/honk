@@ -38,6 +38,7 @@ struct Script {
     enable: Value,
     prompt: PromptReply,
     model_error: Option<&'static str>,
+    model_delay: Option<Duration>,
     effort_error: Option<&'static str>,
     model_list: Option<Value>,
 }
@@ -49,6 +50,7 @@ impl Default for Script {
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
             model_error: None,
+            model_delay: None,
             effort_error: None,
             model_list: None,
         }
@@ -124,6 +126,11 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                 "_goose/unstable/session/rename" => out.push(json!({"id": id, "result": {}})),
                 "session/set_config_option" => {
                     let config_id = v["params"]["configId"].as_str();
+                    if config_id == Some("model")
+                        && let Some(d) = script.model_delay
+                    {
+                        tokio::time::sleep(d).await;
+                    }
                     let err = match config_id {
                         Some("model") => script.model_error,
                         Some("thinking_effort") => script.effort_error,
@@ -234,6 +241,7 @@ fn opts(r: &Rig, tag: TagRequest, launcher: Option<&str>, title: Option<&str>) -
         prompt: "do the thing".into(),
         title: title.map(str::to_string),
         model: None,
+        default_model_cmd: None,
         effort: None,
         tag,
         launcher: launcher.map(str::to_string),
@@ -1125,6 +1133,324 @@ async fn launch_with_model_skips_check_on_other_error_with_warning() {
     o.model = Some("custom-model".into());
     let out = run(&o).await.expect("launch");
     assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+}
+
+fn make_hook_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    let bin = dir.join(name);
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(&bin)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    bin
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_resolves_with_tag_and_orders_before_effort() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let log_path = r.dir.join("hook.log");
+    let script_body = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\necho 'resolved-hook-model'\n",
+        log_path.display()
+    );
+    let hook_bin = make_hook_script(&r.dir, "default_hook.sh", &script_body);
+
+    let mut o = opts(
+        &r,
+        TagRequest::Explicit("MyFeatureTag".into()),
+        None,
+        Some("Fix it"),
+    );
+    o.default_model_cmd = Some(hook_bin);
+    o.effort = Some("medium".into());
+
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    // Verify hook received lowercased tag
+    let log_content = std::fs::read_to_string(&log_path).expect("read hook log");
+    assert_eq!(log_content.trim(), "--tag myfeaturetag");
+
+    // Verify ordering: initialize, session/new, rename, _honk/model/list, set_config_option (model), set_config_option (effort), prompt
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_goose/unstable/session/rename",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let model_req = &reqs[4];
+    assert_eq!(
+        model_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "resolved-hook-model",
+        })
+    );
+    let effort_req = &reqs[5];
+    assert_eq!(
+        effort_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "thinking_effort",
+            "value": "medium",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_resolves_when_untagged() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let log_path = r.dir.join("hook_args.log");
+    let script_body = format!(
+        "#!/bin/sh\necho \"arg_count=$#\" >> '{}'\necho 'untagged-model'\n",
+        log_path.display()
+    );
+    let hook_bin = make_hook_script(&r.dir, "untagged_hook.sh", &script_body);
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    let log_content = std::fs::read_to_string(&log_path).expect("read hook log");
+    assert_eq!(log_content.trim(), "arg_count=0");
+
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let model_req = &reqs[3];
+    assert_eq!(
+        model_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "untagged-model",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_explicit_model_does_not_invoke_default_model_hook() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let marker_path = r.dir.join("marker.txt");
+    let script_body = format!(
+        "#!/bin/sh\ntouch '{}'\necho 'hook-model'\n",
+        marker_path.display()
+    );
+    let hook_bin = make_hook_script(&r.dir, "never_run_hook.sh", &script_body);
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("explicit-model".into());
+    o.default_model_cmd = Some(hook_bin);
+
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    assert!(!marker_path.exists(), "hook should not have been executed");
+
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let model_req = &reqs[3];
+    assert_eq!(
+        model_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "explicit-model",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_non_zero_exit_fails_open() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let fail_hook = make_hook_script(
+        &r.dir,
+        "fail_hook.sh",
+        "#!/bin/sh\necho 'err' >&2\nexit 1\n",
+    );
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(fail_hook);
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds on hook non-zero exit");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(methods(&r), ["initialize", "session/new", "session/prompt"]);
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_missing_binary_fails_open() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(r.dir.join("nonexistent_hook.sh"));
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds on missing hook binary");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(methods(&r), ["initialize", "session/new", "session/prompt"]);
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_timeout_fails_open() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let slow = make_hook_script(
+        &r.dir,
+        "slow.sh",
+        "#!/bin/sh\nsleep 10\necho 'slow-model'\n",
+    );
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(slow);
+    o.timeouts.default_model = Duration::from_millis(50);
+
+    let out = run(&o).await.expect("launch succeeds on hook timeout");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(methods(&r), ["initialize", "session/new", "session/prompt"]);
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_empty_output_fails_open() {
+    let r = rig(Script::default(), Behaviour::default(), "", 0).await;
+    let empty = make_hook_script(&r.dir, "empty.sh", "#!/bin/sh\nexit 0\n");
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(empty);
+
+    let out = run(&o).await.expect("launch succeeds on hook empty output");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    assert_eq!(methods(&r), ["initialize", "session/new", "session/prompt"]);
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_model_rejected_by_honkd_list_fails_open() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "models": [
+                    { "id": "allowed-model-1" },
+                    { "id": "allowed-model-2" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(
+        &r.dir,
+        "disallowed.sh",
+        "#!/bin/sh\necho 'unlisted-model'\n",
+    );
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds when hook model is rejected");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    // Checked model list, but skipped set_config_option and proceeded to prompt
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/prompt"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_set_config_option_error_fails_open() {
+    let script = Script {
+        model_error: Some("internal model configuration error"),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(&r.dir, "err_model.sh", "#!/bin/sh\necho 'failing-model'\n");
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds when setting hook model returns error");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    // Attempted model list and set_config_option, but still continued to prompt
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_set_model_timeout_fails_open() {
+    let script = Script {
+        model_delay: Some(Duration::from_millis(500)),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(
+        &r.dir,
+        "delayed_model.sh",
+        "#!/bin/sh\necho 'delayed-model'\n",
+    );
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+    o.timeouts.model = Duration::from_millis(150);
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds despite set_model timeout");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    // Attempted model list and set_config_option, timed out, but still continued to prompt
     assert_eq!(
         methods(&r),
         [
