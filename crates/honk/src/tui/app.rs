@@ -74,7 +74,6 @@ pub struct App {
     pub model_picker: Option<ModelPicker>,
     pub state_snapshot: Option<StateSnapshot>,
     pub pending_prefix: Option<char>,
-    pub enhanced_keyboard: bool,
     pub should_quit: bool,
     pub exit_code: Option<i32>,
     pub fatal_error: Option<String>,
@@ -204,7 +203,6 @@ impl App {
             model_picker: None,
             state_snapshot: None,
             pending_prefix: None,
-            enhanced_keyboard: false,
             should_quit: false,
             exit_code: None,
             fatal_error: None,
@@ -377,13 +375,7 @@ impl App {
 
         let mode = self.composer.mode;
         let composer_empty = self.is_composer_empty();
-        let action = resolve(
-            mode,
-            composer_empty,
-            key_event,
-            self.pending_prefix,
-            self.enhanced_keyboard,
-        );
+        let action = resolve(mode, composer_empty, key_event, self.pending_prefix);
 
         // Reset pending prefix unless new action is a prefix
         if let Action::PendingPrefix(c) = action {
@@ -880,9 +872,6 @@ impl App {
     pub fn suspend_terminal(&self) -> anyhow::Result<()> {
         let mut stdout = std::io::stdout();
         let _ = crossterm::terminal::disable_raw_mode();
-        if self.enhanced_keyboard {
-            let _ = crossterm::execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
-        }
         let _ = crossterm::execute!(
             stdout,
             crossterm::event::DisableBracketedPaste,
@@ -904,14 +893,6 @@ impl App {
             crossterm::cursor::Hide
         )?;
         let _ = stdout.write_all(b"\x1b[?1007h");
-        if self.enhanced_keyboard {
-            let _ = crossterm::execute!(
-                stdout,
-                crossterm::event::PushKeyboardEnhancementFlags(
-                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                )
-            );
-        }
         let _ = stdout.flush();
         Ok(())
     }
@@ -1153,25 +1134,20 @@ impl App {
 
 static RESTORED: AtomicBool = AtomicBool::new(false);
 
-pub struct TerminalGuard {
-    pub enhanced_keyboard: bool,
-}
+pub struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal(self.enhanced_keyboard);
+        restore_terminal();
     }
 }
 
-pub fn restore_terminal(enhanced_keyboard: bool) {
+pub fn restore_terminal() {
     if RESTORED.swap(true, Ordering::SeqCst) {
         return;
     }
     let mut stdout = std::io::stdout();
     let _ = crossterm::terminal::disable_raw_mode();
-    if enhanced_keyboard {
-        let _ = crossterm::execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
-    }
     let _ = crossterm::execute!(
         stdout,
         crossterm::event::DisableBracketedPaste,
@@ -1201,23 +1177,11 @@ pub fn setup_terminal() -> anyhow::Result<(
     stdout.write_all(b"\x1b[22;0t\x1b[?1007h")?;
     stdout.flush()?;
 
-    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        let _ = crossterm::execute!(
-            stdout,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            )
-        );
-    }
-
-    let guard = TerminalGuard {
-        enhanced_keyboard: enhanced,
-    };
+    let guard = TerminalGuard;
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal(enhanced);
+        restore_terminal();
         default_hook(info);
     }));
 
@@ -1245,7 +1209,6 @@ pub async fn run_app(
     handle: crate::chat::driver::DriverHandle,
 ) -> anyhow::Result<i32> {
     let (mut terminal, _guard) = setup_terminal()?;
-    app.enhanced_keyboard = _guard.enhanced_keyboard;
 
     let mut event_stream = crossterm::event::EventStream::new();
     let mut render_interval = tokio::time::interval(std::time::Duration::from_millis(33));
@@ -1451,12 +1414,15 @@ mod tests {
         press(KeyCode::Char(c), KeyModifiers::SHIFT)
     }
 
-    fn send_chord() -> KeyEvent {
-        press(KeyCode::Enter, KeyModifiers::CONTROL)
+    fn submit(app: &mut App) {
+        if app.composer.mode != EditorMode::Normal {
+            app.handle_key(key(KeyCode::Esc));
+        }
+        app.handle_key(key(KeyCode::Enter));
     }
 
     #[test]
-    fn test_insert_enter_inserts_newline_and_ctrl_enter_submits() {
+    fn test_insert_enter_inserts_newline_and_normal_enter_submits() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_1", cmd_tx);
         app.composer.mode = EditorMode::Insert;
@@ -1467,22 +1433,18 @@ mod tests {
         type_str(&mut app, "line 2");
         assert_eq!(app.get_composer_text(), "line 1\nline 2");
 
-        // Ctrl-Enter submits from insert mode
-        app.handle_key(send_chord());
+        // Ctrl-Enter in insert mode must not submit
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "insert Ctrl-Enter must not submit"
+        );
+
+        // Normal-mode plain Enter submits
+        submit(&mut app);
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
             UiCommand::Line("line 1\nline 2".into())
-        );
-        assert!(app.is_composer_empty());
-        assert_eq!(app.composer.mode, EditorMode::Insert);
-
-        // Normal-mode plain Enter submits
-        app.set_composer_text("from normal");
-        app.composer.mode = EditorMode::Normal;
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            cmd_rx.try_recv().unwrap(),
-            UiCommand::Line("from normal".into())
         );
         assert!(app.is_composer_empty());
         assert_eq!(app.composer.mode, EditorMode::Insert);
@@ -1496,11 +1458,11 @@ mod tests {
         app.handle_key(ctrl('d'));
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Eof);
 
-        // Trailing newline (e.g. habitual Enter before send chord) is stripped on submit.
+        // Trailing newline (e.g. habitual Enter before Esc+Enter) is stripped on submit.
         app.composer.mode = EditorMode::Insert;
         type_str(&mut app, "hello");
         app.handle_key(key(KeyCode::Enter));
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("hello".into()));
         assert_eq!(app.history.last().map(String::as_str), Some("hello"));
     }
@@ -1512,7 +1474,7 @@ mod tests {
         app.set_composer_text("hello honk");
         app.composer.mode = EditorMode::Insert;
 
-        app.handle_key(send_chord());
+        submit(&mut app);
 
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
@@ -1530,11 +1492,11 @@ mod tests {
 
         // Submit first prompt
         app.set_composer_text("first prompt");
-        app.handle_key(send_chord());
+        submit(&mut app);
 
         // Submit second prompt
         app.set_composer_text("second prompt");
-        app.handle_key(send_chord());
+        submit(&mut app);
 
         // Recall prev (second prompt)
         app.handle_key(ctrl('p'));
@@ -2640,7 +2602,7 @@ mod tests {
     fn test_slash_quote_asks_honkd_and_fills_maximized_normal_composer() {
         let (mut app, mut cmd_rx) = quote_app();
         type_str(&mut app, "/quote 2");
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
         let t = app.trim.as_ref().expect("asked");
         assert_eq!(t.req.session_id, "ses_q");
@@ -2847,7 +2809,7 @@ mod tests {
         let (mut app, mut cmd_rx) = quote_app();
         app.execute_app_command("quote");
         type_str(&mut app, "go ahead");
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert!(app.trim.is_none());
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
@@ -2903,14 +2865,14 @@ mod tests {
         );
         // `//quote` is the literal escape and goes upstream untouched.
         type_str(&mut app, "//quote");
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
             UiCommand::Line("//quote".into())
         );
         // `/quoted` is not the command.
         type_str(&mut app, "/quoted");
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
             UiCommand::Line("/quoted".into())
@@ -2921,7 +2883,7 @@ mod tests {
     fn test_slash_yank_stays_local() {
         let (mut app, mut cmd_rx) = quote_app();
         type_str(&mut app, "/yank");
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert!(cmd_rx.try_recv().is_err());
         assert!(app.is_composer_empty());
     }
@@ -2944,7 +2906,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.composer.mode, EditorMode::Insert);
-        app.handle_key(send_chord());
+        submit(&mut app);
         assert!(app.is_composer_empty(), "submitted");
         assert!(!app.composer_maximized);
     }

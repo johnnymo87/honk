@@ -114,7 +114,6 @@ The user interface consists of three distinct vertical areas:
 |-----|--------|
 | `Enter` | Insert a newline. |
 | `Shift-Enter` / `Ctrl-J` | Insert a newline. |
-| `Ctrl-Enter` | Submit current prompt (when composer is not empty; requires terminal/tmux extended-keys support). |
 | `Up` / `Down` | Scroll transcript up / down 3 lines (when composer is empty, e.g. mouse wheel via `?1007`); moves cursor in editor when composer has text. |
 | `Ctrl-C` | If composer has text: exits to **Normal Mode** (vim habit). If composer is empty: interrupts active turn (`Action::Interrupt`). |
 | `Ctrl-D` | If composer is empty: quits `honk chat` (`Action::Quit`). If composer has text: ignored (no-op). |
@@ -127,7 +126,7 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Submit current prompt (when composer is not empty). `Ctrl-Enter` also submits. |
+| `Enter` | Submit current prompt (when composer is not empty). |
 | `Ctrl-E` | Scroll transcript down 1 line. |
 | `Ctrl-Y` | Scroll transcript up 1 line. |
 | `Ctrl-D` | Scroll transcript down half a page. |
@@ -438,14 +437,6 @@ After sending the prompt, `honk launch` auto-opens the new session in a new nvim
 ## Tmux Configuration
 
 If you run `honk chat` inside `tmux`, consider the following settings in `~/.tmux.conf`:
-
-### Ctrl-Enter through tmux
-To allow `Ctrl-Enter` (CSI u / modifyOtherKeys) to pass through `tmux` into apps that request extended keys (such as Neovim `:terminal`):
-```tmux
-# Enable extended keys (tmux 3.2+ with compatible terminal)
-set -s extended-keys on
-set -as terminal-features ',xterm*:extkeys'
-```
 
 ### OSC 52 Clipboard (`:yank`)
 To enable OSC 52 clipboard passthrough from tmux to your outer terminal:
