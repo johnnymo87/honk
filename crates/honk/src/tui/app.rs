@@ -1441,6 +1441,53 @@ mod tests {
         press(KeyCode::Char(c), KeyModifiers::SHIFT)
     }
 
+    fn send_chord() -> KeyEvent {
+        press(KeyCode::Enter, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn test_insert_enter_inserts_newline_and_chords_submit() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new("ses_1", cmd_tx);
+        app.composer.mode = EditorMode::Insert;
+
+        type_str(&mut app, "line 1");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(cmd_rx.try_recv().is_err(), "insert Enter must not submit");
+        type_str(&mut app, "line 2");
+        assert_eq!(app.get_composer_text(), "line 1\nline 2");
+
+        // Cmd-Enter (SUPER), Alt-Enter, Ctrl-Enter, Ctrl-S all submit from insert mode
+        for chord in [
+            press(KeyCode::Enter, KeyModifiers::SUPER),
+            press(KeyCode::Enter, KeyModifiers::ALT),
+            press(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ] {
+            app.composer.mode = EditorMode::Insert;
+            app.set_composer_text("line 1\nline 2");
+            app.handle_key(chord);
+            assert_eq!(
+                cmd_rx.try_recv().unwrap(),
+                UiCommand::Line("line 1\nline 2".into()),
+                "chord {chord:?} should submit"
+            );
+            assert!(app.is_composer_empty());
+            assert_eq!(app.composer.mode, EditorMode::Insert);
+        }
+
+        // Normal-mode plain Enter submits
+        app.set_composer_text("from normal");
+        app.composer.mode = EditorMode::Normal;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("from normal".into())
+        );
+        assert!(app.is_composer_empty());
+        assert_eq!(app.composer.mode, EditorMode::Insert);
+    }
+
     #[test]
     fn test_submit_sends_line_and_clears_composer() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -1448,7 +1495,7 @@ mod tests {
         app.set_composer_text("hello honk");
         app.composer.mode = EditorMode::Insert;
 
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
 
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
@@ -1466,11 +1513,11 @@ mod tests {
 
         // Submit first prompt
         app.set_composer_text("first prompt");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
 
         // Submit second prompt
         app.set_composer_text("second prompt");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
 
         // Recall prev (second prompt)
         app.handle_key(ctrl('p'));
@@ -2576,7 +2623,7 @@ mod tests {
     fn test_slash_quote_asks_honkd_and_fills_maximized_normal_composer() {
         let (mut app, mut cmd_rx) = quote_app();
         type_str(&mut app, "/quote 2");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert!(cmd_rx.try_recv().is_err(), "/quote must not go upstream");
         let t = app.trim.as_ref().expect("asked");
         assert_eq!(t.req.session_id, "ses_q");
@@ -2783,7 +2830,7 @@ mod tests {
         let (mut app, mut cmd_rx) = quote_app();
         app.execute_app_command("quote");
         type_str(&mut app, "go ahead");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert!(app.trim.is_none());
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
@@ -2839,14 +2886,14 @@ mod tests {
         );
         // `//quote` is the literal escape and goes upstream untouched.
         type_str(&mut app, "//quote");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
             UiCommand::Line("//quote".into())
         );
         // `/quoted` is not the command.
         type_str(&mut app, "/quoted");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert_eq!(
             cmd_rx.try_recv().unwrap(),
             UiCommand::Line("/quoted".into())
@@ -2857,7 +2904,7 @@ mod tests {
     fn test_slash_yank_stays_local() {
         let (mut app, mut cmd_rx) = quote_app();
         type_str(&mut app, "/yank");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert!(cmd_rx.try_recv().is_err());
         assert!(app.is_composer_empty());
     }
@@ -2880,7 +2927,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.composer.mode, EditorMode::Insert);
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(send_chord());
         assert!(app.is_composer_empty(), "submitted");
         assert!(!app.composer_maximized);
     }
