@@ -67,6 +67,9 @@ pub struct CatalogEntry {
     pub source: EntrySource,
     /// False only when the entry says `"enabled": false`. Defaults to true.
     pub enabled: bool,
+    /// The `url` of a `type:"remote"` entry, however it reaches goose (native
+    /// http or bridged through mcp-remote), so URL-based rules see both.
+    pub remote_url: Option<String>,
 }
 
 impl CatalogEntry {
@@ -81,6 +84,7 @@ impl CatalogEntry {
             kind,
             source: EntrySource::User,
             enabled: true,
+            remote_url: None,
         }
     }
 
@@ -609,13 +613,26 @@ fn bridged_remote(
     })
 }
 
+/// mcp-remote 0.1.38 refuses a plain-http url unless its host is exactly
+/// `localhost` or `127.0.0.1`.
+fn mcp_remote_accepts(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match u.scheme() {
+        "https" => true,
+        "http" => matches!(u.host_str(), Some("localhost") | Some("127.0.0.1")),
+        _ => false,
+    }
+}
+
 /// Validates a `type:"remote"` entry. Returns the spec or the reason it is unsupported.
 ///
 /// - `oauth` as an object (a static client) is unsupported.
 /// - With headers, the entry needs `--mcp-remote-bin` and is bridged.
-/// - Without headers, a non-loopback url without `"oauth": false` may need
-///   OAuth: bridged when `--mcp-remote-bin` is set, so mcp-remote's token store
-///   holds the login. Everything else is goose's native http transport.
+/// - Without headers, a non-loopback https url without `"oauth": false` may
+///   need OAuth: bridged when `--mcp-remote-bin` is set, so mcp-remote's token
+///   store holds the login. Everything else is goose's native http transport.
 fn parse_remote(
     name: &str,
     val: &serde_json::Value,
@@ -658,12 +675,19 @@ fn parse_remote(
         let Some(bin) = opts.mcp_remote_bin else {
             return Err("remote MCP servers with headers need honkd --mcp-remote-bin".to_string());
         };
+        if !mcp_remote_accepts(url) {
+            return Err(
+                "remote MCP servers with headers need an https url (or http://localhost or http://127.0.0.1)"
+                    .to_string(),
+            );
+        }
         return bridged_remote(name, url, headers, opts, bin);
     }
     let oauth_off = val.get("oauth") == Some(&serde_json::Value::Bool(false));
     if let Some(bin) = opts.mcp_remote_bin
         && !oauth_off
         && !is_loopback_url(url)
+        && url.starts_with("https://")
     {
         return bridged_remote(name, url, &serde_json::Map::new(), opts, bin);
     }
@@ -699,7 +723,9 @@ fn parse_entry_inner(name: &str, val: &serde_json::Value, opts: ParseOpts<'_>) -
     match type_str {
         Some("local") => {}
         Some("remote") => {
-            return CatalogEntry::new(name, parse_remote(name, val, opts), McpKind::Remote);
+            let mut entry = CatalogEntry::new(name, parse_remote(name, val, opts), McpKind::Remote);
+            entry.remote_url = val.get("url").and_then(|v| v.as_str()).map(str::to_string);
+            return entry;
         }
         Some(other) => {
             return CatalogEntry::new(
@@ -1237,6 +1263,37 @@ mod tests {
                 assert!(matches!(spec.transport, Transport::Http { .. }), "{body}");
             }
         }
+    }
+
+    #[test]
+    fn test_remote_bridge_url_schemes() {
+        let (_d, bin) = fake_bin();
+        // mcp-remote takes plain http only for localhost and 127.0.0.1.
+        for url in ["http://localhost:9/mcp", "http://127.0.0.1:9/mcp"] {
+            let body = format!(r#"{{"type":"remote","url":"{url}","headers":{{"X-A":"b"}}}}"#);
+            let spec = bridged_entry(&body, &bin, None).supported.unwrap();
+            assert!(matches!(spec.transport, Transport::Stdio { .. }), "{url}");
+        }
+        for url in [
+            "http://10.0.0.5/mcp",
+            "http://[::1]:9/mcp",
+            "http://127.0.0.2/mcp",
+        ] {
+            let body = format!(r#"{{"type":"remote","url":"{url}","headers":{{"X-A":"b"}}}}"#);
+            let err = bridged_entry(&body, &bin, None).supported.unwrap_err();
+            assert!(err.contains("https"), "{url}: {err}");
+        }
+        // A plain-http, non-loopback entry without headers stays native http.
+        let plain = bridged_entry(
+            r#"{"type":"remote","url":"http://10.0.0.5/mcp"}"#,
+            &bin,
+            None,
+        );
+        assert!(matches!(
+            plain.supported.unwrap().transport,
+            Transport::Http { .. }
+        ));
+        assert_eq!(plain.remote_url.as_deref(), Some("http://10.0.0.5/mcp"));
     }
 
     #[test]

@@ -416,10 +416,9 @@ fn user_outranks(user: &Catalog, entry: &CatalogEntry) -> Option<String> {
         && let Some(norm) = normalized_url(url)
     {
         for other in &user.entries {
-            if let Ok(GooseExtensionSpec {
-                transport: Transport::Http { url: other_url },
-                ..
-            }) = &other.supported
+            // Any user remote, whether it reaches goose as native http or
+            // bridged through mcp-remote.
+            if let Some(other_url) = &other.remote_url
                 && normalized_url(other_url).as_deref() == Some(norm.as_str())
             {
                 return Some(format!("same url as user catalog entry {}", other.name));
@@ -1085,5 +1084,40 @@ mod tests {
         );
         assert!(eff.catalog.get("other").is_some());
         assert!(eff.catalog.get("alias").is_none());
+    }
+
+    #[test]
+    fn project_url_equal_to_a_bridged_user_remote_is_shadowed() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        let bin = r.join("mcp-remote");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        write(
+            &r,
+            "opencode.json",
+            r#"{"mcp":{"alias":{"type":"remote","url":"https://MCP.example.com/mcp"}}}"#,
+        );
+        let user = Catalog::load_from_str_with(
+            r#"{"mcp":{"notion":{"type":"remote","url":"https://mcp.example.com/mcp"}}}"#,
+            crate::mcp::catalog::ParseOpts {
+                home: None,
+                mcp_remote_bin: Some(&bin),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            user.get("notion")
+                .unwrap()
+                .supported
+                .as_ref()
+                .unwrap()
+                .transport,
+            Transport::Stdio { .. }
+        ));
+        let eff = effective_catalog(user, &discover(&r));
+        assert_eq!(
+            shadowed(&eff),
+            vec![("alias", "same url as user catalog entry notion")]
+        );
     }
 }
