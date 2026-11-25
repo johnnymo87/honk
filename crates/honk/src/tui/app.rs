@@ -233,6 +233,12 @@ impl App {
         }
     }
 
+    fn reset_event_handler(&mut self) {
+        let mut key_handler = edtui::events::KeyEventHandler::vim_mode();
+        configure_key_handler(&mut key_handler);
+        self.event_handler = edtui::EditorEventHandler::new(key_handler);
+    }
+
     pub fn is_composer_empty(&self) -> bool {
         self.get_composer_text().is_empty()
     }
@@ -508,13 +514,16 @@ impl App {
             }
             Action::Submit => {
                 let text = self.get_composer_text();
+                let text = text.trim_end_matches('\n').to_string();
                 let trimmed = text.trim();
                 if let Some(arg) = local_command(trimmed, "/quote") {
                     let arg = arg.to_string();
                     self.set_composer_text("");
+                    self.reset_event_handler();
                     self.quote(&arg, false);
                 } else if local_command(trimmed, "/yank").is_some() {
                     self.set_composer_text("");
+                    self.reset_event_handler();
                     self.reset_history_recall();
                     let mut stdout = std::io::stdout();
                     self.yank_last_assistant(&mut stdout);
@@ -527,6 +536,7 @@ impl App {
                     self.history.push(text);
                     self.reset_history_recall();
                     self.set_composer_text("");
+                    self.reset_event_handler();
                     self.composer.mode = EditorMode::Insert;
                     self.composer_maximized = false;
                 }
@@ -1486,6 +1496,23 @@ mod tests {
         );
         assert!(app.is_composer_empty());
         assert_eq!(app.composer.mode, EditorMode::Insert);
+
+        // Habitual Enter on an empty composer does not insert a hidden "\n":
+        // composer stays empty so Ctrl-C still interrupts and Ctrl-D still quits.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.is_composer_empty());
+        app.handle_key(ctrl('c'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Interrupt);
+        app.handle_key(ctrl('d'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Eof);
+
+        // Trailing newline (e.g. habitual Enter before send chord) is stripped on submit.
+        app.composer.mode = EditorMode::Insert;
+        type_str(&mut app, "hello");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ctrl('s'));
+        assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("hello".into()));
+        assert_eq!(app.history.last().map(String::as_str), Some("hello"));
     }
 
     #[test]

@@ -198,7 +198,9 @@ pub fn resolve(
             // Enter variants in insert mode:
             // - Cmd-Enter (SUPER), Alt-Enter (ALT), Ctrl-Enter (CONTROL): Submit
             //   (Alt-Enter also matches fast Esc+Enter, agreeing with Normal-mode Enter).
-            // - Plain Enter and Shift-Enter: Newline.
+            // - Plain Enter and Shift-Enter: Newline when composer has text; Ignore when
+            //   empty so habitual Enter never leaves an invisible "\n" that breaks
+            //   empty-composer shortcuts (Up/Down scroll, Ctrl-C interrupt, Ctrl-D quit).
             if key_event.code == KeyCode::Enter {
                 if key_event
                     .modifiers
@@ -211,7 +213,11 @@ pub fn resolve(
                     };
                 }
                 if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT {
-                    return Action::Newline;
+                    return if composer_empty {
+                        Action::Ignore
+                    } else {
+                        Action::Newline
+                    };
                 }
             }
 
@@ -603,25 +609,28 @@ mod tests {
     #[test]
     fn test_insert_mode_enter_and_newlines() {
         let enter = key(KeyCode::Enter);
-        // Plain Enter inserts a newline in insert mode (empty or non-empty)
+        // Plain Enter on empty composer is ignored (avoids invisible "\n" breaking empty shortcuts)
         assert_eq!(
             resolve(EditorMode::Insert, true, enter, None, false),
-            Action::Newline
+            Action::Ignore
         );
+        // Plain Enter on non-empty composer inserts a newline
         assert_eq!(
             resolve(EditorMode::Insert, false, enter, None, false),
             Action::Newline
         );
 
-        // Shift-Enter inserts a newline regardless of enhanced_keyboard
+        // Shift-Enter matches plain Enter regardless of enhanced_keyboard
         let shift_enter = press(KeyCode::Enter, KeyModifiers::SHIFT);
         for enhanced in [false, true] {
-            for empty in [false, true] {
-                assert_eq!(
-                    resolve(EditorMode::Insert, empty, shift_enter, None, enhanced),
-                    Action::Newline
-                );
-            }
+            assert_eq!(
+                resolve(EditorMode::Insert, false, shift_enter, None, enhanced),
+                Action::Newline
+            );
+            assert_eq!(
+                resolve(EditorMode::Insert, true, shift_enter, None, enhanced),
+                Action::Ignore
+            );
         }
 
         // Ctrl-J inserts newline

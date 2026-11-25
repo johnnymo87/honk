@@ -449,6 +449,8 @@ macOS terminals normally intercept `⌘↩` (`Cmd-Enter`) before it reaches a re
 2. Keyboard Shortcut: press `⌘↩`
 3. Action: **Send Hex Code** → `0x1b 0x0d` (`ESC CR`, which arrives as `Alt-Enter` everywhere)
 
+*(iTerm2 binds `⌘↩` to **Window → Toggle Full Screen** by default; a profile Key Mapping overrides it, or you can clear that shortcut in macOS Keyboard Shortcuts if needed.)*
+
 Without any terminal mapping, `Ctrl-S`, `Alt-Enter` (Option-Enter with Option set to Esc+), and Normal-mode `Enter` (`Esc` then `Enter`) all submit out of the box.
 
 ### Ctrl-Enter through tmux
