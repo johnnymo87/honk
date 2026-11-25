@@ -244,5 +244,6 @@ pub enum PendingModelReq {
         model: String,
         queued: Option<(String, u32)>,
         record_recent: bool,
+        after_provider: Option<String>,
     },
 }

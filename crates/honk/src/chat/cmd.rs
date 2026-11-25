@@ -1,4 +1,4 @@
-use super::core::ChatCore;
+use super::core::{ChatCore, PendingModelChain};
 use super::types::{Effect, Notice, Ownership, RunState};
 use serde_json::json;
 
@@ -381,7 +381,11 @@ impl ChatCore {
             effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
             return effects;
         }
-        let line = if record_recent {
+        let line = if let Some(prov) = provider
+            && self.provider.as_deref() != Some(prov)
+        {
+            format!("/model {prov}/{id}")
+        } else if record_recent {
             format!("/model {id}")
         } else {
             format!("\0model:{id}")
@@ -513,8 +517,13 @@ impl ChatCore {
         }
 
         if let Some(ref prov) = target_provider
+            && self.provider.is_some()
             && self.provider.as_deref() != Some(prov)
         {
+            self.pending_model_chain = Some(PendingModelChain {
+                target_model: target_model.clone(),
+                original_model: self.model.clone(),
+            });
             let req_id = self.allocate_id();
             self.pending_model_reqs.insert(
                 req_id,
@@ -542,6 +551,7 @@ impl ChatCore {
                     model: target_model.clone(),
                     queued,
                     record_recent,
+                    after_provider: None,
                 },
             );
             effects.push(Effect::Request {

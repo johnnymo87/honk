@@ -966,6 +966,32 @@ async fn check_model_allowed(
     if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array)
         && !models.is_empty()
     {
+        // Search for exact model ID match in current session provider first, then any provider
+        let matched_entry = models
+            .iter()
+            .find(|m| {
+                m.get("id").and_then(Value::as_str) == Some(model)
+                    && m.get("provider").and_then(Value::as_str) == session_provider.as_deref()
+            })
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+            });
+
+        if let Some(m) = matched_entry {
+            let entry_prov = m.get("provider").and_then(Value::as_str);
+            let target_provider = if session_provider.is_some()
+                && entry_prov.is_some()
+                && entry_prov != session_provider.as_deref()
+            {
+                entry_prov.map(str::to_string)
+            } else {
+                None
+            };
+            return Ok((target_provider, model.to_string()));
+        }
+
         // Check if model starts with <provider>/<id>
         if let Some((prov, m_id)) = model.split_once('/') {
             let matches_provider = models
@@ -981,37 +1007,14 @@ async fn check_model_allowed(
                         "{model} is not in honkd's model list (configured via honkd --models-file)"
                     );
                 }
-                let target_provider = if session_provider.as_deref() == Some(prov) {
-                    None
-                } else {
-                    Some(prov.to_string())
-                };
+                let target_provider =
+                    if session_provider.is_some() && session_provider.as_deref() != Some(prov) {
+                        Some(prov.to_string())
+                    } else {
+                        None
+                    };
                 return Ok((target_provider, m_id.to_string()));
             }
-        }
-
-        // Search for model in current session provider first, then any provider
-        let matched_entry = models
-            .iter()
-            .find(|m| {
-                m.get("id").and_then(Value::as_str) == Some(model)
-                    && m.get("provider").and_then(Value::as_str) == session_provider.as_deref()
-            })
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
-            });
-
-        if let Some(m) = matched_entry {
-            let entry_prov = m.get("provider").and_then(Value::as_str);
-            let target_provider =
-                if entry_prov.is_some() && entry_prov != session_provider.as_deref() {
-                    entry_prov.map(str::to_string)
-                } else {
-                    None
-                };
-            return Ok((target_provider, model.to_string()));
         }
 
         bail!("{model} is not in honkd's model list (configured via honkd --models-file)");

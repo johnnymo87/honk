@@ -12,6 +12,12 @@ use super::types::{
     PromptSent, RunState,
 };
 
+#[derive(Clone, Debug)]
+pub(crate) struct PendingModelChain {
+    pub target_model: String,
+    pub original_model: Option<String>,
+}
+
 pub struct ChatCore {
     pub(crate) session_id: String,
     pub(crate) opts: ChatOpts,
@@ -51,6 +57,7 @@ pub struct ChatCore {
     pub(crate) known_model_ids: Vec<String>,
     pub(crate) models_listed: bool,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
+    pub(crate) pending_model_chain: Option<PendingModelChain>,
     pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
     pub(crate) undone_prompts: Vec<String>,
 }
@@ -112,6 +119,7 @@ impl ChatCore {
             known_model_ids: Vec::new(),
             models_listed: false,
             pending_model_reqs: HashMap::new(),
+            pending_model_chain: None,
             pending_revert_reqs: HashMap::new(),
             undone_prompts: Vec::new(),
         }
@@ -235,15 +243,43 @@ impl ChatCore {
         self.known_model_ids = known;
     }
 
-    pub(crate) fn resolve_target_provider(
+    pub fn resolve_target_provider(
         &self,
         target_model: &str,
         explicit_provider: Option<&str>,
     ) -> (Option<String>, String) {
         if let Some(prov) = explicit_provider {
-            return (Some(prov.to_string()), target_model.to_string());
+            let p = if self.provider.is_some() {
+                Some(prov.to_string())
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
         }
 
+        // Try exact listed-id match first (current provider first, then any)
+        if let Some(m) = self
+            .listed_models
+            .iter()
+            .find(|m| m.id == target_model && m.provider == self.provider)
+        {
+            let p = if self.provider.is_some() {
+                m.provider.clone()
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
+        }
+        if let Some(m) = self.listed_models.iter().find(|m| m.id == target_model) {
+            let p = if self.provider.is_some() {
+                m.provider.clone()
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
+        }
+
+        // Next, try splitting on '/'
         if let Some((prov, m_id)) = target_model.split_once('/')
             && (self
                 .listed_models
@@ -251,21 +287,15 @@ impl ChatCore {
                 .any(|m| m.provider.as_deref() == Some(prov))
                 || self.provider.as_deref() == Some(prov))
         {
-            return (Some(prov.to_string()), m_id.to_string());
+            let p = if self.provider.is_some() {
+                Some(prov.to_string())
+            } else {
+                None
+            };
+            return (p, m_id.to_string());
         }
 
-        let m_id = target_model;
-        if let Some(m) = self
-            .listed_models
-            .iter()
-            .find(|m| m.id == m_id && m.provider == self.provider)
-        {
-            (m.provider.clone(), m_id.to_string())
-        } else if let Some(m) = self.listed_models.iter().find(|m| m.id == m_id) {
-            (m.provider.clone(), m_id.to_string())
-        } else {
-            (None, m_id.to_string())
-        }
+        (None, target_model.to_string())
     }
 
     pub(crate) fn request_model_list_silent(&mut self, effects: &mut Vec<Effect>) {
@@ -313,7 +343,23 @@ impl ChatCore {
             self.recompute_known_model_ids();
         }
         if let Some(new_m) = honk_wire::config_select_value(val, "model") {
-            if allow_notice
+            if let Some(ref chain) = self.pending_model_chain.clone() {
+                if new_m == chain.target_model {
+                    if allow_notice && !self.is_replaying {
+                        let old = chain.original_model.as_deref().or(self.model.as_deref());
+                        if let Some(old_m) = old
+                            && old_m != new_m
+                        {
+                            effects.push(Effect::Notice(Notice::info(format!(
+                                "model: {old_m} → {new_m}"
+                            ))));
+                        }
+                    }
+                    self.pending_model_chain = None;
+                } else {
+                    // Suppress intermediate notice for provider default model!
+                }
+            } else if allow_notice
                 && !self.is_replaying
                 && let Some(ref old_m) = self.model
                 && old_m != &new_m
@@ -468,7 +514,12 @@ impl ChatCore {
 
         match &self.run_state {
             RunState::Unknown | RunState::Idle => {
-                self.send_prompt(text, conversion_count, effects);
+                if !self.local_queue.is_empty() {
+                    self.local_queue.push_back((text, conversion_count));
+                    self.check_queued_prompts(effects);
+                } else {
+                    self.send_prompt(text, conversion_count, effects);
+                }
             }
             RunState::Running(run_id) => {
                 if self.run_ownership == Ownership::Own {
@@ -1539,6 +1590,7 @@ impl ChatCore {
                 record_recent,
             } => {
                 if let Some(err) = frame.get("error") {
+                    self.pending_model_chain = None;
                     let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
                     let msg = err
                         .get("message")
@@ -1573,6 +1625,7 @@ impl ChatCore {
                         model: then_model.clone(),
                         queued,
                         record_recent,
+                        after_provider: Some(provider),
                     },
                 );
                 effects.push(Effect::Request {
@@ -1590,8 +1643,10 @@ impl ChatCore {
                 model,
                 queued,
                 record_recent,
+                after_provider,
             } => {
                 if let Some(err) = frame.get("error") {
+                    self.pending_model_chain = None;
                     let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
                     let msg = err
                         .get("message")
@@ -1609,8 +1664,21 @@ impl ChatCore {
                         return true;
                     }
 
-                    effects.push(Effect::Notice(Notice::error(msg)));
+                    let notice_text = if let Some(ref prov) = after_provider {
+                        let cur_prov = self.provider.as_deref().unwrap_or(prov.as_str());
+                        let cur_model = self.model.as_deref().unwrap_or("unknown");
+                        format!(
+                            "model switch to {model} failed after provider switch to {cur_prov}; session is now on {cur_prov}/{cur_model}"
+                        )
+                    } else {
+                        msg.to_string()
+                    };
+                    effects.push(Effect::Notice(Notice::error(notice_text)));
                     self.request_model_list_silent(effects);
+                    if after_provider.is_some() {
+                        // Do not flush prompts queued during switch; keep them queued
+                        return true;
+                    }
                     return false;
                 }
 

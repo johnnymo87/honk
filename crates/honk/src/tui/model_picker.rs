@@ -74,30 +74,36 @@ impl ModelPicker {
     pub fn recompute_rows(&mut self) {
         if self.query.is_empty() {
             let mut rows = Vec::new();
-            let mut shown_ids = HashSet::new();
+            let mut shown: HashSet<(Option<String>, String)> = HashSet::new();
 
             // 1. Recent section
             if !self.recent.is_empty() {
                 let mut recent_items = Vec::new();
                 for id in &self.recent {
-                    if shown_ids.contains(id) {
-                        continue;
-                    }
-                    if !self.models.is_empty() && !self.models.iter().any(|m| &m.id == id) {
-                        continue;
-                    }
-                    shown_ids.insert(id.clone());
-                    let item = self
-                        .models
-                        .iter()
-                        .find(|m| &m.id == id)
-                        .cloned()
-                        .unwrap_or_else(|| ModelItem {
+                    let item = if !self.models.is_empty() {
+                        let matched = self
+                            .models
+                            .iter()
+                            .find(|m| &m.id == id && m.provider == self.current_provider)
+                            .or_else(|| self.models.iter().find(|m| &m.id == id));
+                        let Some(m) = matched else {
+                            continue;
+                        };
+                        m.clone()
+                    } else {
+                        ModelItem {
                             id: id.clone(),
                             name: id.clone(),
                             source: String::new(),
                             provider: None,
-                        });
+                        }
+                    };
+
+                    let key = (item.provider.clone(), item.id.clone());
+                    if shown.contains(&key) {
+                        continue;
+                    }
+                    shown.insert(key);
                     recent_items.push(item);
                 }
                 if !recent_items.is_empty() {
@@ -112,13 +118,15 @@ impl ModelPicker {
             let configured_items: Vec<ModelItem> = self
                 .models
                 .iter()
-                .filter(|m| m.source == "configured" && !shown_ids.contains(&m.id))
+                .filter(|m| {
+                    m.source == "configured" && !shown.contains(&(m.provider.clone(), m.id.clone()))
+                })
                 .cloned()
                 .collect();
             if !configured_items.is_empty() {
                 rows.push(PickerRow::Header("Configured".to_string()));
                 for item in configured_items {
-                    shown_ids.insert(item.id.clone());
+                    shown.insert((item.provider.clone(), item.id.clone()));
                     rows.push(PickerRow::Model(item));
                 }
             }
@@ -127,13 +135,13 @@ impl ModelPicker {
             let goose_items: Vec<ModelItem> = self
                 .models
                 .iter()
-                .filter(|m| !shown_ids.contains(&m.id))
+                .filter(|m| !shown.contains(&(m.provider.clone(), m.id.clone())))
                 .cloned()
                 .collect();
             if !goose_items.is_empty() {
                 rows.push(PickerRow::Header("goose".to_string()));
                 for item in goose_items {
-                    shown_ids.insert(item.id.clone());
+                    shown.insert((item.provider.clone(), item.id.clone()));
                     rows.push(PickerRow::Model(item));
                 }
             }
@@ -867,5 +875,115 @@ mod tests {
         let mut buf0 = Buffer::empty(area0);
         picker.render(area0, &mut buf0);
         assert_eq!(picker.cursor_position(area0), None);
+    }
+
+    #[test]
+    fn test_picker_same_id_in_two_providers_shows_both_rows() {
+        let models = vec![
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_a".to_string()),
+            },
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_b".to_string()),
+            },
+        ];
+        let mut picker = ModelPicker::new(
+            Some("prov_a".to_string()),
+            Some("shared-model".to_string()),
+            models,
+            vec![],
+        );
+
+        let model_rows: Vec<_> = picker
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                PickerRow::Model(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(model_rows.len(), 2);
+        assert_eq!(model_rows[0].provider.as_deref(), Some("prov_a"));
+        assert_eq!(model_rows[1].provider.as_deref(), Some("prov_b"));
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        picker.render(Rect::new(0, 0, 80, 24), &mut buf);
+        let mut found_prov_b_label = false;
+        for y in 0..24 {
+            let line_str: String = (0..80)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            if line_str.contains("prov_b") {
+                found_prov_b_label = true;
+            }
+        }
+        assert!(found_prov_b_label, "expected prov_b label in buffer");
+    }
+
+    #[test]
+    fn test_picker_same_id_in_recent_and_other_provider_shows_both_rows() {
+        let models = vec![
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model Current".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_current".to_string()),
+            },
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model Other".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_other".to_string()),
+            },
+        ];
+        let recent = vec!["shared-model".to_string()];
+        let picker = ModelPicker::new(Some("prov_current".to_string()), None, models, recent);
+        let model_rows: Vec<_> = picker
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                PickerRow::Model(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(model_rows.len(), 2);
+    }
+
+    #[test]
+    fn test_picker_recents_resolves_current_provider_first() {
+        let models = vec![
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model Other".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_other".to_string()),
+            },
+            ModelItem {
+                id: "shared-model".to_string(),
+                name: "Shared Model Current".to_string(),
+                source: "configured".to_string(),
+                provider: Some("prov_current".to_string()),
+            },
+        ];
+        let recent = vec!["shared-model".to_string()];
+        let picker = ModelPicker::new(Some("prov_current".to_string()), None, models, recent);
+
+        // Recent item should be the one from prov_current
+        let first_model = picker
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                PickerRow::Model(m) => Some(m),
+                _ => None,
+            })
+            .expect("expected model row");
+        assert_eq!(first_model.provider.as_deref(), Some("prov_current"));
+        assert_eq!(first_model.name, "Shared Model Current");
     }
 }

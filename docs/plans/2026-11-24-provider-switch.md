@@ -41,26 +41,38 @@ id on the Vertex provider (accepted by goose, fails at the next turn).
 - Every `_honk/model/list` request honk sends carries `allProviders: true`.
 - Switching to an item (picker selection, `/model <id>`, recent-model pick) resolves the
   target provider:
-  - picker / recents: the item's `provider`;
-  - `/model <id>`: the first listed entry with that id whose provider equals the session's
-    current provider, else the first listed entry with that id; unknown id -> today's
-    behaviour (warning + model-only set).
-  - `/model <provider>/<id>` (only when `<provider>` is a provider key in the list) names
-    the provider explicitly.
+  - picker: uses selected item's `(provider, id)`. When queued/buffered/replayed, if the
+    explicit provider differs from current, encodes as `/model <provider>/<id>` to preserve
+    the picked provider across replay and queueing.
+  - recents: records model `id` as today and resolves recents via the same rule as
+    `/model <id>` (current provider first).
+  - `/model <id>` and resolution (`resolve_target_provider`): tries an exact listed-id match
+    (current provider first, then any) BEFORE splitting on '/'. Sends the provider step
+    only when the session's current provider is known (`Some`); if `None`, does a model-only set.
+  - `/model <provider>/<id>` (only when `<provider>` is a provider key in the list or the current provider)
+    names the provider explicitly.
 - If the target provider is None or equals the session's current provider: today's
   single `configId:"model"` set.
 - Otherwise two steps: `configId:"provider"` with the provider, then on success
-  `configId:"model"` with the id. Implement as a new pending variant (e.g.
-  `PendingModelReq::SetProvider { provider, then_model, queued, record_recent }`) whose
-  success dispatches the model set; the model step's existing success path records recents
-  and emits the `model: a → b` notice. Busy (-32002 honk busy) on the provider step
-  requeues exactly like the model step. Any error on either step: error notice naming the
-  step (`provider switch to codex_lb failed: ...`) and a silent list refresh. While the two
-  steps are in flight, `has_pending_model_mutation()` must be true so prompts queue.
+  `configId:"model"` with the id. Implement as `PendingModelReq::SetProvider` whose
+  success dispatches `PendingModelReq::Set { model, queued, record_recent, after_provider: Some(provider) }`.
+  - While a provider-to-model chain is pending, the intermediate `model: X → <provider default>`
+    notice produced by goose's `config_option_update` notification between provider and model steps
+    is suppressed, so the user sees `provider: a → b` and `model: X → <target>` only.
+  - If the model step fails after a successful provider step: emit error notice
+    `model switch to <id> failed after provider switch to <provider>; session is now on <provider>/<current model>`
+    (with current model from core state). Do not let prompts queued during the switch go out
+    automatically: keep them queued; they flush on the next successful model/provider set, or when
+    the user sends a new line.
+  - Same for `honk chat --new --model` in driver.rs: name the step in the error notice.
+  - Busy (-32002 honk busy) on the provider step requeues exactly like the model step. Any error
+    on either step: error notice naming the step and a silent list refresh. While the two steps
+    are in flight, `has_pending_model_mutation()` is true so prompts queue.
 - A provider change emits a notice `provider: gcp_vertex_ai → codex_lb` (from
   `update_model_state`, mirroring the model notice).
-- Picker: entries whose provider differs from the session's show the provider as a
-  suffix/label (e.g. `GPT-6 Astra  codex_lb`); grouping/ordering otherwise unchanged.
+- Picker: dedups rows by `(provider, id)`, not `id`, so the same id under two providers shows
+  twice. Entries whose provider differs from the session's show the provider as a suffix/label
+  (e.g. `GPT-6 Astra  codex_lb`); grouping/ordering otherwise unchanged.
 - `honk launch --model <id>` and `honk chat --new --model <id>`: resolve the provider from
   the list the same way and, when it differs, send the provider set before the model set.
   The "not in honkd's model list" check accepts ids of any provider.

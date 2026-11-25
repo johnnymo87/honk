@@ -858,36 +858,37 @@ async fn run_driver(
                         let models = res.get("models").and_then(Value::as_array);
 
                         if let Some(models) = models {
-                            if let Some((prov, m_id)) = initial_model_arg.split_once('/') {
-                                if models.iter().any(|m| {
-                                    m.get("provider").and_then(Value::as_str) == Some(prov)
-                                }) {
-                                    target_model = m_id.to_string();
-                                    if session_provider != Some(prov) {
-                                        target_provider = Some(prov.to_string());
-                                    }
-                                }
-                            } else {
-                                let matched = models
-                                    .iter()
-                                    .find(|m| {
+                            let matched_entry = models
+                                .iter()
+                                .find(|m| {
+                                    m.get("id").and_then(Value::as_str)
+                                        == Some(initial_model_arg.as_str())
+                                        && m.get("provider").and_then(Value::as_str)
+                                            == session_provider
+                                })
+                                .or_else(|| {
+                                    models.iter().find(|m| {
                                         m.get("id").and_then(Value::as_str)
                                             == Some(initial_model_arg.as_str())
-                                            && m.get("provider").and_then(Value::as_str)
-                                                == session_provider
                                     })
-                                    .or_else(|| {
-                                        models.iter().find(|m| {
-                                            m.get("id").and_then(Value::as_str)
-                                                == Some(initial_model_arg.as_str())
-                                        })
-                                    });
+                                });
 
-                                if let Some(m) = matched {
-                                    let m_prov = m.get("provider").and_then(Value::as_str);
-                                    if m_prov.is_some() && m_prov != session_provider {
-                                        target_provider = m_prov.map(str::to_string);
-                                    }
+                            if let Some(m) = matched_entry {
+                                let m_prov = m.get("provider").and_then(Value::as_str);
+                                if session_provider.is_some()
+                                    && m_prov.is_some()
+                                    && m_prov != session_provider
+                                {
+                                    target_provider = m_prov.map(str::to_string);
+                                }
+                            } else if let Some((prov, m_id)) = initial_model_arg.split_once('/')
+                                && models.iter().any(|m| {
+                                    m.get("provider").and_then(Value::as_str) == Some(prov)
+                                })
+                            {
+                                target_model = m_id.to_string();
+                                if session_provider.is_some() && session_provider != Some(prov) {
+                                    target_provider = Some(prov.to_string());
                                 }
                             }
                         }
@@ -993,7 +994,26 @@ async fn run_driver(
                                         .get("message")
                                         .and_then(Value::as_str)
                                         .unwrap_or("model error");
-                                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(msg)));
+                                    let err_text = if let Some(ref prov) = target_provider {
+                                        let cur_prov = model_config_options
+                                            .as_ref()
+                                            .and_then(|val| {
+                                                honk_wire::config_select_value(val, "provider")
+                                            })
+                                            .unwrap_or_else(|| prov.clone());
+                                        let cur_model = model_config_options
+                                            .as_ref()
+                                            .and_then(|val| {
+                                                honk_wire::config_select_value(val, "model")
+                                            })
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        format!(
+                                            "model switch to {target_model} failed after provider switch to {cur_prov}; session is now on {cur_prov}/{cur_model}"
+                                        )
+                                    } else {
+                                        msg.to_string()
+                                    };
+                                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(err_text)));
                                 } else {
                                     let res = frame.get("result").cloned().unwrap_or(Value::Null);
                                     model_config_options = Some(res);

@@ -7042,7 +7042,7 @@ fn test_model_cross_provider_set_emits_provider_then_model() {
 
     assert!(final_effs.iter().any(|e| matches!(
         e,
-        Effect::Notice(n) if n.text == "model: default-codex-model → gpt-6-astra"
+        Effect::Notice(n) if n.text == "model: claude-opus-5-5 → gpt-6-astra"
     )));
     assert!(final_effs.iter().any(|e| matches!(
         e,
@@ -7522,4 +7522,436 @@ fn test_provider_change_live_notice() {
         .collect();
     assert!(notices.contains(&"provider: gcp_vertex_ai → codex_lb".to_string()));
     assert!(notices.contains(&"model: claude-opus-5-5 → gpt-6-astra".to_string()));
+}
+
+#[test]
+fn test_model_step_failure_after_provider_success_notice_and_queue_held() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        { "id": "provider", "currentValue": "gcp_vertex_ai" },
+        { "id": "model", "currentValue": "claude-opus-5-5" }
+    ]));
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "provider": "gcp_vertex_ai",
+            "current": "claude-opus-5-5",
+            "models": [
+                { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
+                { "id": "bad-model", "name": "Bad Model", "source": "configured", "provider": "codex_lb" },
+                { "id": "good-model", "name": "Good Model", "source": "configured", "provider": "codex_lb" }
+            ]
+        }
+    })));
+
+    // Switch model to codex_lb/bad-model
+    let effs = core.handle(Input::Line("/model codex_lb/bad-model".into()));
+    let prov_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // While provider switch is in flight, queue a prompt
+    let _prompt_effs = core.handle(Input::Line("hello while pending".into()));
+    assert_eq!(core.local_queue().len(), 1);
+
+    // Provider step succeeds: goose sets provider to codex_lb and interim model to codex-default
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prov_req_id,
+        "result": {
+            "configOptions": [
+                { "id": "provider", "currentValue": "codex_lb" },
+                { "id": "model", "currentValue": "codex-default" }
+            ]
+        }
+    })));
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Now model step fails with error
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "error": {
+            "code": -32603,
+            "message": "model not supported"
+        }
+    })));
+
+    // Notice text must match:
+    // model switch to <id> failed after provider switch to <provider>; session is now on <provider>/<current model>
+    let error_notice = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notice(n) if n.kind == NoticeKind::Error => Some(&n.text),
+            _ => None,
+        })
+        .expect("expected error notice");
+    assert_eq!(
+        error_notice,
+        "model switch to bad-model failed after provider switch to codex_lb; session is now on codex_lb/codex-default"
+    );
+
+    // Prompt MUST NOT have been sent! local_queue must still have the held prompt!
+    assert!(
+        !effs
+            .iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if method == "session/prompt"))
+    );
+    assert_eq!(core.local_queue().len(), 1);
+
+    // When user sends a new line (e.g. another prompt or user input), queued prompts go out
+    let effs = core.handle(Input::Line("hello after failure".into()));
+    assert_eq!(core.local_queue().len(), 1); // first prompt sent, new prompt queued behind it
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Request { method, params, .. }
+            if method == "session/prompt"
+                && params["prompt"][0]["text"] == "hello while pending"
+    )));
+}
+
+#[test]
+fn test_picker_select_while_busy_preserves_provider() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        { "id": "provider", "currentValue": "gcp_vertex_ai" },
+        { "id": "model", "currentValue": "claude-opus-5-5" }
+    ]));
+
+    // Mark run as active
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": "run-42" } }
+            }
+        }
+    })));
+
+    // Picker select for gpt-6-astra on codex_lb while busy
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "provider": "gcp_vertex_ai",
+            "current": "claude-opus-5-5",
+            "models": [
+                { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
+                { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
+            ]
+        }
+    })));
+
+    let effs = core.handle_model_set_command("gpt-6-astra", Some("codex_lb"), true);
+    assert!(effs.iter().any(|e| matches!(
+        e,
+        Effect::Notice(n) if n.text == "queued: /model codex_lb/gpt-6-astra"
+    )));
+    assert_eq!(core.local_queue().len(), 1);
+    assert_eq!(core.local_queue()[0].0, "/model codex_lb/gpt-6-astra");
+
+    // Run finishes -> queued command is dispatched
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "session_info_update",
+                "_meta": { "goose": { "activeRunId": null } }
+            }
+        }
+    })));
+
+    // First request must be provider step for codex_lb!
+    let _prov_req = effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, params, .. }
+                    if method == "session/set_config_option"
+                        && params.get("configId") == Some(&json!("provider"))
+                        && params.get("value") == Some(&json!("codex_lb"))
+            )
+        })
+        .expect("should dispatch provider request for codex_lb");
+}
+
+#[test]
+fn test_model_cross_provider_same_id_two_providers_core_resolution() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        { "id": "provider", "currentValue": "prov_a" },
+        { "id": "model", "currentValue": "shared-model" }
+    ]));
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "provider": "prov_a",
+            "current": "shared-model",
+            "models": [
+                { "id": "shared-model", "name": "Shared A", "source": "configured", "provider": "prov_a" },
+                { "id": "shared-model", "name": "Shared B", "source": "configured", "provider": "prov_b" },
+                { "id": "b-only", "name": "B Only", "source": "configured", "provider": "prov_b" }
+            ]
+        }
+    })));
+
+    // When on prov_a, bare "shared-model" resolves to prov_a (current provider first)
+    let (p, m) = core.resolve_target_provider("shared-model", None);
+    assert_eq!(p.as_deref(), Some("prov_a"));
+    assert_eq!(m, "shared-model");
+
+    // With explicit provider, resolves to explicit provider
+    let (p, m) = core.resolve_target_provider("shared-model", Some("prov_b"));
+    assert_eq!(p.as_deref(), Some("prov_b"));
+    assert_eq!(m, "shared-model");
+
+    // Model only on prov_b resolves to prov_b
+    let (p, m) = core.resolve_target_provider("b-only", None);
+    assert_eq!(p.as_deref(), Some("prov_b"));
+    assert_eq!(m, "b-only");
+}
+
+#[test]
+fn test_model_cross_provider_slash_in_exact_id_first() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        { "id": "provider", "currentValue": "prov_a" },
+        { "id": "model", "currentValue": "base-model" }
+    ]));
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "provider": "prov_a",
+            "current": "base-model",
+            "models": [
+                { "id": "org/model-name", "name": "Org Model", "source": "configured", "provider": "prov_a" },
+                { "id": "model-name", "name": "Other Model", "source": "configured", "provider": "org" }
+            ]
+        }
+    })));
+
+    // "org/model-name" matches exact ID in listed_models first, so provider is prov_a, not "org"
+    let (p, m) = core.resolve_target_provider("org/model-name", None);
+    assert_eq!(p.as_deref(), Some("prov_a"));
+    assert_eq!(m, "org/model-name");
+}
+
+#[test]
+fn test_model_cross_provider_provider_step_only_when_current_provider_known() {
+    let (mut core, _) = new_test_core();
+    assert!(core.provider().is_none());
+
+    // Switch model with provider prefix
+    let effs = core.handle(Input::Line("/model codex_lb/gpt-6-astra".into()));
+    let req = effs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                Effect::Request { method, .. } if method == "session/set_config_option"
+            )
+        })
+        .expect("should send request");
+
+    match req {
+        Effect::Request { params, .. } => {
+            assert_eq!(params.get("configId"), Some(&json!("model")));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn test_model_cross_provider_suppresses_intermediate_model_notice() {
+    let (mut core, _) = new_test_core();
+
+    core.set_config_options(&json!([
+        { "id": "provider", "currentValue": "gcp_vertex_ai" },
+        { "id": "model", "currentValue": "claude-opus-5-5" }
+    ]));
+
+    let effs = core.handle(Input::Line("/model".into()));
+    let list_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "_honk/model/list" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+
+    core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": list_req_id,
+        "result": {
+            "provider": "gcp_vertex_ai",
+            "current": "claude-opus-5-5",
+            "models": [
+                { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
+                { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
+            ]
+        }
+    })));
+
+    // Switch to codex_lb/gpt-6-astra
+    let effs = core.handle(Input::Line("/model codex_lb/gpt-6-astra".into()));
+    let prov_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Goose sends intermediate config_option_update with provider default model "gpt-4o"
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [
+                    { "id": "provider", "currentValue": "codex_lb" },
+                    { "id": "model", "currentValue": "gpt-4o" }
+                ]
+            }
+        }
+    })));
+
+    let notices: Vec<_> = effs
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Notice(n) => Some(n.text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Provider notice IS emitted
+    assert!(notices.contains(&"provider: gcp_vertex_ai → codex_lb".to_string()));
+    // Intermediate model notice MUST NOT be emitted!
+    assert!(
+        !notices.iter().any(|t| t.contains("gpt-4o")),
+        "intermediate model notice should be suppressed: {notices:?}"
+    );
+
+    // Provider response arrives
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": prov_req_id,
+        "result": {
+            "configOptions": [
+                { "id": "provider", "currentValue": "codex_lb" },
+                { "id": "model", "currentValue": "gpt-4o" }
+            ]
+        }
+    })));
+    let prov_res_notices: Vec<_> = effs
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Notice(n) => Some(n.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !prov_res_notices.iter().any(|t| t.contains("gpt-4o")),
+        "intermediate model notice should be suppressed in prov response: {prov_res_notices:?}"
+    );
+
+    let model_req_id = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { id, method, .. } if method == "session/set_config_option" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    // Final model step succeeds -> notice shows claude-opus-5-5 → gpt-6-astra directly!
+    let effs = core.handle(Input::Frame(json!({
+        "jsonrpc": "2.0",
+        "id": model_req_id,
+        "result": {
+            "configOptions": [
+                { "id": "provider", "currentValue": "codex_lb" },
+                { "id": "model", "currentValue": "gpt-6-astra" }
+            ]
+        }
+    })));
+    let final_notices: Vec<_> = effs
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Notice(n) => Some(n.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        final_notices.contains(&"model: claude-opus-5-5 → gpt-6-astra".to_string()),
+        "expected final model notice: {final_notices:?}"
+    );
 }
