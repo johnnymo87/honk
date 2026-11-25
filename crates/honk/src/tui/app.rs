@@ -1452,11 +1452,11 @@ mod tests {
     }
 
     fn send_chord() -> KeyEvent {
-        press(KeyCode::Enter, KeyModifiers::ALT)
+        press(KeyCode::Enter, KeyModifiers::CONTROL)
     }
 
     #[test]
-    fn test_insert_enter_inserts_newline_and_chords_submit() {
+    fn test_insert_enter_inserts_newline_and_ctrl_enter_submits() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let mut app = App::new("ses_1", cmd_tx);
         app.composer.mode = EditorMode::Insert;
@@ -1467,24 +1467,14 @@ mod tests {
         type_str(&mut app, "line 2");
         assert_eq!(app.get_composer_text(), "line 1\nline 2");
 
-        // Cmd-Enter (SUPER), Alt-Enter, Ctrl-Enter, Ctrl-S all submit from insert mode
-        for chord in [
-            press(KeyCode::Enter, KeyModifiers::SUPER),
-            press(KeyCode::Enter, KeyModifiers::ALT),
-            press(KeyCode::Enter, KeyModifiers::CONTROL),
-            ctrl('s'),
-        ] {
-            app.composer.mode = EditorMode::Insert;
-            app.set_composer_text("line 1\nline 2");
-            app.handle_key(chord);
-            assert_eq!(
-                cmd_rx.try_recv().unwrap(),
-                UiCommand::Line("line 1\nline 2".into()),
-                "chord {chord:?} should submit"
-            );
-            assert!(app.is_composer_empty());
-            assert_eq!(app.composer.mode, EditorMode::Insert);
-        }
+        // Ctrl-Enter submits from insert mode
+        app.handle_key(send_chord());
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            UiCommand::Line("line 1\nline 2".into())
+        );
+        assert!(app.is_composer_empty());
+        assert_eq!(app.composer.mode, EditorMode::Insert);
 
         // Normal-mode plain Enter submits
         app.set_composer_text("from normal");
@@ -1510,7 +1500,7 @@ mod tests {
         app.composer.mode = EditorMode::Insert;
         type_str(&mut app, "hello");
         app.handle_key(key(KeyCode::Enter));
-        app.handle_key(ctrl('s'));
+        app.handle_key(send_chord());
         assert_eq!(cmd_rx.try_recv().unwrap(), UiCommand::Line("hello".into()));
         assert_eq!(app.history.last().map(String::as_str), Some("hello"));
     }

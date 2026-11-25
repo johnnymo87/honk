@@ -46,8 +46,6 @@ pub fn configure_key_handler(handler: &mut edtui::events::KeyEventHandler) {
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('d')]));
     handler.remove(&KeyEventRegister::n(vec![KeyInput::ctrl('x')]));
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('x')]));
-    handler.remove(&KeyEventRegister::n(vec![KeyInput::ctrl('s')]));
-    handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('s')]));
     handler.remove(&KeyEventRegister::n(vec![KeyInput::new(':')]));
 }
 
@@ -125,10 +123,9 @@ pub fn resolve(
 
     match mode {
         EditorMode::Normal => {
-            // Submit on Enter (any modifier) or Ctrl-S
+            // Submit on Enter or Ctrl-Enter
             if key_event.code == KeyCode::Enter
-                || (key_event.modifiers == KeyModifiers::CONTROL
-                    && key_event.code == KeyCode::Char('s'))
+                && (key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::CONTROL)
             {
                 return if composer_empty {
                     Action::Ignore
@@ -196,16 +193,12 @@ pub fn resolve(
         }
         EditorMode::Insert => {
             // Enter variants in insert mode:
-            // - Cmd-Enter (SUPER), Alt-Enter (ALT), Ctrl-Enter (CONTROL): Submit
-            //   (Alt-Enter also matches fast Esc+Enter, agreeing with Normal-mode Enter).
+            // - Ctrl-Enter: Submit when composer has text; Ignore when empty.
             // - Plain Enter and Shift-Enter: Newline when composer has text; Ignore when
             //   empty so habitual Enter never leaves an invisible "\n" that breaks
             //   empty-composer shortcuts (Up/Down scroll, Ctrl-C interrupt, Ctrl-D quit).
             if key_event.code == KeyCode::Enter {
-                if key_event
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::CONTROL)
-                {
+                if key_event.modifiers == KeyModifiers::CONTROL {
                     return if composer_empty {
                         Action::Ignore
                     } else {
@@ -274,19 +267,12 @@ pub fn resolve(
                 }
             }
 
-            // Ctrl-P, Ctrl-N, Ctrl-J, Ctrl-S
+            // Ctrl-P, Ctrl-N, Ctrl-J
             if key_event.modifiers == KeyModifiers::CONTROL {
                 match key_event.code {
                     KeyCode::Char('p') => return Action::HistoryPrev,
                     KeyCode::Char('n') => return Action::HistoryNext,
                     KeyCode::Char('j') => return Action::Newline,
-                    KeyCode::Char('s') => {
-                        return if composer_empty {
-                            Action::Ignore
-                        } else {
-                            Action::Submit
-                        };
-                    }
                     _ => {}
                 }
             }
@@ -325,10 +311,6 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         press(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-
-    fn alt(code: KeyCode) -> KeyEvent {
-        press(code, KeyModifiers::ALT)
     }
 
     fn shift(c: char) -> KeyEvent {
@@ -646,37 +628,24 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_mode_send_chords() {
-        let send_chords = [
-            press(KeyCode::Enter, KeyModifiers::SUPER),
-            alt(KeyCode::Enter),
-            press(KeyCode::Enter, KeyModifiers::CONTROL),
-            ctrl('s'),
-        ];
-        for chord in send_chords {
-            assert_eq!(
-                resolve(EditorMode::Insert, false, chord, None, false),
-                Action::Submit,
-                "expected Submit for {chord:?} on non-empty composer"
-            );
-            assert_eq!(
-                resolve(EditorMode::Insert, true, chord, None, false),
-                Action::Ignore,
-                "expected Ignore for {chord:?} on empty composer"
-            );
-        }
+    fn test_insert_mode_ctrl_enter_submits() {
+        let ctrl_enter = press(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(
+            resolve(EditorMode::Insert, false, ctrl_enter, None, false),
+            Action::Submit
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, ctrl_enter, None, false),
+            Action::Ignore
+        );
     }
 
     #[test]
-    fn test_normal_mode_enter_and_send_chords() {
-        let send_chords = [
+    fn test_normal_mode_enter_submits() {
+        for chord in [
             key(KeyCode::Enter),
-            press(KeyCode::Enter, KeyModifiers::SUPER),
-            alt(KeyCode::Enter),
             press(KeyCode::Enter, KeyModifiers::CONTROL),
-            ctrl('s'),
-        ];
-        for chord in send_chords {
+        ] {
             assert_eq!(
                 resolve(EditorMode::Normal, false, chord, None, false),
                 Action::Submit,
@@ -687,6 +656,24 @@ mod tests {
                 Action::Ignore,
                 "expected Ignore for {chord:?} in normal mode on empty composer"
             );
+        }
+    }
+
+    #[test]
+    fn test_removed_send_chords_do_not_submit() {
+        let removed = [
+            press(KeyCode::Enter, KeyModifiers::SUPER),
+            press(KeyCode::Enter, KeyModifiers::ALT),
+            ctrl('s'),
+        ];
+        for mode in [EditorMode::Insert, EditorMode::Normal] {
+            for chord in removed {
+                assert_ne!(
+                    resolve(mode, false, chord, None, false),
+                    Action::Submit,
+                    "removed chord {chord:?} must not submit in {mode:?}"
+                );
+            }
         }
     }
 
@@ -702,17 +689,6 @@ mod tests {
         assert_eq!(
             resolve(EditorMode::Insert, false, alt_q, None, false),
             Action::EscKey(key(KeyCode::Char('q')))
-        );
-
-        // Alt-Enter submits (also matches fast Esc+Enter -> normal-mode Enter)
-        let alt_enter = press(KeyCode::Enter, KeyModifiers::ALT);
-        assert_eq!(
-            resolve(EditorMode::Insert, false, alt_enter, None, false),
-            Action::Submit
-        );
-        assert_eq!(
-            resolve(EditorMode::Insert, true, alt_enter, None, false),
-            Action::Ignore
         );
     }
 
