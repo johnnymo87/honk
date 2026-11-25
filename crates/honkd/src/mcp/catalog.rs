@@ -759,12 +759,19 @@ fn parse_entry_inner(name: &str, val: &serde_json::Value, opts: ParseOpts<'_>) -
                 .and_then(|o| o.get(name))
                 .and_then(|pairs| {
                     let url = val.get("url")?.as_str()?;
+                    // Re-encoding would hide a placeholder from parse_remote's check.
+                    if url.contains("{env:") || url.contains("{file:") {
+                        return None;
+                    }
                     let mut v = val.clone();
                     v["url"] = serde_json::Value::String(apply_query_overrides(url, pairs)?);
                     Some(v)
                 });
-            let val = overridden.as_ref().unwrap_or(val);
-            let mut entry = CatalogEntry::new(name, parse_remote(name, val, opts), McpKind::Remote);
+            let effective = overridden.as_ref().unwrap_or(val);
+            let mut entry =
+                CatalogEntry::new(name, parse_remote(name, effective, opts), McpKind::Remote);
+            // The url as written in the file, which is what the user trusted:
+            // project entries are shadowed by it (project::user_outranks).
             entry.remote_url = val.get("url").and_then(|v| v.as_str()).map(str::to_string);
             return entry;
         }
@@ -1235,7 +1242,11 @@ mod tests {
         .unwrap();
         let srv = cat.get("srv").unwrap();
         let want = "https://mcp.example.com/v1/mcp?toolsets=core%2Cddsql";
-        assert_eq!(srv.remote_url.as_deref(), Some(want));
+        // remote_url keeps the file's url, which project shadowing compares to.
+        assert_eq!(
+            srv.remote_url.as_deref(),
+            Some("https://mcp.example.com/v1/mcp?toolsets=all")
+        );
         let (command, env) = stdio(srv.supported.as_ref().unwrap());
         assert_eq!(command[1], want);
         assert_eq!(command[3], "Authorization:Bearer ${HONK_MCP_HDR_0}");
@@ -1248,6 +1259,25 @@ mod tests {
                 url: "https://o.example/mcp?toolsets=all".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_query_override_leaves_placeholder_url_to_be_rejected() {
+        let overrides = QueryOverrides::from([(
+            "srv".to_string(),
+            vec![("toolsets".to_string(), "core".to_string())],
+        )]);
+        let cat = Catalog::load_from_str_with(
+            r#"{"mcp":{"srv":{"type":"remote","url":"https://x.example/mcp?k={env:X}"}}}"#,
+            ParseOpts {
+                home: None,
+                mcp_remote_bin: None,
+                query_overrides: Some(&overrides),
+            },
+        )
+        .unwrap();
+        let err = cat.get("srv").unwrap().supported.as_ref().unwrap_err();
+        assert!(err.contains("not expanded"), "{err}");
     }
 
     #[test]

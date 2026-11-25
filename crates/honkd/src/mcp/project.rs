@@ -1087,6 +1087,35 @@ mod tests {
     }
 
     #[test]
+    fn project_url_equal_to_an_overridden_user_remote_is_shadowed_by_the_file_url() {
+        let (_td, r) = root();
+        fs::create_dir(r.join(".git")).unwrap();
+        write(
+            &r,
+            "opencode.json",
+            r#"{"mcp":{"alias":{"type":"remote","url":"https://dd.example/v1/mcp?toolsets=all"}}}"#,
+        );
+        let overrides = crate::mcp::catalog::QueryOverrides::from([(
+            "datadog".to_string(),
+            vec![("toolsets".to_string(), "core".to_string())],
+        )]);
+        let user = Catalog::load_from_str_with(
+            r#"{"mcp":{"datadog":{"type":"remote","url":"https://dd.example/v1/mcp?toolsets=all","oauth":false}}}"#,
+            crate::mcp::catalog::ParseOpts {
+                home: None,
+                mcp_remote_bin: None,
+                query_overrides: Some(&overrides),
+            },
+        )
+        .unwrap();
+        let eff = effective_catalog(user, &discover(&r));
+        assert_eq!(
+            shadowed(&eff),
+            vec![("alias", "same url as user catalog entry datadog")]
+        );
+    }
+
+    #[test]
     fn project_url_equal_to_a_bridged_user_remote_is_shadowed() {
         let (_td, r) = root();
         fs::create_dir(r.join(".git")).unwrap();
