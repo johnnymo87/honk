@@ -38,6 +38,7 @@ struct Script {
     enable: Value,
     prompt: PromptReply,
     model_error: Option<&'static str>,
+    model_delay: Option<Duration>,
     effort_error: Option<&'static str>,
     model_list: Option<Value>,
 }
@@ -49,6 +50,7 @@ impl Default for Script {
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
             model_error: None,
+            model_delay: None,
             effort_error: None,
             model_list: None,
         }
@@ -124,6 +126,11 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                 "_goose/unstable/session/rename" => out.push(json!({"id": id, "result": {}})),
                 "session/set_config_option" => {
                     let config_id = v["params"]["configId"].as_str();
+                    if config_id == Some("model")
+                        && let Some(d) = script.model_delay
+                    {
+                        tokio::time::sleep(d).await;
+                    }
                     let err = match config_id {
                         Some("model") => script.model_error,
                         Some("thinking_effort") => script.effort_error,
@@ -1409,6 +1416,41 @@ async fn launch_default_model_hook_set_config_option_error_fails_open() {
     assert_eq!(out.prompt, honk::launch::PromptState::Ok);
 
     // Attempted model list and set_config_option, but still continued to prompt
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_set_model_timeout_fails_open() {
+    let script = Script {
+        model_delay: Some(Duration::from_millis(500)),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(
+        &r.dir,
+        "delayed_model.sh",
+        "#!/bin/sh\necho 'delayed-model'\n",
+    );
+
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+    o.timeouts.model = Duration::from_millis(150);
+
+    let out = run(&o)
+        .await
+        .expect("launch succeeds despite set_model timeout");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    // Attempted model list and set_config_option, timed out, but still continued to prompt
     assert_eq!(
         methods(&r),
         [

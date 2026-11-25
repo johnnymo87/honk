@@ -367,6 +367,8 @@ pub async fn resolve_default_model(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let child = match command.spawn() {
         Ok(c) => c,
@@ -378,6 +380,7 @@ pub async fn resolve_default_model(
             return None;
         }
     };
+    let pid = child.id();
 
     let out = match tokio::time::timeout(timeout, wait_bounded(child, MAX_HOOK_OUTPUT_BYTES)).await
     {
@@ -390,6 +393,15 @@ pub async fn resolve_default_model(
             return None;
         }
         Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid
+                && let Ok(pgid) = libc::pid_t::try_from(pid)
+                && pgid > 0
+            {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             eprintln!(
                 "honk launch: warning: default-model-cmd {} timed out after {timeout:?}; using server default",
                 cmd.display()
@@ -430,6 +442,12 @@ pub async fn resolve_default_model(
     let stdout_str = String::from_utf8_lossy(&out.stdout);
     let first_line = stdout_str.lines().next().unwrap_or("").trim();
     if first_line.is_empty() {
+        None
+    } else if first_line.chars().any(|c| c.is_control()) {
+        eprintln!(
+            "honk launch: warning: default-model-cmd {} output contained control characters; using server default",
+            cmd.display()
+        );
         None
     } else {
         Some(first_line.to_string())
@@ -1384,9 +1402,13 @@ mod tests {
             .kill_on_drop(true);
 
         let child = cmd.spawn().expect("spawn sh");
-        let output = wait_bounded(child, MAX_HOOK_OUTPUT_BYTES)
-            .await
-            .expect("wait bounded");
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_bounded(child, MAX_HOOK_OUTPUT_BYTES),
+        )
+        .await
+        .expect("timed out waiting for bounded reader")
+        .expect("wait bounded");
 
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), MAX_HOOK_OUTPUT_BYTES as usize);
@@ -1403,6 +1425,18 @@ mod tests {
         );
         let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
         assert_eq!(res.as_deref(), Some("custom-model"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_control_characters_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(
+            tmp.path(),
+            "ctrl.sh",
+            "#!/bin/sh\nprintf 'bad\\x1b[31mmodel\\n'\n",
+        );
+        let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
+        assert_eq!(res, None);
     }
 
     #[tokio::test]

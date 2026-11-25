@@ -56,10 +56,11 @@ stall-watch coordinator gives its program's tag, never its own \
 
 Default model hook: when `--model` is omitted, checks `$HONK_DEFAULT_MODEL_CMD` \
 (empty disables) or `$XDG_CONFIG_HOME/honk/default-model-cmd` \
-(`~/.config/honk/default-model-cmd`); runs it with `[--tag <tag>]` (lowercased \
-resolved tag, or no args when untagged) before `session/new` and applies its \
-first stdout line as the model. Fails open with a stderr warning on any error, \
-timeout, or rejected model (exit 0).
+(`~/.config/honk/default-model-cmd`). The hook is an executable path (not a \
+shell command string), receives optional `--tag <lowercased-tag>` (or no args \
+when untagged; working directory is unspecified) before `session/new`, and applies \
+its first stdout line as the model. Hook failures warn on stderr and do not \
+affect the exit code (the server default model is used instead).
 
 Output: on stdout, exactly one line once a session exists:
   native=<goose id> gse=<pigeon id or -> tag=<tag or -> prompt=<ok|no|unknown>
@@ -75,8 +76,8 @@ timeout may still have created one, see `honk list`). No stdout line.
   3  the session exists but a step failed (swarm, title, explicit model, \
 tag, pigeon, prompt refused); the line says how far it got. A tag failure \
 does not stop the launch: it may be prompt=ok with tag=-. A hook-resolved \
-default model failure warns and continues (exit 0), whereas explicit --model \
-failure exits 3.
+default model failure warns on stderr and does not affect the exit code, \
+whereas explicit --model failure exits 3.
   4  as 3, but the prompt was sent and not seen to start (prompt=unknown): the \
 turn may be running. Do not relaunch the same task.";
 
