@@ -49,23 +49,12 @@ pub fn configure_key_handler(handler: &mut edtui::events::KeyEventHandler) {
     handler.remove(&KeyEventRegister::n(vec![KeyInput::new(':')]));
 }
 
-/// Helper resolving with default enhancement setting (false).
-pub fn resolve_default(
-    mode: EditorMode,
-    composer_empty: bool,
-    key_event: KeyEvent,
-    pending_prefix: Option<char>,
-) -> Action {
-    resolve(mode, composer_empty, key_event, pending_prefix, false)
-}
-
 /// Resolves a key event into an Action.
 pub fn resolve(
     mode: EditorMode,
     composer_empty: bool,
     key_event: KeyEvent,
     pending_prefix: Option<char>,
-    enhanced_keyboard: bool,
 ) -> Action {
     // Release events are ignored
     if key_event.kind == KeyEventKind::Release {
@@ -123,10 +112,8 @@ pub fn resolve(
 
     match mode {
         EditorMode::Normal => {
-            // Submit on Enter or Ctrl-Enter
-            if key_event.code == KeyCode::Enter
-                && (key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::CONTROL)
-            {
+            // Submit on Enter
+            if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
                 return if composer_empty {
                     Action::Ignore
                 } else {
@@ -192,26 +179,17 @@ pub fn resolve(
             Action::Edtui(key_event)
         }
         EditorMode::Insert => {
-            // Enter variants in insert mode:
-            // - Ctrl-Enter: Submit when composer has text; Ignore when empty.
-            // - Plain Enter and Shift-Enter: Newline when composer has text; Ignore when
-            //   empty so habitual Enter never leaves an invisible "\n" that breaks
-            //   empty-composer shortcuts (Up/Down scroll, Ctrl-C interrupt, Ctrl-D quit).
-            if key_event.code == KeyCode::Enter {
-                if key_event.modifiers == KeyModifiers::CONTROL {
-                    return if composer_empty {
-                        Action::Ignore
-                    } else {
-                        Action::Submit
-                    };
-                }
-                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT {
-                    return if composer_empty {
-                        Action::Ignore
-                    } else {
-                        Action::Newline
-                    };
-                }
+            // Enter and Shift-Enter in insert mode: Newline when composer has text; Ignore
+            // when empty so habitual Enter never leaves an invisible "\n" that breaks
+            // empty-composer shortcuts (Up/Down scroll, Ctrl-C interrupt, Ctrl-D quit).
+            if key_event.code == KeyCode::Enter
+                && (key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT)
+            {
+                return if composer_empty {
+                    Action::Ignore
+                } else {
+                    Action::Newline
+                };
             }
 
             // Alt+<printable> in insert mode (fast typing Esc followed by key):
@@ -277,7 +255,6 @@ pub fn resolve(
                 }
             }
 
-            let _ = enhanced_keyboard;
             Action::Edtui(key_event)
         }
         _ => {
@@ -320,27 +297,27 @@ mod tests {
     #[test]
     fn test_normal_mode_scroll_keys() {
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('e'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('e'), None),
             Action::ScrollLines(1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('y'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('y'), None),
             Action::ScrollLines(-1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('d'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('d'), None),
             Action::ScrollHalfPage(1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('u'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('u'), None),
             Action::ScrollHalfPage(-1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('f'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('f'), None),
             Action::ScrollPage(1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('b'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('b'), None),
             Action::ScrollPage(-1)
         );
     }
@@ -352,37 +329,37 @@ mod tests {
 
         // When composer is empty: Up/Down scroll transcript 3 lines in BOTH modes
         assert_eq!(
-            resolve(EditorMode::Normal, true, up, None, false),
+            resolve(EditorMode::Normal, true, up, None),
             Action::ScrollLines(-3)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, down, None, false),
+            resolve(EditorMode::Normal, true, down, None),
             Action::ScrollLines(3)
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, up, None, false),
+            resolve(EditorMode::Insert, true, up, None),
             Action::ScrollLines(-3)
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, down, None, false),
+            resolve(EditorMode::Insert, true, down, None),
             Action::ScrollLines(3)
         );
 
         // When composer is NOT empty: Up/Down pass through to edtui in BOTH modes
         assert_eq!(
-            resolve(EditorMode::Normal, false, up, None, false),
+            resolve(EditorMode::Normal, false, up, None),
             Action::Edtui(up)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, down, None, false),
+            resolve(EditorMode::Normal, false, down, None),
             Action::Edtui(down)
         );
         assert_eq!(
-            resolve(EditorMode::Insert, false, up, None, false),
+            resolve(EditorMode::Insert, false, up, None),
             Action::Edtui(up)
         );
         assert_eq!(
-            resolve(EditorMode::Insert, false, down, None, false),
+            resolve(EditorMode::Insert, false, down, None),
             Action::Edtui(down)
         );
     }
@@ -392,29 +369,17 @@ mod tests {
         // When composer is empty:
         // 'g' without prefix returns PendingPrefix('g')
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('g')),
-                None,
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('g')), None,),
             Action::PendingPrefix('g')
         );
         // 'g' with prefix 'g' returns ScrollTop
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('g')),
-                Some('g'),
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('g')), Some('g'),),
             Action::ScrollTop
         );
         // 'G' (shift-G) when empty returns ScrollBottom
         assert_eq!(
-            resolve(EditorMode::Normal, true, shift('G'), None, false),
+            resolve(EditorMode::Normal, true, shift('G'), None),
             Action::ScrollBottom
         );
 
@@ -422,12 +387,12 @@ mod tests {
         // 'g' and 'G' pass through to edtui
         let g_event = key(KeyCode::Char('g'));
         assert_eq!(
-            resolve(EditorMode::Normal, false, g_event, None, false),
+            resolve(EditorMode::Normal, false, g_event, None),
             Action::Edtui(g_event)
         );
         let shift_g_event = shift('G');
         assert_eq!(
-            resolve(EditorMode::Normal, false, shift_g_event, None, false),
+            resolve(EditorMode::Normal, false, shift_g_event, None),
             Action::Edtui(shift_g_event)
         );
     }
@@ -436,46 +401,22 @@ mod tests {
     fn test_normal_mode_za_zt_toggles() {
         // 'z' without prefix -> PendingPrefix('z')
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('z')),
-                None,
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('z')), None,),
             Action::PendingPrefix('z')
         );
         // 'a' with prefix 'z' -> ToggleTools
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('a')),
-                Some('z'),
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('a')), Some('z'),),
             Action::ToggleTools
         );
         // 't' with prefix 'z' -> ToggleThoughts
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('t')),
-                Some('z'),
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('t')), Some('z'),),
             Action::ToggleThoughts
         );
         // 'j' with prefix 'z' -> ToggleJson
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char('j')),
-                Some('z'),
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char('j')), Some('z'),),
             Action::ToggleJson
         );
         // 'm' with prefix 'z' -> ToggleMaximize, whether or not the composer is empty
@@ -486,7 +427,6 @@ mod tests {
                     empty,
                     key(KeyCode::Char('m')),
                     Some('z'),
-                    false
                 ),
                 Action::ToggleMaximize
             );
@@ -494,7 +434,7 @@ mod tests {
         // any other key with prefix 'z' -> Edtui
         let x_event = key(KeyCode::Char('x'));
         assert_eq!(
-            resolve(EditorMode::Normal, true, x_event, Some('z'), false),
+            resolve(EditorMode::Normal, true, x_event, Some('z')),
             Action::Edtui(x_event)
         );
     }
@@ -502,13 +442,7 @@ mod tests {
     #[test]
     fn test_normal_mode_colon_opens_command() {
         assert_eq!(
-            resolve(
-                EditorMode::Normal,
-                true,
-                key(KeyCode::Char(':')),
-                None,
-                false
-            ),
+            resolve(EditorMode::Normal, true, key(KeyCode::Char(':')), None,),
             Action::OpenCommand
         );
     }
@@ -516,19 +450,19 @@ mod tests {
     #[test]
     fn test_ctrl_p_ctrl_n_history() {
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('p'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('p'), None),
             Action::HistoryPrev
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('n'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('n'), None),
             Action::HistoryNext
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl('p'), None, false),
+            resolve(EditorMode::Insert, true, ctrl('p'), None),
             Action::HistoryPrev
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl('n'), None, false),
+            resolve(EditorMode::Insert, true, ctrl('n'), None),
             Action::HistoryNext
         );
     }
@@ -537,22 +471,22 @@ mod tests {
     fn test_ctrl_d_conflict_normal_vs_insert() {
         // In Normal mode: ctrl-d is half page scroll down regardless of composer empty
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('d'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('d'), None),
             Action::ScrollHalfPage(1)
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, ctrl('d'), None, false),
+            resolve(EditorMode::Normal, false, ctrl('d'), None),
             Action::ScrollHalfPage(1)
         );
 
         // In Insert mode: ctrl-d on empty composer is Quit
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl('d'), None, false),
+            resolve(EditorMode::Insert, true, ctrl('d'), None),
             Action::Quit
         );
         // In Insert mode: ctrl-d on non-empty composer is Ignore (consistent with removal from edtui)
         assert_eq!(
-            resolve(EditorMode::Insert, false, ctrl('d'), None, false),
+            resolve(EditorMode::Insert, false, ctrl('d'), None),
             Action::Ignore
         );
     }
@@ -561,29 +495,29 @@ mod tests {
     fn test_ctrl_c_insert_with_vs_without_text_and_normal() {
         // Normal mode: Ctrl-C sends Interrupt
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl('c'), None, false),
+            resolve(EditorMode::Normal, true, ctrl('c'), None),
             Action::Interrupt
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, ctrl('c'), None, false),
+            resolve(EditorMode::Normal, false, ctrl('c'), None),
             Action::Interrupt
         );
 
         // Insert mode with text: LeaveInsertMode only
         assert_eq!(
-            resolve(EditorMode::Insert, false, ctrl('c'), None, false),
+            resolve(EditorMode::Insert, false, ctrl('c'), None),
             Action::LeaveInsertMode
         );
 
         // Insert mode empty: Interrupt
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl('c'), None, false),
+            resolve(EditorMode::Insert, true, ctrl('c'), None),
             Action::Interrupt
         );
 
         // Visual mode: Interrupt
         assert_eq!(
-            resolve(EditorMode::Visual, false, ctrl('c'), None, false),
+            resolve(EditorMode::Visual, false, ctrl('c'), None),
             Action::Interrupt
         );
     }
@@ -593,75 +527,55 @@ mod tests {
         let enter = key(KeyCode::Enter);
         // Plain Enter on empty composer is ignored (avoids invisible "\n" breaking empty shortcuts)
         assert_eq!(
-            resolve(EditorMode::Insert, true, enter, None, false),
+            resolve(EditorMode::Insert, true, enter, None),
             Action::Ignore
         );
         // Plain Enter on non-empty composer inserts a newline
         assert_eq!(
-            resolve(EditorMode::Insert, false, enter, None, false),
+            resolve(EditorMode::Insert, false, enter, None),
             Action::Newline
         );
 
-        // Shift-Enter matches plain Enter regardless of enhanced_keyboard
+        // Shift-Enter matches plain Enter
         let shift_enter = press(KeyCode::Enter, KeyModifiers::SHIFT);
-        for enhanced in [false, true] {
-            assert_eq!(
-                resolve(EditorMode::Insert, false, shift_enter, None, enhanced),
-                Action::Newline
-            );
-            assert_eq!(
-                resolve(EditorMode::Insert, true, shift_enter, None, enhanced),
-                Action::Ignore
-            );
-        }
+        assert_eq!(
+            resolve(EditorMode::Insert, false, shift_enter, None),
+            Action::Newline
+        );
+        assert_eq!(
+            resolve(EditorMode::Insert, true, shift_enter, None),
+            Action::Ignore
+        );
 
         // Ctrl-J inserts newline
         let ctrl_j = ctrl('j');
         assert_eq!(
-            resolve(EditorMode::Insert, false, ctrl_j, None, false),
+            resolve(EditorMode::Insert, false, ctrl_j, None),
             Action::Newline
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl_j, None, false),
+            resolve(EditorMode::Insert, true, ctrl_j, None),
             Action::Newline
-        );
-    }
-
-    #[test]
-    fn test_insert_mode_ctrl_enter_submits() {
-        let ctrl_enter = press(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert_eq!(
-            resolve(EditorMode::Insert, false, ctrl_enter, None, false),
-            Action::Submit
-        );
-        assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl_enter, None, false),
-            Action::Ignore
         );
     }
 
     #[test]
     fn test_normal_mode_enter_submits() {
-        for chord in [
-            key(KeyCode::Enter),
-            press(KeyCode::Enter, KeyModifiers::CONTROL),
-        ] {
-            assert_eq!(
-                resolve(EditorMode::Normal, false, chord, None, false),
-                Action::Submit,
-                "expected Submit for {chord:?} in normal mode"
-            );
-            assert_eq!(
-                resolve(EditorMode::Normal, true, chord, None, false),
-                Action::Ignore,
-                "expected Ignore for {chord:?} in normal mode on empty composer"
-            );
-        }
+        let enter = key(KeyCode::Enter);
+        assert_eq!(
+            resolve(EditorMode::Normal, false, enter, None),
+            Action::Submit
+        );
+        assert_eq!(
+            resolve(EditorMode::Normal, true, enter, None),
+            Action::Ignore
+        );
     }
 
     #[test]
     fn test_removed_send_chords_do_not_submit() {
         let removed = [
+            press(KeyCode::Enter, KeyModifiers::CONTROL),
             press(KeyCode::Enter, KeyModifiers::SUPER),
             press(KeyCode::Enter, KeyModifiers::ALT),
             ctrl('s'),
@@ -669,7 +583,7 @@ mod tests {
         for mode in [EditorMode::Insert, EditorMode::Normal] {
             for chord in removed {
                 assert_ne!(
-                    resolve(mode, false, chord, None, false),
+                    resolve(mode, false, chord, None),
                     Action::Submit,
                     "removed chord {chord:?} must not submit in {mode:?}"
                 );
@@ -681,13 +595,13 @@ mod tests {
     fn test_alt_printable_in_insert_mode_yields_esc_key() {
         let alt_colon = press(KeyCode::Char(':'), KeyModifiers::ALT);
         assert_eq!(
-            resolve(EditorMode::Insert, false, alt_colon, None, false),
+            resolve(EditorMode::Insert, false, alt_colon, None),
             Action::EscKey(key(KeyCode::Char(':')))
         );
 
         let alt_q = press(KeyCode::Char('q'), KeyModifiers::ALT);
         assert_eq!(
-            resolve(EditorMode::Insert, false, alt_q, None, false),
+            resolve(EditorMode::Insert, false, alt_q, None),
             Action::EscKey(key(KeyCode::Char('q')))
         );
     }
@@ -701,7 +615,7 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert_eq!(
-            resolve(EditorMode::Insert, false, release, None, false),
+            resolve(EditorMode::Insert, false, release, None),
             Action::Ignore
         );
     }
@@ -710,13 +624,13 @@ mod tests {
     fn test_other_keys_pass_to_edtui() {
         let h = key(KeyCode::Char('h'));
         assert_eq!(
-            resolve(EditorMode::Normal, false, h, None, false),
+            resolve(EditorMode::Normal, false, h, None),
             Action::Edtui(h)
         );
 
         let esc = key(KeyCode::Esc);
         assert_eq!(
-            resolve(EditorMode::Insert, false, esc, None, false),
+            resolve(EditorMode::Insert, false, esc, None),
             Action::Edtui(esc)
         );
     }
@@ -729,37 +643,37 @@ mod tests {
 
         // Normal mode
         assert_eq!(
-            resolve(EditorMode::Normal, true, ctrl_x, None, false),
+            resolve(EditorMode::Normal, true, ctrl_x, None),
             Action::PendingPrefix('\x18')
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, ctrl_x, None, false),
+            resolve(EditorMode::Normal, false, ctrl_x, None),
             Action::PendingPrefix('\x18')
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, m_key, Some('\x18'), false),
+            resolve(EditorMode::Normal, true, m_key, Some('\x18')),
             Action::OpenModelPicker
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, a_key, Some('\x18'), false),
+            resolve(EditorMode::Normal, true, a_key, Some('\x18')),
             Action::Ignore
         );
 
         // Insert mode
         assert_eq!(
-            resolve(EditorMode::Insert, true, ctrl_x, None, false),
+            resolve(EditorMode::Insert, true, ctrl_x, None),
             Action::PendingPrefix('\x18')
         );
         assert_eq!(
-            resolve(EditorMode::Insert, false, ctrl_x, None, false),
+            resolve(EditorMode::Insert, false, ctrl_x, None),
             Action::PendingPrefix('\x18')
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, m_key, Some('\x18'), false),
+            resolve(EditorMode::Insert, true, m_key, Some('\x18')),
             Action::OpenModelPicker
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, a_key, Some('\x18'), false),
+            resolve(EditorMode::Insert, true, a_key, Some('\x18')),
             Action::Ignore
         );
     }
@@ -771,48 +685,48 @@ mod tests {
 
         // Normal mode
         assert_eq!(
-            resolve(EditorMode::Normal, true, f2, None, false),
+            resolve(EditorMode::Normal, true, f2, None),
             Action::CycleModelNext
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, f2, None, false),
+            resolve(EditorMode::Normal, false, f2, None),
             Action::CycleModelNext
         );
         assert_eq!(
-            resolve(EditorMode::Normal, true, shift_f2, None, false),
+            resolve(EditorMode::Normal, true, shift_f2, None),
             Action::CycleModelPrev
         );
         assert_eq!(
-            resolve(EditorMode::Normal, false, shift_f2, None, false),
+            resolve(EditorMode::Normal, false, shift_f2, None),
             Action::CycleModelPrev
         );
 
         // Insert mode
         assert_eq!(
-            resolve(EditorMode::Insert, true, f2, None, false),
+            resolve(EditorMode::Insert, true, f2, None),
             Action::CycleModelNext
         );
         assert_eq!(
-            resolve(EditorMode::Insert, false, f2, None, false),
+            resolve(EditorMode::Insert, false, f2, None),
             Action::CycleModelNext
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, shift_f2, None, false),
+            resolve(EditorMode::Insert, true, shift_f2, None),
             Action::CycleModelPrev
         );
         assert_eq!(
-            resolve(EditorMode::Insert, false, shift_f2, None, false),
+            resolve(EditorMode::Insert, false, shift_f2, None),
             Action::CycleModelPrev
         );
 
         // F(14) without modifiers (Shift+F2 on xterm/tmux without kitty keyboard protocol)
         let f14 = key(KeyCode::F(14));
         assert_eq!(
-            resolve(EditorMode::Normal, true, f14, None, false),
+            resolve(EditorMode::Normal, true, f14, None),
             Action::CycleModelPrev
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, f14, None, false),
+            resolve(EditorMode::Insert, true, f14, None),
             Action::CycleModelPrev
         );
     }
