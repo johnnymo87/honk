@@ -28,11 +28,13 @@
 //! ([`LaunchError::Partial`]); the line's `prompt=` field says whether it was
 //! prompted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::client::Client;
 use crate::octags::{self, TagSettings, WhichOutcome};
@@ -93,6 +95,7 @@ pub struct Timeouts {
     pub swarm_enable: Duration,
     pub rename: Duration,
     pub model: Duration,
+    pub default_model: Duration,
     pub effort: Duration,
     pub prompt_confirm: Duration,
     pub which: Duration,
@@ -107,6 +110,7 @@ impl Default for Timeouts {
             swarm_enable: Duration::from_secs(30),
             rename: Duration::from_secs(10),
             model: Duration::from_secs(10),
+            default_model: Duration::from_secs(3),
             effort: Duration::from_secs(10),
             prompt_confirm: Duration::from_secs(60),
             which: octags::DEFAULT_WHICH_TIMEOUT,
@@ -122,6 +126,7 @@ pub struct LaunchOpts {
     pub prompt: String,
     pub title: Option<String>,
     pub model: Option<String>,
+    pub default_model_cmd: Option<PathBuf>,
     pub effort: Option<String>,
     pub tag: TagRequest,
     /// The launching session as an oc-tags key (`ses_…` or `goose:<id>`).
@@ -165,6 +170,7 @@ impl std::fmt::Debug for LaunchOpts {
             .field("prompt", &self.prompt)
             .field("title", &self.title)
             .field("model", &self.model)
+            .field("default_model_cmd", &self.default_model_cmd)
             .field("effort", &self.effort)
             .field("tag", &self.tag)
             .field("launcher", &self.launcher)
@@ -277,6 +283,159 @@ fn bin_exists(bin: &str) -> bool {
     }
 }
 
+pub const MAX_HOOK_OUTPUT_BYTES: u64 = 8 * 1024;
+
+pub struct HookOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Reads up to `limit` bytes from `reader`, then drains any remaining bytes to `tokio::io::sink()`.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut take = (&mut reader).take(limit);
+    take.read_to_end(&mut buf).await?;
+    tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+    Ok(buf)
+}
+
+/// Waits for `child` while boundedly reading `stdout` and `stderr` (up to `limit` bytes each).
+pub async fn wait_bounded(
+    mut child: tokio::process::Child,
+    limit: u64,
+) -> std::io::Result<HookOutput> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_fut = async {
+        if let Some(stdout) = stdout {
+            read_bounded(stdout, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let stderr_fut = async {
+        if let Some(stderr) = stderr {
+            read_bounded(stderr, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (stdout_res, stderr_res, status_res) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+    let stdout = stdout_res?;
+    let stderr = stderr_res?;
+    let status = status_res?;
+    Ok(HookOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSource {
+    Explicit,
+    Hook,
+}
+
+pub async fn resolve_default_model(
+    cmd: &Path,
+    tag: Option<&str>,
+    timeout: Duration,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new(cmd);
+    if let Some(t) = tag {
+        command.arg("--tag").arg(t.to_ascii_lowercase());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "honk launch: warning: default-model-cmd {} failed to spawn: {e}; using server default",
+                cmd.display()
+            );
+            return None;
+        }
+    };
+
+    let out = match tokio::time::timeout(timeout, wait_bounded(child, MAX_HOOK_OUTPUT_BYTES)).await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            eprintln!(
+                "honk launch: warning: default-model-cmd {} wait error: {e}; using server default",
+                cmd.display()
+            );
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "honk launch: warning: default-model-cmd {} timed out after {timeout:?}; using server default",
+                cmd.display()
+            );
+            return None;
+        }
+    };
+
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let stderr_trimmed = stderr_str.trim();
+    let snippet = if stderr_trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_str(stderr_trimmed, 512))
+    };
+
+    if !out.status.success() {
+        if let Some(snip) = snippet {
+            eprintln!(
+                "honk launch: warning: default-model-cmd {} exited with {}: {snip}; using server default",
+                cmd.display(),
+                out.status
+            );
+        } else {
+            eprintln!(
+                "honk launch: warning: default-model-cmd {} exited with {}; using server default",
+                cmd.display(),
+                out.status
+            );
+        }
+        return None;
+    }
+
+    if let Some(snip) = snippet {
+        eprintln!("honk launch: default-model-cmd stderr: {snip}");
+    }
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let first_line = stdout_str.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        None
+    } else {
+        Some(first_line.to_string())
+    }
+}
+
 /// Everything checkable before a session exists: pigeon reachable and
 /// accepting our token, the tag decided, session-tags present.
 async fn preflight(opts: &LaunchOpts) -> anyhow::Result<(Option<String>, String)> {
@@ -298,6 +457,19 @@ async fn preflight(opts: &LaunchOpts) -> anyhow::Result<(Option<String>, String)
 /// Runs the whole launch. On success the session is prompted and detached.
 pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
     let (tag, endpoint) = preflight(opts).await.map_err(LaunchError::NotCreated)?;
+
+    let effective_model = if let Some(m) = opts.model.clone() {
+        Some((m, ModelSource::Explicit))
+    } else if let Some(cmd) = &opts.default_model_cmd {
+        let resolved =
+            resolve_default_model(cmd, tag.as_deref(), opts.timeouts.default_model).await;
+        if let Some(m) = &resolved {
+            eprintln!("honk launch: model {m} (default-model-cmd)");
+        }
+        resolved.map(|m| (m, ModelSource::Hook))
+    } else {
+        None
+    };
 
     let mut client = match tokio::time::timeout(
         opts.timeouts.connect,
@@ -356,15 +528,36 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
         );
     }
 
-    if let Some(model) = &opts.model {
-        step!(
-            check_model_allowed(&mut client, &native, model, opts.timeouts.model).await,
-            "setting the model failed"
-        );
-        step!(
-            set_model(&mut client, &native, model, opts.timeouts.model).await,
-            "setting the model failed"
-        );
+    match effective_model {
+        Some((model, ModelSource::Explicit)) => {
+            step!(
+                check_model_allowed(&mut client, &native, &model, opts.timeouts.model).await,
+                "setting the model failed"
+            );
+            step!(
+                set_model(&mut client, &native, &model, opts.timeouts.model).await,
+                "setting the model failed"
+            );
+        }
+        Some((model, ModelSource::Hook)) => {
+            match check_model_allowed(&mut client, &native, &model, opts.timeouts.model).await {
+                Ok(()) => {
+                    if let Err(e) =
+                        set_model(&mut client, &native, &model, opts.timeouts.model).await
+                    {
+                        eprintln!(
+                            "honk launch: warning: setting default-model-cmd model '{model}' failed ({e:#}); continuing (if timed out, ambiguous: may still apply)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "honk launch: warning: default-model-cmd model '{model}' skipped ({e:#}); using server default"
+                    );
+                }
+            }
+        }
+        None => {}
     }
 
     if let Some(effort) = &opts.effort {
@@ -1081,6 +1274,7 @@ mod tests {
             prompt: "p".into(),
             title: None,
             model: None,
+            default_model_cmd: None,
             effort: None,
             tag: TagRequest::Off,
             launcher: None,
@@ -1149,5 +1343,120 @@ mod tests {
             panic!("spawn_fn should not be called")
         });
         assert_eq!(line, None);
+    }
+
+    fn make_temp_script(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        path
+    }
+
+    #[test]
+    fn test_truncate_str() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello");
+        assert_eq!(truncate_str("🦀🦀🦀", 4), "🦀");
+        assert_eq!(truncate_str("🦀🦀🦀", 5), "🦀");
+        assert_eq!(truncate_str("🦀🦀🦀", 8), "🦀🦀");
+    }
+
+    #[tokio::test]
+    async fn test_wait_bounded_large_output() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let child = cmd.spawn().expect("spawn sh");
+        let output = wait_bounded(child, MAX_HOOK_OUTPUT_BYTES)
+            .await
+            .expect("wait bounded");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_HOOK_OUTPUT_BYTES as usize);
+        assert_eq!(output.stderr.len(), MAX_HOOK_OUTPUT_BYTES as usize);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_stdout_trimming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(
+            tmp.path(),
+            "trim.sh",
+            "#!/bin/sh\necho '  custom-model  '\n",
+        );
+        let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
+        assert_eq!(res.as_deref(), Some("custom-model"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_multiline_takes_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(
+            tmp.path(),
+            "multi.sh",
+            "#!/bin/sh\nprintf 'first-line\\nsecond-line\\n'\n",
+        );
+        let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
+        assert_eq!(res.as_deref(), Some("first-line"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_stderr_relay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(
+            tmp.path(),
+            "err.sh",
+            "#!/bin/sh\necho 'warning message' >&2\necho 'good-model'\n",
+        );
+        let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
+        assert_eq!(res.as_deref(), Some("good-model"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_non_zero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(
+            tmp.path(),
+            "fail.sh",
+            "#!/bin/sh\necho 'something broke' >&2\nexit 1\n",
+        );
+        let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = make_temp_script(tmp.path(), "slow.sh", "#!/bin/sh\nsleep 10\necho 'model'\n");
+        let res = resolve_default_model(&script, None, Duration::from_millis(50)).await;
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_model_missing_binary() {
+        let res = resolve_default_model(
+            Path::new("/nonexistent/binary/path"),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(res, None);
     }
 }

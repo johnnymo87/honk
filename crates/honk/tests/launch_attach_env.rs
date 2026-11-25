@@ -160,6 +160,7 @@ fn opts(r: &Rig) -> LaunchOpts {
         prompt: "do the thing".into(),
         title: Some("Fix it".into()),
         model: None,
+        default_model_cmd: None,
         effort: None,
         tag: TagRequest::Explicit("honk".into()),
         launcher: Some("ses_launcher".into()),

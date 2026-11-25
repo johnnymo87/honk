@@ -54,6 +54,13 @@ Tag: --tag <tag> wins. Without --tag the launching session's tag is inherited \
 stall-watch coordinator gives its program's tag, never its own \
 'stall-watcher-runs'. --tag auto applies no tag.
 
+Default model hook: when `--model` is omitted, checks `$HONK_DEFAULT_MODEL_CMD` \
+(empty disables) or `$XDG_CONFIG_HOME/honk/default-model-cmd` \
+(`~/.config/honk/default-model-cmd`); runs it with `[--tag <tag>]` (lowercased \
+resolved tag, or no args when untagged) before `session/new` and applies its \
+first stdout line as the model. Fails open with a stderr warning on any error, \
+timeout, or rejected model (exit 0).
+
 Output: on stdout, exactly one line once a session exists:
   native=<goose id> gse=<pigeon id or -> tag=<tag or -> prompt=<ok|no|unknown>
 Everything else goes to stderr. Put `--` before <dir> if the prompt may start \
@@ -65,9 +72,11 @@ Exit codes:
 token, tag undecidable, session-tags missing, honkd unreachable; a session/new \
 timeout may still have created one, see `honk list`). No stdout line.
   2  usage error
-  3  the session exists but a step failed (swarm, title, tag, pigeon, prompt \
-refused); the line says how far it got. A tag failure does not stop the launch: \
-it may be prompt=ok with tag=-.
+  3  the session exists but a step failed (swarm, title, explicit model, \
+tag, pigeon, prompt refused); the line says how far it got. A tag failure \
+does not stop the launch: it may be prompt=ok with tag=-. A hook-resolved \
+default model failure warns and continues (exit 0), whereas explicit --model \
+failure exits 3.
   4  as 3, but the prompt was sent and not seen to start (prompt=unknown): the \
 turn may be running. Do not relaunch the same task.";
 
@@ -130,6 +139,33 @@ struct LaunchArgs {
 /// opencode's tool shells, which is where `honk launch` runs.
 const DEFAULT_PIGEON_TOKEN_FILE: &str = "/run/secrets/pigeon_daemon_auth_token";
 
+fn resolve_default_model_cmd_from(
+    env_get: impl Fn(&str) -> Option<String>,
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(val) = env_get("HONK_DEFAULT_MODEL_CMD") {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+
+    let candidate = if let Some(xdg) = env_get("XDG_CONFIG_HOME")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        PathBuf::from(xdg).join("honk/default-model-cmd")
+    } else {
+        let home = env_get("HOME")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        PathBuf::from(home).join(".config/honk/default-model-cmd")
+    };
+
+    is_file(&candidate).then_some(candidate)
+}
+
 fn launch_opts(
     args: LaunchArgs,
     env_get: impl Fn(&str) -> Option<String>,
@@ -159,6 +195,11 @@ fn launch_opts(
         Some(m) if m.trim().is_empty() => anyhow::bail!("--model is empty"),
         Some(m) => Some(m.trim().to_string()),
         None => None,
+    };
+    let default_model_cmd = if model.is_none() {
+        resolve_default_model_cmd_from(&env_get, |p| p.is_file())
+    } else {
+        None
     };
     let effort = match args.effort {
         Some(e) if e.trim().is_empty() => anyhow::bail!("--effort is empty"),
@@ -191,6 +232,7 @@ fn launch_opts(
         prompt,
         title,
         model,
+        default_model_cmd,
         effort,
         tag,
         launcher: honk::octags::resolve_launcher_from(&env_get),
@@ -1383,6 +1425,128 @@ mod tests {
                 "honk", "launch", "--effort", "bogus", "--secret", "s", "/tmp", "do it",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_model_cmd_from_env_var() {
+        let env = |k: &str| match k {
+            "HONK_DEFAULT_MODEL_CMD" => Some("/bin/custom-model-cmd".into()),
+            _ => None,
+        };
+        let res = resolve_default_model_cmd_from(env, |_| false);
+        assert_eq!(res, Some(PathBuf::from("/bin/custom-model-cmd")));
+    }
+
+    #[test]
+    fn test_resolve_default_model_cmd_from_empty_env_disables() {
+        for empty in ["", "   ", "\t\n"] {
+            let env = |k: &str| match k {
+                "HONK_DEFAULT_MODEL_CMD" => Some(empty.into()),
+                "XDG_CONFIG_HOME" => Some("/xdg".into()),
+                "HOME" => Some("/home/dev".into()),
+                _ => None,
+            };
+            let res = resolve_default_model_cmd_from(env, |_| true);
+            assert_eq!(
+                res, None,
+                "empty env value '{empty}' must disable and not fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_default_model_cmd_from_xdg_honored_without_home_fallback() {
+        // 1. XDG file exists -> returned
+        let env = |k: &str| match k {
+            "XDG_CONFIG_HOME" => Some("/custom/xdg".into()),
+            "HOME" => Some("/home/dev".into()),
+            _ => None,
+        };
+        let is_file =
+            |p: &std::path::Path| p == std::path::Path::new("/custom/xdg/honk/default-model-cmd");
+        let res = resolve_default_model_cmd_from(env, is_file);
+        assert_eq!(
+            res,
+            Some(PathBuf::from("/custom/xdg/honk/default-model-cmd"))
+        );
+
+        // 2. XDG set, but file does not exist in XDG while existing in HOME -> returns None (NO fallback to HOME!)
+        let is_home_file = |p: &std::path::Path| {
+            p == std::path::Path::new("/home/dev/.config/honk/default-model-cmd")
+        };
+        let res_no_fallback = resolve_default_model_cmd_from(env, is_home_file);
+        assert_eq!(
+            res_no_fallback, None,
+            "must not fall back to HOME when XDG_CONFIG_HOME is set"
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_model_cmd_from_home_fallback_when_xdg_unset_or_empty() {
+        // 1. XDG unset -> falls back to HOME
+        let env_unset = |k: &str| match k {
+            "HOME" => Some("/home/dev".into()),
+            _ => None,
+        };
+        let is_file = |p: &std::path::Path| {
+            p == std::path::Path::new("/home/dev/.config/honk/default-model-cmd")
+        };
+        let res = resolve_default_model_cmd_from(env_unset, is_file);
+        assert_eq!(
+            res,
+            Some(PathBuf::from("/home/dev/.config/honk/default-model-cmd"))
+        );
+
+        // 2. XDG empty -> falls back to HOME
+        let env_empty_xdg = |k: &str| match k {
+            "XDG_CONFIG_HOME" => Some("   ".into()),
+            "HOME" => Some("/home/dev".into()),
+            _ => None,
+        };
+        let res2 = resolve_default_model_cmd_from(env_empty_xdg, is_file);
+        assert_eq!(
+            res2,
+            Some(PathBuf::from("/home/dev/.config/honk/default-model-cmd"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_model_cmd_from_missing_file_returns_none() {
+        let env = |k: &str| match k {
+            "HOME" => Some("/home/dev".into()),
+            _ => None,
+        };
+        let res = resolve_default_model_cmd_from(env, |_| false);
+        assert_eq!(res, None);
+
+        let no_env = |_: &str| None;
+        let res2 = resolve_default_model_cmd_from(no_env, |_| true);
+        assert_eq!(res2, None);
+    }
+
+    #[test]
+    fn test_launch_opts_explicit_model_ignores_default_model_cmd() {
+        let temp = tempfile::tempdir().unwrap();
+        let d = temp.path().to_str().unwrap();
+        let env = |k: &str| match k {
+            "HONK_DEFAULT_MODEL_CMD" => Some("/bin/default-model-cmd".into()),
+            other => launch_env(other),
+        };
+
+        // Explicit --model: default_model_cmd is None
+        let a = launch(&[d, "--secret", "s", "--model", "custom-model", "p"]).unwrap();
+        let o = launch_opts(a, env, || unreachable!()).unwrap();
+        assert_eq!(o.model.as_deref(), Some("custom-model"));
+        assert_eq!(o.default_model_cmd, None);
+
+        // Omitted --model: default_model_cmd is resolved
+        let a2 = launch(&[d, "--secret", "s", "p"]).unwrap();
+        let o2 = launch_opts(a2, env, || unreachable!()).unwrap();
+        assert_eq!(o2.model, None);
+        assert_eq!(
+            o2.default_model_cmd,
+            Some(PathBuf::from("/bin/default-model-cmd"))
         );
     }
 }
