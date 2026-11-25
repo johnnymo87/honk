@@ -88,6 +88,11 @@ pub struct Args {
     /// Repeatable, one server per flag. A server with no entry gets every tool.
     #[arg(long = "mcp-allow-tools", value_name = "SERVER=TOOL,...")]
     pub mcp_allow_tools: Vec<String>,
+    /// An executable with mcp-remote's command line. With it, catalog remote
+    /// servers that send headers ({file:} secrets) or may need OAuth run through
+    /// it as stdio servers.
+    #[arg(long, value_name = "PATH")]
+    pub mcp_remote_bin: Option<PathBuf>,
     #[arg(long, help = "Allow agents to self-grant MCP servers via POST /mcp/*")]
     pub mcp_self_grant: bool,
     #[arg(
@@ -296,6 +301,7 @@ mod tests {
         assert!(args.mcp_no_confirm.is_empty());
         assert!(!args.mcp_self_grant);
         assert!(!args.project_mcp);
+        assert_eq!(args.mcp_remote_bin, None);
     }
 
     #[test]

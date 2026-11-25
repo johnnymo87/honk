@@ -322,6 +322,7 @@ impl Hub {
                 policy,
                 swarm,
                 project: args.project_mcp,
+                mcp_remote_bin: args.mcp_remote_bin.clone(),
             })
         } else {
             None

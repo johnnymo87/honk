@@ -6246,6 +6246,7 @@ mod tests {
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
             project: false,
+            mcp_remote_bin: None,
         });
 
         // 1. Agent origin timeout
@@ -6549,6 +6550,7 @@ mod tests {
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
             project: false,
+            mcp_remote_bin: None,
         });
 
         // 1. Agent origin op
@@ -6644,6 +6646,7 @@ mod tests {
             policy: crate::mcp::ops::Policy::new(vec!["local-test".to_string()]),
             swarm: None,
             project: false,
+            mcp_remote_bin: None,
         });
 
         // 1. Immediate McpSelfOp with closed reply
