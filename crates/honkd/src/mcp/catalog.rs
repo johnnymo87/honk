@@ -226,7 +226,7 @@ fn is_disallowed_env_key(key: &str) -> bool {
         .any(|disallowed| disallowed.eq_ignore_ascii_case(key))
 }
 
-fn key_looks_secret(key: &str) -> bool {
+pub(crate) fn key_looks_secret(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     upper.contains("TOKEN")
         || upper.contains("SECRET")
@@ -337,10 +337,12 @@ impl Catalog {
     }
 
     /// Like [`Catalog::load`], bridging remote entries that need headers or
-    /// OAuth through `mcp_remote_bin` (see [`ParseOpts::mcp_remote_bin`]).
+    /// OAuth through `mcp_remote_bin` (see [`ParseOpts::mcp_remote_bin`]), with
+    /// `query_overrides` set in remote urls (see [`ParseOpts::query_overrides`]).
     pub fn load_bridged(
         path: impl AsRef<Path>,
         mcp_remote_bin: Option<&Path>,
+        query_overrides: Option<&QueryOverrides>,
     ) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let content = std::fs::read_to_string(path.as_ref())?;
@@ -349,6 +351,7 @@ impl Catalog {
             ParseOpts {
                 home: home.as_deref(),
                 mcp_remote_bin,
+                query_overrides,
             },
         )
     }
@@ -359,6 +362,7 @@ impl Catalog {
             ParseOpts {
                 home,
                 mcp_remote_bin: None,
+                query_overrides: None,
             },
         )
     }
@@ -439,8 +443,32 @@ pub(crate) fn parse_entry(
         ParseOpts {
             home,
             mcp_remote_bin: None,
+            query_overrides: None,
         },
     )
+}
+
+/// `--mcp-query-override`: server name -> `(key, value)` query parameters to set
+/// in that remote entry's url.
+pub type QueryOverrides = BTreeMap<String, Vec<(String, String)>>;
+
+/// `url` with each `(key, value)` of `overrides` set: every existing parameter
+/// named `key` is removed and `key=value` appended; other parameters keep their
+/// order. `None` when `url` does not parse (the caller reports that).
+pub fn apply_query_overrides(url: &str, overrides: &[(String, String)]) -> Option<String> {
+    let mut u = reqwest::Url::parse(url).ok()?;
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| !overrides.iter().any(|(ok, _)| ok == k))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut q = u.query_pairs_mut();
+        q.clear();
+        q.extend_pairs(kept.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        q.extend_pairs(overrides.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
+    Some(u.to_string())
 }
 
 /// Options for parsing catalog entries.
@@ -454,6 +482,9 @@ pub struct ParseOpts<'a> {
     /// Without it such entries stay as before (headers unsupported, the rest
     /// native http).
     pub mcp_remote_bin: Option<&'a Path>,
+    /// `--mcp-query-override`, applied to remote entries' urls before anything
+    /// else reads them.
+    pub query_overrides: Option<&'a QueryOverrides>,
 }
 
 pub(crate) fn parse_entry_with(
@@ -723,6 +754,16 @@ fn parse_entry_inner(name: &str, val: &serde_json::Value, opts: ParseOpts<'_>) -
     match type_str {
         Some("local") => {}
         Some("remote") => {
+            let overridden = opts
+                .query_overrides
+                .and_then(|o| o.get(name))
+                .and_then(|pairs| {
+                    let url = val.get("url")?.as_str()?;
+                    let mut v = val.clone();
+                    v["url"] = serde_json::Value::String(apply_query_overrides(url, pairs)?);
+                    Some(v)
+                });
+            let val = overridden.as_ref().unwrap_or(val);
             let mut entry = CatalogEntry::new(name, parse_remote(name, val, opts), McpKind::Remote);
             entry.remote_url = val.get("url").and_then(|v| v.as_str()).map(str::to_string);
             return entry;
@@ -1113,6 +1154,7 @@ mod tests {
             ParseOpts {
                 home,
                 mcp_remote_bin: Some(bin),
+                query_overrides: None,
             },
         )
         .unwrap();
@@ -1151,6 +1193,81 @@ mod tests {
         assert_eq!(add["server"]["command"], "/bin/sh");
         let text = serde_json::to_string(&add).unwrap();
         assert!(!text.contains("{file:"), "{text}");
+    }
+
+    #[test]
+    fn test_apply_query_overrides_replaces_and_keeps_others() {
+        let o = vec![("toolsets".to_string(), "core,alerting".to_string())];
+        assert_eq!(
+            apply_query_overrides(
+                "https://x.example/v1/mcp?a=1&toolsets=all&toolsets=x&b=2",
+                &o
+            )
+            .unwrap(),
+            "https://x.example/v1/mcp?a=1&b=2&toolsets=core%2Calerting"
+        );
+        assert_eq!(
+            apply_query_overrides("https://x.example/v1/mcp", &o).unwrap(),
+            "https://x.example/v1/mcp?toolsets=core%2Calerting"
+        );
+        assert!(apply_query_overrides("not a url", &o).is_none());
+    }
+
+    #[test]
+    fn test_query_override_reaches_bridged_command_and_remote_url() {
+        let (_d, bin) = fake_bin();
+        let overrides = QueryOverrides::from([(
+            "srv".to_string(),
+            vec![("toolsets".to_string(), "core,ddsql".to_string())],
+        )]);
+        let json = r#"{"mcp":{
+            "srv":{"type":"remote","url":"https://mcp.example.com/v1/mcp?toolsets=all","oauth":false,
+                "headers":{"Authorization":"Bearer {file:/run/secrets/dd_pat}"}},
+            "other":{"type":"remote","url":"https://o.example/mcp?toolsets=all","oauth":false}}}"#;
+        let cat = Catalog::load_from_str_with(
+            json,
+            ParseOpts {
+                home: None,
+                mcp_remote_bin: Some(&bin),
+                query_overrides: Some(&overrides),
+            },
+        )
+        .unwrap();
+        let srv = cat.get("srv").unwrap();
+        let want = "https://mcp.example.com/v1/mcp?toolsets=core%2Cddsql";
+        assert_eq!(srv.remote_url.as_deref(), Some(want));
+        let (command, env) = stdio(srv.supported.as_ref().unwrap());
+        assert_eq!(command[1], want);
+        assert_eq!(command[3], "Authorization:Bearer ${HONK_MCP_HDR_0}");
+        assert_eq!(env.len(), 1);
+        // Other entries are untouched.
+        let other = cat.get("other").unwrap();
+        assert_eq!(
+            other.supported.as_ref().unwrap().transport,
+            Transport::Http {
+                url: "https://o.example/mcp?toolsets=all".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_query_override_ignores_local_entries() {
+        let overrides = QueryOverrides::from([(
+            "loc".to_string(),
+            vec![("toolsets".to_string(), "core".to_string())],
+        )]);
+        let json = r#"{"mcp":{"loc":{"type":"local","command":["/bin/true"]}}}"#;
+        let with = Catalog::load_from_str_with(
+            json,
+            ParseOpts {
+                home: None,
+                mcp_remote_bin: None,
+                query_overrides: Some(&overrides),
+            },
+        )
+        .unwrap();
+        let without = Catalog::load_from_str(json, None).unwrap();
+        assert_eq!(with, without);
     }
 
     #[test]

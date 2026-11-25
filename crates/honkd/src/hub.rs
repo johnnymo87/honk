@@ -299,8 +299,9 @@ impl Hub {
             if has_swarm {
                 policy.no_confirm.insert("swarm".to_string());
             }
+            let query_overrides = args.mcp_query_overrides_map()?;
             if let Some(path) = &args.mcp_catalog
-                && !policy.available_tools.is_empty()
+                && (!policy.available_tools.is_empty() || !query_overrides.is_empty())
             {
                 match crate::mcp::catalog::Catalog::load(path) {
                     Ok(catalog) => {
@@ -310,9 +311,20 @@ impl Hub {
                                 path.display()
                             );
                         }
+                        for name in query_overrides.keys() {
+                            let remote = catalog
+                                .get(name)
+                                .is_some_and(|e| e.kind == crate::mcp::catalog::McpKind::Remote);
+                            if !remote {
+                                tracing::warn!(
+                                    "--mcp-query-override names '{name}', which is not a remote server in {}; it changes nothing",
+                                    path.display()
+                                );
+                            }
+                        }
                     }
                     Err(e) => tracing::warn!(
-                        "cannot read {} to check --mcp-allow-tools names: {e:#}",
+                        "cannot read {} to check --mcp-allow-tools and --mcp-query-override names: {e:#}",
                         path.display()
                     ),
                 }
@@ -323,6 +335,7 @@ impl Hub {
                 swarm,
                 project: args.project_mcp,
                 mcp_remote_bin: args.mcp_remote_bin.clone(),
+                query_overrides,
             })
         } else {
             None

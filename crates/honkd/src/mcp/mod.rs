@@ -29,6 +29,9 @@ pub struct McpConfig {
     /// `--mcp-remote-bin`: bridges user-catalog remote entries that send
     /// headers or may need OAuth (see [`catalog::ParseOpts::mcp_remote_bin`]).
     pub mcp_remote_bin: Option<PathBuf>,
+    /// `--mcp-query-override`: query parameters set in user-catalog remote urls
+    /// (see [`catalog::ParseOpts::query_overrides`]).
+    pub query_overrides: catalog::QueryOverrides,
 }
 
 /// The catalog one session sees, and what went into it.
@@ -64,8 +67,12 @@ impl McpConfig {
         session_id: &str,
     ) -> Result<SessionCatalog, OpError> {
         let user = match &self.catalog_path {
-            Some(path) => Catalog::load_bridged(path, self.mcp_remote_bin.as_deref())
-                .map_err(OpError::catalog_unreadable)?,
+            Some(path) => Catalog::load_bridged(
+                path,
+                self.mcp_remote_bin.as_deref(),
+                Some(&self.query_overrides),
+            )
+            .map_err(OpError::catalog_unreadable)?,
             None => Catalog::default(),
         };
 
@@ -220,6 +227,7 @@ mod tests {
             swarm: None,
             project: true,
             mcp_remote_bin: None,
+            query_overrides: Default::default(),
         };
         let sc = cfg
             .session_catalog(Some(td.path().to_str().unwrap()), "s")
@@ -291,6 +299,7 @@ mod tests {
             swarm: None,
             project,
             mcp_remote_bin: None,
+            query_overrides: Default::default(),
         }
     }
 

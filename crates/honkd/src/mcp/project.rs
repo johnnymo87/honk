@@ -1102,6 +1102,7 @@ mod tests {
             crate::mcp::catalog::ParseOpts {
                 home: None,
                 mcp_remote_bin: Some(&bin),
+                query_overrides: None,
             },
         )
         .unwrap();
