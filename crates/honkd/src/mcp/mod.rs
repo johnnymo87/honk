@@ -26,6 +26,9 @@ pub struct McpConfig {
     pub swarm: Option<SwarmMcpConfig>,
     /// Read the session cwd's `opencode.json[c]` MCP servers (`--project-mcp`).
     pub project: bool,
+    /// `--mcp-remote-bin`: bridges user-catalog remote entries that send
+    /// headers or may need OAuth (see [`catalog::ParseOpts::mcp_remote_bin`]).
+    pub mcp_remote_bin: Option<PathBuf>,
 }
 
 /// The catalog one session sees, and what went into it.
@@ -61,7 +64,8 @@ impl McpConfig {
         session_id: &str,
     ) -> Result<SessionCatalog, OpError> {
         let user = match &self.catalog_path {
-            Some(path) => Catalog::load(path).map_err(OpError::catalog_unreadable)?,
+            Some(path) => Catalog::load_bridged(path, self.mcp_remote_bin.as_deref())
+                .map_err(OpError::catalog_unreadable)?,
             None => Catalog::default(),
         };
 
@@ -215,6 +219,7 @@ mod tests {
             policy: Policy::default(),
             swarm: None,
             project: true,
+            mcp_remote_bin: None,
         };
         let sc = cfg
             .session_catalog(Some(td.path().to_str().unwrap()), "s")
@@ -285,6 +290,7 @@ mod tests {
             policy: Policy::default(),
             swarm: None,
             project,
+            mcp_remote_bin: None,
         }
     }
 

@@ -4,7 +4,8 @@
 //! harnesses, and is stricter where opencode is loose. See [`discover`].
 
 use crate::mcp::catalog::{
-    Catalog, CatalogEntry, EntrySource, GooseExtensionSpec, Transport, parse_entry, sibling_name,
+    Catalog, CatalogEntry, EntrySource, GooseExtensionSpec, McpKind, Transport, parse_entry,
+    sibling_name,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,8 @@ pub struct EffectiveCatalog {
 }
 
 const PROJECT_STDIO_UNSUPPORTED: &str = "project stdio MCP servers are not supported yet";
+const PROJECT_HEADERS_UNSUPPORTED: &str =
+    "project remote MCP servers with headers are not supported";
 
 /// Deep-merges `over` onto `base`: objects merge key by key, recursively;
 /// scalars and arrays in `over` replace whatever `base` held.
@@ -350,9 +353,18 @@ pub(crate) fn discover_as(cwd: &Path, expected_uid: Option<u32>) -> ProjectConfi
     }
 
     for (name, val) in &merged {
+        // Parsed without --mcp-remote-bin: a repo must not get a header filled
+        // from one of this machine's secret files and sent to a URL it chose.
         let mut entry = parse_entry(name, val, None);
         if let Some(file) = last_file.get(name) {
             entry.source = EntrySource::Project(file.clone());
+        }
+        if entry.kind == McpKind::Remote
+            && val
+                .get("headers")
+                .is_some_and(|h| h.as_object().is_some_and(|o| !o.is_empty()))
+        {
+            entry.supported = Err(PROJECT_HEADERS_UNSUPPORTED.to_string());
         }
         // A repo must not choose a command honkd runs.
         if matches!(

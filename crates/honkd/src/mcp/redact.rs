@@ -38,12 +38,21 @@ fn url_secrets(url: &str) -> Vec<String> {
 pub fn redact_mcp_error(err: &str, spec: &GooseExtensionSpec) -> String {
     let mut needles = BTreeSet::new();
 
-    // An http spec holds no secret files (headers are unsupported). Its URL
-    // may still carry a token in the query string, and goose echoes URLs in
-    // its errors, so that is what gets redacted.
+    // An http spec holds no secret files (honkd never sends it headers). Its
+    // URL may still carry a token in the query string, and goose echoes URLs in
+    // its errors, so that is what gets redacted. A remote bridged through
+    // mcp-remote carries its URL as a stdio argument, which gets the same.
     let no_env = BTreeMap::new();
     let env = match &spec.transport {
-        Transport::Stdio { env, .. } => env,
+        Transport::Stdio { env, command } => {
+            for arg in command
+                .iter()
+                .filter(|a| a.starts_with("http://") || a.starts_with("https://"))
+            {
+                needles.extend(url_secrets(arg));
+            }
+            env
+        }
         Transport::Http { url } => {
             needles.extend(url_secrets(url));
             &no_env
@@ -114,6 +123,23 @@ mod tests {
         let err = "Failed to connect: token xoxb-12345-67890-abcdef was rejected";
         let redacted = redact_mcp_error(err, &spec);
         assert_eq!(redacted, "Failed to connect: token [redacted] was rejected");
+    }
+
+    #[test]
+    fn test_bridged_url_query_secret_is_redacted() {
+        let spec = GooseExtensionSpec {
+            name: "srv".to_string(),
+            transport: Transport::Stdio {
+                command: vec![
+                    "/bin/mcp-remote".to_string(),
+                    "https://x.example/mcp?key=abcd1234secret".to_string(),
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+        let err = "cannot reach https://x.example/mcp?key=abcd1234secret";
+        let redacted = redact_mcp_error(err, &spec);
+        assert!(!redacted.contains("abcd1234secret"), "{redacted}");
     }
 
     #[test]

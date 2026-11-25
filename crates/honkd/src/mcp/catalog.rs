@@ -332,7 +332,34 @@ impl Catalog {
         Self::load_from_str(&content, home)
     }
 
+    /// Like [`Catalog::load`], bridging remote entries that need headers or
+    /// OAuth through `mcp_remote_bin` (see [`ParseOpts::mcp_remote_bin`]).
+    pub fn load_bridged(
+        path: impl AsRef<Path>,
+        mcp_remote_bin: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let content = std::fs::read_to_string(path.as_ref())?;
+        Self::load_from_str_with(
+            &content,
+            ParseOpts {
+                home: home.as_deref(),
+                mcp_remote_bin,
+            },
+        )
+    }
+
     pub fn load_from_str(json_str: &str, home: Option<&Path>) -> anyhow::Result<Self> {
+        Self::load_from_str_with(
+            json_str,
+            ParseOpts {
+                home,
+                mcp_remote_bin: None,
+            },
+        )
+    }
+
+    pub fn load_from_str_with(json_str: &str, opts: ParseOpts<'_>) -> anyhow::Result<Self> {
         let root: serde_json::Value = serde_json::from_str(json_str)?;
         let mcp_obj = match root.get("mcp").and_then(|v| v.as_object()) {
             Some(obj) => obj,
@@ -345,7 +372,7 @@ impl Catalog {
 
         let mut entries = Vec::new();
         for (name, val) in mcp_obj {
-            entries.push(parse_entry(name, val, home));
+            entries.push(parse_entry_with(name, val, opts));
         }
 
         // Keep entries sorted by name
@@ -402,13 +429,198 @@ pub(crate) fn parse_entry(
     val: &serde_json::Value,
     home: Option<&Path>,
 ) -> CatalogEntry {
-    let mut entry = parse_entry_inner(name, val, home);
+    parse_entry_with(
+        name,
+        val,
+        ParseOpts {
+            home,
+            mcp_remote_bin: None,
+        },
+    )
+}
+
+/// Options for parsing catalog entries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOpts<'a> {
+    /// Directory `~/` in a `{file:}` path expands to.
+    pub home: Option<&'a Path>,
+    /// An executable with the `mcp-remote` command line (`honkd --mcp-remote-bin`).
+    /// With it, a remote entry that sends headers, or that may need OAuth, runs
+    /// as a stdio server: `BIN URL [--header NAME:VALUE]...`.
+    /// Without it such entries stay as before (headers unsupported, the rest
+    /// native http).
+    pub mcp_remote_bin: Option<&'a Path>,
+}
+
+pub(crate) fn parse_entry_with(
+    name: &str,
+    val: &serde_json::Value,
+    opts: ParseOpts<'_>,
+) -> CatalogEntry {
+    let mut entry = parse_entry_inner(name, val, opts);
     entry.enabled = val.get("enabled").and_then(|v| v.as_bool()) != Some(false);
     entry
 }
 
+/// Prefix of the environment variables that carry header secrets from the
+/// wrapper to mcp-remote, which substitutes `${NAME}` in `--header` values.
+pub const HEADER_ENV_PREFIX: &str = "HONK_MCP_HDR_";
+
+/// Header names whose value is a credential even when the name does not say
+/// so to [`key_looks_secret`].
+fn header_looks_secret(name: &str) -> bool {
+    let key = name.replace('-', "_");
+    key_looks_secret(&key) || key.eq_ignore_ascii_case("cookie")
+}
+
+/// Resolves the inside of a `{file:PATH}` reference to an absolute path.
+fn resolve_file_ref(inner: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    let path = if let Some(stripped) = inner.strip_prefix("~/") {
+        match home {
+            Some(h) => h.join(stripped),
+            None => return Err(format!("HOME not set to expand '~/' in '{inner}'")),
+        }
+    } else {
+        PathBuf::from(inner)
+    };
+    if !path.is_absolute() {
+        return Err(format!("file path must be absolute in '{{file:{inner}}}'"));
+    }
+    Ok(path)
+}
+
+/// Checks literal header text: it must not contain `${` (mcp-remote would
+/// substitute a variable of its own environment there) or control characters.
+fn check_header_literal(header: &str, text: &str) -> Result<(), String> {
+    if text.contains("${") {
+        return Err(format!("header '{header}' must not contain '${{'"));
+    }
+    if text.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "header '{header}' must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Turns one header value into an mcp-remote `--header` template. Each
+/// `{file:PATH}` or `{env:NAME}` reference becomes `${HONK_MCP_HDR_<n>}`, and
+/// `env` gains that variable, so the wrapper reads the secret at spawn and it
+/// never appears in argv.
+fn header_template(
+    header: &str,
+    value: &str,
+    home: Option<&Path>,
+    env: &mut BTreeMap<String, EnvVarSpec>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = value;
+    let mut refs = 0;
+    loop {
+        let next = [("{file:", true), ("{env:", false)]
+            .into_iter()
+            .filter_map(|(tag, is_file)| rest.find(tag).map(|pos| (pos, tag, is_file)))
+            .min_by_key(|(pos, _, _)| *pos);
+        let Some((pos, tag, is_file)) = next else {
+            check_header_literal(header, rest)?;
+            out.push_str(rest);
+            break;
+        };
+        check_header_literal(header, &rest[..pos])?;
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + tag.len()..];
+        let Some(end) = after.find('}') else {
+            return Err(format!("unterminated '{tag}' in header '{header}'"));
+        };
+        let inner = &after[..end];
+        if inner.is_empty() || inner.contains('{') {
+            return Err(format!(
+                "invalid '{tag}...}}' reference in header '{header}'"
+            ));
+        }
+        let spec = if is_file {
+            EnvVarSpec::File(
+                resolve_file_ref(inner, home).map_err(|e| format!("header '{header}': {e}"))?,
+            )
+        } else {
+            if !is_valid_env_key(inner) {
+                return Err(format!(
+                    "invalid environment variable name '{inner}' in header '{header}'"
+                ));
+            }
+            EnvVarSpec::Env(inner.to_string())
+        };
+        let var = format!("{HEADER_ENV_PREFIX}{}", env.len());
+        env.insert(var.clone(), spec);
+        out.push_str("${");
+        out.push_str(&var);
+        out.push('}');
+        refs += 1;
+        rest = &after[end + 1..];
+    }
+    if refs == 0 && header_looks_secret(header) {
+        return Err(format!(
+            "literal value for secret-like header '{header}' is not allowed; use {{file:...}} or {{env:...}}"
+        ));
+    }
+    Ok(out)
+}
+
+/// The stdio spec that runs a remote entry through mcp-remote.
+fn bridged_remote(
+    name: &str,
+    url: &str,
+    headers: &serde_json::Map<String, serde_json::Value>,
+    opts: ParseOpts<'_>,
+    bin: &Path,
+) -> Result<GooseExtensionSpec, String> {
+    if !bin.is_absolute() {
+        return Err(format!(
+            "--mcp-remote-bin '{}' is not an absolute path",
+            bin.display()
+        ));
+    }
+    if !bin.exists() {
+        return Err(format!(
+            "--mcp-remote-bin '{}' does not exist",
+            bin.display()
+        ));
+    }
+    let mut command = vec![bin.to_string_lossy().to_string(), url.to_string()];
+    let mut env = BTreeMap::new();
+    for (header, value) in headers {
+        if header.is_empty()
+            || !header
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!("invalid header name '{header}'"));
+        }
+        let Some(value) = value.as_str() else {
+            return Err(format!("header '{header}' must be a string"));
+        };
+        let template = header_template(header, value, opts.home, &mut env)?;
+        command.push("--header".to_string());
+        command.push(format!("{header}:{template}"));
+    }
+    Ok(GooseExtensionSpec {
+        name: name.to_string(),
+        transport: Transport::Stdio { command, env },
+    })
+}
+
 /// Validates a `type:"remote"` entry. Returns the spec or the reason it is unsupported.
-fn parse_remote(name: &str, val: &serde_json::Value) -> Result<GooseExtensionSpec, String> {
+///
+/// - `oauth` as an object (a static client) is unsupported.
+/// - With headers, the entry needs `--mcp-remote-bin` and is bridged.
+/// - Without headers, a non-loopback url without `"oauth": false` may need
+///   OAuth: bridged when `--mcp-remote-bin` is set, so mcp-remote's token store
+///   holds the login. Everything else is goose's native http transport.
+fn parse_remote(
+    name: &str,
+    val: &serde_json::Value,
+    opts: ParseOpts<'_>,
+) -> Result<GooseExtensionSpec, String> {
     let url = match val.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.is_empty() => u,
         _ => return Err("missing or non-string url".to_string()),
@@ -430,11 +642,30 @@ fn parse_remote(name: &str, val: &serde_json::Value) -> Result<GooseExtensionSpe
         Ok(_) => {}
         Err(e) => return Err(format!("invalid url: {e}")),
     }
-    if val.get("headers").is_some() {
-        return Err("remote MCP servers with headers are not supported yet".to_string());
-    }
     if val.get("oauth").is_some_and(|v| v.is_object()) {
-        return Err("remote MCP servers with OAuth are not supported under honkd".to_string());
+        return Err(
+            "remote MCP servers with an OAuth client config are not supported under honkd"
+                .to_string(),
+        );
+    }
+    let headers = match val.get("headers") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(h)) if h.is_empty() => None,
+        Some(serde_json::Value::Object(h)) => Some(h),
+        Some(_) => return Err("headers must be an object".to_string()),
+    };
+    if let Some(headers) = headers {
+        let Some(bin) = opts.mcp_remote_bin else {
+            return Err("remote MCP servers with headers need honkd --mcp-remote-bin".to_string());
+        };
+        return bridged_remote(name, url, headers, opts, bin);
+    }
+    let oauth_off = val.get("oauth") == Some(&serde_json::Value::Bool(false));
+    if let Some(bin) = opts.mcp_remote_bin
+        && !oauth_off
+        && !is_loopback_url(url)
+    {
+        return bridged_remote(name, url, &serde_json::Map::new(), opts, bin);
     }
     Ok(GooseExtensionSpec {
         name: name.to_string(),
@@ -444,7 +675,8 @@ fn parse_remote(name: &str, val: &serde_json::Value) -> Result<GooseExtensionSpe
     })
 }
 
-fn parse_entry_inner(name: &str, val: &serde_json::Value, home: Option<&Path>) -> CatalogEntry {
+fn parse_entry_inner(name: &str, val: &serde_json::Value, opts: ParseOpts<'_>) -> CatalogEntry {
+    let home = opts.home;
     let type_str = val.get("type").and_then(|v| v.as_str());
     let kind = match type_str {
         Some("local") => McpKind::Local,
@@ -467,7 +699,7 @@ fn parse_entry_inner(name: &str, val: &serde_json::Value, home: Option<&Path>) -
     match type_str {
         Some("local") => {}
         Some("remote") => {
-            return CatalogEntry::new(name, parse_remote(name, val), McpKind::Remote);
+            return CatalogEntry::new(name, parse_remote(name, val, opts), McpKind::Remote);
         }
         Some(other) => {
             return CatalogEntry::new(
@@ -811,11 +1043,11 @@ mod tests {
             ),
             (
                 r#"{"type":"remote","url":"https://example.com/mcp","headers":{"X-A":"b"}}"#,
-                "headers",
+                "need honkd --mcp-remote-bin",
             ),
             (
-                r#"{"type":"remote","url":"https://example.com/mcp","headers":{}}"#,
-                "headers",
+                r#"{"type":"remote","url":"https://example.com/mcp","headers":"x"}"#,
+                "headers must be an object",
             ),
             (
                 r#"{"type":"remote","url":"https://example.com/mcp","oauth":{"clientId":"x"}}"#,
@@ -838,6 +1070,227 @@ mod tests {
                 "{body}: reason {err:?} lacks {needle:?}"
             );
         }
+    }
+
+    /// A stand-in for mcp-remote that exists on disk.
+    fn fake_bin() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("mcp-remote");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        (dir, bin)
+    }
+
+    fn bridged_entry(body: &str, bin: &Path, home: Option<&Path>) -> CatalogEntry {
+        let json = format!(r#"{{"mcp":{{"srv":{body}}}}}"#);
+        let mut cat = Catalog::load_from_str_with(
+            &json,
+            ParseOpts {
+                home,
+                mcp_remote_bin: Some(bin),
+            },
+        )
+        .unwrap();
+        cat.entries.remove(0)
+    }
+
+    #[test]
+    fn test_remote_with_header_bridges_through_mcp_remote() {
+        let (_d, bin) = fake_bin();
+        let entry = bridged_entry(
+            r#"{"type":"remote","url":"https://mcp.example.com/v1/mcp?toolsets=all","oauth":false,
+                "headers":{"Authorization":"Bearer {file:/run/secrets/dd_pat}"}}"#,
+            &bin,
+            None,
+        );
+        assert_eq!(entry.kind, McpKind::Remote);
+        assert!(!entry.auto_eligible());
+        let spec = entry.supported.as_ref().unwrap();
+        let (command, env) = stdio(spec);
+        assert_eq!(
+            *command,
+            vec![
+                bin.to_string_lossy().to_string(),
+                "https://mcp.example.com/v1/mcp?toolsets=all".to_string(),
+                "--header".to_string(),
+                "Authorization:Bearer ${HONK_MCP_HDR_0}".to_string(),
+            ]
+        );
+        assert_eq!(
+            env.get("HONK_MCP_HDR_0"),
+            Some(&EnvVarSpec::File(PathBuf::from("/run/secrets/dd_pat")))
+        );
+        assert_eq!(env.len(), 1);
+
+        let add = spec.to_add_extension_json();
+        assert_eq!(add["server"]["command"], "/bin/sh");
+        let text = serde_json::to_string(&add).unwrap();
+        assert!(!text.contains("{file:"), "{text}");
+    }
+
+    #[test]
+    fn test_remote_header_refs_env_home_and_literals() {
+        let (_d, bin) = fake_bin();
+        let entry = bridged_entry(
+            r#"{"type":"remote","url":"https://x.example/mcp","headers":{
+                "X-Org":"acme",
+                "X-Pair":"{env:DD_APP}:{file:~/.secrets/k}"}}"#,
+            &bin,
+            Some(Path::new("/home/u")),
+        );
+        let spec = entry.supported.as_ref().unwrap();
+        let (command, env) = stdio(spec);
+        assert_eq!(
+            command[2..6],
+            [
+                "--header".to_string(),
+                "X-Org:acme".to_string(),
+                "--header".to_string(),
+                "X-Pair:${HONK_MCP_HDR_0}:${HONK_MCP_HDR_1}".to_string(),
+            ]
+        );
+        assert_eq!(
+            env.get("HONK_MCP_HDR_0"),
+            Some(&EnvVarSpec::Env("DD_APP".to_string()))
+        );
+        assert_eq!(
+            env.get("HONK_MCP_HDR_1"),
+            Some(&EnvVarSpec::File(PathBuf::from("/home/u/.secrets/k")))
+        );
+    }
+
+    #[test]
+    fn test_remote_header_rejections() {
+        let (_d, bin) = fake_bin();
+        let cases: &[(&str, &str)] = &[
+            (r#"{"Authorization":"Bearer abcdef"}"#, "secret-like header"),
+            (r#"{"X-Api-Key":"abcdef"}"#, "secret-like header"),
+            (r#"{"Cookie":"a=b"}"#, "secret-like header"),
+            (r#"{"X-A":"${HOME}"}"#, "'${'"),
+            (r#"{"X-A":"a\nb"}"#, "control characters"),
+            (r#"{"X-A":7}"#, "must be a string"),
+            (r#"{"X A":"b"}"#, "invalid header name"),
+            (r#"{"X:A":"b"}"#, "invalid header name"),
+            (r#"{"X-A":"Bearer {file:/run/x"}"#, "unterminated"),
+            (r#"{"X-A":"{file:}"}"#, "invalid"),
+            (r#"{"X-A":"{file:rel/x}"}"#, "absolute"),
+            (r#"{"X-A":"{file:~/x}"}"#, "HOME not set"),
+            (
+                r#"{"X-A":"{env:bad-name}"}"#,
+                "invalid environment variable name",
+            ),
+            (r#"{"X-A":"{env:{file:/x}}"}"#, "invalid"),
+        ];
+        for (headers, needle) in cases {
+            let body =
+                format!(r#"{{"type":"remote","url":"https://x.example/mcp","headers":{headers}}}"#);
+            let entry = bridged_entry(&body, &bin, None);
+            let err = entry
+                .supported
+                .as_ref()
+                .expect_err(&format!("expected unsupported: {headers}"));
+            assert!(err.contains(needle), "{headers}: {err:?} lacks {needle:?}");
+        }
+    }
+
+    #[test]
+    fn test_remote_oauth_capable_bridges_only_with_bin() {
+        let (_d, bin) = fake_bin();
+        // No headers, no "oauth": false, not loopback: mcp-remote holds the login.
+        let entry = bridged_entry(
+            r#"{"type":"remote","url":"https://mcp.notion.example/mcp"}"#,
+            &bin,
+            None,
+        );
+        let spec = entry.supported.as_ref().unwrap();
+        let (command, env) = stdio(spec);
+        assert_eq!(
+            *command,
+            vec![
+                bin.to_string_lossy().to_string(),
+                "https://mcp.notion.example/mcp".to_string(),
+            ]
+        );
+        assert!(env.is_empty());
+        let add = spec.to_add_extension_json();
+        assert_eq!(add["server"]["command"], bin.to_string_lossy().as_ref());
+
+        // Without the bin it stays native http (the probe refuses OAuth).
+        let plain = remote_entry(r#"{"type":"remote","url":"https://mcp.notion.example/mcp"}"#);
+        assert!(matches!(
+            plain.supported.unwrap().transport,
+            Transport::Http { .. }
+        ));
+    }
+
+    #[test]
+    fn test_remote_native_http_kept_for_oauth_false_and_loopback() {
+        let (_d, bin) = fake_bin();
+        for body in [
+            r#"{"type":"remote","url":"https://x.example/mcp","oauth":false}"#,
+            r#"{"type":"remote","url":"http://localhost:4006/mcp"}"#,
+            r#"{"type":"remote","url":"https://x.example/mcp","headers":{}}"#,
+            r#"{"type":"remote","url":"https://x.example/mcp","oauth":false,"headers":null}"#,
+        ] {
+            let entry = bridged_entry(body, &bin, None);
+            let spec = entry.supported.unwrap_or_else(|e| panic!("{body}: {e}"));
+            if body.contains("localhost") || body.contains("oauth\":false") {
+                assert!(matches!(spec.transport, Transport::Http { .. }), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_remote_bridge_needs_existing_absolute_bin() {
+        let body = r#"{"type":"remote","url":"https://x.example/mcp","headers":{"X-A":"b"}}"#;
+        let missing = bridged_entry(body, Path::new("/nonexistent/honk-test/mcp-remote"), None);
+        assert!(missing.supported.unwrap_err().contains("does not exist"));
+        let relative = bridged_entry(body, Path::new("mcp-remote"), None);
+        assert!(relative.supported.unwrap_err().contains("absolute"));
+    }
+
+    /// The real wrapper reads the header secret at spawn and hands it to the
+    /// bridge in its environment; argv keeps only the `${...}` template.
+    #[test]
+    fn test_bridged_header_secret_reaches_env_not_argv() {
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("pat");
+        fs::write(&secret, "  s3cr3t-value \n").unwrap();
+        let out = dir.path().join("out");
+        let bin = dir.path().join("mcp-remote");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {out}\nprintf 'ENV=%s\\n' \"$HONK_MCP_HDR_0\" >> {out}\n",
+                out = out.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let body = format!(
+            r#"{{"type":"remote","url":"https://x.example/mcp","headers":{{"Authorization":"Bearer {{file:{}}}"}}}}"#,
+            secret.display()
+        );
+        let entry = bridged_entry(&body, &bin, None);
+        let add = entry.supported.unwrap().to_add_extension_json();
+        let args: Vec<String> = add["server"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(!args.iter().any(|a| a.contains("s3cr3t")));
+        let status = std::process::Command::new(add["server"]["command"].as_str().unwrap())
+            .args(&args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let got = fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            got,
+            "https://x.example/mcp\n--header\nAuthorization:Bearer ${HONK_MCP_HDR_0}\nENV=s3cr3t-value\n"
+        );
     }
 
     #[test]
