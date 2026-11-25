@@ -11,9 +11,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 type Predicate = Box<dyn Fn(&Value) -> bool + Send + Sync>;
 type StreamSubscriber = (
@@ -142,7 +142,7 @@ struct FakeGooseInner {
     conflict_connections: Mutex<HashSet<String>>,
     lose_next_predicates: Mutex<HashMap<String, Vec<Predicate>>>,
     gap_on_next_resume: Mutex<HashSet<String>>,
-    inbound_frames: Mutex<Vec<Value>>,
+    inbound_frames: Mutex<Vec<(Instant, Value)>>,
     deleted_connections: Mutex<Vec<String>>,
     deleted_sessions: Mutex<Vec<String>>,
     archived_sessions: Mutex<Vec<String>>,
@@ -151,6 +151,7 @@ struct FakeGooseInner {
     next_session_num: AtomicU64,
     prompt_chunks: Mutex<Vec<String>>,
     scripted_frames: Mutex<Vec<Value>>,
+    scripted_frame_gate: Mutex<Option<(usize, Arc<Notify>)>>,
     load_frames: Mutex<HashMap<String, Vec<Value>>>,
     load_frames_before: Mutex<HashMap<String, Vec<Value>>>,
     scripted_load_frames: Mutex<Vec<Value>>,
@@ -222,6 +223,7 @@ impl FakeGoose {
             next_session_num: AtomicU64::new(1),
             prompt_chunks: Mutex::new(vec!["fake chunk".to_string()]),
             scripted_frames: Mutex::new(Vec::new()),
+            scripted_frame_gate: Mutex::new(None),
             load_frames: Mutex::new(HashMap::new()),
             load_frames_before: Mutex::new(HashMap::new()),
             scripted_load_frames: Mutex::new(Vec::new()),
@@ -352,6 +354,16 @@ impl FakeGoose {
     }
 
     pub fn inbound(&self) -> Vec<Value> {
+        self.state
+            .inbound_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    pub fn inbound_with_timestamps(&self) -> Vec<(Instant, Value)> {
         self.state.inbound_frames.lock().unwrap().clone()
     }
 
@@ -375,6 +387,14 @@ impl FakeGoose {
 
     pub fn script_frames(&self, frames: Vec<Value>) {
         *self.state.scripted_frames.lock().unwrap() = frames;
+    }
+
+    /// Pause scripted frame emission after emitting the frame at `after_index` (0-based)
+    /// until the returned `Notify` is notified.
+    pub fn set_scripted_frame_gate(&self, after_index: usize) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        *self.state.scripted_frame_gate.lock().unwrap() = Some((after_index, notify.clone()));
+        notify
     }
 
     pub fn set_load_frames(&self, sid: &str, frames: Vec<Value>) {
@@ -526,12 +546,12 @@ impl FakeGoose {
         let frames = self.state.inbound_frames.lock().unwrap();
         frames
             .iter()
-            .filter(|f| {
+            .filter(|(_, f)| {
                 f.get("method").and_then(Value::as_str) == Some("session/prompt")
                     && (f.pointer("/params/sessionId").and_then(Value::as_str) == Some(sid)
                         || f.get("sessionId").and_then(Value::as_str) == Some(sid))
             })
-            .cloned()
+            .map(|(_, f)| f.clone())
             .collect()
     }
 
@@ -609,11 +629,11 @@ impl FakeGoose {
         let frames = self.state.inbound_frames.lock().unwrap();
         frames
             .iter()
-            .filter(|f| {
+            .filter(|(_, f)| {
                 f.get("method").and_then(Value::as_str)
                     == Some("_goose/unstable/session/conversation/truncate_from_message")
             })
-            .cloned()
+            .map(|(_, f)| f.clone())
             .collect()
     }
 
@@ -767,7 +787,11 @@ async fn handle_post(
     let req_id = frame.get("id").cloned();
 
     if method == Some("initialize") {
-        state.inbound_frames.lock().unwrap().push(frame.clone());
+        state
+            .inbound_frames
+            .lock()
+            .unwrap()
+            .push((Instant::now(), frame.clone()));
         let conn_id = format!(
             "conn-{}",
             state.next_conn_num.fetch_add(1, Ordering::SeqCst)
@@ -827,6 +851,11 @@ async fn handle_post(
         .map(String::from);
     let target_session = session_header.or(session_param);
 
+    // Snapshot prompt-drop flags BEFORE recording the inbound frame so tests that
+    // poll `received_prompts` and then toggle these flags cannot race this request.
+    let drop_announcement_at_start = state.drop_prompt_announcement.load(Ordering::SeqCst);
+    let drop_reply_at_start = state.drop_prompt_reply.load(Ordering::SeqCst);
+
     let mut recorded_frame = frame.clone();
     if let Some(ref sid) = target_session
         && recorded_frame.get("sessionId").is_none()
@@ -834,7 +863,11 @@ async fn handle_post(
     {
         recorded_frame["sessionId"] = json!(sid);
     }
-    state.inbound_frames.lock().unwrap().push(recorded_frame);
+    state
+        .inbound_frames
+        .lock()
+        .unwrap()
+        .push((Instant::now(), recorded_frame));
 
     if method.is_some_and(method_requires_session) && target_session.is_none() {
         return (StatusCode::BAD_REQUEST, "Acp-Session-Id header required").into_response();
@@ -1441,7 +1474,7 @@ async fn handle_post(
                 return StatusCode::ACCEPTED.into_response();
             }
 
-            if state.drop_prompt_announcement.load(Ordering::SeqCst) {
+            if drop_announcement_at_start {
                 return StatusCode::ACCEPTED.into_response();
             }
 
@@ -1505,6 +1538,7 @@ async fn handle_post(
                 }
 
                 let custom_frames = state_clone.scripted_frames.lock().unwrap().clone();
+                let frame_gate = state_clone.scripted_frame_gate.lock().unwrap().take();
                 let run_id = "run_fake_001".to_string();
 
                 if !custom_frames.is_empty() {
@@ -1513,18 +1547,24 @@ async fn handle_post(
                         .lock()
                         .unwrap()
                         .insert(sid_clone.clone(), run_id.clone());
-                    for f in custom_frames {
+                    for (idx, f) in custom_frames.into_iter().enumerate() {
                         if cancel_flag.load(Ordering::SeqCst) {
                             break;
                         }
                         emit_session_frame(&state_clone, &conn_id_clone, &sid_clone, f);
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        if let Some((gate_idx, ref notify)) = frame_gate
+                            && idx == gate_idx
+                        {
+                            notify.notified().await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
                     }
                     state_clone.active_runs.lock().unwrap().remove(&sid_clone);
                     if state_clone.probe_overtakes_reply.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
-                    if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
+                    if drop_reply_at_start || state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
                         return;
                     }
                     if let Some(id) = req_id_clone {
@@ -1645,7 +1685,7 @@ async fn handle_post(
                 if state_clone.probe_overtakes_reply.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                if state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
+                if drop_reply_at_start || state_clone.drop_prompt_reply.load(Ordering::SeqCst) {
                     return;
                 }
                 if let Some(id) = req_id_clone {

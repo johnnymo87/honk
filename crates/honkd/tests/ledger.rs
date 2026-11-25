@@ -883,8 +883,18 @@ async fn prompt_post_ambiguous_failure_keeps_inflight_without_false_negative_not
         )
         .await;
 
-    // Wait for transport drop to occur
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for transport drop of prompt 1 AND for honkd to classify the failure
+    // before checking state.json (otherwise we would only observe the pre-POST entry).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while proxy.dropped_prompts() < 1 || !h.stderr_text().contains("ambiguous prompt POST failure")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for honkd to classify ambiguous prompt POST failure; stderr:\n{}",
+            h.stderr_text()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Check state.json: crid-ambig MUST STILL BE InFlight (not marked not_delivered!)
     let state_content = std::fs::read_to_string(h.state_dir.path().join("state.json")).unwrap();
@@ -972,7 +982,14 @@ async fn prompt_post_ambiguous_failure_accepted_slow_delivered_dispatches_parked
         .await;
 
     // Wait for transport drop of prompt 1 to complete
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while proxy.dropped_prompts() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for proxy to drop prompt 1"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     proxy.set_drop_on_prompt(false);
 
     // Send prompt 2 while prompt 1 is in-flight (parks behind prompt 1)
@@ -1056,8 +1073,17 @@ async fn prompt_post_ambiguous_failure_idle_not_delivered_dispatches_parked() {
         )
         .await;
 
-    // Turn off proxy drop and enable prompt execution so parked prompt can succeed
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until proxy has dropped prompt 1 AND FakeGoose has received it (with
+    // drop_prompt_announcement/drop_prompt_reply still enabled) before re-enabling
+    // prompt execution for parked prompt 2.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while proxy.dropped_prompts() < 1 || fake.received_prompts(&sid).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for prompt 1 to be dropped and seen by FakeGoose"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     proxy.set_drop_on_prompt(false);
     fake.set_drop_prompt_announcement(false);
     fake.set_drop_prompt_reply(false);

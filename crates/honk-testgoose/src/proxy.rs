@@ -8,7 +8,7 @@
 //! - Cites M0 probe P2d: `release()` drops frozen sockets, sending TCP FIN to allow TCP teardown.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,6 +18,7 @@ pub struct TcpProxy {
     addr: SocketAddr,
     freeze_tx: broadcast::Sender<()>,
     drop_on_prompt: Arc<AtomicBool>,
+    dropped_prompts: Arc<AtomicUsize>,
     held_sockets: Arc<Mutex<Vec<TcpStream>>>,
     server_task: tokio::task::JoinHandle<()>,
 }
@@ -29,10 +30,12 @@ impl TcpProxy {
         let addr = listener.local_addr()?;
         let (freeze_tx, _) = broadcast::channel(16);
         let drop_on_prompt = Arc::new(AtomicBool::new(false));
+        let dropped_prompts = Arc::new(AtomicUsize::new(0));
         let held_sockets = Arc::new(Mutex::new(Vec::new()));
 
         let freeze_tx_clone = freeze_tx.clone();
         let drop_prompt_clone = drop_on_prompt.clone();
+        let dropped_prompts_clone = dropped_prompts.clone();
         let held_clone = held_sockets.clone();
 
         let server_task = tokio::spawn(async move {
@@ -55,6 +58,7 @@ impl TcpProxy {
                 // allowing new connections to pass through freely (M0 probe P2f).
                 let mut freeze_rx = freeze_tx_clone.subscribe();
                 let drop_prompt = drop_prompt_clone.clone();
+                let dropped_prompts_conn = dropped_prompts_clone.clone();
                 let held = held_clone.clone();
 
                 tokio::spawn(async move {
@@ -75,6 +79,7 @@ impl TcpProxy {
                                             if has_prompt {
                                                 drop(c_read);
                                                 drop(c_write);
+                                                dropped_prompts_conn.fetch_add(1, Ordering::SeqCst);
                                                 tokio::spawn(async move {
                                                     let _tw = t_write;
                                                     let mut discard = vec![0u8; 1024];
@@ -122,6 +127,7 @@ impl TcpProxy {
             addr,
             freeze_tx,
             drop_on_prompt,
+            dropped_prompts,
             held_sockets,
             server_task,
         })
@@ -133,6 +139,11 @@ impl TcpProxy {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Number of `session/prompt` client connections dropped so far.
+    pub fn dropped_prompts(&self) -> usize {
+        self.dropped_prompts.load(Ordering::SeqCst)
     }
 
     /// When set to true, the proxy will read the prompt POST from the client,

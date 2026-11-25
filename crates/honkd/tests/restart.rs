@@ -1301,6 +1301,10 @@ async fn tool_turn_mid_run_gap_never_synthesizes_and_uses_real_reply() {
         }),
     ]);
 
+    // Pause scripted emission right after `tool_call` (index 1) so the turn stays
+    // in flight until we observe `_honk/gap`, avoiding any wall-clock race under load.
+    let gate = fake.set_scripted_frame_gate(1);
+
     // Gap on resume
     fake.gap_on_next_resume(&sid);
 
@@ -1323,6 +1327,9 @@ async fn tool_turn_mid_run_gap_never_synthesizes_and_uses_real_reply() {
     v.wait_for(|f| f.get("method").and_then(Value::as_str) == Some("_honk/gap"))
         .await;
     assert_eq!(v.blocks.resets, 1, "NO reset while tool turn is running");
+
+    // Release the rest of the turn now that mid-run gap has been observed
+    gate.notify_one();
 
     // Turn completes live: real prompt response arrives, rebuild runs at turn end
     let resp = v.response_timeout(&pid, Duration::from_secs(10)).await;
