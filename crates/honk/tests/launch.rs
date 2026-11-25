@@ -38,8 +38,8 @@ struct Script {
     enable: Value,
     prompt: PromptReply,
     model_error: Option<&'static str>,
-    model_delay: Option<Duration>,
     provider_error: Option<&'static str>,
+    model_delay: Option<Duration>,
     effort_error: Option<&'static str>,
     model_list: Option<Value>,
 }
@@ -51,8 +51,8 @@ impl Default for Script {
             enable: json!({"result": {"results": [{"name": "swarm", "ok": true}]}}),
             prompt: PromptReply::Echo,
             model_error: None,
-            model_delay: None,
             provider_error: None,
+            model_delay: None,
             effort_error: None,
             model_list: None,
         }
@@ -1194,27 +1194,6 @@ async fn launch_default_model_hook_resolves_with_tag_and_orders_before_effort() 
     assert_eq!(log_content.trim(), "--tag myfeaturetag");
 
     // Verify ordering: initialize, session/new, rename, _honk/model/list, set_config_option (model), set_config_option (effort), prompt
-#[tokio::test]
-async fn launch_with_cross_provider_model_sets_provider_then_model() {
-    let script = Script {
-        model_list: Some(json!({
-            "result": {
-                "provider": "gcp_vertex_ai",
-                "current": "claude-opus-5-5",
-                "models": [
-                    { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
-                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
-                ]
-            }
-        })),
-        ..Script::default()
-    };
-    let r = rig(script, Behaviour::default(), "", 0).await;
-    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
-    o.model = Some("gpt-6-astra".into());
-    let out = run(&o).await.expect("launch");
-    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
-
     assert_eq!(
         methods(&r),
         [
@@ -1281,30 +1260,12 @@ async fn launch_default_model_hook_resolves_when_untagged() {
 
     let reqs = r.honkd.reqs.lock().unwrap().clone();
     let model_req = &reqs[3];
-            "session/set_config_option", // provider
-            "session/set_config_option", // model
-            "session/prompt"
-        ],
-        "cross-provider set must call provider set then model set"
-    );
-    let reqs = r.honkd.reqs.lock().unwrap().clone();
-    let prov_req = &reqs[4];
-    assert_eq!(
-        prov_req.params,
-        json!({
-            "sessionId": SID,
-            "configId": "provider",
-            "value": "codex_lb",
-        })
-    );
-    let model_req = &reqs[5];
     assert_eq!(
         model_req.params,
         json!({
             "sessionId": SID,
             "configId": "model",
             "value": "untagged-model",
-            "value": "gpt-6-astra",
         })
     );
 }
@@ -1408,15 +1369,6 @@ async fn launch_default_model_hook_model_rejected_by_honkd_list_fails_open() {
                 "models": [
                     { "id": "allowed-model-1" },
                     { "id": "allowed-model-2" }
-async fn launch_with_cross_provider_model_failure_aborts_before_model_and_prompt() {
-    let script = Script {
-        provider_error: Some("unknown provider"),
-        model_list: Some(json!({
-            "result": {
-                "provider": "gcp_vertex_ai",
-                "current": "claude-opus-5-5",
-                "models": [
-                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
                 ]
             }
         })),
@@ -1502,6 +1454,89 @@ async fn launch_default_model_hook_set_model_timeout_fails_open() {
     assert_eq!(out.prompt, honk::launch::PromptState::Ok);
 
     // Attempted model list and set_config_option, timed out, but still continued to prompt
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_honk/model/list",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_with_cross_provider_model_sets_provider_then_model() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
+                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    o.model = Some("gpt-6-astra".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
+    assert_eq!(
+        methods(&r),
+        [
+            "initialize",
+            "session/new",
+            "_goose/unstable/session/rename",
+            "_honk/model/list",
+            "session/set_config_option", // provider
+            "session/set_config_option", // model
+            "session/prompt"
+        ],
+        "cross-provider set must call provider set then model set"
+    );
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let prov_req = &reqs[4];
+    assert_eq!(
+        prov_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "provider",
+            "value": "codex_lb",
+        })
+    );
+    let model_req = &reqs[5];
+    assert_eq!(
+        model_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "model",
+            "value": "gpt-6-astra",
+        })
+    );
+}
+
+#[tokio::test]
+async fn launch_with_cross_provider_model_failure_aborts_before_model_and_prompt() {
+    let script = Script {
+        provider_error: Some("unknown provider"),
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
     let mut o = opts(&r, TagRequest::Off, None, None);
     o.model = Some("gpt-6-astra".into());
     let err = run(&o)
@@ -1529,11 +1564,73 @@ async fn launch_default_model_hook_set_model_timeout_fails_open() {
             "initialize",
             "session/new",
             "_honk/model/list",
-            "session/set_config_option",
-            "session/prompt"
-        ]
             "session/set_config_option"
         ],
         "model set and prompt must not be called when provider set fails"
     );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_cross_provider_sets_provider_then_model() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "claude-opus-5-5", "source": "configured", "provider": "gcp_vertex_ai" },
+                    { "id": "gpt-6-astra", "source": "configured", "provider": "codex_lb" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(&r.dir, "astra_hook.sh", "#!/bin/sh\necho 'gpt-6-astra'\n");
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let sets: Vec<Value> = reqs
+        .iter()
+        .filter(|q| q.method == "session/set_config_option")
+        .map(|q| q.params.clone())
+        .collect();
+    assert_eq!(
+        sets,
+        vec![
+            json!({"sessionId": SID, "configId": "provider", "value": "codex_lb"}),
+            json!({"sessionId": SID, "configId": "model", "value": "gpt-6-astra"}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_default_model_hook_provider_failure_warns_and_skips_model() {
+    let script = Script {
+        provider_error: Some("Unknown provider: codex_lb"),
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "gpt-6-astra", "source": "configured", "provider": "codex_lb" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let hook_bin = make_hook_script(&r.dir, "astra_hook2.sh", "#!/bin/sh\necho 'gpt-6-astra'\n");
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.default_model_cmd = Some(hook_bin);
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let model_sets = reqs
+        .iter()
+        .filter(|q| q.method == "session/set_config_option" && q.params["configId"] == "model")
+        .count();
+    assert_eq!(model_sets, 0, "model must not be set on the old provider");
 }
