@@ -1433,7 +1433,7 @@ mod tests {
         let script = make_temp_script(
             tmp.path(),
             "ctrl.sh",
-            "#!/bin/sh\nprintf 'bad\\x1b[31mmodel\\n'\n",
+            "#!/bin/sh\nprintf 'bad\\033[31mmodel\\n'\n",
         );
         let res = resolve_default_model(&script, None, Duration::from_secs(3)).await;
         assert_eq!(res, None);
