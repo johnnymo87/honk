@@ -126,6 +126,7 @@ pub enum Action {
         user_text: Option<String>,
         prompt_index: Option<usize>,
         turn: Option<TurnMeta>,
+        upstream_id: Option<String>,
     },
     NotifySteerUnconsumed {
         viewer: ViewerId,
@@ -202,6 +203,7 @@ impl TurnCore {
                 user_text: None,
                 prompt_index: None,
                 turn: None,
+                upstream_id: None,
             }];
         }
         if self.inflight.is_some() {
@@ -317,6 +319,7 @@ impl TurnCore {
             user_text,
             prompt_index,
             turn,
+            upstream_id: Some(inf.upstream_id),
         }];
         if self.run.is_none() {
             self.current_prompt_msg_id = None;
@@ -341,6 +344,7 @@ impl TurnCore {
             user_text: None,
             prompt_index: Some(inf.prompt_index),
             turn: None,
+            upstream_id: Some(inf.upstream_id),
         }];
         if self.run.is_none() {
             self.current_prompt_msg_id = None;
@@ -371,6 +375,7 @@ impl TurnCore {
             user_text: None,
             prompt_index: Some(inf.prompt_index),
             turn: None,
+            upstream_id: Some(inf.upstream_id),
         }];
         if self.run.is_none() {
             self.current_prompt_msg_id = None;
@@ -457,6 +462,7 @@ impl TurnCore {
                     user_text: None,
                     prompt_index: Some(inf.prompt_index),
                     turn,
+                    upstream_id: Some(inf.upstream_id),
                 });
             }
         }
@@ -473,6 +479,7 @@ impl TurnCore {
                 user_text: None,
                 prompt_index: None,
                 turn: None,
+                upstream_id: None,
             });
         }
 
@@ -525,7 +532,7 @@ pub enum TurnOutcome {
 /// `session/list`; an error reply can quote a whole provider response.
 pub const TURN_ERROR_MAX_BYTES: usize = 2048;
 
-fn capped(mut text: String) -> String {
+pub(crate) fn capped(mut text: String) -> String {
     if text.len() <= TURN_ERROR_MAX_BYTES {
         return text;
     }
@@ -620,6 +627,23 @@ pub fn turn_outcome(
     }
 }
 
+/// Serializes the raw error payload from a failed `Action::Reply` for WARN
+/// logging, applying `redact` to the JSON value before serializing and capping
+/// to `TURN_ERROR_MAX_BYTES` on a UTF-8 char boundary.
+pub fn raw_turn_error_with_redactor(body: &Reply, redact: impl FnOnce(Value) -> Value) -> String {
+    let val = match body {
+        Reply::Error(err) => err,
+        Reply::Result(result) => result.pointer("/_meta/goose/turnError").unwrap_or(result),
+    };
+    capped(redact(val.clone()).to_string())
+}
+
+/// Serializes the raw error payload from a failed `Action::Reply` without
+/// redaction, capped to `TURN_ERROR_MAX_BYTES` on a UTF-8 char boundary.
+pub fn raw_turn_error(body: &Reply) -> String {
+    raw_turn_error_with_redactor(body, |v| v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +676,7 @@ mod tests {
                 user_text: None,
                 prompt_index: None,
                 turn: None,
+                upstream_id: None,
             }]
         );
         assert!(core.inflight.is_none());
@@ -723,6 +748,7 @@ mod tests {
                     run_id: Some("run_1".into()),
                     honk_reason: None,
                 }),
+                upstream_id: Some("hk1-1".into()),
             }
         );
         let Action::SendPrompt {
@@ -774,6 +800,7 @@ mod tests {
                     run_id: None,
                     honk_reason: None,
                 }),
+                upstream_id: Some("hk1-1".into()),
             }
         );
         let Action::SendPrompt {
@@ -827,6 +854,7 @@ mod tests {
                     run_id: Some("run_1".into()),
                     honk_reason: None,
                 }),
+                upstream_id: Some("hk1-1".into()),
             }]
         );
         assert!(core.inflight.is_none());
@@ -921,6 +949,7 @@ mod tests {
                     user_text: None,
                     prompt_index: Some(0),
                     turn: None,
+                    upstream_id: Some("hk1-1".into()),
                 },
                 Action::Reply {
                     owners: vec![owner2],
@@ -935,6 +964,7 @@ mod tests {
                     user_text: None,
                     prompt_index: None,
                     turn: None,
+                    upstream_id: None,
                 },
             ]
         );
@@ -1194,6 +1224,7 @@ mod tests {
                 user_text: Some("p1".into()),
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-1".into()),
             }]
         );
         // 2. Run is recorded
@@ -1212,6 +1243,7 @@ mod tests {
                 user_text: None,
                 prompt_index: None,
                 turn: None,
+                upstream_id: None,
             }]
         );
         assert_eq!(core.parked.len(), 1);
@@ -1259,6 +1291,7 @@ mod tests {
                 user_text: None,
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-1".into()),
             }
         );
         let Action::SendPrompt {
@@ -1342,6 +1375,7 @@ mod tests {
                     run_id: None,
                     honk_reason: None,
                 }),
+                upstream_id: Some("hk1-2".into()),
             }]
         );
     }
@@ -1424,6 +1458,7 @@ mod tests {
                     run_id: Some("run_999".into()),
                     honk_reason: None,
                 }),
+                upstream_id: Some("hk1-1".into()),
             }]
         );
     }
@@ -1507,6 +1542,7 @@ mod tests {
                 user_text: Some("p1".into()),
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-1".into()),
             }]
         );
 
@@ -1521,6 +1557,7 @@ mod tests {
                 user_text: None,
                 prompt_index: None,
                 turn: None,
+                upstream_id: None,
             }]
         );
     }
@@ -1542,6 +1579,7 @@ mod tests {
                 user_text: None,
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-1".into()),
             }]
         );
 
@@ -1562,6 +1600,7 @@ mod tests {
                 user_text: None,
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-2".into()),
             }]
         );
     }
@@ -1601,6 +1640,7 @@ mod tests {
                         run_id: Some("run_1".into()),
                         honk_reason: Some("cancelled".into()),
                     }),
+                    upstream_id: Some("hk1-1".into()),
                 },
                 Action::Reply {
                     owners: vec![owner2],
@@ -1615,6 +1655,7 @@ mod tests {
                     user_text: None,
                     prompt_index: None,
                     turn: None,
+                    upstream_id: None,
                 },
             ]
         );
@@ -1643,6 +1684,7 @@ mod tests {
                 user_text: None,
                 prompt_index: Some(0),
                 turn: None,
+                upstream_id: Some("hk1-1".into()),
             }]
         );
     }
@@ -1676,6 +1718,7 @@ mod tests {
                     run_id: None,
                     honk_reason: Some("upstream_restart".into()),
                 }),
+                upstream_id: Some("hk1-1".into()),
             }]
         );
 
@@ -1704,6 +1747,7 @@ mod tests {
                     run_id: None,
                     honk_reason: Some("delivery_unknown".into()),
                 }),
+                upstream_id: Some("hk1-2".into()),
             }]
         );
     }
@@ -1947,6 +1991,50 @@ mod tests {
             panic!("not_delivered replies: {actions:?}");
         };
         assert_eq!(turn_outcome(body, turn.as_ref(), *prompt_index), None);
+    }
+
+    #[test]
+    fn raw_turn_error_extracts_and_caps_each_failure_shape() {
+        let rpc_err = Reply::Error(json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": { "reason": "turn_failed", "kind": "provider", "message": "overloaded" }
+        }));
+        let raw_rpc: Value = serde_json::from_str(&raw_turn_error(&rpc_err)).unwrap();
+        assert_eq!(raw_rpc["code"], -32603);
+        assert_eq!(raw_rpc["data"]["kind"], "provider");
+
+        let meta_err = Reply::Result(json!({
+            "stopReason": "end_turn",
+            "_meta": { "goose": { "turnError": { "kind": "network", "message": "reset" } } }
+        }));
+        let raw_meta: Value = serde_json::from_str(&raw_turn_error(&meta_err)).unwrap();
+        assert_eq!(raw_meta, json!({ "kind": "network", "message": "reset" }));
+
+        let interrupted = Reply::Result(json!({
+            "stopReason": "cancelled",
+            "_meta": { "honk": { "reason": "upstream_restart" } }
+        }));
+        let raw_int: Value = serde_json::from_str(&raw_turn_error(&interrupted)).unwrap();
+        assert_eq!(raw_int["stopReason"], "cancelled");
+        assert_eq!(raw_int["_meta"]["honk"]["reason"], "upstream_restart");
+
+        let huge = Reply::Error(json!({
+            "code": -32603,
+            "message": "é".repeat(TURN_ERROR_MAX_BYTES),
+        }));
+        let capped_raw = raw_turn_error(&huge);
+        assert!(capped_raw.len() <= TURN_ERROR_MAX_BYTES);
+        assert!(capped_raw.ends_with('…'));
+
+        let redactor =
+            honk_upstream::Redactor::new(vec![("secret-token-123".into(), "[REDACTED]".into())]);
+        let redacted = raw_turn_error_with_redactor(
+            &Reply::Error(json!({ "code": -32603, "message": "secret-token-123" })),
+            |v| redactor.apply(v),
+        );
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("secret-token-123"));
     }
 
     #[test]

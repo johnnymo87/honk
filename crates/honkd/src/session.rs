@@ -1923,7 +1923,7 @@ impl Session {
 
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     if run_opt.is_some() {
-                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean, None)
                             .await;
                     }
                     let actions = self.turn.on_run_state(run_opt, &mut self.ids);
@@ -1965,7 +1965,7 @@ impl Session {
                 if let Some(run_opt) = honk_wire::run_state(update) {
                     if run_opt.is_some() {
                         self.ambiguous_check_token += 1;
-                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean, None)
                             .await;
                     }
                     let actions = self.turn.on_run_state(run_opt.clone(), &mut self.ids);
@@ -2043,7 +2043,7 @@ impl Session {
                         self.sync_inflight().await;
                         // The run's start frame was missed; this is where it
                         // starts for honkd, so the same clear applies.
-                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean)
+                        self.record_turn_outcome(crate::turn::TurnOutcome::Clean, None)
                             .await;
                         self.turn.run = Some(run_id.to_string());
                         self.sync_running();
@@ -2306,8 +2306,37 @@ impl Session {
 
     /// Records or clears the session's turn error. A clear writes state only
     /// when there is an entry, so clean turns cost no extra save.
-    async fn record_turn_outcome(&mut self, outcome: crate::turn::TurnOutcome) {
+    async fn record_turn_outcome(
+        &mut self,
+        outcome: crate::turn::TurnOutcome,
+        failure_log: Option<(&str, &str, &Reply)>,
+    ) {
         let sid = self.sid.clone();
+        if let crate::turn::TurnOutcome::Failed {
+            ref kind,
+            ref message,
+        } = outcome
+        {
+            let redactor = Redactor::from_env();
+            let (upstream_id, method, raw_error) = match failure_log {
+                Some((up_id, method, body)) => (
+                    up_id,
+                    method,
+                    crate::turn::raw_turn_error_with_redactor(body, |v| redactor.apply(v)),
+                ),
+                None => ("-", "session/prompt", String::new()),
+            };
+            let redacted_msg = crate::turn::capped(redactor.redact_string(message));
+            tracing::warn!(
+                sid = %sid,
+                kind = %kind,
+                error_message = %redacted_msg,
+                upstream_id = %upstream_id,
+                method = %method,
+                raw_error = %raw_error,
+                "Session {sid}: turn failed (kind={kind} upstream_id={upstream_id} method={method}): {redacted_msg}"
+            );
+        }
         let mut s = self.state_store.lock().await;
         let res = match outcome {
             crate::turn::TurnOutcome::Clean => {
@@ -2350,11 +2379,18 @@ impl Session {
                 body,
                 turn,
                 prompt_index,
+                upstream_id,
                 ..
             } = &action
                 && let Some(outcome) = crate::turn::turn_outcome(body, turn.as_ref(), *prompt_index)
             {
-                self.record_turn_outcome(outcome).await;
+                let up_id = upstream_id
+                    .as_deref()
+                    .or_else(|| turn.as_ref().map(|t| t.upstream_id.as_str()))
+                    .unwrap_or("-");
+                let failure_log = matches!(outcome, crate::turn::TurnOutcome::Failed { .. })
+                    .then_some((up_id, "session/prompt", body));
+                self.record_turn_outcome(outcome, failure_log).await;
             }
             match action {
                 Action::SendPrompt {
@@ -2655,6 +2691,7 @@ impl Session {
                     user_text,
                     prompt_index,
                     turn,
+                    ..
                 } => match body {
                     Reply::Error(err) => {
                         self.handle_reply_text(owners, Reply::Error(err), None, turn)
