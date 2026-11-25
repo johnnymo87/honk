@@ -88,6 +88,15 @@ pub struct Args {
     /// Repeatable, one server per flag. A server with no entry gets every tool.
     #[arg(long = "mcp-allow-tools", value_name = "SERVER=TOOL,...")]
     pub mcp_allow_tools: Vec<String>,
+    /// `SERVER:KEY=VALUE`: honkd sets query parameter KEY to VALUE in the url of
+    /// the user catalog's remote entry SERVER (replacing any KEY already there,
+    /// keeping every other parameter) before goose or mcp-remote connects to it.
+    /// For a server whose url selects what it serves, such as Datadog's
+    /// `toolsets`, without editing the catalog file. Repeatable, one parameter per
+    /// flag. Never a credential: the url is on honkd's command line and in
+    /// goose's session.
+    #[arg(long = "mcp-query-override", value_name = "SERVER:KEY=VALUE")]
+    pub mcp_query_override: Vec<String>,
     /// An executable with mcp-remote's command line. With it, catalog remote
     /// servers that send headers ({file:} secrets) or may need OAuth run through
     /// it as stdio servers.
@@ -149,6 +158,43 @@ impl Args {
             if map.insert(server.to_string(), list).is_some() {
                 anyhow::bail!("--mcp-allow-tools: server '{server}' is given more than once");
             }
+        }
+        Ok(map)
+    }
+
+    /// Parses `--mcp-query-override` into server name -> `(key, value)` pairs, in
+    /// flag order.
+    ///
+    /// Fails on a malformed value, an empty server, key or value, a key that
+    /// looks like a credential, or the same server and key given twice.
+    pub fn mcp_query_overrides_map(&self) -> anyhow::Result<crate::mcp::catalog::QueryOverrides> {
+        let mut map = crate::mcp::catalog::QueryOverrides::new();
+        for raw in &self.mcp_query_override {
+            let Some((server, param)) = raw.split_once(':') else {
+                anyhow::bail!("--mcp-query-override '{raw}': expected SERVER:KEY=VALUE");
+            };
+            let Some((key, value)) = param.split_once('=') else {
+                anyhow::bail!("--mcp-query-override '{raw}': expected SERVER:KEY=VALUE");
+            };
+            let (server, key, value) = (server.trim(), key.trim(), value.trim());
+            if server.is_empty() || key.is_empty() || value.is_empty() {
+                anyhow::bail!(
+                    "--mcp-query-override '{raw}': server, key and value must all be non-empty"
+                );
+            }
+            if key.contains(['&', '#', '?']) {
+                anyhow::bail!("--mcp-query-override '{raw}': invalid query key '{key}'");
+            }
+            if crate::mcp::catalog::key_looks_secret(key) {
+                anyhow::bail!(
+                    "--mcp-query-override '{raw}': '{key}' looks like a credential; credentials do not belong in a url"
+                );
+            }
+            let pairs: &mut Vec<(String, String)> = map.entry(server.to_string()).or_default();
+            if pairs.iter().any(|(k, _)| k == key) {
+                anyhow::bail!("--mcp-query-override: '{server}:{key}' is given more than once");
+            }
+            pairs.push((key.to_string(), value.to_string()));
         }
         Ok(map)
     }
@@ -389,6 +435,71 @@ mod tests {
             Some(PathBuf::from("/tmp/pigeon-token"))
         );
     }
+    fn query_override_args(values: &[&str]) -> Args {
+        let mut argv = vec!["honkd", "--upstream-secret-file", "/tmp/secret"];
+        for v in values {
+            argv.push("--mcp-query-override");
+            argv.push(v);
+        }
+        Args::try_parse_from(argv).expect("parse args")
+    }
+
+    #[test]
+    fn default_mcp_query_overrides_is_empty() {
+        assert!(
+            query_override_args(&[])
+                .mcp_query_overrides_map()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parsed_mcp_query_overrides_keep_commas_and_order() {
+        let args = query_override_args(&[
+            "datadog:toolsets=core,alerting",
+            " datadog : omit_tools = a,b ",
+            "other:x=1",
+        ]);
+        let map = args.mcp_query_overrides_map().unwrap();
+        assert_eq!(
+            map["datadog"],
+            vec![
+                ("toolsets".to_string(), "core,alerting".to_string()),
+                ("omit_tools".to_string(), "a,b".to_string()),
+            ]
+        );
+        assert_eq!(map["other"], vec![("x".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn mcp_query_overrides_reject_malformed_values() {
+        for bad in [
+            "datadog",
+            "datadog:toolsets",
+            ":toolsets=core",
+            "datadog:=core",
+            "datadog:toolsets=",
+            "datadog:a&b=1",
+            "datadog:api_key=x",
+            "datadog:access_token=x",
+        ] {
+            assert!(
+                query_override_args(&[bad])
+                    .mcp_query_overrides_map()
+                    .is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_query_overrides_reject_duplicate_key() {
+        let args = query_override_args(&["datadog:toolsets=core", "datadog:toolsets=all"]);
+        let err = args.mcp_query_overrides_map().unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
     fn allow_tools_args(values: &[&str]) -> Args {
         let mut argv = vec!["honkd", "--upstream-secret-file", "/tmp/secret"];
         for v in values {

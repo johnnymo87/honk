@@ -6291,6 +6291,7 @@ mod tests {
             swarm: None,
             project: false,
             mcp_remote_bin: None,
+            query_overrides: Default::default(),
         });
 
         // 1. Agent origin timeout
@@ -6595,6 +6596,7 @@ mod tests {
             swarm: None,
             project: false,
             mcp_remote_bin: None,
+            query_overrides: Default::default(),
         });
 
         // 1. Agent origin op
@@ -6691,6 +6693,7 @@ mod tests {
             swarm: None,
             project: false,
             mcp_remote_bin: None,
+            query_overrides: Default::default(),
         });
 
         // 1. Immediate McpSelfOp with closed reply
