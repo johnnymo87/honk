@@ -112,10 +112,12 @@ The user interface consists of three distinct vertical areas:
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Submit current prompt (when composer is not empty). |
-| `Alt-Enter` | Insert a newline. |
-| `Ctrl-J` | Insert a newline. |
-| `Shift-Enter` | Insert a newline (requires terminal/tmux keyboard enhancement support; otherwise treated as `Enter`). |
+| `Enter` | Insert a newline. |
+| `Shift-Enter` / `Ctrl-J` | Insert a newline. |
+| `Cmd-Enter` | Submit current prompt (when composer is not empty; requires a terminal sending kitty `Super+Enter` or a terminal key mapping such as iTerm2 `⌘↩` → `0x1b 0x0d`). |
+| `Alt-Enter` | Submit current prompt (when composer is not empty; works across SSH, mosh, tmux, and Neovim `:terminal`; also matches fast `Esc` + `Enter`). |
+| `Ctrl-Enter` | Submit current prompt (when composer is not empty; requires terminal/tmux extended-keys support). |
+| `Ctrl-S` | Submit current prompt (when composer is not empty; universal fallback that works in every terminal without configuration). |
 | `Up` / `Down` | Scroll transcript up / down 3 lines (when composer is empty, e.g. mouse wheel via `?1007`); moves cursor in editor when composer has text. |
 | `Ctrl-C` | If composer has text: exits to **Normal Mode** (vim habit). If composer is empty: interrupts active turn (`Action::Interrupt`). |
 | `Ctrl-D` | If composer is empty: quits `honk chat` (`Action::Quit`). If composer has text: ignored (no-op). |
@@ -128,6 +130,7 @@ Press `Esc` or `Ctrl-C` from insert mode to enter normal mode. Press `i` or `a` 
 
 | Key | Action |
 |-----|--------|
+| `Enter` | Submit current prompt (when composer is not empty). `Cmd-Enter`, `Alt-Enter`, `Ctrl-Enter`, and `Ctrl-S` also submit. |
 | `Ctrl-E` | Scroll transcript down 1 line. |
 | `Ctrl-Y` | Scroll transcript up 1 line. |
 | `Ctrl-D` | Scroll transcript down half a page. |
@@ -435,17 +438,28 @@ After sending the prompt, `honk launch` auto-opens the new session in a new nvim
 
 ---
 
-## Tmux Configuration
+## Terminal & Tmux Configuration
 
-If you run `honk chat` inside `tmux`, consider the following settings in `~/.tmux.conf`:
+If you run `honk chat` inside `tmux` or over SSH/mosh from macOS, consider the following settings:
 
-### Shift-Enter for Newlines
-By default, tmux may intercept `Shift-Enter` and report it as a plain `Enter`. To allow `Shift-Enter` to insert newlines:
+### Cmd-Enter on macOS (iTerm2)
+macOS terminals normally intercept `⌘↩` (`Cmd-Enter`) before it reaches a remote app, and neither `tmux` nor Neovim's `:terminal` (libvterm) preserves a distinct `Super` modifier on CSI u sequences. To make `⌘↩` send from insert mode through SSH, mosh, `tmux`, and Neovim `:terminal`:
+
+1. In iTerm2: **Settings → Profiles → Keys → Key Mappings → `+`**
+2. Keyboard Shortcut: press `⌘↩`
+3. Action: **Send Hex Code** → `0x1b 0x0d` (`ESC CR`, which arrives as `Alt-Enter` everywhere)
+
+*(iTerm2 binds `⌘↩` to **Window → Toggle Full Screen** by default; a profile Key Mapping overrides it, or you can clear that shortcut in macOS Keyboard Shortcuts if needed.)*
+
+Without any terminal mapping, `Ctrl-S`, `Alt-Enter` (Option-Enter with Option set to Esc+), and Normal-mode `Enter` (`Esc` then `Enter`) all submit out of the box.
+
+### Ctrl-Enter through tmux
+To allow `Ctrl-Enter` (CSI u / modifyOtherKeys) to pass through `tmux` into apps that request extended keys (such as Neovim `:terminal`):
 ```tmux
 # Enable extended keys (tmux 3.2+ with compatible terminal)
 set -s extended-keys on
+set -as terminal-features ',xterm*:extkeys'
 ```
-*(Note: If your terminal does not support extended keys, you can always use `Alt-Enter` or `Ctrl-J` to insert newlines).*
 
 ### OSC 52 Clipboard (`:yank`)
 To enable OSC 52 clipboard passthrough from tmux to your outer terminal:

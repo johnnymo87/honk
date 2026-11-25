@@ -46,6 +46,8 @@ pub fn configure_key_handler(handler: &mut edtui::events::KeyEventHandler) {
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('d')]));
     handler.remove(&KeyEventRegister::n(vec![KeyInput::ctrl('x')]));
     handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('x')]));
+    handler.remove(&KeyEventRegister::n(vec![KeyInput::ctrl('s')]));
+    handler.remove(&KeyEventRegister::i(vec![KeyInput::ctrl('s')]));
     handler.remove(&KeyEventRegister::n(vec![KeyInput::new(':')]));
 }
 
@@ -123,6 +125,18 @@ pub fn resolve(
 
     match mode {
         EditorMode::Normal => {
+            // Submit on Enter (any modifier) or Ctrl-S
+            if key_event.code == KeyCode::Enter
+                || (key_event.modifiers == KeyModifiers::CONTROL
+                    && key_event.code == KeyCode::Char('s'))
+            {
+                return if composer_empty {
+                    Action::Ignore
+                } else {
+                    Action::Submit
+                };
+            }
+
             // Control keys
             if key_event.modifiers == KeyModifiers::CONTROL {
                 match key_event.code {
@@ -181,21 +195,42 @@ pub fn resolve(
             Action::Edtui(key_event)
         }
         EditorMode::Insert => {
+            // Enter variants in insert mode:
+            // - Cmd-Enter (SUPER), Alt-Enter (ALT), Ctrl-Enter (CONTROL): Submit
+            //   (Alt-Enter also matches fast Esc+Enter, agreeing with Normal-mode Enter).
+            // - Plain Enter and Shift-Enter: Newline when composer has text; Ignore when
+            //   empty so habitual Enter never leaves an invisible "\n" that breaks
+            //   empty-composer shortcuts (Up/Down scroll, Ctrl-C interrupt, Ctrl-D quit).
+            if key_event.code == KeyCode::Enter {
+                if key_event
+                    .modifiers
+                    .intersects(KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                {
+                    return if composer_empty {
+                        Action::Ignore
+                    } else {
+                        Action::Submit
+                    };
+                }
+                if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT {
+                    return if composer_empty {
+                        Action::Ignore
+                    } else {
+                        Action::Newline
+                    };
+                }
+            }
+
             // Alt+<printable> in insert mode (fast typing Esc followed by key):
             // Treat as Esc followed by that key (vim behavior).
-            // Alt-Enter is preserved as Newline.
             if key_event.modifiers.contains(KeyModifiers::ALT)
                 && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                && let KeyCode::Char(c) = key_event.code
+                && !c.is_control()
             {
-                if key_event.code == KeyCode::Enter {
-                    return Action::Newline;
-                } else if let KeyCode::Char(c) = key_event.code
-                    && !c.is_control()
-                {
-                    let mut next = key_event;
-                    next.modifiers.remove(KeyModifiers::ALT);
-                    return Action::EscKey(next);
-                }
+                let mut next = key_event;
+                next.modifiers.remove(KeyModifiers::ALT);
+                return Action::EscKey(next);
             }
 
             // Up/Down in insert mode: scroll transcript if empty, editor cursor if non-empty
@@ -239,39 +274,24 @@ pub fn resolve(
                 }
             }
 
-            // Ctrl-P, Ctrl-N, Ctrl-J
+            // Ctrl-P, Ctrl-N, Ctrl-J, Ctrl-S
             if key_event.modifiers == KeyModifiers::CONTROL {
                 match key_event.code {
                     KeyCode::Char('p') => return Action::HistoryPrev,
                     KeyCode::Char('n') => return Action::HistoryNext,
                     KeyCode::Char('j') => return Action::Newline,
+                    KeyCode::Char('s') => {
+                        return if composer_empty {
+                            Action::Ignore
+                        } else {
+                            Action::Submit
+                        };
+                    }
                     _ => {}
                 }
             }
 
-            // Enter / Alt-Enter / Shift-Enter
-            if key_event.code == KeyCode::Enter {
-                if key_event.modifiers.contains(KeyModifiers::ALT) {
-                    return Action::Newline;
-                }
-                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                    if enhanced_keyboard {
-                        return Action::Newline;
-                    } else if composer_empty {
-                        return Action::Ignore;
-                    } else {
-                        return Action::Submit;
-                    }
-                }
-                if key_event.modifiers.is_empty() {
-                    if composer_empty {
-                        return Action::Ignore;
-                    } else {
-                        return Action::Submit;
-                    }
-                }
-            }
-
+            let _ = enhanced_keyboard;
             Action::Edtui(key_event)
         }
         _ => {
@@ -589,27 +609,29 @@ mod tests {
     #[test]
     fn test_insert_mode_enter_and_newlines() {
         let enter = key(KeyCode::Enter);
-        // Empty composer: Enter ignored
+        // Plain Enter on empty composer is ignored (avoids invisible "\n" breaking empty shortcuts)
         assert_eq!(
             resolve(EditorMode::Insert, true, enter, None, false),
             Action::Ignore
         );
-        // Non-empty composer: Enter submits
+        // Plain Enter on non-empty composer inserts a newline
         assert_eq!(
             resolve(EditorMode::Insert, false, enter, None, false),
-            Action::Submit
+            Action::Newline
         );
 
-        // Alt-Enter inserts newline
-        let alt_enter = alt(KeyCode::Enter);
-        assert_eq!(
-            resolve(EditorMode::Insert, false, alt_enter, None, false),
-            Action::Newline
-        );
-        assert_eq!(
-            resolve(EditorMode::Insert, true, alt_enter, None, false),
-            Action::Newline
-        );
+        // Shift-Enter matches plain Enter regardless of enhanced_keyboard
+        let shift_enter = press(KeyCode::Enter, KeyModifiers::SHIFT);
+        for enhanced in [false, true] {
+            assert_eq!(
+                resolve(EditorMode::Insert, false, shift_enter, None, enhanced),
+                Action::Newline
+            );
+            assert_eq!(
+                resolve(EditorMode::Insert, true, shift_enter, None, enhanced),
+                Action::Ignore
+            );
+        }
 
         // Ctrl-J inserts newline
         let ctrl_j = ctrl('j');
@@ -621,6 +643,51 @@ mod tests {
             resolve(EditorMode::Insert, true, ctrl_j, None, false),
             Action::Newline
         );
+    }
+
+    #[test]
+    fn test_insert_mode_send_chords() {
+        let send_chords = [
+            press(KeyCode::Enter, KeyModifiers::SUPER),
+            alt(KeyCode::Enter),
+            press(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ];
+        for chord in send_chords {
+            assert_eq!(
+                resolve(EditorMode::Insert, false, chord, None, false),
+                Action::Submit,
+                "expected Submit for {chord:?} on non-empty composer"
+            );
+            assert_eq!(
+                resolve(EditorMode::Insert, true, chord, None, false),
+                Action::Ignore,
+                "expected Ignore for {chord:?} on empty composer"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normal_mode_enter_and_send_chords() {
+        let send_chords = [
+            key(KeyCode::Enter),
+            press(KeyCode::Enter, KeyModifiers::SUPER),
+            alt(KeyCode::Enter),
+            press(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ];
+        for chord in send_chords {
+            assert_eq!(
+                resolve(EditorMode::Normal, false, chord, None, false),
+                Action::Submit,
+                "expected Submit for {chord:?} in normal mode"
+            );
+            assert_eq!(
+                resolve(EditorMode::Normal, true, chord, None, false),
+                Action::Ignore,
+                "expected Ignore for {chord:?} in normal mode on empty composer"
+            );
+        }
     }
 
     #[test]
@@ -637,35 +704,14 @@ mod tests {
             Action::EscKey(key(KeyCode::Char('q')))
         );
 
-        // Alt-Enter is still Newline
+        // Alt-Enter submits (also matches fast Esc+Enter -> normal-mode Enter)
         let alt_enter = press(KeyCode::Enter, KeyModifiers::ALT);
         assert_eq!(
             resolve(EditorMode::Insert, false, alt_enter, None, false),
-            Action::Newline
-        );
-    }
-
-    #[test]
-    fn test_shift_enter_with_and_without_enhancement() {
-        let shift_enter = press(KeyCode::Enter, KeyModifiers::SHIFT);
-
-        // With enhancement flags pushed: Shift-Enter is always Newline
-        assert_eq!(
-            resolve(EditorMode::Insert, false, shift_enter, None, true),
-            Action::Newline
-        );
-        assert_eq!(
-            resolve(EditorMode::Insert, true, shift_enter, None, true),
-            Action::Newline
-        );
-
-        // Without enhancement flags: Shift-Enter behaves like plain Enter (Submit if non-empty, Ignore if empty)
-        assert_eq!(
-            resolve(EditorMode::Insert, false, shift_enter, None, false),
             Action::Submit
         );
         assert_eq!(
-            resolve(EditorMode::Insert, true, shift_enter, None, false),
+            resolve(EditorMode::Insert, true, alt_enter, None, false),
             Action::Ignore
         );
     }
