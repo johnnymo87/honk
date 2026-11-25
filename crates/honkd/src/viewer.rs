@@ -1443,6 +1443,11 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                         continue;
                     };
 
+                    let all_providers = params
+                        .get("allProviders")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+
                     let (configured, warning) =
                         crate::models::load_for_list(hub.args.models_file.as_deref()).await;
 
@@ -1454,6 +1459,7 @@ pub async fn viewer_loop(socket: WebSocket, hub: Arc<Hub>) {
                             id: id.clone(),
                             configured: configured.clone(),
                             warning: warning.clone(),
+                            all_providers,
                         }
                     })
                     .await

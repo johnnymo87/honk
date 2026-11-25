@@ -224,8 +224,10 @@ async fn test_model_list_e2e() {
     assert_eq!(models_no_flag.len(), 2);
     assert_eq!(models_no_flag[0]["id"], "claude-opus-5-5");
     assert_eq!(models_no_flag[0]["source"], "goose");
+    assert_eq!(models_no_flag[0]["provider"], "gcp_vertex_ai");
     assert_eq!(models_no_flag[1]["id"], "gemini-3.8-flash");
     assert_eq!(models_no_flag[1]["source"], "goose");
+    assert_eq!(models_no_flag[1]["provider"], "gcp_vertex_ai");
 
     // 2. With --models-file flag: configured first then goose, current reflects switch
     let temp_dir = tempfile::tempdir().unwrap();
@@ -235,6 +237,9 @@ async fn test_model_list_e2e() {
             "gcp_vertex_ai": [
                 { "id": "custom-model", "name": "Custom Model" },
                 { "id": "claude-opus-5-5", "name": "Claude Opus Configured" }
+            ],
+            "codex_lb": [
+                { "id": "gpt-6-astra", "name": "GPT-6 Astra" }
             ]
         }
     });
@@ -258,6 +263,7 @@ async fn test_model_list_e2e() {
         .unwrap()
         .to_string();
 
+    // Without allProviders flag (default false): codex_lb is not included
     let list_res = v
         .call("_honk/model/list", json!({ "sessionId": sid2 }))
         .await;
@@ -273,12 +279,31 @@ async fn test_model_list_e2e() {
     assert_eq!(models[0]["id"], "custom-model");
     assert_eq!(models[0]["name"], "Custom Model");
     assert_eq!(models[0]["source"], "configured");
+    assert_eq!(models[0]["provider"], "gcp_vertex_ai");
     assert_eq!(models[1]["id"], "claude-opus-5-5");
     assert_eq!(models[1]["name"], "Claude Opus Configured");
     assert_eq!(models[1]["source"], "configured");
+    assert_eq!(models[1]["provider"], "gcp_vertex_ai");
     // Goose option that wasn't already listed
     assert_eq!(models[2]["id"], "gemini-3.8-flash");
     assert_eq!(models[2]["source"], "goose");
+    assert_eq!(models[2]["provider"], "gcp_vertex_ai");
+
+    // With allProviders: true: codex_lb is appended
+    let list_all_res = v
+        .call(
+            "_honk/model/list",
+            json!({ "sessionId": sid2, "allProviders": true }),
+        )
+        .await;
+    let models_all = list_all_res["result"]["models"]
+        .as_array()
+        .expect("models_all array");
+    assert_eq!(models_all.len(), 4);
+    assert_eq!(models_all[3]["id"], "gpt-6-astra");
+    assert_eq!(models_all[3]["name"], "GPT-6 Astra");
+    assert_eq!(models_all[3]["source"], "configured");
+    assert_eq!(models_all[3]["provider"], "codex_lb");
 
     // Switch model and verify current reflects prior switch
     let switch_res = v

@@ -250,6 +250,7 @@ pub enum SessionMsg {
         id: Value,
         configured: Option<crate::models::ModelsFile>,
         warning: Option<String>,
+        all_providers: bool,
     },
     Internal {
         method: String,
@@ -3417,12 +3418,17 @@ impl Session {
                 id,
                 configured,
                 warning,
+                all_providers,
             } => {
                 if !self.viewers.contains_key(&viewer_id) {
                     self.attach_live(viewer_id, viewer.clone(), is_honk_aware);
                 }
-                let reply =
-                    crate::models::list_reply(configured.as_ref(), warning, &self.init_result);
+                let reply = crate::models::list_reply(
+                    configured.as_ref(),
+                    warning,
+                    &self.init_result,
+                    all_providers,
+                );
                 self.send_to_viewer(viewer_id, crate::rpc::response(id, reply));
             }
             SessionMsg::Internal {
@@ -5868,6 +5874,7 @@ mod tests {
                 id: json!(42),
                 configured: None,
                 warning: None,
+                all_providers: false,
             })
             .await;
 

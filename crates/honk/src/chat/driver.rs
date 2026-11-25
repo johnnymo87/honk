@@ -184,6 +184,7 @@ pub enum UiEvent {
     },
     State(StateSnapshot),
     ModelList {
+        provider: Option<String>,
         current: Option<String>,
         models: Vec<crate::chat::types::ModelItem>,
         warning: Option<String>,
@@ -208,7 +209,11 @@ pub enum UiCommand {
     Eof,
     RetryAttach,
     Shutdown,
-    SetModel { id: String, record_recent: bool },
+    SetModel {
+        id: String,
+        provider: Option<String>,
+        record_recent: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -466,11 +471,13 @@ async fn process_effects(
                 record_recent_model(recent_dir, &id);
             }
             Effect::ModelList {
+                provider,
                 current,
                 models,
                 warning,
             } => {
                 let _ = ui_tx.send(UiEvent::ModelList {
+                    provider,
                     current,
                     models,
                     warning,
@@ -815,56 +822,213 @@ async fn run_driver(
             }
 
             let mut model_config_options = None;
-            if let Some(ref model_id) = opts.model {
-                let model_req_id = ids.allocate();
-                let model_params = json!({
+            if let Some(ref initial_model_arg) = opts.model {
+                // Fetch model list to resolve provider if cross-provider
+                let list_req_id = ids.allocate();
+                let mut target_provider = None;
+                let mut target_model = initial_model_arg.clone();
+
+                let list_params = json!({
                     "sessionId": session_id,
-                    "configId": "model",
-                    "value": model_id,
+                    "allProviders": true,
                 });
-                if let Err(e) = conn
-                    .send_request(model_req_id, "session/set_config_option", model_params)
+                if let Ok(()) = conn
+                    .send_request(list_req_id, "_honk/model/list", list_params)
                     .await
                 {
-                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
-                } else {
-                    let model_timeout = Duration::from_secs(5);
-                    let model_res = tokio::time::timeout(model_timeout, async {
+                    let list_timeout = Duration::from_secs(5);
+                    let list_res = tokio::time::timeout(list_timeout, async {
                         while let Some(frame) = frame_rx.recv().await {
-                            if frame.get("id") == Some(&json!(model_req_id))
+                            if frame.get("id") == Some(&json!(list_req_id))
                                 && crate::conn::is_response(&frame)
                             {
                                 return Ok(frame);
                             }
                         }
                         Err(anyhow::anyhow!(
-                            "stream closed while awaiting session/set_config_option response"
+                            "stream closed while awaiting _honk/model/list"
                         ))
                     })
                     .await;
 
-                    match model_res {
-                        Ok(Ok(frame)) => {
-                            if let Some(err) = frame.get("error") {
-                                let msg = err
-                                    .get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("model error");
-                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(msg)));
-                            } else {
-                                let res = frame.get("result").cloned().unwrap_or(Value::Null);
-                                model_config_options = Some(res);
-                                record_recent_model(opts.recent_dir.as_deref(), model_id);
+                    if let Ok(Ok(frame)) = list_res
+                        && let Some(res) = frame.get("result")
+                    {
+                        let session_provider = res.get("provider").and_then(Value::as_str);
+                        let models = res.get("models").and_then(Value::as_array);
+
+                        if let Some(models) = models {
+                            let matched_entry = models
+                                .iter()
+                                .find(|m| {
+                                    m.get("id").and_then(Value::as_str)
+                                        == Some(initial_model_arg.as_str())
+                                        && m.get("provider").and_then(Value::as_str)
+                                            == session_provider
+                                })
+                                .or_else(|| {
+                                    models.iter().find(|m| {
+                                        m.get("id").and_then(Value::as_str)
+                                            == Some(initial_model_arg.as_str())
+                                    })
+                                });
+
+                            if let Some(m) = matched_entry {
+                                let m_prov = m.get("provider").and_then(Value::as_str);
+                                if session_provider.is_some()
+                                    && m_prov.is_some()
+                                    && m_prov != session_provider
+                                {
+                                    target_provider = m_prov.map(str::to_string);
+                                }
+                            } else if let Some((prov, m_id)) = initial_model_arg.split_once('/')
+                                && models.iter().any(|m| {
+                                    m.get("provider").and_then(Value::as_str) == Some(prov)
+                                })
+                            {
+                                target_model = m_id.to_string();
+                                if session_provider.is_some() && session_provider != Some(prov) {
+                                    target_provider = Some(prov.to_string());
+                                }
                             }
                         }
-                        Ok(Err(e)) => {
-                            let _ =
-                                ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                    }
+                }
+
+                let mut provider_ok = true;
+                if let Some(ref prov) = target_provider {
+                    let prov_req_id = ids.allocate();
+                    let prov_params = json!({
+                        "sessionId": session_id,
+                        "configId": "provider",
+                        "value": prov,
+                    });
+                    if let Err(e) = conn
+                        .send_request(prov_req_id, "session/set_config_option", prov_params)
+                        .await
+                    {
+                        let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!(
+                            "provider switch to {prov} failed: {e}"
+                        ))));
+                        provider_ok = false;
+                    } else {
+                        let prov_timeout = Duration::from_secs(5);
+                        let prov_res = tokio::time::timeout(prov_timeout, async {
+                            while let Some(frame) = frame_rx.recv().await {
+                                if frame.get("id") == Some(&json!(prov_req_id))
+                                    && crate::conn::is_response(&frame)
+                                {
+                                    return Ok(frame);
+                                }
+                            }
+                            Err(anyhow::anyhow!(
+                                "stream closed while awaiting session/set_config_option response"
+                            ))
+                        })
+                        .await;
+
+                        match prov_res {
+                            Ok(Ok(frame)) => {
+                                if let Some(err) = frame.get("error") {
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("provider error");
+                                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!(
+                                        "provider switch to {prov} failed: {msg}"
+                                    ))));
+                                    provider_ok = false;
+                                } else {
+                                    let res = frame.get("result").cloned().unwrap_or(Value::Null);
+                                    model_config_options = Some(res);
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!(
+                                    "provider switch to {prov} failed: {e}"
+                                ))));
+                                provider_ok = false;
+                            }
+                            Err(_) => {
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!(
+                                    "provider switch to {prov} failed: timed out setting provider"
+                                ))));
+                                provider_ok = false;
+                            }
                         }
-                        Err(_) => {
-                            let _ = ui_tx.send(UiEvent::Notice(Notice::error(
-                                "model: timed out setting initial model",
-                            )));
+                    }
+                }
+
+                if provider_ok {
+                    let model_req_id = ids.allocate();
+                    let model_params = json!({
+                        "sessionId": session_id,
+                        "configId": "model",
+                        "value": target_model,
+                    });
+                    if let Err(e) = conn
+                        .send_request(model_req_id, "session/set_config_option", model_params)
+                        .await
+                    {
+                        let _ = ui_tx.send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                    } else {
+                        let model_timeout = Duration::from_secs(5);
+                        let model_res = tokio::time::timeout(model_timeout, async {
+                            while let Some(frame) = frame_rx.recv().await {
+                                if frame.get("id") == Some(&json!(model_req_id))
+                                    && crate::conn::is_response(&frame)
+                                {
+                                    return Ok(frame);
+                                }
+                            }
+                            Err(anyhow::anyhow!(
+                                "stream closed while awaiting session/set_config_option response"
+                            ))
+                        })
+                        .await;
+
+                        match model_res {
+                            Ok(Ok(frame)) => {
+                                if let Some(err) = frame.get("error") {
+                                    let msg = err
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("model error");
+                                    let err_text = if let Some(ref prov) = target_provider {
+                                        let cur_prov = model_config_options
+                                            .as_ref()
+                                            .and_then(|val| {
+                                                honk_wire::config_select_value(val, "provider")
+                                            })
+                                            .unwrap_or_else(|| prov.clone());
+                                        let cur_model = model_config_options
+                                            .as_ref()
+                                            .and_then(|val| {
+                                                honk_wire::config_select_value(val, "model")
+                                            })
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        format!(
+                                            "model switch to {target_model} failed after provider switch to {cur_prov}; session is now on {cur_prov}/{cur_model}"
+                                        )
+                                    } else {
+                                        msg.to_string()
+                                    };
+                                    let _ = ui_tx.send(UiEvent::Notice(Notice::error(err_text)));
+                                } else {
+                                    let res = frame.get("result").cloned().unwrap_or(Value::Null);
+                                    model_config_options = Some(res);
+                                    record_recent_model(opts.recent_dir.as_deref(), &target_model);
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                let _ = ui_tx
+                                    .send(UiEvent::Notice(Notice::error(format!("model: {e}"))));
+                            }
+                            Err(_) => {
+                                let _ = ui_tx.send(UiEvent::Notice(Notice::error(
+                                    "model: timed out setting initial model",
+                                )));
+                            }
                         }
                     }
                 }
@@ -1011,8 +1175,13 @@ async fn run_driver(
                         }
                         return;
                     }
-                    UiCommand::SetModel { id, record_recent } => {
-                        let effects = core.handle_model_set_command(&id, record_recent);
+                    UiCommand::SetModel {
+                        id,
+                        provider,
+                        record_recent,
+                    } => {
+                        let effects =
+                            core.handle_model_set_command(&id, provider.as_deref(), record_recent);
                         let action = process_effects(
                             effects,
                             &mut core,

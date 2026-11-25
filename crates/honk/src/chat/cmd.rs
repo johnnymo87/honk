@@ -1,4 +1,4 @@
-use super::core::ChatCore;
+use super::core::{ChatCore, PendingModelChain};
 use super::types::{Effect, Notice, Ownership, RunState};
 use serde_json::json;
 
@@ -369,19 +369,28 @@ impl ChatCore {
         self.handle_model_command_inner(line, None, effects);
     }
 
-    pub fn handle_model_set_command(&mut self, id: &str, record_recent: bool) -> Vec<Effect> {
+    pub fn handle_model_set_command(
+        &mut self,
+        id: &str,
+        provider: Option<&str>,
+        record_recent: bool,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let id = id.trim();
         if id.is_empty() {
             effects.push(Effect::Notice(Notice::warning("usage: /model [id]")));
             return effects;
         }
-        let line = if record_recent {
+        let line = if let Some(prov) = provider
+            && self.provider.as_deref() != Some(prov)
+        {
+            format!("/model {prov}/{id}")
+        } else if record_recent {
             format!("/model {id}")
         } else {
             format!("\0model:{id}")
         };
-        self.dispatch_model_set(&line, None, id, record_recent, &mut effects);
+        self.dispatch_model_set(&line, None, id, provider, record_recent, &mut effects);
         effects
     }
 
@@ -391,7 +400,14 @@ impl ChatCore {
             return;
         }
         let line = format!("\0model:{id}");
-        self.dispatch_model_set(&line, Some((line.clone(), requeues)), id, false, effects);
+        self.dispatch_model_set(
+            &line,
+            Some((line.clone(), requeues)),
+            id,
+            None,
+            false,
+            effects,
+        );
     }
 
     pub fn handle_queued_model_command(
@@ -405,7 +421,14 @@ impl ChatCore {
         let Some(id) = tokens.next() else {
             return;
         };
-        self.dispatch_model_set(line, Some((line.to_string(), requeues)), id, true, effects);
+        self.dispatch_model_set(
+            line,
+            Some((line.to_string(), requeues)),
+            id,
+            None,
+            true,
+            effects,
+        );
     }
 
     fn handle_model_command_inner(
@@ -430,7 +453,7 @@ impl ChatCore {
             return;
         }
 
-        self.dispatch_model_set(line, queued, id, true, effects);
+        self.dispatch_model_set(line, queued, id, None, true, effects);
     }
 
     fn dispatch_model_list(&mut self, line: &str, effects: &mut Vec<Effect>) {
@@ -445,7 +468,10 @@ impl ChatCore {
         effects.push(Effect::Request {
             id: req_id,
             method: "_honk/model/list".to_string(),
-            params: json!({ "sessionId": self.session_id }),
+            params: json!({
+                "sessionId": self.session_id,
+                "allProviders": true,
+            }),
         });
     }
 
@@ -462,6 +488,7 @@ impl ChatCore {
         line: &str,
         queued: Option<(String, u32)>,
         id: &str,
+        explicit_provider: Option<&str>,
         record_recent: bool,
         effects: &mut Vec<Effect>,
     ) {
@@ -477,19 +504,32 @@ impl ChatCore {
                 format!("queued: {line}")
             };
             effects.push(Effect::Notice(Notice::info(notice_text)));
-        } else {
-            let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
-            if requeues == 0 && !self.known_model_ids.iter().any(|k| k == id) {
-                effects.push(Effect::Notice(Notice::warning(format!(
-                    "{id} is not in the model list; goose does not check it, a wrong id fails at the next turn"
-                ))));
-            }
+            return;
+        }
 
+        let (target_provider, target_model) = self.resolve_target_provider(id, explicit_provider);
+
+        let requeues = queued.as_ref().map_or(0, |(_, c)| *c);
+        if requeues == 0 && !self.known_model_ids.iter().any(|k| k == &target_model) {
+            effects.push(Effect::Notice(Notice::warning(format!(
+                "{target_model} is not in the model list; goose does not check it, a wrong id fails at the next turn"
+            ))));
+        }
+
+        if let Some(ref prov) = target_provider
+            && self.provider.is_some()
+            && self.provider.as_deref() != Some(prov)
+        {
+            self.pending_model_chain = Some(PendingModelChain {
+                target_model: target_model.clone(),
+                original_model: self.model.clone(),
+            });
             let req_id = self.allocate_id();
             self.pending_model_reqs.insert(
                 req_id,
-                super::types::PendingModelReq::Set {
-                    model: id.to_string(),
+                super::types::PendingModelReq::SetProvider {
+                    provider: prov.clone(),
+                    then_model: target_model.clone(),
                     queued,
                     record_recent,
                 },
@@ -499,8 +539,28 @@ impl ChatCore {
                 method: "session/set_config_option".to_string(),
                 params: json!({
                     "sessionId": self.session_id,
+                    "configId": "provider",
+                    "value": prov,
+                }),
+            });
+        } else {
+            let req_id = self.allocate_id();
+            self.pending_model_reqs.insert(
+                req_id,
+                super::types::PendingModelReq::Set {
+                    model: target_model.clone(),
+                    queued,
+                    record_recent,
+                    after_provider: None,
+                },
+            );
+            effects.push(Effect::Request {
+                id: req_id,
+                method: "session/set_config_option".to_string(),
+                params: json!({
+                    "sessionId": self.session_id,
                     "configId": "model",
-                    "value": id,
+                    "value": target_model,
                 }),
             });
         }

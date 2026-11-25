@@ -12,6 +12,12 @@ use super::types::{
     PromptSent, RunState,
 };
 
+#[derive(Clone, Debug)]
+pub(crate) struct PendingModelChain {
+    pub target_model: String,
+    pub original_model: Option<String>,
+}
+
 pub struct ChatCore {
     pub(crate) session_id: String,
     pub(crate) opts: ChatOpts,
@@ -46,10 +52,12 @@ pub struct ChatCore {
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) goose_model_ids: Vec<String>,
+    pub(crate) listed_models: Vec<super::types::ModelItem>,
     pub(crate) listed_model_ids: Vec<String>,
     pub(crate) known_model_ids: Vec<String>,
     pub(crate) models_listed: bool,
     pub(crate) pending_model_reqs: HashMap<u64, super::types::PendingModelReq>,
+    pub(crate) pending_model_chain: Option<PendingModelChain>,
     pub(crate) pending_revert_reqs: HashMap<u64, super::types::PendingRevertReq>,
     pub(crate) undone_prompts: Vec<String>,
 }
@@ -106,10 +114,12 @@ impl ChatCore {
             model: None,
             provider: None,
             goose_model_ids: Vec::new(),
+            listed_models: Vec::new(),
             listed_model_ids: Vec::new(),
             known_model_ids: Vec::new(),
             models_listed: false,
             pending_model_reqs: HashMap::new(),
+            pending_model_chain: None,
             pending_revert_reqs: HashMap::new(),
             undone_prompts: Vec::new(),
         }
@@ -215,6 +225,10 @@ impl ChatCore {
         &self.known_model_ids
     }
 
+    pub fn listed_models(&self) -> &[super::types::ModelItem] {
+        &self.listed_models
+    }
+
     pub fn models_listed(&self) -> bool {
         self.models_listed
     }
@@ -229,6 +243,61 @@ impl ChatCore {
         self.known_model_ids = known;
     }
 
+    pub fn resolve_target_provider(
+        &self,
+        target_model: &str,
+        explicit_provider: Option<&str>,
+    ) -> (Option<String>, String) {
+        if let Some(prov) = explicit_provider {
+            let p = if self.provider.is_some() {
+                Some(prov.to_string())
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
+        }
+
+        // Try exact listed-id match first (current provider first, then any)
+        if let Some(m) = self
+            .listed_models
+            .iter()
+            .find(|m| m.id == target_model && m.provider == self.provider)
+        {
+            let p = if self.provider.is_some() {
+                m.provider.clone()
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
+        }
+        if let Some(m) = self.listed_models.iter().find(|m| m.id == target_model) {
+            let p = if self.provider.is_some() {
+                m.provider.clone()
+            } else {
+                None
+            };
+            return (p, target_model.to_string());
+        }
+
+        // Next, try splitting on '/'
+        if let Some((prov, m_id)) = target_model.split_once('/')
+            && (self
+                .listed_models
+                .iter()
+                .any(|m| m.provider.as_deref() == Some(prov))
+                || self.provider.as_deref() == Some(prov))
+        {
+            let p = if self.provider.is_some() {
+                Some(prov.to_string())
+            } else {
+                None
+            };
+            return (p, m_id.to_string());
+        }
+
+        (None, target_model.to_string())
+    }
+
     pub(crate) fn request_model_list_silent(&mut self, effects: &mut Vec<Effect>) {
         let req_id = self.allocate_id();
         self.pending_model_reqs
@@ -236,7 +305,10 @@ impl ChatCore {
         effects.push(Effect::Request {
             id: req_id,
             method: "_honk/model/list".to_string(),
-            params: json!({ "sessionId": self.session_id }),
+            params: json!({
+                "sessionId": self.session_id,
+                "allProviders": true,
+            }),
         });
     }
 
@@ -253,8 +325,17 @@ impl ChatCore {
         allow_notice: bool,
         effects: &mut Vec<Effect>,
     ) {
-        if let Some(p) = honk_wire::config_select_value(val, "provider") {
-            self.provider = Some(p);
+        if let Some(new_p) = honk_wire::config_select_value(val, "provider") {
+            if allow_notice
+                && !self.is_replaying
+                && let Some(ref old_p) = self.provider
+                && old_p != &new_p
+            {
+                effects.push(Effect::Notice(Notice::info(format!(
+                    "provider: {old_p} → {new_p}"
+                ))));
+            }
+            self.provider = Some(new_p);
         }
         let opts = honk_wire::config_select_options(val, "model");
         if !opts.is_empty() {
@@ -262,7 +343,23 @@ impl ChatCore {
             self.recompute_known_model_ids();
         }
         if let Some(new_m) = honk_wire::config_select_value(val, "model") {
-            if allow_notice
+            if let Some(ref chain) = self.pending_model_chain.clone() {
+                if new_m == chain.target_model {
+                    if allow_notice && !self.is_replaying {
+                        let old = chain.original_model.as_deref().or(self.model.as_deref());
+                        if let Some(old_m) = old
+                            && old_m != new_m
+                        {
+                            effects.push(Effect::Notice(Notice::info(format!(
+                                "model: {old_m} → {new_m}"
+                            ))));
+                        }
+                    }
+                    self.pending_model_chain = None;
+                } else {
+                    // Suppress intermediate notice for provider default model!
+                }
+            } else if allow_notice
                 && !self.is_replaying
                 && let Some(ref old_m) = self.model
                 && old_m != &new_m
@@ -417,7 +514,12 @@ impl ChatCore {
 
         match &self.run_state {
             RunState::Unknown | RunState::Idle => {
-                self.send_prompt(text, conversion_count, effects);
+                if !self.local_queue.is_empty() {
+                    self.local_queue.push_back((text, conversion_count));
+                    self.check_queued_prompts(effects);
+                } else {
+                    self.send_prompt(text, conversion_count, effects);
+                }
             }
             RunState::Running(run_id) => {
                 if self.run_ownership == Ownership::Own {
@@ -539,9 +641,13 @@ impl ChatCore {
     }
 
     pub fn has_pending_model_mutation(&self) -> bool {
-        self.pending_model_reqs
-            .values()
-            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }))
+        self.pending_model_reqs.values().any(|req| {
+            matches!(
+                req,
+                super::types::PendingModelReq::Set { .. }
+                    | super::types::PendingModelReq::SetProvider { .. }
+            )
+        })
     }
 
     fn check_queued_prompts(&mut self, effects: &mut Vec<Effect>) {
@@ -1223,10 +1329,13 @@ impl ChatCore {
                 "mcp: change may or may not have applied; run /mcp to check",
             )));
         }
-        let had_model_mutation = self
-            .pending_model_reqs
-            .values()
-            .any(|req| matches!(req, super::types::PendingModelReq::Set { .. }));
+        let had_model_mutation = self.pending_model_reqs.values().any(|req| {
+            matches!(
+                req,
+                super::types::PendingModelReq::Set { .. }
+                    | super::types::PendingModelReq::SetProvider { .. }
+            )
+        });
         self.pending_model_reqs.clear();
         if had_model_mutation {
             effects.push(Effect::Notice(Notice::warning(
@@ -1405,6 +1514,14 @@ impl ChatCore {
                 }
 
                 let result = frame.get("result").unwrap_or(&Value::Null);
+                let provider = result
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| self.provider.clone());
+                if let Some(ref p) = provider {
+                    self.provider = Some(p.clone());
+                }
                 let current = result
                     .get("current")
                     .and_then(Value::as_str)
@@ -1434,13 +1551,21 @@ impl ChatCore {
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
-                                Some(super::types::ModelItem { id, name, source })
+                                let provider =
+                                    m.get("provider").and_then(Value::as_str).map(String::from);
+                                Some(super::types::ModelItem {
+                                    id,
+                                    name,
+                                    source,
+                                    provider,
+                                })
                             })
                             .collect()
                     })
                     .unwrap_or_default();
 
                 self.models_listed = true;
+                self.listed_models = models.clone();
                 self.listed_model_ids = models.iter().map(|m| m.id.clone()).collect();
                 self.recompute_known_model_ids();
 
@@ -1450,6 +1575,7 @@ impl ChatCore {
                     }
 
                     effects.push(Effect::ModelList {
+                        provider,
                         current,
                         models,
                         warning,
@@ -1457,12 +1583,70 @@ impl ChatCore {
                 }
                 false
             }
-            super::types::PendingModelReq::Set {
-                model,
+            super::types::PendingModelReq::SetProvider {
+                provider,
+                then_model,
                 queued,
                 record_recent,
             } => {
                 if let Some(err) = frame.get("error") {
+                    self.pending_model_chain = None;
+                    let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+                    let msg = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider error");
+
+                    let is_busy = code == -32002
+                        && err.pointer("/data/honk").and_then(Value::as_str) == Some("busy");
+
+                    if is_busy
+                        && let Some((raw_line, count)) = queued
+                        && count < 3
+                    {
+                        self.local_queue.push_front((raw_line, count + 1));
+                        return true;
+                    }
+
+                    effects.push(Effect::Notice(Notice::error(format!(
+                        "provider switch to {provider} failed: {msg}"
+                    ))));
+                    self.request_model_list_silent(effects);
+                    return false;
+                }
+
+                let result = frame.get("result").unwrap_or(&Value::Null);
+                self.update_model_state(result, true, effects);
+
+                let req_id = self.allocate_id();
+                self.pending_model_reqs.insert(
+                    req_id,
+                    super::types::PendingModelReq::Set {
+                        model: then_model.clone(),
+                        queued,
+                        record_recent,
+                        after_provider: Some(provider),
+                    },
+                );
+                effects.push(Effect::Request {
+                    id: req_id,
+                    method: "session/set_config_option".to_string(),
+                    params: json!({
+                        "sessionId": self.session_id,
+                        "configId": "model",
+                        "value": then_model,
+                    }),
+                });
+                false
+            }
+            super::types::PendingModelReq::Set {
+                model,
+                queued,
+                record_recent,
+                after_provider,
+            } => {
+                if let Some(err) = frame.get("error") {
+                    self.pending_model_chain = None;
                     let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
                     let msg = err
                         .get("message")
@@ -1480,8 +1664,21 @@ impl ChatCore {
                         return true;
                     }
 
-                    effects.push(Effect::Notice(Notice::error(msg)));
+                    let notice_text = if let Some(ref prov) = after_provider {
+                        let cur_prov = self.provider.as_deref().unwrap_or(prov.as_str());
+                        let cur_model = self.model.as_deref().unwrap_or("unknown");
+                        format!(
+                            "model switch to {model} failed after provider switch to {cur_prov}; session is now on {cur_prov}/{cur_model}"
+                        )
+                    } else {
+                        msg.to_string()
+                    };
+                    effects.push(Effect::Notice(Notice::error(notice_text)));
                     self.request_model_list_silent(effects);
+                    if after_provider.is_some() {
+                        // Do not flush prompts queued during switch; keep them queued
+                        return true;
+                    }
                     return false;
                 }
 

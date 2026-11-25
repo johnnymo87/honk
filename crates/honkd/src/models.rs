@@ -38,6 +38,7 @@ pub fn list_reply(
     configured: Option<&ModelsFile>,
     warning: Option<String>,
     init_result: &Value,
+    all_providers: bool,
 ) -> Value {
     let config_options = init_result.get("configOptions").and_then(Value::as_array);
 
@@ -58,7 +59,7 @@ pub fn list_reply(
         .map(str::to_string);
 
     let mut models = Vec::new();
-    let mut seen_ids = HashSet::new();
+    let mut seen: HashSet<(Option<String>, String)> = HashSet::new();
 
     if let Some(ref prov) = provider
         && let Some(cfg) = configured
@@ -68,13 +69,13 @@ pub fn list_reply(
             if entry.id.is_empty() {
                 continue;
             }
-            if !seen_ids.contains(&entry.id) {
-                seen_ids.insert(entry.id.clone());
+            if seen.insert((Some(prov.clone()), entry.id.clone())) {
                 let name = entry.name.clone().unwrap_or_else(|| entry.id.clone());
                 models.push(json!({
                     "id": entry.id,
                     "name": name,
                     "source": "configured",
+                    "provider": prov,
                 }));
             }
         }
@@ -85,14 +86,47 @@ pub fn list_reply(
     {
         for g_opt in goose_opts {
             let val = g_opt.get("value").and_then(Value::as_str).unwrap_or("");
-            if !val.is_empty() && !seen_ids.contains(val) {
-                seen_ids.insert(val.to_string());
+            if !val.is_empty() && seen.insert((provider.clone(), val.to_string())) {
                 let name = g_opt.get("name").and_then(Value::as_str).unwrap_or(val);
-                models.push(json!({
+                let mut entry_json = json!({
                     "id": val,
                     "name": name,
                     "source": "goose",
-                }));
+                });
+                if let Some(ref prov) = provider {
+                    entry_json["provider"] = json!(prov);
+                } else {
+                    entry_json["provider"] = Value::Null;
+                }
+                models.push(entry_json);
+            }
+        }
+    }
+
+    if all_providers && let Some(cfg) = configured {
+        let mut other_providers: Vec<&String> = cfg
+            .providers
+            .keys()
+            .filter(|&k| provider.as_deref() != Some(k.as_str()))
+            .collect();
+        other_providers.sort();
+
+        for other_prov in other_providers {
+            if let Some(entries) = cfg.providers.get(other_prov) {
+                for entry in entries {
+                    if entry.id.is_empty() {
+                        continue;
+                    }
+                    if seen.insert((Some(other_prov.clone()), entry.id.clone())) {
+                        let name = entry.name.clone().unwrap_or_else(|| entry.id.clone());
+                        models.push(json!({
+                            "id": entry.id,
+                            "name": name,
+                            "source": "configured",
+                            "provider": other_prov,
+                        }));
+                    }
+                }
             }
         }
     }
@@ -170,7 +204,7 @@ mod tests {
         let mf = ModelsFile { providers };
         let init_result = sample_init_result(Some("gcp_vertex_ai"), Some("claude-opus-5-5"));
 
-        let reply = list_reply(Some(&mf), None, &init_result);
+        let reply = list_reply(Some(&mf), None, &init_result, false);
 
         assert_eq!(reply["provider"], "gcp_vertex_ai");
         assert_eq!(reply["current"], "claude-opus-5-5");
@@ -183,21 +217,25 @@ mod tests {
         assert_eq!(models[0]["id"], "custom-1");
         assert_eq!(models[0]["name"], "Custom 1");
         assert_eq!(models[0]["source"], "configured");
+        assert_eq!(models[0]["provider"], "gcp_vertex_ai");
 
         // 2. Configured claude-opus-5-5 (name defaults to id)
         assert_eq!(models[1]["id"], "claude-opus-5-5");
         assert_eq!(models[1]["name"], "claude-opus-5-5");
         assert_eq!(models[1]["source"], "configured");
+        assert_eq!(models[1]["provider"], "gcp_vertex_ai");
 
         // 3. Goose gemini-3.8-flash (claude-opus-5-5 was already listed)
         assert_eq!(models[2]["id"], "gemini-3.8-flash");
         assert_eq!(models[2]["name"], "Gemini 3.8 Flash");
         assert_eq!(models[2]["source"], "goose");
+        assert_eq!(models[2]["provider"], "gcp_vertex_ai");
 
         // 4. Goose model-3
         assert_eq!(models[3]["id"], "model-3");
         assert_eq!(models[3]["name"], "Goose Model 3");
         assert_eq!(models[3]["source"], "goose");
+        assert_eq!(models[3]["provider"], "gcp_vertex_ai");
     }
 
     #[test]
@@ -213,13 +251,14 @@ mod tests {
         let mf = ModelsFile { providers };
         let init_result = sample_init_result(Some("gcp_vertex_ai"), Some("gemini-3.8-flash"));
 
-        let reply = list_reply(Some(&mf), None, &init_result);
+        let reply = list_reply(Some(&mf), None, &init_result, false);
         assert_eq!(reply["provider"], "gcp_vertex_ai");
         assert_eq!(reply["current"], "gemini-3.8-flash");
 
         let models = reply["models"].as_array().expect("models array");
         assert_eq!(models.len(), 3);
         assert!(models.iter().all(|m| m["source"] == "goose"));
+        assert!(models.iter().all(|m| m["provider"] == "gcp_vertex_ai"));
     }
 
     #[test]
@@ -235,11 +274,149 @@ mod tests {
         let mf = ModelsFile { providers };
         let init_result = json!({ "sessionId": "test_sid" });
 
-        let reply = list_reply(Some(&mf), None, &init_result);
+        let reply = list_reply(Some(&mf), None, &init_result, false);
         assert!(reply["provider"].is_null());
         assert!(reply["current"].is_null());
         let models = reply["models"].as_array().expect("models array");
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_all_providers_false_only_current_provider() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gcp_vertex_ai".to_string(),
+            vec![ModelEntry {
+                id: "vertex-model".to_string(),
+                name: None,
+            }],
+        );
+        providers.insert(
+            "codex_lb".to_string(),
+            vec![ModelEntry {
+                id: "gpt-6-astra".to_string(),
+                name: Some("GPT-6 Astra".to_string()),
+            }],
+        );
+        let mf = ModelsFile { providers };
+        let init_result = sample_init_result(Some("gcp_vertex_ai"), Some("gemini-3.8-flash"));
+
+        let reply = list_reply(Some(&mf), None, &init_result, false);
+        let models = reply["models"].as_array().expect("models array");
+        assert!(!models.iter().any(|m| m["id"] == "gpt-6-astra"));
+        assert!(models.iter().all(|m| m["provider"] == "gcp_vertex_ai"));
+    }
+
+    #[test]
+    fn test_all_providers_true_appends_other_providers_sorted() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gcp_vertex_ai".to_string(),
+            vec![ModelEntry {
+                id: "vertex-model".to_string(),
+                name: None,
+            }],
+        );
+        providers.insert(
+            "zebra_provider".to_string(),
+            vec![ModelEntry {
+                id: "z-model".to_string(),
+                name: None,
+            }],
+        );
+        providers.insert(
+            "codex_lb".to_string(),
+            vec![
+                ModelEntry {
+                    id: "gpt-6-astra".to_string(),
+                    name: Some("GPT-6 Astra".to_string()),
+                },
+                ModelEntry {
+                    id: "gpt-6.1-sol".to_string(),
+                    name: None,
+                },
+            ],
+        );
+        let mf = ModelsFile { providers };
+        let init_result = sample_init_result(Some("gcp_vertex_ai"), Some("claude-opus-5-5"));
+
+        let reply = list_reply(Some(&mf), None, &init_result, true);
+        let models = reply["models"].as_array().expect("models array");
+
+        // 1: current provider configured (vertex-model)
+        assert_eq!(models[0]["id"], "vertex-model");
+        assert_eq!(models[0]["provider"], "gcp_vertex_ai");
+
+        // 2..4: goose options from current provider
+        assert_eq!(models[1]["id"], "claude-opus-5-5");
+        assert_eq!(models[1]["source"], "goose");
+        assert_eq!(models[1]["provider"], "gcp_vertex_ai");
+        assert_eq!(models[2]["id"], "gemini-3.8-flash");
+        assert_eq!(models[2]["provider"], "gcp_vertex_ai");
+        assert_eq!(models[3]["id"], "model-3");
+        assert_eq!(models[3]["provider"], "gcp_vertex_ai");
+
+        // 5..6: codex_lb (sorted before zebra_provider) in file order
+        assert_eq!(models[4]["id"], "gpt-6-astra");
+        assert_eq!(models[4]["name"], "GPT-6 Astra");
+        assert_eq!(models[4]["source"], "configured");
+        assert_eq!(models[4]["provider"], "codex_lb");
+
+        assert_eq!(models[5]["id"], "gpt-6.1-sol");
+        assert_eq!(models[5]["name"], "gpt-6.1-sol");
+        assert_eq!(models[5]["source"], "configured");
+        assert_eq!(models[5]["provider"], "codex_lb");
+
+        // 7: zebra_provider
+        assert_eq!(models[6]["id"], "z-model");
+        assert_eq!(models[6]["source"], "configured");
+        assert_eq!(models[6]["provider"], "zebra_provider");
+    }
+
+    #[test]
+    fn test_per_provider_id_dedup() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gcp_vertex_ai".to_string(),
+            vec![
+                ModelEntry {
+                    id: "shared-model".to_string(),
+                    name: Some("Vertex Shared".to_string()),
+                },
+                ModelEntry {
+                    id: "shared-model".to_string(), // duplicate within provider
+                    name: Some("Vertex Duplicate".to_string()),
+                },
+            ],
+        );
+        providers.insert(
+            "codex_lb".to_string(),
+            vec![
+                ModelEntry {
+                    id: "shared-model".to_string(), // same ID across providers -> kept!
+                    name: Some("Codex Shared".to_string()),
+                },
+                ModelEntry {
+                    id: "shared-model".to_string(), // duplicate within codex_lb -> deduped
+                    name: Some("Codex Duplicate".to_string()),
+                },
+            ],
+        );
+        let mf = ModelsFile { providers };
+        let init_result = sample_init_result(Some("gcp_vertex_ai"), None);
+
+        let reply = list_reply(Some(&mf), None, &init_result, true);
+        let models = reply["models"].as_array().expect("models array");
+
+        let shared_entries: Vec<_> = models
+            .iter()
+            .filter(|m| m["id"] == "shared-model")
+            .collect();
+        assert_eq!(shared_entries.len(), 2);
+        assert_eq!(shared_entries[0]["provider"], "gcp_vertex_ai");
+        assert_eq!(shared_entries[0]["name"], "Vertex Shared");
+        assert_eq!(shared_entries[1]["provider"], "codex_lb");
+        assert_eq!(shared_entries[1]["name"], "Codex Shared");
     }
 
     #[test]
@@ -260,10 +437,11 @@ mod tests {
         );
         let mf = ModelsFile { providers };
         let init_result = sample_init_result(Some("gcp_vertex_ai"), None);
-        let reply = list_reply(Some(&mf), None, &init_result);
+        let reply = list_reply(Some(&mf), None, &init_result, false);
         let models = reply["models"].as_array().expect("models array");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["id"], "valid-id");
+        assert_eq!(models[0]["provider"], "gcp_vertex_ai");
     }
 
     #[tokio::test]
@@ -303,6 +481,7 @@ mod tests {
             None,
             Some("warning: file garbled".to_string()),
             &init_result,
+            false,
         );
         assert_eq!(reply["warning"], "warning: file garbled");
     }

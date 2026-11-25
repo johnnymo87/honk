@@ -103,6 +103,7 @@ pub enum Effect {
     Reattach,
     RecordRecentModel(String),
     ModelList {
+        provider: Option<String>,
         current: Option<String>,
         models: Vec<ModelItem>,
         warning: Option<String>,
@@ -224,6 +225,8 @@ pub struct ModelItem {
     pub name: String,
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,9 +234,16 @@ pub enum PendingModelReq {
     List {
         silent: bool,
     },
+    SetProvider {
+        provider: String,
+        then_model: String,
+        queued: Option<(String, u32)>,
+        record_recent: bool,
+    },
     Set {
         model: String,
         queued: Option<(String, u32)>,
         record_recent: bool,
+        after_provider: Option<String>,
     },
 }
