@@ -321,10 +321,11 @@ impl App {
                 PickerOutcome::Close => {
                     self.pending_prefix = None;
                 }
-                PickerOutcome::Select(id) => {
+                PickerOutcome::Select { id, provider } => {
                     self.pending_prefix = None;
                     let _ = self.cmd_tx.send(UiCommand::SetModel {
                         id,
+                        provider,
                         record_recent: true,
                     });
                 }
@@ -455,6 +456,7 @@ impl App {
                     crate::chat::recent::CycleResult::Switch(id) => {
                         let _ = self.cmd_tx.send(UiCommand::SetModel {
                             id,
+                            provider: None,
                             record_recent: false,
                         });
                     }
@@ -493,6 +495,7 @@ impl App {
                     crate::chat::recent::CycleResult::Switch(id) => {
                         let _ = self.cmd_tx.send(UiCommand::SetModel {
                             id,
+                            provider: None,
                             record_recent: false,
                         });
                     }
@@ -1022,6 +1025,7 @@ impl App {
             }
             UiEvent::Transcript(_) => {}
             UiEvent::ModelList {
+                provider,
                 current,
                 models,
                 warning: _,
@@ -1029,7 +1033,7 @@ impl App {
                 self.pending_prefix = None;
                 self.command_line = None;
                 let recent = self.load_recent();
-                self.model_picker = Some(ModelPicker::new(current, models, recent));
+                self.model_picker = Some(ModelPicker::new(provider, current, models, recent));
             }
         }
     }
@@ -2179,14 +2183,17 @@ mod tests {
                 id: "model-a".to_string(),
                 name: "Model A".to_string(),
                 source: "configured".to_string(),
+                provider: None,
             },
             crate::chat::types::ModelItem {
                 id: "model-b".to_string(),
                 name: "Model B".to_string(),
                 source: "goose".to_string(),
+                provider: None,
             },
         ];
         app.handle_ui_event(UiEvent::ModelList {
+            provider: None,
             current: Some("model-a".to_string()),
             models,
             warning: None,
@@ -2209,6 +2216,7 @@ mod tests {
             cmd,
             UiCommand::SetModel {
                 id: "model-b".to_string(),
+                provider: None,
                 record_recent: true
             }
         );
@@ -2222,6 +2230,7 @@ mod tests {
         // 1. Prefix is cleared when picker opens
         app.pending_prefix = Some('z');
         app.handle_ui_event(UiEvent::ModelList {
+            provider: None,
             current: None,
             models: vec![],
             warning: None,
@@ -2236,11 +2245,13 @@ mod tests {
 
         // 3. Prefix is cleared when picker closes via Enter (Select)
         app.handle_ui_event(UiEvent::ModelList {
+            provider: None,
             current: None,
             models: vec![crate::chat::types::ModelItem {
                 id: "m1".to_string(),
                 name: "m1".to_string(),
                 source: "goose".to_string(),
+                provider: None,
             }],
             warning: None,
         });
@@ -2330,6 +2341,7 @@ mod tests {
             cmd,
             UiCommand::SetModel {
                 id: "model-2".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2341,6 +2353,7 @@ mod tests {
             cmd,
             UiCommand::SetModel {
                 id: "model-2".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2387,6 +2400,7 @@ mod tests {
             cmd1,
             UiCommand::SetModel {
                 id: "model-b".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2408,6 +2422,7 @@ mod tests {
             cmd2,
             UiCommand::SetModel {
                 id: "model-c".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2429,6 +2444,7 @@ mod tests {
             cmd3,
             UiCommand::SetModel {
                 id: "model-a".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2480,6 +2496,7 @@ mod tests {
             cmd,
             UiCommand::SetModel {
                 id: "custom-author-model-2".to_string(),
+                provider: None,
                 record_recent: false
             }
         );
@@ -2496,6 +2513,7 @@ mod tests {
 
         // UiEvent::ModelList arrives
         app.handle_ui_event(UiEvent::ModelList {
+            provider: None,
             current: None,
             models: vec![],
             warning: None,

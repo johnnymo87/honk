@@ -548,20 +548,44 @@ pub async fn run(opts: &LaunchOpts) -> Result<Launched, LaunchError> {
 
     match effective_model {
         Some((model, ModelSource::Explicit)) => {
-            step!(
+            let (target_provider, target_model) = step!(
                 check_model_allowed(&mut client, &native, &model, opts.timeouts.model).await,
                 "setting the model failed"
             );
+            if let Some(ref prov) = target_provider {
+                step!(
+                    set_provider(&mut client, &native, prov, opts.timeouts.model).await,
+                    "setting the model failed"
+                );
+            }
             step!(
-                set_model(&mut client, &native, &model, opts.timeouts.model).await,
+                set_model(&mut client, &native, &target_model, opts.timeouts.model).await,
                 "setting the model failed"
             );
         }
         Some((model, ModelSource::Hook)) => {
             match check_model_allowed(&mut client, &native, &model, opts.timeouts.model).await {
-                Ok(()) => {
-                    if let Err(e) =
-                        set_model(&mut client, &native, &model, opts.timeouts.model).await
+                Ok((target_provider, target_model)) => {
+                    let provider_ok = match target_provider {
+                        Some(ref prov) => {
+                            match set_provider(&mut client, &native, prov, opts.timeouts.model)
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    eprintln!(
+                                        "honk launch: warning: switching to provider '{prov}' for default-model-cmd model '{model}' failed ({e:#}); using server default"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        None => true,
+                    };
+                    if provider_ok
+                        && let Err(e) =
+                            set_model(&mut client, &native, &target_model, opts.timeouts.model)
+                                .await
                     {
                         eprintln!(
                             "honk launch: warning: setting default-model-cmd model '{model}' failed ({e:#}); continuing (if timed out, ambiguous: may still apply)"
@@ -902,11 +926,14 @@ async fn check_model_allowed(
     sid: &str,
     model: &str,
     timeout: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Option<String>, String)> {
     let frame = match call_with_timeout(
         client,
         "_honk/model/list",
-        json!({ "sessionId": sid }),
+        json!({
+            "sessionId": sid,
+            "allProviders": true,
+        }),
         timeout,
     )
     .await
@@ -914,7 +941,7 @@ async fn check_model_allowed(
         Ok(f) => f,
         Err(e) => {
             eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({e})");
-            return Ok(());
+            return Ok((None, model.to_string()));
         }
     };
 
@@ -925,23 +952,94 @@ async fn check_model_allowed(
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
         if code == -32601 {
-            return Ok(());
+            return Ok((None, model.to_string()));
         }
         eprintln!("honk launch: warning: could not verify model '{model}' against honkd ({msg})");
-        return Ok(());
+        return Ok((None, model.to_string()));
     }
+
+    let session_provider = frame
+        .pointer("/result/provider")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     if let Some(models) = frame.pointer("/result/models").and_then(Value::as_array)
         && !models.is_empty()
     {
-        let found = models
-            .iter()
-            .any(|m| m.get("id").and_then(Value::as_str) == Some(model));
-        if !found {
-            bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
+        // Check if model starts with <provider>/<id>
+        if let Some((prov, m_id)) = model.split_once('/') {
+            let matches_provider = models
+                .iter()
+                .any(|m| m.get("provider").and_then(Value::as_str) == Some(prov));
+            if matches_provider {
+                let found = models.iter().any(|m| {
+                    m.get("id").and_then(Value::as_str) == Some(m_id)
+                        && m.get("provider").and_then(Value::as_str) == Some(prov)
+                });
+                if !found {
+                    bail!(
+                        "{model} is not in honkd's model list (configured via honkd --models-file)"
+                    );
+                }
+                let target_provider = if session_provider.as_deref() == Some(prov) {
+                    None
+                } else {
+                    Some(prov.to_string())
+                };
+                return Ok((target_provider, m_id.to_string()));
+            }
         }
+
+        // Search for model in current session provider first, then any provider
+        let matched_entry = models
+            .iter()
+            .find(|m| {
+                m.get("id").and_then(Value::as_str) == Some(model)
+                    && m.get("provider").and_then(Value::as_str) == session_provider.as_deref()
+            })
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+            });
+
+        if let Some(m) = matched_entry {
+            let entry_prov = m.get("provider").and_then(Value::as_str);
+            let target_provider =
+                if entry_prov.is_some() && entry_prov != session_provider.as_deref() {
+                    entry_prov.map(str::to_string)
+                } else {
+                    None
+                };
+            return Ok((target_provider, model.to_string()));
+        }
+
+        bail!("{model} is not in honkd's model list (configured via honkd --models-file)");
     }
 
+    Ok((None, model.to_string()))
+}
+
+async fn set_provider(
+    client: &mut Client,
+    sid: &str,
+    provider: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let frame = call_with_timeout(
+        client,
+        "session/set_config_option",
+        json!({
+            "sessionId": sid,
+            "configId": "provider",
+            "value": provider,
+        }),
+        timeout,
+    )
+    .await?;
+    if let Some(e) = rpc_error(&frame) {
+        bail!("session/set_config_option: {e}");
+    }
     Ok(())
 }
 

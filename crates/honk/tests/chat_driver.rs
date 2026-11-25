@@ -4195,7 +4195,23 @@ async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
             .await
             .unwrap();
 
-            // 3. session/set_config_option
+            // 3. _honk/model/list (answering with method not found so it falls back to model-only)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "_honk/model/list");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/set_config_option
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/set_config_option");
@@ -4218,7 +4234,7 @@ async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
             .await
             .unwrap();
 
-            // 4. session/load
+            // 5. session/load
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/load");
@@ -4277,6 +4293,182 @@ async fn test_new_session_with_model_sets_config_option_and_updates_recents() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_new_session_with_cross_provider_model_sets_provider_then_model() {
+    let temp_xdg = tempfile::tempdir().unwrap();
+    let recent_dir = temp_xdg.path().join("honk");
+
+    let (url, server_task) = fake_ws_server(|listener| {
+        Box::pin(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(tcp, |_req: &Request, resp: Response| Ok(resp))
+                    .await
+                    .unwrap();
+
+            // 1. initialize
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "protocolVersion": 1 } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 2. session/new
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/new");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "sessionId": "s_cross_new",
+                        "configOptions": [
+                            {"id": "provider", "currentValue": "gcp_vertex_ai"},
+                            {"id": "model", "currentValue": "claude-opus-5-5"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 3. _honk/model/list
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "_honk/model/list");
+            assert_eq!(v["params"]["allProviders"], true);
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "provider": "gcp_vertex_ai",
+                        "current": "claude-opus-5-5",
+                        "models": [
+                            {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai"},
+                            {"id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/set_config_option provider
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            assert_eq!(v["params"]["sessionId"], "s_cross_new");
+            assert_eq!(v["params"]["configId"], "provider");
+            assert_eq!(v["params"]["value"], "codex_lb");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "configOptions": [
+                            {"id": "provider", "currentValue": "codex_lb"},
+                            {"id": "model", "currentValue": "default-codex"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 5. session/set_config_option model
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/set_config_option");
+            assert_eq!(v["params"]["sessionId"], "s_cross_new");
+            assert_eq!(v["params"]["configId"], "model");
+            assert_eq!(v["params"]["value"], "gpt-6-astra");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "result": {
+                        "configOptions": [
+                            {"id": "provider", "currentValue": "codex_lb"},
+                            {"id": "model", "currentValue": "gpt-6-astra"}
+                        ]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 6. session/load
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "session/load");
+            ws.send(Message::Text(
+                json!({ "jsonrpc": "2.0", "id": v["id"], "result": { "sessionId": "s_cross_new" } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+        })
+    })
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut opts = DriverOpts::new(
+        url,
+        "sekrit",
+        Target::New {
+            cwd: tmp.path().to_path_buf(),
+            extensions: None,
+            mcp: None,
+        },
+    );
+    opts.no_swarm = true;
+    opts.model = Some("gpt-6-astra".into());
+    opts.recent_dir = Some(recent_dir.clone());
+
+    let (handle, mut rx) = start(opts).await.unwrap();
+
+    let mut model_in_state = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(Some(evt)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            match evt {
+                UiEvent::State(s) => {
+                    if s.model.is_some() {
+                        model_in_state = s.model;
+                        break;
+                    }
+                }
+                UiEvent::Fatal(f) => panic!("unexpected fatal: {f}"),
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(model_in_state.as_deref(), Some("gpt-6-astra"));
+    let recents = honk::chat::recent::load_from(&recent_dir);
+    assert_eq!(recents, vec!["gpt-6-astra".to_string()]);
+
+    let _ = handle.send(UiCommand::Shutdown);
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
     let (url, server_task) = fake_ws_server(|listener| {
         Box::pin(async move {
@@ -4315,7 +4507,23 @@ async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
             .await
             .unwrap();
 
-            // 3. session/set_config_option -> error
+            // 3. _honk/model/list (answering with method not found so it falls back to model-only)
+            let msg = ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            assert_eq!(v["method"], "_honk/model/list");
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": v["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            // 4. session/set_config_option -> error
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/set_config_option");
@@ -4334,7 +4542,7 @@ async fn test_new_session_with_model_error_shows_notice_and_stays_open() {
             .await
             .unwrap();
 
-            // 4. session/load (must still happen, chat stays open!)
+            // 5. session/load (must still happen, chat stays open!)
             let msg = ws.next().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert_eq!(v["method"], "session/load");

@@ -12,7 +12,10 @@ use crate::chat::types::ModelItem;
 pub enum PickerOutcome {
     Stay,
     Close,
-    Select(String),
+    Select {
+        id: String,
+        provider: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +28,7 @@ pub enum PickerRow {
 pub struct ModelPicker {
     pub query: String,
     pub current: Option<String>,
+    pub current_provider: Option<String>,
     pub models: Vec<ModelItem>,
     pub recent: Vec<String>,
     pub rows: Vec<PickerRow>,
@@ -47,10 +51,16 @@ pub fn is_subsequence(needle: &str, haystack: &str) -> bool {
 }
 
 impl ModelPicker {
-    pub fn new(current: Option<String>, models: Vec<ModelItem>, recent: Vec<String>) -> Self {
+    pub fn new(
+        current_provider: Option<String>,
+        current: Option<String>,
+        models: Vec<ModelItem>,
+        recent: Vec<String>,
+    ) -> Self {
         let mut picker = Self {
             query: String::new(),
             current,
+            current_provider,
             models,
             recent,
             rows: Vec::new(),
@@ -86,6 +96,7 @@ impl ModelPicker {
                             id: id.clone(),
                             name: id.clone(),
                             source: String::new(),
+                            provider: None,
                         });
                     recent_items.push(item);
                 }
@@ -143,6 +154,7 @@ impl ModelPicker {
                             id: id.clone(),
                             name: id.clone(),
                             source: String::new(),
+                            provider: None,
                         });
                     }
                 }
@@ -151,7 +163,11 @@ impl ModelPicker {
             let filtered: Vec<ModelItem> = all_models
                 .into_iter()
                 .filter(|m| {
-                    is_subsequence(&self.query, &m.id) || is_subsequence(&self.query, &m.name)
+                    is_subsequence(&self.query, &m.id)
+                        || is_subsequence(&self.query, &m.name)
+                        || m.provider
+                            .as_ref()
+                            .is_some_and(|p| is_subsequence(&self.query, p))
                 })
                 .collect();
 
@@ -231,10 +247,17 @@ impl ModelPicker {
             if let Some(idx) = self.selected
                 && let Some(PickerRow::Model(m)) = self.rows.get(idx)
             {
-                if self.current.as_deref() == Some(&m.id) {
+                let is_current = self.current.as_deref() == Some(&m.id)
+                    && (m.provider.is_none()
+                        || self.current_provider.is_none()
+                        || m.provider == self.current_provider);
+                if is_current {
                     return PickerOutcome::Close;
                 } else {
-                    return PickerOutcome::Select(m.id.clone());
+                    return PickerOutcome::Select {
+                        id: m.id.clone(),
+                        provider: m.provider.clone(),
+                    };
                 }
             }
             return PickerOutcome::Stay;
@@ -359,7 +382,10 @@ impl ModelPicker {
                     buf.set_line(inner.x, y, &line, inner.width);
                 }
                 PickerRow::Model(m) => {
-                    let is_current = self.current.as_deref() == Some(&m.id);
+                    let is_current = self.current.as_deref() == Some(&m.id)
+                        && (m.provider.is_none()
+                            || self.current_provider.is_none()
+                            || m.provider == self.current_provider);
                     let marker = if is_current { "● " } else { "  " };
 
                     let mut spans = vec![
@@ -376,6 +402,14 @@ impl ModelPicker {
                     if m.name != m.id {
                         spans.push(Span::styled(
                             format!("  {}", m.name),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    if let Some(ref p) = m.provider
+                        && self.current_provider.as_deref() != Some(p)
+                    {
+                        spans.push(Span::styled(
+                            format!("  {p}"),
                             Style::default().fg(Color::DarkGray),
                         ));
                     }
@@ -412,21 +446,25 @@ mod tests {
                 id: "claude-opus-5-5".to_string(),
                 name: "Claude Opus 5.5".to_string(),
                 source: "configured".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             },
             ModelItem {
                 id: "claude-haiku-4-5".to_string(),
                 name: "Claude Haiku 4.5".to_string(),
                 source: "configured".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             },
             ModelItem {
                 id: "gemini-3.8-flash".to_string(),
                 name: "gemini-3.8-flash".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             },
             ModelItem {
                 id: "gemini-2.5-pro".to_string(),
                 name: "Gemini Pro 2.5".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             },
         ]
     }
@@ -449,7 +487,12 @@ mod tests {
             "claude-opus-5-5".to_string(),
             "old-custom-model".to_string(),
         ];
-        let picker = ModelPicker::new(Some("gemini-3.8-flash".to_string()), models, recent);
+        let picker = ModelPicker::new(
+            Some("gcp_vertex_ai".to_string()),
+            Some("gemini-3.8-flash".to_string()),
+            models,
+            recent,
+        );
 
         assert_eq!(picker.rows.len(), 7);
         assert_eq!(picker.rows[0], PickerRow::Header("Recent".to_string()));
@@ -459,6 +502,7 @@ mod tests {
                 id: "gemini-3.8-flash".to_string(),
                 name: "gemini-3.8-flash".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
         assert_eq!(
@@ -467,6 +511,7 @@ mod tests {
                 id: "claude-opus-5-5".to_string(),
                 name: "Claude Opus 5.5".to_string(),
                 source: "configured".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
         // "old-custom-model" is not in sample_models, so it is omitted when models list is non-empty
@@ -477,6 +522,7 @@ mod tests {
                 id: "claude-haiku-4-5".to_string(),
                 name: "Claude Haiku 4.5".to_string(),
                 source: "configured".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
         assert_eq!(picker.rows[5], PickerRow::Header("goose".to_string()));
@@ -486,6 +532,7 @@ mod tests {
                 id: "gemini-2.5-pro".to_string(),
                 name: "Gemini Pro 2.5".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
     }
@@ -493,6 +540,7 @@ mod tests {
     #[test]
     fn test_sectioning_empty_models_shows_recents() {
         let picker = ModelPicker::new(
+            None,
             None,
             vec![],
             vec!["recent-a".to_string(), "recent-b".to_string()],
@@ -505,6 +553,7 @@ mod tests {
                 id: "recent-a".to_string(),
                 name: "recent-a".to_string(),
                 source: String::new(),
+                provider: None,
             })
         );
         assert_eq!(
@@ -513,6 +562,7 @@ mod tests {
                 id: "recent-b".to_string(),
                 name: "recent-b".to_string(),
                 source: String::new(),
+                provider: None,
             })
         );
     }
@@ -523,9 +573,10 @@ mod tests {
             id: "m1".to_string(),
             name: "m1".to_string(),
             source: "goose".to_string(),
+            provider: None,
         }];
         let recent = vec!["stale-1".to_string(), "stale-2".to_string()];
-        let picker = ModelPicker::new(None, models, recent);
+        let picker = ModelPicker::new(None, None, models, recent);
 
         assert!(
             !picker
@@ -542,8 +593,9 @@ mod tests {
             id: "m1".to_string(),
             name: "m1".to_string(),
             source: "goose".to_string(),
+            provider: None,
         }];
-        let picker = ModelPicker::new(None, models, vec![]);
+        let picker = ModelPicker::new(None, None, models, vec![]);
         assert_eq!(picker.rows.len(), 2);
         assert_eq!(picker.rows[0], PickerRow::Header("goose".to_string()));
         assert_eq!(
@@ -552,6 +604,7 @@ mod tests {
                 id: "m1".to_string(),
                 name: "m1".to_string(),
                 source: "goose".to_string(),
+                provider: None,
             })
         );
     }
@@ -560,7 +613,7 @@ mod tests {
     fn test_selection_skips_headers() {
         let models = sample_models();
         let recent = vec!["gemini-3.8-flash".to_string()];
-        let mut picker = ModelPicker::new(None, models, recent);
+        let mut picker = ModelPicker::new(None, None, models, recent);
 
         assert_eq!(picker.selected, Some(1));
 
@@ -595,7 +648,7 @@ mod tests {
     fn test_filtering_hides_headers_and_dedup() {
         let models = sample_models();
         let recent = vec!["gemini-3.8-flash".to_string()];
-        let mut picker = ModelPicker::new(None, models, recent);
+        let mut picker = ModelPicker::new(None, None, models, recent);
 
         let outcome = picker.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert_eq!(outcome, PickerOutcome::Stay);
@@ -612,6 +665,7 @@ mod tests {
                 id: "gemini-3.8-flash".to_string(),
                 name: "gemini-3.8-flash".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
         assert_eq!(
@@ -620,6 +674,7 @@ mod tests {
                 id: "gemini-2.5-pro".to_string(),
                 name: "Gemini Pro 2.5".to_string(),
                 source: "goose".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
             })
         );
         assert_eq!(picker.selected, Some(0));
@@ -644,7 +699,12 @@ mod tests {
             "claude-opus-5-5".to_string(),
             "gemini-3.8-flash".to_string(),
         ];
-        let mut picker = ModelPicker::new(Some("claude-opus-5-5".to_string()), models, recent);
+        let mut picker = ModelPicker::new(
+            Some("gcp_vertex_ai".to_string()),
+            Some("claude-opus-5-5".to_string()),
+            models,
+            recent,
+        );
 
         // Row 1 is claude-opus-5-5 (current). Enter should Close without sending command.
         assert_eq!(picker.selected, Some(1));
@@ -653,6 +713,7 @@ mod tests {
 
         // Recreate and select gemini-3.8-flash (not current)
         let mut picker = ModelPicker::new(
+            Some("gcp_vertex_ai".to_string()),
             Some("claude-opus-5-5".to_string()),
             sample_models(),
             vec![
@@ -665,7 +726,10 @@ mod tests {
         let outcome = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             outcome,
-            PickerOutcome::Select("gemini-3.8-flash".to_string())
+            PickerOutcome::Select {
+                id: "gemini-3.8-flash".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
+            }
         );
 
         // Esc closes
@@ -678,15 +742,82 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_provider_display_and_filter() {
+        let models = vec![
+            ModelItem {
+                id: "claude-opus-5-5".to_string(),
+                name: "Claude Opus 5.5".to_string(),
+                source: "configured".to_string(),
+                provider: Some("gcp_vertex_ai".to_string()),
+            },
+            ModelItem {
+                id: "gpt-6-astra".to_string(),
+                name: "GPT-6 Astra".to_string(),
+                source: "configured".to_string(),
+                provider: Some("codex_lb".to_string()),
+            },
+        ];
+        let mut picker = ModelPicker::new(
+            Some("gcp_vertex_ai".to_string()),
+            Some("claude-opus-5-5".to_string()),
+            models,
+            vec![],
+        );
+
+        // Render to buffer
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        picker.render(Rect::new(0, 0, 80, 24), &mut buf);
+
+        // gpt-6-astra should have codex_lb in its rendered line
+        let buf_str: String = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            buf_str.contains("codex_lb"),
+            "buffer must display codex_lb suffix"
+        );
+
+        // Subsequence filter on provider "codex"
+        let outcome = picker.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(outcome, PickerOutcome::Stay);
+        let outcome = picker.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(outcome, PickerOutcome::Stay);
+        let outcome = picker.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(outcome, PickerOutcome::Stay);
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(
+            picker.rows[0],
+            PickerRow::Model(ModelItem {
+                id: "gpt-6-astra".to_string(),
+                name: "GPT-6 Astra".to_string(),
+                source: "configured".to_string(),
+                provider: Some("codex_lb".to_string()),
+            })
+        );
+
+        // Select it
+        let outcome = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            outcome,
+            PickerOutcome::Select {
+                id: "gpt-6-astra".to_string(),
+                provider: Some("codex_lb".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn test_picker_render_and_scroll() {
         let models: Vec<ModelItem> = (0..20)
             .map(|i| ModelItem {
                 id: format!("model-{i}"),
                 name: format!("Model {i}"),
                 source: "goose".to_string(),
+                provider: None,
             })
             .collect();
-        let mut picker = ModelPicker::new(None, models, vec![]);
+        let mut picker = ModelPicker::new(None, None, models, vec![]);
 
         // Buffer 80x24
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
@@ -707,7 +838,7 @@ mod tests {
     #[test]
     fn test_picker_tiny_buffer_no_panic() {
         let models = sample_models();
-        let mut picker = ModelPicker::new(None, models, vec![]);
+        let mut picker = ModelPicker::new(None, None, models, vec![]);
 
         // 20x5 buffer (narrow width < 30): bounded within buffer, renders without panic
         let area20x5 = Rect::new(0, 0, 20, 5);

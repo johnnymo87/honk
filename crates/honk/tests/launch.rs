@@ -39,6 +39,7 @@ struct Script {
     prompt: PromptReply,
     model_error: Option<&'static str>,
     model_delay: Option<Duration>,
+    provider_error: Option<&'static str>,
     effort_error: Option<&'static str>,
     model_list: Option<Value>,
 }
@@ -51,6 +52,7 @@ impl Default for Script {
             prompt: PromptReply::Echo,
             model_error: None,
             model_delay: None,
+            provider_error: None,
             effort_error: None,
             model_list: None,
         }
@@ -132,6 +134,7 @@ async fn fake_honkd(script: Script, tags_log: PathBuf, pigeon: Arc<StubPigeon>) 
                         tokio::time::sleep(d).await;
                     }
                     let err = match config_id {
+                        Some("provider") => script.provider_error,
                         Some("model") => script.model_error,
                         Some("thinking_effort") => script.effort_error,
                         _ => None,
@@ -1191,6 +1194,27 @@ async fn launch_default_model_hook_resolves_with_tag_and_orders_before_effort() 
     assert_eq!(log_content.trim(), "--tag myfeaturetag");
 
     // Verify ordering: initialize, session/new, rename, _honk/model/list, set_config_option (model), set_config_option (effort), prompt
+#[tokio::test]
+async fn launch_with_cross_provider_model_sets_provider_then_model() {
+    let script = Script {
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "claude-opus-5-5", "name": "Claude Opus 5.5", "source": "configured", "provider": "gcp_vertex_ai" },
+                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
+                ]
+            }
+        })),
+        ..Script::default()
+    };
+    let r = rig(script, Behaviour::default(), "", 0).await;
+    let mut o = opts(&r, TagRequest::Off, None, Some("Fix the thing"));
+    o.model = Some("gpt-6-astra".into());
+    let out = run(&o).await.expect("launch");
+    assert_eq!(out.prompt, honk::launch::PromptState::Ok);
+
     assert_eq!(
         methods(&r),
         [
@@ -1257,12 +1281,30 @@ async fn launch_default_model_hook_resolves_when_untagged() {
 
     let reqs = r.honkd.reqs.lock().unwrap().clone();
     let model_req = &reqs[3];
+            "session/set_config_option", // provider
+            "session/set_config_option", // model
+            "session/prompt"
+        ],
+        "cross-provider set must call provider set then model set"
+    );
+    let reqs = r.honkd.reqs.lock().unwrap().clone();
+    let prov_req = &reqs[4];
+    assert_eq!(
+        prov_req.params,
+        json!({
+            "sessionId": SID,
+            "configId": "provider",
+            "value": "codex_lb",
+        })
+    );
+    let model_req = &reqs[5];
     assert_eq!(
         model_req.params,
         json!({
             "sessionId": SID,
             "configId": "model",
             "value": "untagged-model",
+            "value": "gpt-6-astra",
         })
     );
 }
@@ -1366,6 +1408,15 @@ async fn launch_default_model_hook_model_rejected_by_honkd_list_fails_open() {
                 "models": [
                     { "id": "allowed-model-1" },
                     { "id": "allowed-model-2" }
+async fn launch_with_cross_provider_model_failure_aborts_before_model_and_prompt() {
+    let script = Script {
+        provider_error: Some("unknown provider"),
+        model_list: Some(json!({
+            "result": {
+                "provider": "gcp_vertex_ai",
+                "current": "claude-opus-5-5",
+                "models": [
+                    { "id": "gpt-6-astra", "name": "GPT-6 Astra", "source": "configured", "provider": "codex_lb" }
                 ]
             }
         })),
@@ -1451,6 +1502,27 @@ async fn launch_default_model_hook_set_model_timeout_fails_open() {
     assert_eq!(out.prompt, honk::launch::PromptState::Ok);
 
     // Attempted model list and set_config_option, timed out, but still continued to prompt
+    let mut o = opts(&r, TagRequest::Off, None, None);
+    o.model = Some("gpt-6-astra".into());
+    let err = run(&o)
+        .await
+        .expect_err("launch must fail on provider error");
+
+    match err {
+        LaunchError::Partial { error, .. } => {
+            let msg = format!("{error:#}");
+            assert!(
+                msg.contains("setting the model failed"),
+                "error must mention setting the model failed: {msg}"
+            );
+            assert!(
+                msg.contains("unknown provider"),
+                "error must include honkd's message: {msg}"
+            );
+        }
+        other => panic!("expected Partial error, got {other:?}"),
+    }
+
     assert_eq!(
         methods(&r),
         [
@@ -1460,5 +1532,8 @@ async fn launch_default_model_hook_set_model_timeout_fails_open() {
             "session/set_config_option",
             "session/prompt"
         ]
+            "session/set_config_option"
+        ],
+        "model set and prompt must not be called when provider set fails"
     );
 }
