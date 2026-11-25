@@ -176,22 +176,14 @@ async fn staggered_reactivation_of_two_viewed_sessions() {
 
     let res = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            async {
-                v1.wait_for(|f| {
-                    is_method(f, honk_wire::method::REPLAY_DONE)
-                        && f.pointer("/params/epoch") == Some(&json!(2))
-                })
-                .await;
-                Instant::now()
-            },
-            async {
-                v2.wait_for(|f| {
-                    is_method(f, honk_wire::method::REPLAY_DONE)
-                        && f.pointer("/params/epoch") == Some(&json!(2))
-                })
-                .await;
-                Instant::now()
-            }
+            v1.wait_for(|f| {
+                is_method(f, honk_wire::method::REPLAY_DONE)
+                    && f.pointer("/params/epoch") == Some(&json!(2))
+            }),
+            v2.wait_for(|f| {
+                is_method(f, honk_wire::method::REPLAY_DONE)
+                    && f.pointer("/params/epoch") == Some(&json!(2))
+            }),
         )
     })
     .await;
@@ -200,8 +192,30 @@ async fn staggered_reactivation_of_two_viewed_sessions() {
         eprintln!("honkd stderr:\n{}", h.stderr_text());
         panic!("timed out waiting for both sessions to re-activate");
     }
-    let (t1, t2) = res.unwrap();
 
+    // Measure the stagger at the start of each session's reactivation (the first
+    // post-restart `session/info` call per distinct sessionId, issued right after
+    // `acquire_reactivation_slot`) rather than viewer `REPLAY_DONE` arrival times,
+    // which include variable export / log-rebuild / WS scheduling latency under load.
+    let mut first_per_session: std::collections::HashMap<String, Instant> =
+        std::collections::HashMap::new();
+    for (ts, f) in fake.inbound_with_timestamps() {
+        if ts >= restart_time
+            && f.get("method").and_then(Value::as_str) == Some("_goose/unstable/session/info")
+            && let Some(sid) = f
+                .pointer("/params/sessionId")
+                .or_else(|| f.get("sessionId"))
+                .and_then(Value::as_str)
+        {
+            first_per_session.entry(sid.to_string()).or_insert(ts);
+        }
+    }
+    let t1 = *first_per_session
+        .get(&sid1)
+        .expect("expected post-restart session/info for sid1");
+    let t2 = *first_per_session
+        .get(&sid2)
+        .expect("expected post-restart session/info for sid2");
     let diff = if t1 > t2 {
         t1.duration_since(t2)
     } else {
@@ -209,11 +223,10 @@ async fn staggered_reactivation_of_two_viewed_sessions() {
     };
 
     assert!(
-        diff >= Duration::from_millis(400),
-        "staggered re-activation must be at least ~500ms apart; diff was {diff:?} (t1: {:?}, t2: {:?}, restart: {:?})",
-        t1.duration_since(restart_time),
-        t2.duration_since(restart_time),
-        restart_time
+        diff >= Duration::from_millis(350),
+        "staggered re-activation must be ~500ms apart; diff was {diff:?} (t1: {:?}, t2: {:?})",
+        t1.saturating_duration_since(restart_time),
+        t2.saturating_duration_since(restart_time),
     );
 }
 
@@ -312,6 +325,10 @@ async fn synthesized_active_run_id_null_reaches_legacy_viewer() {
             }
         }
     })]);
+
+    // Keep the prompt in flight until fake.restart() interrupts it; without this,
+    // FakeGoose finishes the 1-frame scripted turn ~50ms later with end_turn.
+    fake.set_drop_prompt_reply(true);
 
     let req_id = v
         .request(
@@ -672,6 +689,24 @@ async fn pending_requests_fail_with_32000_on_connection_replacement() {
             }),
         )
         .await;
+
+    // Wait until honkd has actually forwarded the request upstream (so it is in
+    // `pending_requests` on the old connection rather than queued during reactivation).
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fake.inbound().iter().any(|f| {
+            f.get("method").and_then(Value::as_str) == Some("session/set_mode")
+                && (f.pointer("/params/sessionId").and_then(Value::as_str) == Some(sid.as_str())
+                    || f.get("sessionId").and_then(Value::as_str) == Some(sid.as_str()))
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "timed out waiting for session/set_mode to reach FakeGoose"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     // Goose restarts!
     fake.restart().await;

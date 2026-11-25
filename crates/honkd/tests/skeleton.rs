@@ -197,8 +197,10 @@ async fn viewer_overflow_closes_with_4001() {
         .await
         .expect("connect");
 
-    // Flood with initialize requests without reading responses
-    for i in 1..=50 {
+    // Burst 200 initialize requests in a single flush without reading responses.
+    // Feeding and flushing together ensures the 1-slot viewer queue overflows before
+    // honkd's writer task can drain individual frames between per-message flushes.
+    for i in 1..=200 {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "id": i,
@@ -206,11 +208,12 @@ async fn viewer_overflow_closes_with_4001() {
             "params": {"protocolVersion": 1, "clientCapabilities": {}}
         });
         let _ = ws
-            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+            .feed(tokio_tungstenite::tungstenite::protocol::Message::Text(
                 req.to_string().into(),
             ))
             .await;
     }
+    let _ = ws.flush().await;
 
     // Read frames until Close
     let mut close_code = None;
